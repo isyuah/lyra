@@ -429,6 +429,15 @@ struct Emitter {
 
     Value emitNode(ExprId id, const Identifier&) {
         const auto& info = fn.expressions[id];
+        if (info.constantRef) {
+            const auto& constant = *layouts.program.constants[*info.constantRef];
+            auto* type = layouts.native(builder, rawType(id));
+            if (auto value = std::get_if<std::uint64_t>(&constant)) return llvm::ConstantInt::get(type, *value);
+            if (auto value = std::get_if<double>(&constant)) return llvm::ConstantFP::get(type, *value);
+            if (auto value = std::get_if<bool>(&constant)) return builder.getInt1(*value);
+            if (auto value = std::get_if<std::string>(&constant)) return stringConstant(*value);
+            return unit();
+        }
         if (info.functionRef) {
             const auto& syntax = layouts.program.functions[*info.functionRef].syntax;
             const auto& shape = layouts.program.signatures[rawType(id).id];
@@ -1273,6 +1282,7 @@ std::unique_ptr<llvm::Module> lower(const CheckedModule& program, const std::vec
     Layouts layouts(program, builder);
     std::vector<llvm::Function*> functions;
     for (const auto& fn : program.functions) {
+        if (fn.syntax.constant == ConstKind::Value) { functions.push_back(nullptr); continue; }
         std::vector<llvm::Type*> params;
         for (std::size_t index = 0; index < fn.syntax.parameters.size(); ++index) params.push_back(layouts.native(builder, fn.locals[index].type));
         if (!fn.syntax.isAsync && !fn.syntax.foreignSymbol) params.push_back(builder.getPtrTy());
@@ -1282,6 +1292,7 @@ std::unique_ptr<llvm::Module> lower(const CheckedModule& program, const std::vec
     for (std::size_t index = 0; index < functions.size(); ++index) {
         const auto& fn = program.functions[index];
         auto* factory = functions[index];
+        if (!factory) continue;
         if (fn.syntax.foreignSymbol) {
             emitForeign(fn, sources[fn.syntax.file], *factory);
             continue;

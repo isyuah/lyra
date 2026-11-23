@@ -91,6 +91,7 @@ struct Bound { std::size_t parameter; Identifier trait; };
 struct Extension { std::size_t file; Identifier name, receiver; bool isPublic; std::vector<Identifier> typeParameters{}; std::vector<Bound> bounds{}; };
 struct TraitMethod { Identifier name; std::vector<Parameter> parameters; Identifier result; bool asynchronous; };
 struct Trait { std::size_t file; Identifier name; std::vector<TraitMethod> methods; bool isPublic; };
+enum class ConstKind { None, Value, Function };
 struct Function {
     std::size_t file;
     Identifier name;
@@ -108,6 +109,7 @@ struct Function {
     bool initializer{};
     bool hasReceiver{};
     std::optional<Identifier> extensionGroup{};
+    ConstKind constant{};
 };
 
 struct FieldDefault { std::size_t function; bool emptyOption; };

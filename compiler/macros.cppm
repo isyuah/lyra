@@ -260,7 +260,7 @@ std::string expand(const Source& source, const Expansion& prefix, const MacroPac
     std::vector<Source> code{std::move(builtin), loadSource(path, {})};
     auto parsed = parse(code);
     if (!parsed.imports.empty() || !parsed.aggregates.empty() || !parsed.expansions.empty() || !parsed.traits.empty() || !parsed.enums.empty() || !parsed.extensions.empty() || !parsed.exceptions.empty()) throw at(source, prefix.name.span, "LYM0002", "宏实现只能声明同步的纯计算函数");
-    for (const auto& fn : parsed.functions) if (fn.isAsync || fn.foreignSymbol || !fn.typeParameters.empty()) throw at(source, prefix.name.span, "LYM0002", "宏不能使用 extern、异步或泛型入口");
+    for (const auto& fn : parsed.functions) if (fn.isAsync || fn.foreignSymbol || !fn.typeParameters.empty() || fn.constant != ConstKind::None) throw at(source, prefix.name.span, "LYM0002", "宏不能使用 extern、异步、泛型入口或 const 声明");
     auto checked = check(std::move(parsed), code, false);
     auto scalar = [](Type type) { return type == Type::Int || type == Type::Bool || type == Type::String || type == Type::Unit || type == Type::Never; };
     for (const auto& fn : checked.functions) {

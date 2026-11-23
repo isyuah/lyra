@@ -150,7 +150,7 @@ public:
             while (offset < text.size() && (isLetter(text[offset]) || isDigit(text[offset]))) ++offset;
         } else if (isLetter(current)) {
             while (offset < text.size() && (isLetter(text[offset]) || isDigit(text[offset]))) ++offset;
-            constexpr std::string_view keywords[] = {"fn", "val", "var", "if", "else", "while", "for", "in", "return", "break", "continue", "true", "false", "struct", "class", "enum", "trait", "pub", "import", "as", "is", "async", "await", "spawn", "extern", "match", "null", "implicit", "defer", "throw", "try", "catch", "this", "static"};
+            constexpr std::string_view keywords[] = {"fn", "val", "var", "const", "if", "else", "while", "for", "in", "return", "break", "continue", "true", "false", "struct", "class", "enum", "trait", "pub", "import", "as", "is", "async", "await", "spawn", "extern", "match", "null", "implicit", "defer", "throw", "try", "catch", "this", "static"};
             auto word = text.substr(start, offset - start);
             kind = std::ranges::find(keywords, word) == std::end(keywords) ? Kind::Name : Kind::Keyword;
         } else if (current == '`') {
@@ -264,6 +264,30 @@ public:
                 module.expansions.push_back({file, std::move(name), std::move(argument), decorator, false, 0});
             }
             bool pub = visibility();
+            if (is("const")) {
+                if (firstPrefix != module.expansions.size()) throw at(source, module.expansions[firstPrefix].name.span, "LYM0001", "不能修饰 const 声明");
+                auto prefix = consume().span;
+                if (is("fn") && !token.newlineBefore) {
+                    auto fn = function({}, pub);
+                    if (fn.name.text == "main" || fn.result.text.empty() || !fn.typeParameters.empty() || std::ranges::any_of(fn.parameters, [](const auto& param) { return param.variadic || param.defaultValue; }))
+                        throw at(source, prefix, "LYCT0001", "const fn 需要显式返回类型；首版不支持入口、泛型、默认实参和变长形参");
+                    fn.constant = ConstKind::Function;
+                    module.functions.push_back(std::move(fn));
+                } else {
+                    auto name = identifier();
+                    if (name.text == "main") throw at(source, name.span, "LYCT0001", "main 不能声明为常量");
+                    require(":");
+                    auto annotation = type();
+                    require("=");
+                    auto initializer = expression();
+                    if (is(";")) consume();
+                    else if (token.kind != Kind::End && !token.newlineBefore) throw at(source, token.span, "LYP0001", "常量声明后需要换行或分号");
+                    Function constant{file, std::move(name), {}, std::move(annotation), std::exchange(nodes, {}), initializer, {}, pub};
+                    constant.constant = ConstKind::Value;
+                    module.functions.push_back(std::move(constant));
+                }
+                continue;
+            }
             if (is("trait")) {
                 if (firstPrefix != module.expansions.size()) throw at(source, module.expansions[firstPrefix].name.span, "LYM0001", "不能修饰 trait 约束声明");
                 module.traits.push_back(trait(pub));

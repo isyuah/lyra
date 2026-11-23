@@ -86,7 +86,7 @@ struct Linker {
         for (auto& item : syntax.enums) declare(item.file, item.name, item.isPublic, false);
         for (auto& item : syntax.exceptions) declare(item.file, item.name, item.isPublic, false);
         for (auto& extension : syntax.extensions) declare(extension.file, extension.name, extension.isPublic, false, true);
-        for (auto& fn : syntax.functions) if (!fn.owner && !fn.extensionGroup) declare(fn.file, fn.name, fn.isPublic, true);
+        for (auto& fn : syntax.functions) if (!fn.owner && !fn.extensionGroup) declare(fn.file, fn.name, fn.isPublic, fn.constant != ConstKind::Value);
         std::map<std::size_t, std::map<std::string, const Import*>> generatedImports;
         for (const auto& use : syntax.imports) {
             const auto& source = sources[use.file];

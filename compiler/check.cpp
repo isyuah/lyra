@@ -24,6 +24,7 @@ import lyra.collections;
 import lyra.patterns;
 import lyra.numbers;
 import lyra.initialization;
+import lyra.ctfe;
 
 namespace lyra {
 
@@ -1344,9 +1345,13 @@ struct Checker {
         if (expected && expected->kind == Type::Option) expected = module.sumTypes[expected->id].success;
         auto index = candidates.size() == 1 ? candidates.front() : selectFunctionValue(name, candidates, expected);
         const auto& item = symbols.callables[index];
-        auto [type, types] = functionValue(index, name, expected);
         const auto& syntax = symbols.declaration(item);
         refer(name, syntax.file, syntax.name.span);
+        if (syntax.constant == ConstKind::Value) {
+            fn.expressions[id].constantRef = item.target;
+            return module.functions[item.target].result;
+        }
+        auto [type, types] = functionValue(index, name, expected);
         if (!item.generic) fn.expressions[id].functionRef = item.target;
         else if (materializing()) fn.expressions[id].functionRef = symbols.instantiate(index, types, source, name.span);
         fn.expressions[id].callableType = type;
@@ -1635,6 +1640,7 @@ struct Checker {
     Type declaredCall(std::size_t declaration, ExprId id, const Call& call, std::optional<Type> expected, std::span<const Type> ownerTypes = {}, bool onlyArguments = false) {
         const auto& candidate = symbols.callables[declaration];
         const auto& syntax = symbols.declaration(candidate);
+        if (syntax.constant == ConstKind::Value) throw at(source, call.name.span, "LYCT0001", "编译期常量不是函数：" + call.name.text);
         if (!onlyArguments) {
             if (!syntax.initializer) refer(call.name, syntax.file, syntax.name.span);
             fn.calls.push_back({syntax.file, syntax.name.span});
@@ -2034,7 +2040,10 @@ struct Checker {
     bool writable(ExprId id) const {
         const auto& expr = fn.syntax.expressions[id];
         if (auto index = std::get_if<Index>(&expr.node)) return fn.expressions[index->receiver].type.kind == Type::List;
-        if (std::holds_alternative<Identifier>(expr.node)) return !fn.expressions[id].callableType && fn.locals[fn.expressions[id].target].writable;
+        if (std::holds_alternative<Identifier>(expr.node)) {
+            const auto& info = fn.expressions[id];
+            return !info.callableType && !info.constantRef && fn.locals[info.target].writable;
+        }
         if (auto member = std::get_if<Member>(&expr.node)) {
             auto type = fn.expressions[member->receiver].type;
             if (type.kind != Type::Record) return false;
@@ -2447,6 +2456,8 @@ CheckedModule check(Module module, const std::vector<Source>& sources, bool requ
                 throw at(source, function.name.span, "LYN0002", "函数名已声明：" + name);
             auto& candidates = symbols.functions[name];
             if (!candidates.empty() && (name == "main" || name.ends_with("::main"))) throw at(source, function.name.span, "LYN0002", "main 不能重载");
+            if (!candidates.empty() && (function.constant == ConstKind::Value || symbols.declaration(symbols.callables[candidates.front()]).constant == ConstKind::Value))
+                throw at(source, function.name.span, "LYN0002", "常量名已声明：" + name);
             addOverload(candidates, function, source);
         }
         if (!function.typeParameters.empty()) {
@@ -2547,6 +2558,7 @@ CheckedModule check(Module module, const std::vector<Source>& sources, bool requ
     for (std::size_t id = 0; id < checked.aggregates.size(); ++id) layout(layout, id);
     validateForeignDeclarations(checked, sources);
     if (requireEntry && !checked.entry) throw Diagnostic{"LYN0001", "可执行包缺少入口 fn main(): Unit"};
+    evaluateConstants(checked, sources);
     return checked;
 }
 
