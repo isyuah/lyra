@@ -11,6 +11,7 @@ typedef struct LyraDomain LyraDomain;
 typedef struct LyraTask LyraTask;
 typedef void (*LyraTaskStep)(LyraTask *task, void *frame);
 typedef void (*LyraNativeWork)(void *nativeData);
+typedef void *(*LyraBlockingBody)(void *environment);
 
 typedef enum LyraTaskState {
     LYRA_TASK_COLD, LYRA_TASK_READY, LYRA_TASK_RUNNING, LYRA_TASK_SUSPENDED,
@@ -22,6 +23,8 @@ size_t lyraDomainRun(LyraDomain *domain);
 void lyraDomainDestroy(LyraDomain *domain);
 
 LyraTask *lyraTaskCreate(LyraTaskStep step, void *frame);
+LyraTask *lyraTaskBlocking(LyraBlockingBody body, void *environment);
+int lyraTaskWatchDisconnect(int socketFd);
 void lyraTaskStart(LyraDomain *domain, LyraTask *task);
 int lyraTaskAwait(LyraTask *waiter, LyraTask *target);
 int lyraTaskAwaitValue(LyraTask *waiter, LyraTask *target);
@@ -37,6 +40,8 @@ int lyraTaskCancelRequested(const LyraTask *task);
 void lyraTaskFinishCancelled(LyraTask *task);
 LyraTaskState lyraTaskState(const LyraTask *task);
 void *lyraTaskOutcome(const LyraTask *task);
+size_t lyraTaskFailureCount(const LyraTask *task);
+void *lyraTaskFailureAt(const LyraTask *task, size_t index);
 
 #ifdef __cplusplus
 }

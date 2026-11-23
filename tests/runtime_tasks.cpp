@@ -4,6 +4,7 @@
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
 namespace {
@@ -188,6 +189,82 @@ void cancelDuringCall(LyraTask *self, void *storage) {
     lyraTaskComplete(self, nullptr);
 }
 
+struct DisconnectCase {
+    int sockets[2];
+    NativeGate gate;
+    LyraTask *handler{}, *blocked{};
+    bool observed{}, closed{};
+};
+
+void *queuedClosure(void *storage) {
+    auto *test = static_cast<DisconnectCase *>(storage);
+    check(!lyraTaskWatchDisconnect(test->sockets[0]), "worker shared the caller's current task");
+    close(test->sockets[1]);
+    nativeCall(&test->gate);
+    lyraGcCollect();
+    return lyraGcAlloc(sizeof(Counter));
+}
+
+void observeDisconnect(LyraTask *self, void *storage) {
+    auto *test = static_cast<DisconnectCase *>(storage);
+    if (!lyraTaskCancelRequested(test->handler)) {
+        lyraTaskSuspend(self);
+        lyraTaskWake(self);
+        return;
+    }
+    pthread_mutex_lock(&test->gate.lock);
+    check(!test->closed && lyraTaskCancelRequested(test->blocked), "disconnect did not cancel the worker's owner tree");
+    check(lyraTaskState(test->handler) == LYRA_TASK_SUSPENDED && lyraTaskState(test->blocked) == LYRA_TASK_SUSPENDED,
+          "pending C operation or its parent resumed before the worker returned");
+    test->observed = true;
+    test->gate.mayReturn = true;
+    pthread_cond_signal(&test->gate.changed);
+    pthread_mutex_unlock(&test->gate.lock);
+    lyraTaskComplete(self, nullptr);
+}
+
+void watchedHandler(LyraTask *self, void *storage) {
+    auto *test = static_cast<DisconnectCase *>(storage);
+    if (!test->blocked) {
+        check(lyraTaskWatchDisconnect(test->sockets[0]), "owner could not watch a socket");
+        test->blocked = lyraTaskBlocking(queuedClosure, test);
+        check(!lyraTaskAwait(self, test->blocked), "cold blocking closure was already done");
+        return;
+    }
+    check(lyraTaskCancelRequested(self) && test->observed && test->gate.returned, "cleanup ran early or missed disconnect");
+    check(lyraTaskState(test->blocked) == LYRA_TASK_CANCELLED, "blocking work did not complete cancellation");
+    close(test->sockets[0]);
+    test->closed = true;
+    lyraTaskFinishCancelled(self);
+}
+
+struct GroupCase {
+    LyraTask *early;
+    unsigned order;
+    Counter causes[2];
+};
+
+void firstFailure(LyraTask *self, void *storage) {
+    auto *test = static_cast<GroupCase *>(storage);
+    if (!lyraTaskCancelRequested(self)) { lyraTaskSuspend(self); return; }
+    check(++test->order == 2, "unexpected failure order");
+    lyraTaskFail(self, &test->causes[0]);
+}
+
+void secondFailure(LyraTask *self, void *storage) {
+    auto *test = static_cast<GroupCase *>(storage);
+    check(++test->order == 1, "second child did not fail first");
+    lyraTaskFail(self, &test->causes[1]);
+}
+
+void failGroup(LyraTask *self, void *storage) {
+    auto *test = static_cast<GroupCase *>(storage);
+    test->early = lyraTaskSpawn(self, lyraTaskCreate(firstFailure, test));
+    lyraTaskSpawn(self, lyraTaskCreate(secondFailure, test));
+    lyraTaskComplete(self, nullptr);
+    check(lyraTaskState(self) == LYRA_TASK_SUSPENDED, "group completed before children finished");
+}
+
 }
 
 int main() {
@@ -263,6 +340,24 @@ int main() {
     check(gate.closed && lyraTaskState(call) == LYRA_TASK_CANCELLED, "native cleanup did not complete cancellation");
     pthread_cond_destroy(&gate.changed);
     pthread_mutex_destroy(&gate.lock);
+
+    DisconnectCase disconnected{};
+    check(socketpair(AF_UNIX, SOCK_STREAM, 0, disconnected.sockets) == 0, "cannot create test sockets");
+    disconnected.handler = lyraTaskCreate(watchedHandler, &disconnected);
+    lyraTaskStart(origin, disconnected.handler);
+    lyraTaskStart(origin, lyraTaskCreate(observeDisconnect, &disconnected));
+    lyraDomainRun(origin);
+    check(disconnected.closed && lyraTaskState(disconnected.handler) == LYRA_TASK_CANCELLED, "request never finished cleanup");
+    pthread_cond_destroy(&disconnected.gate.changed);
+    pthread_mutex_destroy(&disconnected.gate.lock);
+
+    GroupCase group{};
+    auto *parent = lyraTaskCreate(failGroup, &group);
+    lyraTaskStart(origin, parent);
+    lyraDomainRun(origin);
+    check(lyraTaskState(parent) == LYRA_TASK_FAILED && lyraTaskFailureCount(parent) == 2, "unobserved child failures were lost");
+    check(lyraTaskFailureAt(parent, 0) == &group.causes[0] && lyraTaskFailureAt(parent, 1) == &group.causes[1],
+          "failures were reported by completion instead of registration");
     lyraDomainDestroy(other);
     lyraDomainDestroy(origin);
 }
