@@ -40,6 +40,7 @@ struct Layouts {
         case Type::Bool: return builder.getInt1Ty();
         case Type::Unit: case Type::Never: return builder.getInt8Ty();
         case Type::String: return builder.getPtrTy();
+        case Type::Variable: llvm_unreachable("abstract type reached LLVM lowering");
         case Type::Record: return reference(type) ? static_cast<llvm::Type*>(builder.getPtrTy()) : objects[type.id];
         }
         llvm_unreachable("invalid Lyra type");

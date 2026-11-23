@@ -32,6 +32,7 @@ lyra pack <目录> [-o <源码包>|--registry <本地目录>]
 - `test` 编译并运行每个 `tests/*.ly` 中的 `fn main(): Unit`，用 `import self.<名称>` 访问包的公开 API。workspace 根支持一次检查或测试多个成员。锁、缓存、只读 HTTP(S) 源和脚本边界见[包工具手册](compiler/packages.md)。
 - 支持 `Int`、`Bool`、`Unit`、具名形参、按源码顺序求值的命名实参、`val` / `var`、嵌套作用域、赋值和复合赋值、整数四则与余数、比较、短路 `&&` / `||`、`if` / `else`、`while`、`break`、`continue` 和 `return`。整数溢出或除零在 Debug/Release 都带源码位置报错。普通块以末表达式为值，空块或带末尾分号的块取 `Unit`。
 - `String` 支持 UTF-8、拼接和内容相等；`struct` 按值复制，`class` 保留对象身份，可定义字段、主构造和方法。`gcCollect()` 可主动收集。对象由 BDWGC 管理；编译器安装目录带静态 GC 和 libuv 归档，部署应用不需要安装这两个库。见[对象验收程序](tests/fixtures/objects/src/main.ly)。
+- 泛型函数 `fn identity<T>(value: T): T { value }` 可写 `identity(42)` 或 `identity<String>("Ada")`。未调用的泛型也检查函数体，已调用的具体类型组合各生成一份原生实现。
 - `check` 不调用 Clang、不创建产物。`build` 默认输出 `<包目录>/build/debug/app`（`-O0`），`--release` 输出 `build/release/app`（`-O2`），`-o` 指定其他路径。类型错误或链接失败都不会覆盖已有产物。
 - 诊断写到标准错误；`--diagnostics=json` 输出诊断数组，成功为 `[]`。带源码位置时，`range.start/end` 是左闭右开区间：`offset` 为从 0 开始的原文件 UTF-8 字节偏移，`line/column` 从 1 开始，列按 Unicode 码点计，CRLF 和 LF 均算一次换行。
 

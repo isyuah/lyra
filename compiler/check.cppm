@@ -1,5 +1,7 @@
 module;
+#include <deque>
 #include <optional>
+#include <string>
 #include <vector>
 
 export module lyra.check;
@@ -7,7 +9,7 @@ export import lyra.syntax;
 
 export namespace lyra {
 struct Type {
-    enum Kind { Unit, Int, Bool, String, Never, Record };
+    enum Kind { Unit, Int, Bool, String, Never, Record, Variable };
     Kind kind;
     std::size_t id{};
     constexpr Type(Kind kind = Unit, std::size_t id = 0) : kind(kind), id(id) {}
@@ -23,6 +25,6 @@ struct CheckedFunction {
     std::vector<CheckedExpr> expressions;
 };
 struct CheckedAggregate { Aggregate syntax; std::vector<Type> fields; };
-struct CheckedModule { std::vector<CheckedFunction> functions; std::optional<std::size_t> entry; std::vector<CheckedAggregate> aggregates; };
+struct CheckedModule { std::deque<CheckedFunction> functions; std::optional<std::size_t> entry; std::vector<CheckedAggregate> aggregates; std::vector<std::string> variableNames; };
 CheckedModule check(Module module, const std::vector<Source>& sources, bool requireEntry = true);
 }

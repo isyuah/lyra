@@ -1,7 +1,10 @@
 module;
 #include <algorithm>
 #include <cstdint>
+#include <map>
 #include <optional>
+#include <set>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -10,6 +13,7 @@ module;
 #include <vector>
 
 module lyra.check;
+import lyra.generics;
 
 namespace lyra {
 namespace {
@@ -24,20 +28,49 @@ std::string typeName(const CheckedModule& module, Type type) {
         case Type::Never: return "Never";
         case Type::String: return "String";
         case Type::Record: return module.aggregates[type.id].syntax.name.text;
+        case Type::Variable: return module.variableNames[type.id];
     }
     throw std::logic_error("invalid Lyra type");
 }
 
+struct Callable { std::size_t target; std::optional<Function> generic; std::vector<Type> variables; };
+
 struct Symbols {
-    const CheckedModule& module;
+    CheckedModule& module;
     const std::vector<Source>& sources;
     Names records, functions;
     std::vector<Names> fields, methods;
+    std::vector<Callable> callables;
+    std::map<GenericInstanceKey, std::size_t> specializations;
 
     Type resolve(const Source& source, const Identifier& name) const {
         for (Type type : {Type::Int, Type::Bool, Type::String, Type::Unit}) if (name.text == typeName(module, type)) return type;
         if (auto found = records.find(name.text); found != records.end()) return {Type::Record, found->second};
         throw at(source, name.span, "LYT0003", "找不到类型：" + name.text);
+    }
+
+    Type resolve(const Function& signature, const Identifier& name, std::span<const Type> types) const {
+        if (auto parameter = genericParameter(signature, name.text)) return types[*parameter];
+        return resolve(sources[signature.file], name);
+    }
+
+    CheckedFunction prepare(Function syntax, std::span<const Type> arguments = {}) const {
+        auto result = resolve(syntax, syntax.result, arguments);
+        std::vector<Local> locals;
+        for (const auto& param : syntax.parameters) locals.push_back({resolve(syntax, param.type, arguments), false});
+        std::vector<CheckedExpr> expressions(syntax.expressions.size());
+        return {std::move(syntax), result, std::move(locals), std::move(expressions)};
+    }
+
+    std::size_t instantiate(std::size_t declaration, const std::vector<Type>& arguments, const Source& source, Span site) {
+        GenericInstanceKey key{declaration, {}};
+        for (auto type : arguments) key.arguments.push_back(typeName(module, type));
+        if (auto found = specializations.find(key); found != specializations.end()) return found->second;
+        if (specializations.size() >= 4096) throw at(source, site, "LYG0004", "此编译单元的泛型函数实例超过 4096 个");
+        auto index = module.functions.size();
+        module.functions.push_back(prepare(specializeGeneric(*callables[declaration].generic, key.arguments)));
+        specializations.emplace(std::move(key), index);
+        return index;
     }
 };
 
@@ -52,8 +85,9 @@ struct Checker {
     CheckedFunction& fn;
     const Source& source;
     const CheckedModule& module;
-    const Symbols& symbols;
+    Symbols& symbols;
     std::vector<Names> scopes;
+    std::span<const Type> variables{};
     unsigned loops = 0;
 
     void declare(const Identifier& name, std::size_t slot) {
@@ -90,7 +124,7 @@ struct Checker {
 
     Type infer(ExprId id, const Binding& binding, auto, bool) {
         std::optional<Type> annotation;
-        if (binding.annotation) annotation = symbols.resolve(source, *binding.annotation);
+        if (binding.annotation) annotation = symbols.resolve(fn.syntax, *binding.annotation, variables);
         auto value = visit(binding.value, annotation);
         auto slot = fn.locals.size();
         declare(binding.name, slot);
@@ -141,16 +175,44 @@ struct Checker {
         return record.fields[field];
     }
 
-    Type infer(ExprId id, const Call& call, auto, bool) {
+    Type genericCall(std::size_t declaration, ExprId id, const Call& call, std::optional<Type> expected) {
+        const auto& target = *symbols.callables[declaration].generic;
+        std::vector<Type> explicitTypes;
+        for (const auto& type : call.typeArguments) explicitTypes.push_back(symbols.resolve(fn.syntax, type, variables));
+        if (!explicitTypes.empty() && explicitTypes.size() != target.typeParameters.size()) {
+            throw at(source, call.name.span, "LYG0001", call.name.text + " 需要 " + std::to_string(target.typeParameters.size()) + " 个类型实参");
+        }
+        auto skip = static_cast<std::size_t>(call.receiver.has_value());
+        bool exits = arguments(id, call, target.parameters.size() - skip,
+                [&](auto slot) -> const auto& { return target.parameters[slot + skip].name.text; }, [&](auto slot) -> std::optional<Type> {
+                    const auto& annotation = target.parameters[slot + skip].type;
+                    if (auto parameter = genericParameter(target, annotation.text)) return explicitTypes.empty() ? std::nullopt : std::optional(explicitTypes[*parameter]);
+                    return symbols.resolve(symbols.sources[target.file], annotation);
+                });
         auto& info = fn.expressions[id];
-        if (!call.typeArguments.empty()) throw at(source, call.typeArguments.front().span, "LYT0002", "此调用不接收显式类型实参");
+        std::vector<GenericArgument<Type>> actuals;
+        for (std::size_t index = 0; index < call.arguments.size(); ++index) {
+            auto expr = call.arguments[index].value;
+            actuals.push_back({info.argumentSlots[index] + skip, fn.expressions[expr].type, fn.syntax.expressions[expr].span});
+        }
+        auto types = inferGenericArguments<Type>(target, call, fn.syntax.expressions[id].span, explicitTypes, actuals, expected, source, [&](Type type) { return typeName(module, type); });
+        if (variables.empty()) info.target = symbols.instantiate(declaration, types, source, call.name.span);
+        return exits ? Type{Type::Never} : symbols.resolve(target, target.result, types);
+    }
+
+    Type infer(ExprId id, const Call& call, std::optional<Type> expected, bool) {
+        auto& info = fn.expressions[id];
+        auto noTypeArgs = [&] { if (!call.typeArguments.empty()) throw at(source, call.typeArguments.front().span, "LYG0001", "此调用不接受类型实参：" + call.name.text); };
+        std::size_t declaration;
         if (call.receiver) {
             auto owner = visit(*call.receiver);
             if (owner == Type::Never) return owner;
-            info.target = memberIndex(owner, call.name, symbols.methods);
-            const auto& method = module.functions[info.target].syntax;
+            declaration = memberIndex(owner, call.name, symbols.methods);
+            const auto& item = symbols.callables[declaration];
+            const auto& method = item.generic ? *item.generic : module.functions[item.target].syntax;
             visible(method.file, method.isPublic, call.name);
         } else if (call.name.text == "print") {
+            noTypeArgs();
             info.callee = Callee::Print;
             bool exits = arguments(id, call, 1, [](auto) { return "value"; }, [](auto) { return std::nullopt; });
             auto arg = call.arguments.front().value;
@@ -158,10 +220,12 @@ struct Checker {
             if (!exits && type != Type::Int && type != Type::String) throw at(source, fn.syntax.expressions[arg].span, "LYT0001", "print 需要 Int 或 String，实际是 " + typeName(module, type));
             return exits ? Type::Never : Type::Unit;
         } else if (call.name.text == "gcCollect") {
+            noTypeArgs();
             info.callee = Callee::Collect;
             if (!call.arguments.empty()) throw at(source, call.name.span, "LYT0002", "gcCollect 不接收实参");
             return Type::Unit;
         } else if (auto record = symbols.records.find(call.name.text); record != symbols.records.end()) {
+            noTypeArgs();
             info.callee = Callee::Constructor;
             info.target = record->second;
             const auto& decl = module.aggregates[info.target];
@@ -171,8 +235,11 @@ struct Checker {
         } else {
             auto found = symbols.functions.find(call.name.text);
             if (found == symbols.functions.end()) throw at(source, call.name.span, "LYN0001", "找不到函数：" + call.name.text);
-            info.target = found->second;
+            declaration = found->second;
         }
+        if (symbols.callables[declaration].generic) return genericCall(declaration, id, call, expected);
+        noTypeArgs();
+        info.target = symbols.callables[declaration].target;
         const auto& target = module.functions[info.target];
         auto skip = static_cast<std::size_t>(call.receiver.has_value());
         bool exits = arguments(id, call, target.syntax.parameters.size() - skip,
@@ -212,7 +279,7 @@ struct Checker {
         auto left = visit(binary.left, equality || binary.op == Op::Add ? std::nullopt : std::optional(Type::Int));
         auto right = visit(binary.right, left == Type::Never ? std::nullopt : std::optional(left));
         if (left == Type::Never || right == Type::Never) return Type::Never;
-        if (equality && left.kind == Type::Record && !module.aggregates[left.id].syntax.reference) throw at(source, binary.site, "LYT0006", typeName(module, left) + " 未提供 Eq，不能用 == 或 != 比较");
+        if (equality && (left.kind == Type::Variable || (left.kind == Type::Record && !module.aggregates[left.id].syntax.reference))) throw at(source, binary.site, "LYT0006", typeName(module, left) + " 未提供 Eq，不能用 == 或 != 比较");
         if (binary.op == Op::Add && left == Type::String) return Type::String;
         if (binary.op == Op::Add && left != Type::Int) throw mismatch(module, source, binary.site, Type::Int, left);
         return binary.op <= Op::Ge ? Type::Bool : Type::Int;
@@ -276,7 +343,7 @@ struct Checker {
 
 CheckedModule check(Module module, const std::vector<Source>& sources, bool requireEntry) {
     CheckedModule checked{};
-    Symbols symbols{checked, sources, {}, {}, {}, {}};
+    Symbols symbols{checked, sources, {}, {}, {}, {}, {}, {}};
     for (auto& decl : module.aggregates) {
         auto id = checked.aggregates.size();
         for (Type builtin : {Type::Int, Type::Bool, Type::String, Type::Unit, Type::Never}) {
@@ -312,25 +379,41 @@ CheckedModule check(Module module, const std::vector<Source>& sources, bool requ
     for (std::size_t id = 0; id < checked.aggregates.size(); ++id) layout(layout, id);
     for (auto& function : module.functions) {
         const auto& source = sources[function.file];
-        if (!function.typeParameters.empty()) throw at(source, function.typeParameters.front().span, "LYT0003", "泛型函数需要先实例化");
         auto owner = function.owner ? std::optional(symbols.resolve(source, *function.owner).id) : std::nullopt;
         auto& names = owner ? symbols.methods[*owner] : symbols.functions;
         bool collision = owner ? symbols.fields[*owner].contains(function.name.text) : symbols.records.contains(function.name.text) || function.name.text == "print" || function.name.text == "gcCollect";
-        if (collision || !names.emplace(function.name.text, checked.functions.size()).second) {
+        if (collision || !names.emplace(function.name.text, symbols.callables.size()).second) {
             throw at(source, function.name.span, "LYN0002", "函数名已声明：" + function.name.text);
         }
-        auto result = symbols.resolve(source, function.result);
-        if (!owner && requireEntry && function.name.text == "main") {
-            if (!function.parameters.empty()) throw at(source, function.name.span, "LYT0002", "main 不能接收形参");
-            if (result != Type::Unit) throw mismatch(checked, source, function.result.span, Type::Unit, result);
+        if (!function.typeParameters.empty()) {
+            if (!owner && requireEntry && function.name.text == "main") throw at(source, function.name.span, "LYG0001", "main 不能声明类型形参");
+            std::set<std::string> seen; std::vector<Type> variables;
+            for (const auto& parameter : function.typeParameters) {
+                if (!seen.insert(parameter.text).second) throw at(source, parameter.span, "LYN0002", "类型形参重复：" + parameter.text);
+                variables.emplace_back(Type::Variable, checked.variableNames.size());
+                checked.variableNames.push_back(parameter.text);
+            }
+            symbols.callables.push_back({0, std::move(function), std::move(variables)});
+            continue;
+        }
+        auto concrete = symbols.prepare(std::move(function));
+        const auto& syntax = concrete.syntax;
+        if (!owner && requireEntry && syntax.name.text == "main") {
+            if (!syntax.parameters.empty()) throw at(source, syntax.name.span, "LYT0002", "main 不能接收形参");
+            if (concrete.result != Type::Unit) throw mismatch(checked, source, syntax.result.span, Type::Unit, concrete.result);
             checked.entry = checked.functions.size();
         }
-        std::vector<Local> locals;
-        for (const auto& parameter : function.parameters) locals.push_back({symbols.resolve(source, parameter.type), false});
-        std::vector<CheckedExpr> expressions(function.expressions.size());
-        checked.functions.push_back({std::move(function), result, std::move(locals), std::move(expressions)});
+        symbols.callables.push_back({checked.functions.size(), {}, {}});
+        checked.functions.push_back(std::move(concrete));
     }
-    for (auto& fn : checked.functions) Checker{fn, sources[fn.syntax.file], checked, symbols, {}}.run();
+    for (const auto& callable : symbols.callables) if (callable.generic) {
+        auto body = symbols.prepare(*callable.generic, callable.variables);
+        Checker{body, sources[body.syntax.file], checked, symbols, {}, callable.variables}.run();
+    }
+    for (std::size_t index = 0; index < checked.functions.size(); ++index) {
+        auto& fn = checked.functions[index];
+        Checker{fn, sources[fn.syntax.file], checked, symbols, {}}.run();
+    }
     if (requireEntry && !checked.entry) throw Diagnostic{"LYN0001", "可执行包缺少入口 fn main(): Unit"};
     return checked;
 }
