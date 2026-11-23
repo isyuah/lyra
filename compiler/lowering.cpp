@@ -18,14 +18,33 @@ using Builder = llvm::IRBuilder<>;
 using Value = llvm::Value*;
 using Label = llvm::BasicBlock*;
 
-llvm::Type* nativeType(Builder& builder, Type type) {
-    switch (type) {
+struct Layouts {
+    const CheckedModule& program;
+    std::vector<llvm::StructType*> objects;
+
+    Layouts(const CheckedModule& program, Builder& builder) : program(program) {
+        for (const auto& record : program.aggregates) objects.push_back(llvm::StructType::create(builder.getContext(), "lyra.type." + record.syntax.name.text));
+        for (std::size_t id = 0; id < objects.size(); ++id) {
+            std::vector<llvm::Type*> fields;
+            for (Type field : program.aggregates[id].fields) fields.push_back(native(builder, field));
+            if (fields.empty() && program.aggregates[id].syntax.reference) fields.push_back(builder.getInt8Ty());
+            objects[id]->setBody(fields);
+        }
+    }
+
+    bool reference(Type type) const { return program.aggregates[type.id].syntax.reference; }
+
+    llvm::Type* native(Builder& builder, Type type) const {
+        switch (type.kind) {
         case Type::Int: return builder.getInt64Ty();
         case Type::Bool: return builder.getInt1Ty();
         case Type::Unit: case Type::Never: return builder.getInt8Ty();
+        case Type::String: return builder.getPtrTy();
+        case Type::Record: return reference(type) ? static_cast<llvm::Type*>(builder.getPtrTy()) : objects[type.id];
+        }
+        llvm_unreachable("invalid Lyra type");
     }
-    llvm_unreachable("invalid Lyra type");
-}
+};
 
 struct Emitter {
     const CheckedFunction& fn;
@@ -33,6 +52,7 @@ struct Emitter {
     llvm::Module& module;
     llvm::Function* native;
     const std::vector<llvm::Function*>& functions;
+    const Layouts& layouts;
     Builder builder{module.getContext()};
     std::vector<Value> locals{};
     std::vector<std::pair<Label, Label>> loops{};
@@ -44,7 +64,7 @@ struct Emitter {
 
     void run() {
         builder.SetInsertPoint(label("entry"));
-        for (auto local : fn.locals) locals.push_back(builder.CreateAlloca(nativeType(builder, local.type)));
+        for (auto local : fn.locals) locals.push_back(builder.CreateAlloca(layouts.native(builder, local.type)));
         for (auto& arg : native->args()) builder.CreateStore(&arg, locals[arg.getArgNo()]);
         auto tail = emit(fn.syntax.body);
         if (live()) builder.CreateRet(tail);
@@ -56,8 +76,35 @@ struct Emitter {
 
     Value emitNode(ExprId, std::int64_t value) { return builder.getInt64(value); }
     Value emitNode(ExprId, bool value) { return builder.getInt1(value); }
+    Value emitNode(ExprId, const StringLiteral& string) {
+        auto data = llvm::ConstantDataArray::getString(module.getContext(), string.bytes, false);
+        auto constant = llvm::ConstantStruct::getAnon({builder.getInt64(string.bytes.size()), data});
+        auto global = new llvm::GlobalVariable(module, constant->getType(), true, llvm::GlobalValue::PrivateLinkage, constant, "str");
+        global->setUnnamedAddr(llvm::GlobalValue::UnnamedAddr::Global);
+        return global;
+    }
     Value emitNode(ExprId id, const Identifier&) {
-        return builder.CreateLoad(nativeType(builder, fn.expressions[id].type), locals[fn.expressions[id].target]);
+        return builder.CreateLoad(layouts.native(builder, fn.expressions[id].type), locals[fn.expressions[id].target]);
+    }
+
+    Value address(ExprId id) {
+        const auto& node = fn.syntax.expressions[id].node;
+        if (std::holds_alternative<Identifier>(node)) return locals[fn.expressions[id].target];
+        const auto& member = std::get<Member>(node);
+        auto owner = fn.expressions[member.receiver].type;
+        auto base = layouts.reference(owner) ? emit(member.receiver) : address(member.receiver);
+        if (!live()) return nullptr;
+        return builder.CreateStructGEP(layouts.objects[owner.id], base, fn.expressions[id].target);
+    }
+
+    Value emitNode(ExprId id, const Member& member) {
+        auto object = emit(member.receiver);
+        if (!live()) return unit();
+        auto owner = fn.expressions[member.receiver].type;
+        auto slot = static_cast<unsigned>(fn.expressions[id].target);
+        if (!layouts.reference(owner)) return builder.CreateExtractValue(object, slot);
+        auto field = builder.CreateStructGEP(layouts.objects[owner.id], object, slot);
+        return builder.CreateLoad(layouts.native(builder, fn.expressions[id].type), field);
     }
 
     Value emitNode(ExprId id, const Binding& binding) {
@@ -78,16 +125,40 @@ struct Emitter {
 
     Value emitNode(ExprId id, const Call& call) {
         const auto& info = fn.expressions[id];
-        std::vector<Value> args(call.arguments.size());
-        for (std::size_t index = 0; index < call.arguments.size(); ++index) {
-            args[info.argumentSlots[index]] = emit(call.arguments[index].value);
+        auto skip = static_cast<std::size_t>(call.receiver.has_value());
+        std::vector<Value> args(call.arguments.size() + skip);
+        if (call.receiver) {
+            args[0] = emit(*call.receiver);
             if (!live()) return unit();
         }
-        if (call.name.text == "print") {
-            builder.CreateCall(module.getOrInsertFunction("lyraPrintInt", builder.getVoidTy(), builder.getInt64Ty()), args);
-            return unit();
+        for (std::size_t index = 0; index < call.arguments.size(); ++index) {
+            args[info.argumentSlots[index] + skip] = emit(call.arguments[index].value);
+            if (!live()) return unit();
         }
-        return builder.CreateCall(functions[info.target], args);
+        switch (info.callee) {
+            case Callee::Print: {
+                bool string = fn.expressions[call.arguments[0].value].type == Type::String;
+                builder.CreateCall(module.getOrInsertFunction(string ? "lyraPrintString" : "lyraPrintInt", builder.getVoidTy(), args[0]->getType()), args);
+                return unit();
+            }
+            case Callee::Collect:
+                builder.CreateCall(module.getOrInsertFunction("lyraGcCollect", builder.getVoidTy()));
+                return unit();
+            case Callee::Constructor: {
+                auto storage = layouts.objects[info.target];
+                if (layouts.program.aggregates[info.target].syntax.reference) {
+                    auto alloc = module.getOrInsertFunction("lyraGcAlloc", builder.getPtrTy(), builder.getInt64Ty());
+                    auto object = builder.CreateCall(alloc, {llvm::ConstantExpr::getSizeOf(storage)});
+                    for (unsigned slot = 0; slot < args.size(); ++slot) builder.CreateStore(args[slot], builder.CreateStructGEP(storage, object, slot));
+                    return object;
+                }
+                Value value = llvm::Constant::getNullValue(storage);
+                for (unsigned slot = 0; slot < args.size(); ++slot) value = builder.CreateInsertValue(value, args[slot], slot);
+                return value;
+            }
+            case Callee::Function: return builder.CreateCall(functions[info.target], args);
+        }
+        llvm_unreachable("invalid Lyra callee");
     }
 
     void trapIf(Value condition, Span site, const char* message) {
@@ -129,12 +200,18 @@ struct Emitter {
     Value emitNode(ExprId, const Binary& binary) {
         auto op = binary.op;
         if (op <= Op::RemSet) {
-            auto slot = locals[fn.expressions[binary.left].target];
-            auto left = op == Op::Set ? nullptr : emit(binary.left);
+            if (fn.expressions[binary.left].type == Type::Never) return emit(binary.left);
+            auto slot = address(binary.left);
+            if (!live()) return unit();
+            auto type = fn.expressions[binary.left].type;
+            auto left = op == Op::Set ? nullptr : builder.CreateLoad(layouts.native(builder, type), slot);
             auto right = emit(binary.right);
             if (!live()) return unit();
             constexpr Op compound[] = {Op::Add, Op::Sub, Op::Mul, Op::Div, Op::Rem};
-            builder.CreateStore(op == Op::Set ? right : arithmetic(compound[static_cast<int>(op) - 1], left, right, binary.site), slot);
+            if (op != Op::Set) {
+                right = type == Type::String ? concatenate(left, right) : arithmetic(compound[static_cast<int>(op) - 1], left, right, binary.site);
+            }
+            builder.CreateStore(right, slot);
             return unit();
         }
         auto left = emit(binary.left);
@@ -154,6 +231,12 @@ struct Emitter {
         }
         auto right = emit(binary.right);
         if (!live()) return unit();
+        if (fn.expressions[binary.left].type == Type::String) {
+            if (op == Op::Add) return concatenate(left, right);
+            auto pointer = builder.getPtrTy();
+            auto equal = builder.CreateCall(module.getOrInsertFunction("lyraStringEqual", builder.getInt8Ty(), pointer, pointer), {left, right});
+            return op == Op::Eq ? builder.CreateIsNotNull(equal) : builder.CreateIsNull(equal);
+        }
         switch (op) {
             case Op::Eq: return builder.CreateICmpEQ(left, right);
             case Op::Ne: return builder.CreateICmpNE(left, right);
@@ -163,6 +246,11 @@ struct Emitter {
             case Op::Ge: return builder.CreateICmpSGE(left, right);
             default: return arithmetic(op, left, right, binary.site);
         }
+    }
+
+    Value concatenate(Value left, Value right) {
+        auto pointer = builder.getPtrTy();
+        return builder.CreateCall(module.getOrInsertFunction("lyraStringConcat", pointer, pointer, pointer), {left, right});
     }
 
     Value emitNode(ExprId id, const Conditional& branch) {
@@ -182,7 +270,7 @@ struct Emitter {
         builder.SetInsertPoint(join);
         auto type = fn.expressions[id].type;
         if (type == Type::Unit) return unit();
-        auto value = builder.CreatePHI(nativeType(builder, type), 2);
+        auto value = builder.CreatePHI(layouts.native(builder, type), 2);
         if (trueEnd) value->addIncoming(trueValue, trueEnd);
         if (falseEnd) value->addIncoming(falseValue, falseEnd);
         return value;
@@ -226,20 +314,21 @@ std::unique_ptr<llvm::Module> lower(const CheckedModule& program, const std::vec
     auto module = std::make_unique<llvm::Module>("lyra", context);
     module->setTargetTriple("x86_64-pc-linux-gnu");
     Builder builder(context);
+    Layouts layouts(program, builder);
     std::vector<llvm::Function*> functions;
     for (const auto& fn : program.functions) {
         std::vector<llvm::Type*> params;
-        for (std::size_t index = 0; index < fn.syntax.parameters.size(); ++index) params.push_back(nativeType(builder, fn.locals[index].type));
-        auto signature = llvm::FunctionType::get(nativeType(builder, fn.result), params, false);
+        for (std::size_t index = 0; index < fn.syntax.parameters.size(); ++index) params.push_back(layouts.native(builder, fn.locals[index].type));
+        auto signature = llvm::FunctionType::get(layouts.native(builder, fn.result), params, false);
         functions.push_back(llvm::Function::Create(signature, llvm::Function::InternalLinkage, "lyra.fn." + fn.syntax.name.text, *module));
     }
     for (std::size_t index = 0; index < functions.size(); ++index) {
         const auto& fn = program.functions[index];
-        Emitter{fn, sources[fn.syntax.file], *module, functions[index], functions}.run();
+        Emitter{fn, sources[fn.syntax.file], *module, functions[index], functions, layouts}.run();
     }
     auto main = llvm::Function::Create(llvm::FunctionType::get(builder.getInt32Ty(), false), llvm::Function::ExternalLinkage, "main", *module);
     builder.SetInsertPoint(llvm::BasicBlock::Create(context, "entry", main));
-    builder.CreateCall(functions[program.entry]);
+    builder.CreateCall(functions[program.entry.value()]);
     builder.CreateRet(builder.getInt32(0));
     std::string reason;
     llvm::raw_string_ostream log(reason);

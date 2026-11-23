@@ -1,0 +1,268 @@
+#include "managed.h"
+#include "tasks.h"
+
+#include <pthread.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+
+namespace {
+
+void check(bool condition, const char *message) {
+    if (!condition) {
+        fprintf(stderr, "task test: %s\n", message);
+        exit(EXIT_FAILURE);
+    }
+}
+
+struct Counter {
+    unsigned count;
+};
+
+struct ProducerFrame {
+    Counter *captured;
+    unsigned *executions;
+    bool shouldFail;
+};
+
+void produce(LyraTask *self, void *storage) {
+    auto *frame = static_cast<ProducerFrame *>(storage);
+    if (!frame->captured) {
+        ++*frame->executions;
+        frame->captured = static_cast<Counter *>(lyraGcAlloc(sizeof(Counter)));
+        frame->captured->count = 173;
+        lyraTaskSuspend(self);
+    } else if (frame->shouldFail) {
+        lyraTaskFail(self, frame->captured);
+    } else {
+        lyraTaskComplete(self, frame->captured);
+    }
+}
+
+LyraTask *producer(unsigned *executions, bool shouldFail) {
+    auto *frame = static_cast<ProducerFrame *>(lyraGcAlloc(sizeof(ProducerFrame)));
+    frame->executions = executions;
+    frame->shouldFail = shouldFail;
+    return lyraTaskCreate(produce, frame);
+}
+
+struct WaitFrame {
+    LyraTask *target;
+    unsigned *cleanups;
+};
+
+void observe(LyraTask *self, void *storage) {
+    auto *frame = static_cast<WaitFrame *>(storage);
+    if (lyraTaskCancelRequested(self)) {
+        ++*frame->cleanups;
+        lyraTaskFinishCancelled(self);
+        return;
+    }
+    if (!lyraTaskAwait(self, frame->target)) return;
+    if (lyraTaskState(frame->target) == LYRA_TASK_FAILED) {
+        lyraTaskFail(self, lyraTaskOutcome(frame->target));
+        return;
+    }
+    check(lyraTaskState(frame->target) == LYRA_TASK_COMPLETED, "unexpected observed outcome");
+    lyraTaskComplete(self, lyraTaskOutcome(frame->target));
+}
+
+LyraTask *observer(LyraTask *target, unsigned *cleanups) {
+    auto *frame = static_cast<WaitFrame *>(lyraGcAlloc(sizeof(WaitFrame)));
+    frame->target = target;
+    frame->cleanups = cleanups;
+    return lyraTaskCreate(observe, frame);
+}
+
+struct SpawnFrame {
+    LyraDomain *domain;
+    LyraTask *sibling;
+    unsigned *counter;
+};
+
+void increment(LyraTask *self, void *storage) {
+    ++*static_cast<unsigned *>(storage);
+    lyraTaskComplete(self, nullptr);
+}
+
+void spawnThenIncrement(LyraTask *self, void *storage) {
+    auto *frame = static_cast<SpawnFrame *>(storage);
+    auto before = *frame->counter;
+    lyraTaskStart(frame->domain, frame->sibling);
+    check(*frame->counter == before, "spawn interleaved inside a non-suspending step");
+    *frame->counter = before + 1;
+    lyraTaskComplete(self, nullptr);
+}
+
+void collectUnderPressure() {
+    for (int round = 0; round < 3; ++round) {
+        for (int index = 0; index < 2048; ++index) lyraGcAlloc(256);
+        lyraGcCollect();
+    }
+}
+
+struct NativeTicket {
+    LyraTask *task;
+    unsigned observed;
+};
+
+struct ParkedFrame {
+    NativeTicket *ticket;
+    Counter *soleReference;
+};
+
+void park(LyraTask *self, void *storage) {
+    auto *frame = static_cast<ParkedFrame *>(storage);
+    if (!frame->soleReference) {
+        frame->soleReference = static_cast<Counter *>(lyraGcAlloc(sizeof(Counter)));
+        frame->soleReference->count = 794;
+        lyraTaskSuspend(self);
+    } else {
+        frame->ticket->observed = frame->soleReference->count;
+        lyraTaskComplete(self, nullptr);
+    }
+}
+
+[[gnu::noinline]] void handOff(LyraDomain *domain, NativeTicket *ticket) {
+    auto *frame = static_cast<ParkedFrame *>(lyraGcAlloc(sizeof(ParkedFrame)));
+    frame->ticket = ticket;
+    ticket->task = lyraTaskCreate(park, frame);
+    lyraTaskStart(domain, ticket->task);
+}
+
+struct NativeGate {
+    pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+    pthread_cond_t changed = PTHREAD_COND_INITIALIZER;
+    bool entered = false;
+    bool mayReturn = false;
+    bool returned = false;
+    bool closed = false;
+};
+
+void nativeCall(void *storage) {
+    auto *gate = static_cast<NativeGate *>(storage);
+    pthread_mutex_lock(&gate->lock);
+    gate->entered = true;
+    pthread_cond_signal(&gate->changed);
+    while (!gate->mayReturn) pthread_cond_wait(&gate->changed, &gate->lock);
+    check(!gate->closed, "cancel freed a handle still in use by a worker");
+    gate->returned = true;
+    pthread_mutex_unlock(&gate->lock);
+}
+
+struct BlockingFrame {
+    NativeGate *gate;
+    bool submitted;
+};
+
+void callThenClose(LyraTask *self, void *storage) {
+    auto *frame = static_cast<BlockingFrame *>(storage);
+    if (!frame->submitted) {
+        frame->submitted = true;
+        lyraTaskBlock(self, nativeCall, frame->gate);
+        return;
+    }
+    check(lyraTaskCancelRequested(self), "native cancellation request was lost");
+    check(frame->gate->returned, "cleanup ran before the native worker returned");
+    frame->gate->closed = true;
+    lyraTaskFinishCancelled(self);
+}
+
+struct CancellationFrame {
+    LyraTask *target;
+    NativeGate *gate;
+};
+
+void cancelDuringCall(LyraTask *self, void *storage) {
+    auto *frame = static_cast<CancellationFrame *>(storage);
+    auto *gate = frame->gate;
+    pthread_mutex_lock(&gate->lock);
+    while (!gate->entered) pthread_cond_wait(&gate->changed, &gate->lock);
+    lyraTaskRequestCancel(frame->target);
+    lyraTaskWake(frame->target);
+    check(lyraTaskState(frame->target) == LYRA_TASK_SUSPENDED && !gate->closed, "native request woke before completion");
+    lyraGcCollect();
+    gate->mayReturn = true;
+    pthread_cond_signal(&gate->changed);
+    pthread_mutex_unlock(&gate->lock);
+    lyraTaskComplete(self, nullptr);
+}
+
+}
+
+int main() {
+    alarm(20);
+    auto *origin = lyraDomainCreate();
+    auto *other = lyraDomainCreate();
+    unsigned executions = 0;
+    unsigned cleanups = 0;
+    auto *target = producer(&executions, false);
+    auto *local = observer(target, &cleanups);
+    auto *remote = observer(target, &cleanups);
+    auto *abandonedWait = observer(target, &cleanups);
+    check(executions == 0 && lyraTaskState(target) == LYRA_TASK_COLD, "creating a task executed its body");
+
+    lyraTaskStart(origin, local);
+    lyraDomainRun(origin);
+    check(executions == 1 && lyraTaskState(target) == LYRA_TASK_SUSPENDED && lyraTaskState(local) == LYRA_TASK_SUSPENDED, "await did not activate and suspend the cold target");
+    lyraTaskStart(other, target);
+    lyraTaskStart(other, remote);
+    lyraTaskStart(other, abandonedWait);
+    lyraDomainRun(other);
+    lyraTaskRequestCancel(abandonedWait);
+    lyraTaskRequestCancel(abandonedWait);
+    lyraDomainRun(other);
+    check(cleanups == 1 && lyraTaskState(abandonedWait) == LYRA_TASK_CANCELLED, "cancelled waiter did not clean up exactly once");
+    check(!lyraTaskCancelRequested(target), "cancelling a waiter cancelled another domain's task");
+
+    collectUnderPressure();
+    lyraTaskWake(target);
+    lyraTaskWake(target);
+    lyraDomainRun(origin);
+    check(lyraTaskState(local) == LYRA_TASK_COMPLETED && lyraTaskState(remote) == LYRA_TASK_READY, "cross-domain waiter did not resume on its own domain");
+    lyraDomainRun(other);
+    check(lyraTaskOutcome(remote) == lyraTaskOutcome(local), "waiters received different object identities");
+    check(static_cast<Counter *>(lyraTaskOutcome(remote))->count == 173, "captured object was lost while suspended");
+
+    auto *late = observer(target, &cleanups);
+    lyraTaskStart(other, late);
+    lyraDomainRun(other);
+    check(executions == 1 && lyraTaskOutcome(late) == lyraTaskOutcome(local), "late await recomputed the value");
+
+    auto *failure = producer(&executions, true);
+    auto *failedWaiter = observer(failure, &cleanups);
+    lyraTaskStart(origin, failedWaiter);
+    lyraDomainRun(origin);
+    lyraTaskWake(failure);
+    lyraDomainRun(origin);
+    check(lyraTaskState(failedWaiter) == LYRA_TASK_FAILED && lyraTaskOutcome(failedWaiter) == lyraTaskOutcome(failure), "await lost the failure identity");
+
+    unsigned counter = 0;
+    auto *sibling = lyraTaskCreate(increment, &counter);
+    SpawnFrame serial{origin, sibling, &counter};
+    lyraTaskStart(origin, lyraTaskCreate(spawnThenIncrement, &serial));
+    lyraDomainRun(origin);
+    check(counter == 2, "two serial tasks did not both update the counter");
+
+    auto *ticket = static_cast<NativeTicket *>(calloc(1, sizeof(NativeTicket)));
+    handOff(origin, ticket);
+    lyraDomainRun(origin);
+    collectUnderPressure();
+    lyraTaskWake(ticket->task);
+    lyraDomainRun(origin);
+    check(ticket->observed == 794, "native-only ticket's suspended task lost its managed frame");
+    free(ticket);
+
+    NativeGate gate;
+    BlockingFrame blocking{&gate, false};
+    auto *call = lyraTaskCreate(callThenClose, &blocking);
+    CancellationFrame cancellation{call, &gate};
+    lyraTaskStart(origin, call);
+    lyraTaskStart(origin, lyraTaskCreate(cancelDuringCall, &cancellation));
+    lyraDomainRun(origin);
+    check(gate.closed && lyraTaskState(call) == LYRA_TASK_CANCELLED, "native cleanup did not complete cancellation");
+    pthread_cond_destroy(&gate.changed);
+    pthread_mutex_destroy(&gate.lock);
+    lyraDomainDestroy(other);
+    lyraDomainDestroy(origin);
+}

@@ -5,7 +5,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
     && curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key -o /etc/apt/keyrings/llvm.asc \
     && echo 'deb [signed-by=/etc/apt/keyrings/llvm.asc] https://apt.llvm.org/jammy/ llvm-toolchain-jammy-18 main' > /etc/apt/sources.list.d/llvm.list \
     && apt-get update && apt-get install -y --no-install-recommends \
-       build-essential binutils clang-18 clang-tools-18 llvm-18-dev python3-pip \
+       build-essential binutils clang-18 clang-tools-18 llvm-18-dev libgc-dev libuv1-dev python3-pip \
     && python3 -m pip install --no-cache-dir --no-deps --only-binary=:all: cmake==3.30.9 ninja==1.11.1.4 \
     && clang-scan-deps-18 --version
 WORKDIR /src

@@ -15,7 +15,7 @@ module lyra.syntax;
 namespace lyra {
 namespace {
 
-enum class Kind { Name, Keyword, Escaped, Number, Symbol, End };
+enum class Kind { Name, Keyword, Escaped, Number, String, Symbol, End };
 
 struct Token {
     Kind kind;
@@ -56,9 +56,21 @@ public:
         Kind kind;
         if (isLetter(current) || isDigit(current)) {
             while (offset < text.size() && (isLetter(text[offset]) || isDigit(text[offset]))) ++offset;
-            constexpr std::string_view keywords[] = {"fn", "val", "var", "if", "else", "while", "return", "break", "continue", "true", "false"};
+            constexpr std::string_view keywords[] = {"fn", "val", "var", "if", "else", "while", "return", "break", "continue", "true", "false", "struct", "class", "pub", "import", "as"};
             auto word = text.substr(start, offset - start);
             kind = isDigit(current) ? Kind::Number : std::ranges::find(keywords, word) == std::end(keywords) ? Kind::Name : Kind::Keyword;
+        } else if (current == '"') {
+            kind = Kind::String;
+            while (offset < text.size() && text[offset] != '"') {
+                if (text[offset] == '\r' || text[offset] == '\n') throw at(source, {start, offset}, "LYL0003", "字符串缺少结束引号");
+                if (text[offset] == '$' && text.substr(offset, 2) == "${") throw at(source, {offset, offset + 2}, "LYL0003", "此版本尚不支持字符串插值");
+                if (text[offset++] == '\\') {
+                    if (offset == text.size() || std::string_view("\\\"$nrt0").find(text[offset]) == text.npos) throw at(source, {offset - 1, offset}, "LYL0003", "未知的字符串转义");
+                    ++offset;
+                }
+            }
+            if (offset == text.size()) throw at(source, {start, offset}, "LYL0003", "字符串缺少结束引号");
+            ++offset;
         } else if (current == '`') {
             if (offset == text.size() || !isLetter(text[offset])) throw at(source, {start, offset}, "LYL0001", "反引号内需要标识符");
             while (offset < text.size() && (isLetter(text[offset]) || isDigit(text[offset]))) ++offset;
@@ -69,7 +81,7 @@ public:
             kind = Kind::Symbol;
             constexpr std::string_view doubles[] = {"+=", "-=", "*=", "/=", "%=", "==", "!=", "<=", ">=", "&&", "||"};
             if (std::ranges::find(doubles, text.substr(start, 2)) != std::end(doubles)) ++offset;
-            else if (std::string_view("(){},:;+-*/%=<>!").find(current) == text.npos) {
+            else if (std::string_view("(){},.:;+-*/%=<>!").find(current) == text.npos) {
                 while (offset < text.size() && (static_cast<unsigned char>(text[offset]) & 0xc0) == 0x80) ++offset;
                 throw at(source, {start, offset}, "LYL0001", "此处不是受支持的 Lyra 记号");
             }
@@ -119,7 +131,20 @@ public:
     Parser(const Source& source, std::size_t file) : source(source), file(file), lexer(source), token(lexer.next()), next(lexer.next()) {}
 
     void appendTo(Module& module) {
-        while (token.kind != Kind::End) module.push_back(function());
+        while (token.kind != Kind::End) {
+            bool pub = visibility();
+            if (is("import")) {
+                consume();
+                std::vector<Identifier> path{identifier()};
+                while (is(".")) { consume(); path.push_back(identifier()); }
+                auto alias = path.back();
+                if (is("as")) { consume(); alias = identifier(); }
+                module.imports.push_back({file, pub, std::move(path), std::move(alias)});
+                if (is(";")) consume();
+                else if (token.kind != Kind::End && !token.newlineBefore) throw at(source, token.span, "LYP0001", "导入后需要换行或分号");
+            } else if (is("struct") || is("class")) aggregate(module, pub);
+            else module.functions.push_back(function({}, pub));
+        }
     }
 
 private:
@@ -155,11 +180,75 @@ private:
         return nodes.size() - 1;
     }
 
-    Function function() {
+    std::vector<Identifier> typeList() {
+        require("<");
+        std::vector<Identifier> result{identifier()};
+        while (is(",")) { consume(); result.push_back(identifier()); }
+        require(">");
+        return result;
+    }
+
+    bool explicitTypes(const Identifier& name) const {
+        if (!is("<") || token.span.begin != name.span.end) return false;
+        auto look = lexer;
+        auto current = next;
+        for (;;) {
+            if (current.kind != Kind::Name && current.kind != Kind::Escaped) return false;
+            current = look.next();
+            if (text(current) == ">") { current = look.next(); return text(current) == "(" && !current.newlineBefore; }
+            if (text(current) != ",") return false;
+            current = look.next();
+        }
+    }
+
+    bool visibility() { if (!is("pub")) return false; consume(); return true; }
+
+    Field field(bool pub) {
+        if (!is("var") && !is("val")) throw at(source, token.span, "LYP0001", "字段声明需要 val 或 var");
+        bool writable = text(consume()) == "var";
+        auto name = identifier();
+        require(":");
+        return {std::move(name), identifier(), writable, pub};
+    }
+
+    void aggregate(Module& module, bool pub) {
+        bool reference = text(consume()) == "class";
+        Aggregate decl{file, identifier(), reference, {}, pub};
+        bool primary = is("(");
+        if (primary) {
+            consume();
+            while (!is(")")) {
+                decl.fields.push_back(field(visibility()));
+                if (!is(",")) break;
+                consume();
+            }
+            require(")");
+        }
+        if (!primary || is("{")) {
+            require("{");
+            while (!is("}")) {
+                bool publicMember = visibility();
+                if (is("fn")) module.functions.push_back(function(decl.name, publicMember));
+                else decl.fields.push_back(field(publicMember));
+                if (is(";")) consume();
+                else if (!is("}") && !token.newlineBefore) throw at(source, token.span, "LYP0001", "成员之间需要换行或分号");
+            }
+            consume();
+        }
+        module.aggregates.push_back(std::move(decl));
+    }
+
+    Function function(std::optional<Identifier> owner, bool pub) {
         require("fn");
         auto name = identifier();
+        auto typeParameters = is("<") ? typeList() : std::vector<Identifier>{};
         require("(");
         std::vector<Parameter> parameters;
+        if (owner) {
+            auto self = require("self");
+            parameters.push_back({{"self", self.span}, *owner});
+            if (!is(")")) require(",");
+        }
         while (!is(")")) {
             auto parameter = identifier();
             require(":");
@@ -171,7 +260,7 @@ private:
         require(":");
         auto result = identifier();
         auto body = block();
-        return {file, std::move(name), std::move(parameters), std::move(result), std::exchange(nodes, {}), body};
+        return {file, std::move(name), std::move(parameters), std::move(result), std::exchange(nodes, {}), body, std::move(owner), pub, std::move(typeParameters)};
     }
 
     ExprId block() {
@@ -238,7 +327,48 @@ private:
     }
 
     ExprId primary(bool inParens) {
+        auto value = atom(inParens);
+        while (is(".")) {
+            consume();
+            auto name = identifier();
+            auto begin = nodes[value].span.begin;
+            if (explicitTypes(name) || (is("(") && (inParens || !token.newlineBefore))) value = call(begin, std::move(name), value);
+            else { auto end = name.span.end; value = add({begin, end}, Member{value, std::move(name)}); }
+        }
+        return value;
+    }
+
+    ExprId call(std::size_t begin, Identifier name, std::optional<ExprId> receiver) {
+        auto types = is("<") ? typeList() : std::vector<Identifier>{};
+        require("(");
+        Call node{std::move(name), {}, receiver, std::move(types)};
+        while (!is(")")) {
+            std::optional<Identifier> label;
+            if (text(next) == ":") { label = identifier(); consume(); }
+            node.arguments.push_back({std::move(label), expression(true)});
+            if (!is(",")) break;
+            consume();
+        }
+        auto close = require(")").span;
+        return add({begin, close.end}, std::move(node));
+    }
+
+    ExprId atom(bool inParens) {
         auto start = token.span.begin;
+        if (token.kind == Kind::String) {
+            auto item = consume();
+            auto literal = text(item);
+            std::string result;
+            for (std::size_t offset = 1; offset + 1 < literal.size(); ++offset) {
+                auto byte = literal[offset];
+                if (byte == '\\') {
+                    byte = literal[++offset];
+                    switch (byte) { case 'n': byte = '\n'; break; case 'r': byte = '\r'; break; case 't': byte = '\t'; break; case '0': byte = '\0'; break; }
+                }
+                result.push_back(byte);
+            }
+            return add(item.span, StringLiteral{std::move(result)});
+        }
         if (token.kind == Kind::Number || (is("-") && next.kind == Kind::Number)) {
             bool negative = is("-");
             if (negative) consume();
@@ -265,18 +395,8 @@ private:
         if (is("{")) return block();
         if (token.kind == Kind::Name || token.kind == Kind::Escaped) {
             auto name = identifier();
-            if (!is("(") || (token.newlineBefore && !inParens)) { auto span = name.span; return add(span, std::move(name)); }
-            consume();
-            Call call{std::move(name), {}};
-            while (!is(")")) {
-                std::optional<Identifier> label;
-                if (text(next) == ":") { label = identifier(); consume(); }
-                call.arguments.push_back({std::move(label), expression(true)});
-                if (!is(",")) break;
-                consume();
-            }
-            auto close = require(")").span;
-            return add({start, close.end}, std::move(call));
+            if (!explicitTypes(name) && (!is("(") || (token.newlineBefore && !inParens))) { auto span = name.span; return add(span, std::move(name)); }
+            return call(start, std::move(name), {});
         }
         if (is("(")) {
             consume();

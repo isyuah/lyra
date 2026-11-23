@@ -1,6 +1,6 @@
 # Lyra
 
-Lyra 是一门使用 LLVM AOT 的编译型语言。当前编译器跑通了[第一个正反例](rfc/compiler-acceptance.md)：同一个程序，有末尾分号时报告返回类型错误，去掉分号后编译成打印 `3` 的 Linux 可执行文件。完整语言设计见 [RFC 索引](rfc/README.md)；GC、异步、泛型、宏和包解析还不是这个编译器的功能。
+Lyra 是一门使用 LLVM AOT 的编译型语言。编译器把通过静态检查的源码编译成 Linux 可执行文件，不需要在部署机安装 LLVM。语言设计和验收契约见 [RFC 索引](rfc/README.md)，当前可以运行的语法见下文。
 
 ## 从源码构建
 
@@ -25,7 +25,8 @@ lyra build <包目录> [-o <产物>] [--release] [--diagnostics=json]
 ```
 
 - 两条命令只读取包内 `src` 直属的 `.ly` 文件，作为一个可执行模块，入口为 `fn main(): Unit`。不递归、不需要包清单；同模块函数可前向引用。
-- 支持显式返回 `Int` / `Unit` 的无参函数、整数和检查溢出的加法、括号、嵌套函数调用、换行或分号分隔的表达式、`print(Int)`。块正常结束时取最后一个表达式；空块或带末尾分号的块取 `Unit`。`print` 输出十进制整数及换行。
+- 支持 `Int`、`Bool`、`Unit`、具名形参、按源码顺序求值的命名实参、`val` / `var`、嵌套作用域、赋值和复合赋值、整数四则与余数、比较、短路 `&&` / `||`、`if` / `else`、`while`、`break`、`continue` 和 `return`。整数溢出或除零在 Debug/Release 都带源码位置报错。普通块以末表达式为值，空块或带末尾分号的块取 `Unit`。
+- `String` 支持 UTF-8、拼接和内容相等；`struct` 按值复制，`class` 保留对象身份，可定义字段、主构造和方法。`gcCollect()` 可主动收集。对象由 BDWGC 管理；编译器安装目录带静态 GC 和 libuv 归档，部署应用不需要安装这两个库。见[对象验收程序](tests/fixtures/objects/src/main.ly)。
 - `check` 不调用 Clang、不创建产物。`build` 默认输出 `<包目录>/build/debug/app`（`-O0`），`--release` 输出 `build/release/app`（`-O2`），`-o` 指定其他路径。类型错误或链接失败都不会覆盖已有产物。
 - 诊断写到标准错误；`--diagnostics=json` 输出诊断数组，成功为 `[]`。带源码位置时，`range.start/end` 是左闭右开区间：`offset` 为从 0 开始的原文件 UTF-8 字节偏移，`line/column` 从 1 开始，列按 Unicode 码点计，CRLF 和 LF 均算一次换行。
 

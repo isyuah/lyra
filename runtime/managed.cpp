@@ -1,0 +1,73 @@
+#include "managed.h"
+
+#define GC_THREADS
+#include <gc/gc.h>
+#include <new>
+#include <pthread.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+struct LyraGcRoot {
+    void *value;
+};
+
+namespace {
+
+pthread_once_t initialization = PTHREAD_ONCE_INIT;
+
+void initialize() {
+    GC_INIT();
+    GC_allow_register_threads();
+}
+
+void *requireMemory(void *memory) {
+    if (!memory) {
+        fputs("Lyra runtime: managed allocation failed\n", stderr);
+        abort();
+    }
+    return memory;
+}
+
+}
+
+void *lyraGcAlloc(size_t bytes) {
+    pthread_once(&initialization, initialize);
+    return requireMemory(GC_MALLOC(bytes ? bytes : 1));
+}
+
+void *lyraGcAllocAtomic(size_t bytes) {
+    pthread_once(&initialization, initialize);
+    return requireMemory(GC_MALLOC_ATOMIC(bytes ? bytes : 1));
+}
+
+void lyraGcCollect() {
+    pthread_once(&initialization, initialize);
+    GC_gcollect();
+}
+
+LyraGcRoot *lyraGcRootCreate(void *value) {
+    pthread_once(&initialization, initialize);
+    return ::new (requireMemory(GC_MALLOC_UNCOLLECTABLE(sizeof(LyraGcRoot)))) LyraGcRoot{value};
+}
+
+void *lyraGcRootGet(const LyraGcRoot *root) {
+    return root->value;
+}
+
+void lyraGcRootDrop(LyraGcRoot *root) {
+    GC_FREE(root);
+}
+
+int lyraGcEnterWorker() {
+    if (GC_thread_is_registered()) return 0;
+    GC_stack_base base;
+    if (GC_get_stack_base(&base) != GC_SUCCESS) abort();
+    auto status = GC_register_my_thread(&base);
+    if (status == GC_SUCCESS) return 1;
+    if (status == GC_DUPLICATE) return 0;
+    abort();
+}
+
+void lyraGcLeaveWorker(int registration) {
+    if (registration && GC_unregister_my_thread() != GC_SUCCESS) abort();
+}

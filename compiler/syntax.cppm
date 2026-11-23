@@ -18,7 +18,11 @@ struct Argument { std::optional<Identifier> label; ExprId value; };
 struct Call {
     Identifier name;
     std::vector<Argument> arguments;
+    std::optional<ExprId> receiver{};
+    std::vector<Identifier> typeArguments{};
 };
+struct Member { ExprId receiver; Identifier name; };
+struct StringLiteral { std::string bytes; };
 
 enum class Op { Set, AddSet, SubSet, MulSet, DivSet, RemSet, Or, And, Eq, Ne, Lt, Le, Gt, Ge, Add, Sub, Mul, Div, Rem, Not };
 struct Unary { Op op; Span site; ExprId operand; };
@@ -33,7 +37,7 @@ enum class Jump { Break, Continue };
 
 struct Expr {
     Span span;
-    std::variant<std::int64_t, bool, Identifier, Call, Unary, Binary, Block, Binding, Conditional, While, Return, Jump> node;
+    std::variant<std::int64_t, bool, StringLiteral, Identifier, Call, Member, Unary, Binary, Block, Binding, Conditional, While, Return, Jump> node;
 };
 
 struct Parameter { Identifier name, type; };
@@ -44,9 +48,15 @@ struct Function {
     Identifier result;
     std::vector<Expr> expressions;
     ExprId body;
+    std::optional<Identifier> owner{};
+    bool isPublic{};
+    std::vector<Identifier> typeParameters{};
 };
 
-using Module = std::vector<Function>;
+struct Field { Identifier name, type; bool writable; bool isPublic{}; };
+struct Aggregate { std::size_t file; Identifier name; bool reference; std::vector<Field> fields; bool isPublic{}; };
+struct Import { std::size_t file; bool isPublic; std::vector<Identifier> path; Identifier alias; };
+struct Module { std::vector<Function> functions; std::vector<Aggregate> aggregates; std::vector<Import> imports; };
 Module parse(const std::vector<Source>& sources);
 
 }

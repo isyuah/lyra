@@ -71,7 +71,9 @@ void emitExecutable(const llvm::Module& module, const fs::path& output, bool rel
     }
     auto target = "--target=" + module.getTargetTriple();
     runClang(*driver, {target, release ? "-O2" : "-O0", "-c", "-x", "ir", ir, "-o", object}, log);
-    runClang(*driver, {target, object, runtime.string(), "-o", executable.string()}, log);
+    auto lib = runtime.parent_path();
+    runClang(*driver, {target, object, runtime.string(), (lib / "libgc.a").string(), (lib / "libuv.a").string(),
+                       "-pthread", "-ldl", "-lrt", "-o", executable.string()}, log);
     fs::rename(executable, output);
 }
 

@@ -22,6 +22,7 @@ struct Source {
     std::filesystem::path path;
     std::string text;
     std::vector<std::size_t> lineStarts;
+    std::string moduleId{};
 
     Position position(std::size_t offset) const;
 };
@@ -42,5 +43,6 @@ struct Diagnostic {
 Diagnostic at(const Source& source, Span span, std::string code, std::string message);
 void report(const Diagnostic& error, bool json);
 std::vector<Source> loadSources(const std::filesystem::path& package);
+Source loadSource(const std::filesystem::path& path, std::string moduleId);
 
 }

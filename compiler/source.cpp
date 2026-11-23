@@ -77,25 +77,23 @@ std::vector<Source> loadSources(const fs::path& package) {
     if (paths.empty()) throw Diagnostic{"LYI0001", "源码目录里没有 .ly 文件：" + directory.string()};
     std::sort(paths.begin(), paths.end());
     std::vector<Source> sources;
-    for (const auto& path : paths) {
-        std::ifstream input(path, std::ios::binary);
-        if (!input) throw Diagnostic{"LYI0001", "无法打开源码：" + path.string()};
-        Source source{path, {}, {0}};
-        char buffer[8192];
-        while (input.read(buffer, sizeof buffer) || input.gcount() > 0) source.text.append(buffer, input.gcount());
-        if (!input.eof() || input.bad()) throw Diagnostic{"LYI0001", "读取源码失败：" + path.string()};
-        for (std::size_t index = 0; index < source.text.size(); ++index) {
-            if (source.text[index] == '\n' || (source.text[index] == '\r' && (index + 1 == source.text.size() || source.text[index + 1] != '\n'))) {
-                source.lineStarts.push_back(index + 1);
-            }
-        }
-        std::size_t invalidOffset;
-        if (!llvm::json::isUTF8(source.text, &invalidOffset)) {
-            throw at(source, {invalidOffset, std::min(invalidOffset + 1, source.text.size())}, "LYL0001", "源码必须是有效的 UTF-8");
-        }
-        sources.push_back(std::move(source));
-    }
+    for (const auto& path : paths) sources.push_back(loadSource(path, {}));
     return sources;
+}
+
+Source loadSource(const fs::path& path, std::string moduleId) {
+    std::ifstream input(path, std::ios::binary);
+    if (!input) throw Diagnostic{"LYI0001", "无法打开源码：" + path.string()};
+    Source source{path, {}, {0}, std::move(moduleId)};
+    char buffer[8192];
+    while (input.read(buffer, sizeof buffer) || input.gcount() > 0) source.text.append(buffer, input.gcount());
+    if (!input.eof() || input.bad()) throw Diagnostic{"LYI0001", "读取源码失败：" + path.string()};
+    for (std::size_t index = 0; index < source.text.size(); ++index) {
+        if (source.text[index] == '\n' || (source.text[index] == '\r' && (index + 1 == source.text.size() || source.text[index + 1] != '\n'))) source.lineStarts.push_back(index + 1);
+    }
+    std::size_t invalidOffset;
+    if (!llvm::json::isUTF8(source.text, &invalidOffset)) throw at(source, {invalidOffset, std::min(invalidOffset + 1, source.text.size())}, "LYL0001", "源码必须是有效的 UTF-8");
+    return source;
 }
 
 }

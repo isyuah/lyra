@@ -15,26 +15,39 @@ case "$mode" in
             ctest --preset "$preset" --no-tests=error
             test -s "build/$preset/lib/liblyraRuntime.a"
             if [ "$preset" = dev ]; then
-                app="$apps/debug"
-                build/dev/bin/lyra build examples/compiler-smoke/pass -o "$app"
+                profile=debug
+                set --
             else
-                app="$apps/release"
-                build/release/bin/lyra build examples/compiler-smoke/pass --release -o "$app"
+                profile=release
+                set -- --release
             fi
-            dynamic=$(readelf -dW "$app")
-            needed=$(printf '%s\n' "$dynamic" | sed -n 's/.*(NEEDED).*\[\([^]]*\)\].*/\1/p')
-            printf '%s DT_NEEDED: %s\n' "$app" "$needed"
-            test "$needed" = libc.so.6
+            for sample in integer objects; do
+                case "$sample" in
+                    integer) package=examples/compiler-smoke/pass; app="$apps/$profile" ;;
+                    objects) package=tests/fixtures/objects; app="$apps/objects-$profile" ;;
+                esac
+                "build/$preset/bin/lyra" build "$package" "$@" -o "$app"
+                dynamic=$(readelf -dW "$app")
+                needed=$(printf '%s\n' "$dynamic" | sed -n 's/.*(NEEDED).*\[\([^]]*\)\].*/\1/p')
+                printf '%s DT_NEEDED: %s\n' "$app" "$needed"
+                test "$needed" = libc.so.6
+            done
         done
         ;;
     verify)
         scratch=$(mktemp -d)
-        printf '3\n' > "$scratch/expected"
-        for app in "$apps/debug" "$apps/release"; do
-            "$app" > "$scratch/stdout" 2> "$scratch/stderr"
-            cmp "$scratch/expected" "$scratch/stdout"
-            test ! -s "$scratch/stderr"
-            printf '%s: stdout=3\\n, exit=0, stderr empty (%s)\n' "$app" "$PRETTY_NAME"
+        for sample in integer objects; do
+            case "$sample" in
+                integer) prefix=; printf '3\n' > "$scratch/expected" ;;
+                objects) prefix=objects-; printf '持有\nA\000B\n1\n2\n' > "$scratch/expected" ;;
+            esac
+            for profile in debug release; do
+                app="$apps/$prefix$profile"
+                "$app" > "$scratch/stdout" 2> "$scratch/stderr"
+                cmp "$scratch/expected" "$scratch/stdout"
+                test ! -s "$scratch/stderr"
+                printf '%s: exact stdout matched, exit=0, stderr empty (%s)\n' "$app" "$PRETTY_NAME"
+            done
         done
         rm "$scratch/expected" "$scratch/stdout" "$scratch/stderr"
         rmdir "$scratch"
