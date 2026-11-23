@@ -242,6 +242,35 @@ pub fn build(): Counter { Counter(Hidden(42)) }
         self.source.write_text('import cfg.make as aliased\nfn main(): Unit { print(aliased().read()) }')
         self.assertEqual(self.command('run', self.app).stdout, '42\n')
 
+    def test_any_preserves_canonical_types_and_gc_roots(self):
+        (self.lib / 'src/net/box.ly').write_text('''
+pub class Box<Item>(pub var value: Item)
+pub fn erase<T>(value: Box<T>): Any { value }
+''')
+        (self.lib / 'src/lib.ly').write_text('pub import self.net.Box as Exported\n')
+        self.source.write_text('''
+import cfg.Exported as Original
+import cfg.net.erase
+class Box<Item>(val value: Item)
+async fn main(): Unit {
+    val original = Original("same")
+    val boxed = erase(original)
+    val retained = erase(Original("only via Any"))
+    await blocking { gcCollect() }
+    print(boxed is Original<String>)
+    print(boxed is Original<Int>)
+    print(boxed is Box<String>)
+    match boxed as? Original<String> {
+        None => print("lost"),
+        Some(value) => { value.value = "changed"; print(value == original) },
+    }
+    print(original.value)
+    print((retained as? Original<String>)?.value ?? "lost")
+}
+''')
+        for options in ((), ('--release',)):
+            self.assertEqual(self.command('run', self.app, *options).stdout, 'true\nfalse\nfalse\ntrue\nchanged\nonly via Any\n')
+
 
 if __name__ == '__main__':
     unittest.main()

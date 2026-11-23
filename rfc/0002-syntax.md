@@ -73,7 +73,7 @@ val name: String? = absent()
 
 - **已定：** 在声明前缀位置，`[path]` 是标记，`@trace` 是函数装饰器，`#derive(Json)` 是声明宏调用；在表达式位置，`#query(...)` 是表达式宏调用，`items[index]` 仍是索引。宏种类必须与使用位置匹配。见[元编程与数据交换](metaprogramming-data.md#f1-macro-inputs)。
 - **已定：** 标识符区分大小写，首版为 ASCII 字母或 `_` 开头，后接 ASCII 字母、数字或 `_`，关键字作名字用反引号转义。Lyra 自有 API 和示例采用驼峰：函数、方法、参数、局部值、字段用 `lowerCamelCase`（`getUser`、`teamId`），类型、trait 和枚举分支用 `UpperCamelCase`（`Request`、`Some`）。这是命名风格，不是让词法器拒绝下划线；C ABI 原符号如 `sqlite3_open` 不改名，SQL 和 JSON 的外部键名也不受影响。
-- 当前保留词为 `fn val var if else while for in return break continue true false struct class enum trait pub import as async await spawn extern match null implicit defer throw try catch this static`。`init` 仅在对象声明体内引入构造器；`blocking` 仅在表达式中紧随同一行块时引入阻塞操作；`it` 只在单参尾部 lambda 内自动绑定。裸表达式 `None` 表示空值，同名绑定可用反引号引用；在模式中按被匹配的类型解析，反引号可以强制把裸名称当绑定。
+- 当前保留词为 `fn val var if else while for in return break continue true false struct class enum trait pub import as is async await spawn extern match null implicit defer throw try catch this static`。`init` 仅在对象声明体内引入构造器；`blocking` 仅在表达式中紧随同一行块时引入阻塞操作；`extension` 只在声明起始处引入扩展组；`it` 只在单参尾部 lambda 内自动绑定。裸表达式 `None` 表示空值，同名绑定可用反引号引用；在模式中按被匹配的类型解析，反引号可以强制把裸名称当绑定。
 - **已定：** `//` 行注释及 `/* ... */` 块注释。块注释不嵌套，遇到首个 `*/` 结束；到文件末尾未闭合，定位开头的 `/*`。注释不拼接两侧 token，内部的换行参与和普通空白相同的换行规则。
 - **已定：** `Int`/`UInt` 为 64 位；支持十进制、`0x`、`0b`、`0o` 和数字分隔符 `_`。无后缀浮点默认 `Float64`。双引号为字符串，单引号为单个 Unicode 标量。`${expr}` 在匹配的 `}` 结束；内部的字符串和花括号按表达式解析，而不是遇到第一个 `}` 就截断。插值按 `Display` 的 `toString` 检查，失败定位到插值内的表达式。
 - 字符和普通字符串支持 `\n`、`\r`、`\t`、`\0`、`\\`、转义引号和 `\u{1F642}`（1–6 个十六进制数字，必须是 Unicode 标量）；字符串中可写 `\${` 输出字面量 `${`。只有插值表达式和原始字面量可跨行。
@@ -104,7 +104,7 @@ val name: String? = absent()
 4. 前缀 `!`、`-`，从右向左。
 5. `*`、`/`、`%`。
 6. `+`、`-`。
-7. `<`、`<=`、`>`、`>=`、`==`、`!=`；本层不连写，区间判断写 `low < value && value < high`。
+7. `<`、`<=`、`>`、`>=`、`==`、`!=`、`is T`、`as? T`；本层不连写，区间判断写 `low < value && value < high`。
 8. `&&`，再是 `||`（两级，各自左结合）。
 9. `??`，右结合。
 10. `=` 与复合赋值（如 `+=`）；不连写赋值，结果为 `Unit`。

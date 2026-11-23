@@ -150,7 +150,7 @@ public:
             while (offset < text.size() && (isLetter(text[offset]) || isDigit(text[offset]))) ++offset;
         } else if (isLetter(current)) {
             while (offset < text.size() && (isLetter(text[offset]) || isDigit(text[offset]))) ++offset;
-            constexpr std::string_view keywords[] = {"fn", "val", "var", "if", "else", "while", "for", "in", "return", "break", "continue", "true", "false", "struct", "class", "enum", "trait", "pub", "import", "as", "async", "await", "spawn", "extern", "match", "null", "implicit", "defer", "throw", "try", "catch", "this", "static"};
+            constexpr std::string_view keywords[] = {"fn", "val", "var", "if", "else", "while", "for", "in", "return", "break", "continue", "true", "false", "struct", "class", "enum", "trait", "pub", "import", "as", "is", "async", "await", "spawn", "extern", "match", "null", "implicit", "defer", "throw", "try", "catch", "this", "static"};
             auto word = text.substr(start, offset - start);
             kind = std::ranges::find(keywords, word) == std::end(keywords) ? Kind::Name : Kind::Keyword;
         } else if (current == '`') {
@@ -757,6 +757,20 @@ private:
                 auto name = hidden("some", site);
                 auto result = add(site, name);
                 left = optional(left, name, result, right, site, {nodes[left].span.begin, nodes[right].span.end}, OptionalForm::Default);
+                continue;
+            }
+            if ((is("is") || is("as")) && minRank <= 5) {
+                if (previous == 5) throw at(source, token.span, "LYP0001", "比较或类型检查不能连写");
+                previous = 5;
+                auto operation = is("is") ? TypeOperator::Is : TypeOperator::CheckedCast;
+                auto site = consume().span;
+                if (operation == TypeOperator::CheckedCast) {
+                    if (!is("?") || token.span.begin != site.end) throw at(source, site, "LYP0001", "检查转换写作 as? T");
+                    site.end = consume().span.end;
+                }
+                auto target = type();
+                auto span = Span{nodes[left].span.begin, target.span.end};
+                left = add(span, TypeOperation{operation, left, std::move(target), site});
                 continue;
             }
             auto op = std::ranges::find(infix, text(token), &Infix::text);

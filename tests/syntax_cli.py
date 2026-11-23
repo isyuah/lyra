@@ -176,6 +176,38 @@ fn main(): Unit {
 ''', '-1\n-128\n-9223372036854775808\n')
         self.reject('fn main(): Unit { val number = -1.toInt8Checked() }', 'LYT0001', '1.toInt8Checked()')
 
+    def test_boxed_variadic_items_and_spread(self):
+        self.native('''
+fn countArgs(values: Any...): Int { values.size }
+fn unbox<T>(value: Any): T? { value as? T }
+fn genericCount<T>(values: T...): Int { values.size }
+fn first(values: Any...): Int {
+    val value = unbox<Int>(values[0]) ?? -1
+    values[0] = "local"
+    value
+}
+class Cursor()
+fn main(): Unit {
+    val ids = [2, 5]
+    val empty: List<Int> = []
+    print(countArgs(ids)); print(countArgs(...ids))
+    print(countArgs(empty)); print(countArgs(...empty))
+    print(countArgs(Cursor()))
+    print(first(...ids)); print(ids[0]); print(genericCount<Any>(...ids))
+    val data: Any = 42
+    print(data is Int64 && !(data is UInt64))
+    print(data as? Bool ?? false)
+}
+''', '1\n2\n1\n0\n1\n2\n2\n2\ntrue\nfalse\n')
+        for program, code, span in (
+            ('fn countArgs(values: Any...): Int { values.size }\nclass Cursor()\nfn main(): Unit { val cursor = Cursor(); countArgs(...cursor); }', 'LYT0001', '...cursor'),
+            ('fn main(): Unit { val boxed: Any = 1; boxed == boxed; }', 'LYT0006', '=='),
+            ('fn main(): Unit { val int = 1; int is Bool; }', 'LYT0021', 'is'),
+            ('fn main(): Unit { val ints = [1, 2]; val all: List<Any> = ints }', 'LYT0001', 'ints'),
+        ):
+            with self.subTest(program=program):
+                self.reject(program, code, span)
+
     def test_await_precedes_propagation_without_flattening_option(self):
         self.native('''
 async fn find(fails: Bool): Result<Int?,String> { if fails { Err("lost") } else { Ok(None) } }

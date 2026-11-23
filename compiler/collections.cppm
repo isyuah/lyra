@@ -102,6 +102,11 @@ struct NativeLists {
         builder.CreateCall(module().getOrInsertFunction("lyraListExtend", builder.getVoidTy(), pointer, pointer), {list, values});
     }
 
+    void extendAny(llvm::Value* list, llvm::Value* values, llvm::Value* type) const {
+        auto pointer = builder.getPtrTy();
+        builder.CreateCall(module().getOrInsertFunction("lyraListExtendAny", builder.getVoidTy(), pointer, pointer, pointer), {list, values, type});
+    }
+
     llvm::Value* get(llvm::Value* list, llvm::Value* index, const Source& source, Span site) const {
         auto pointer = builder.getPtrTy(); auto integer = builder.getInt64Ty();
         auto position = source.position(site.begin);

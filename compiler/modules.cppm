@@ -185,6 +185,7 @@ struct Linker {
                     for (auto& type : call->typeArguments) renameType(type);
                 }
                 if (auto* binding = std::get_if<Binding>(&expr.node); binding && binding->annotation) renameType(*binding->annotation);
+                if (auto* operation = std::get_if<TypeOperation>(&expr.node)) renameType(operation->type);
                 if (auto* attempt = std::get_if<Attempt>(&expr.node); attempt && attempt->binding) renameType(attempt->binding->type);
                 if (auto* match = std::get_if<Match>(&expr.node)) for (auto& arm : match->arms) renamePattern(renamePattern, arm.pattern);
                 if (auto* lambda = std::get_if<Lambda>(&expr.node)) {

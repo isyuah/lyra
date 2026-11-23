@@ -65,7 +65,7 @@ using Overloads = std::unordered_map<std::string, std::vector<std::size_t>>;
 
 const std::string& linkedName(const Identifier& name) { return name.linked.empty() ? name.text : name.linked; }
 
-constexpr Type scalarTypes[] = {Type::Bool, Type::String, Type::Char, Type::Bytes, Type::Unit, Type::CPtr, Type::Exception};
+constexpr Type scalarTypes[] = {Type::Bool, Type::String, Type::Char, Type::Bytes, Type::Unit, Type::CPtr, Type::Exception, Type::Any};
 
 bool builtInDisplay(Type type) { return numericType(type) || type == Type::Bool || type == Type::String || type == Type::Char; }
 
@@ -81,6 +81,7 @@ std::string typeName(const CheckedModule& module, Type type, bool canonical = fa
         case Type::Bytes: return "Bytes";
         case Type::Exception: return "Exception";
         case Type::CPtr: return "CPtr";
+        case Type::Any: return "Any";
         case Type::Record: case Type::Enum: {
             const auto& full = type.kind == Type::Record ? module.aggregates[type.id].syntax.name.text : module.enums[type.id].syntax.name.text;
             const auto& arguments = type.kind == Type::Record ? module.aggregates[type.id].arguments : module.enums[type.id].arguments;
@@ -140,13 +141,13 @@ OverloadKey overloadKey(const Function& syntax) {
     return key;
 }
 
-enum class MatchKind { Exact, Number, Nullable, Literal, User };
+enum class MatchKind { Exact, Number, Nullable, Literal, User, Box };
 struct ArgumentMatch {
     MatchKind kind;
     Type target{};
 
     std::partial_ordering compare(const ArgumentMatch& other) const {
-        auto rank = [](MatchKind kind) { return kind == MatchKind::Exact ? 0 : kind == MatchKind::User ? 2 : 1; };
+        auto rank = [](MatchKind kind) { return kind == MatchKind::Exact ? 0 : kind == MatchKind::User ? 2 : kind == MatchKind::Box ? 3 : 1; };
         auto tier = rank(kind) <=> rank(other.kind);
         if (tier != 0) return tier;
         if (kind != other.kind) return std::partial_ordering::unordered;
@@ -797,7 +798,7 @@ struct Checker {
         auto& info = fn.expressions[id];
         if (expected && type != *expected && type != Type::Never) {
             auto site = fn.syntax.expressions[id].span;
-            if (!losslessNumber(type, *expected) && (expected->kind != Type::Option || module.sumTypes[expected->id].success != type)) {
+            if (*expected != Type::Any && !losslessNumber(type, *expected) && (expected->kind != Type::Option || module.sumTypes[expected->id].success != type)) {
                 info.conversion = directConversion(symbols.conversions, module, symbols.sources, type, *expected, source, site, !probing);
                 if (!info.conversion) throw mismatch(module, source, site, *expected, type);
             }
@@ -805,6 +806,23 @@ struct Checker {
             type = *expected;
         }
         return info.type = type;
+    }
+
+    Type fitArgument(ExprId id, Type actual, std::optional<Type> expected, bool spread) {
+        if (spread && expected && actual != *expected && actual.kind == Type::List && module.listElements[expected->id] == Type::Any) {
+            fn.expressions[id].boxedSpread = true;
+            return actual;
+        }
+        return fit(id, actual, expected);
+    }
+
+    Type infer(ExprId id, const TypeOperation& operation, auto, bool) {
+        auto target = symbols.resolve(fn.syntax, operation.type, variables);
+        auto actual = visit(operation.value);
+        if (actual == Type::Never) return actual;
+        if (actual != Type::Any) throw at(source, operation.site, "LYT0021", "is 与 as? 需要 Any 值，实际是 " + typeName(module, actual));
+        fn.expressions[id].testedType = target;
+        return operation.op == TypeOperator::Is ? Type{Type::Bool} : symbols.sum(Type::Option, target);
     }
 
     std::optional<Type> numericHint(std::optional<Type> type) const {
@@ -1328,15 +1346,19 @@ struct Checker {
             if (type && selected.mode == ArgumentMode::Spread) type = symbols.list(*type);
             auto expr = call.arguments[index].value;
             auto inferred = inspect(expr, type);
-            if (selected.mode == ArgumentMode::Item && type && inferred.kind == Type::List && module.listElements[inferred.id] == *type) {
+            if (selected.mode == ArgumentMode::Item && type && *type != Type::Any && inferred.kind == Type::List && module.listElements[inferred.id] == *type) {
                 auto error = mismatch(module, source, arguments[index].site, *type, inferred);
                 error.hint = "若要逐项传入列表，请在实参前写 ...。";
                 throw error;
             }
-            auto value = fit(expr, inferred, type);
+            auto spread = selected.mode == ArgumentMode::Spread;
+            if (spread && inferred != Type::Never && inferred.kind != Type::List) {
+                auto site = Span{call.arguments[index].spread->begin, fn.syntax.expressions[expr].span.end};
+                throw at(source, site, "LYT0001", "展开需要 List，实际是 " + typeName(module, inferred));
+            }
+            auto value = fitArgument(expr, inferred, type, spread);
             checked[index] = true;
             if (value == Type::Never) exits = true;
-            else if (selected.mode == ArgumentMode::Spread && value.kind != Type::List) throw at(source, arguments[index].site, "LYT0001", "展开需要 List，实际是 " + typeName(module, value));
         }
         return exits;
     }
@@ -1424,7 +1446,7 @@ struct Checker {
         for (std::size_t prior = 0; prior < checked.size(); ++prior) if (checked[prior]) {
             auto type = fn.expressions[call.arguments[prior].value].type;
             if (type == Type::Never) continue;
-            if (call.arguments[prior].spread) type = module.listElements[type.id];
+            if (call.arguments[prior].spread) type = fn.expressions[call.arguments[prior].value].boxedSpread ? Type{Type::Any} : module.listElements[type.id];
             learn(learn, typeForm(target.parameters[fn.expressions[id].argumentSlots[prior] + skip].type.text), type, true);
         }
         if (expected && !target.result.text.empty()) learn(learn, typeForm(target.result.text), *expected, false);
@@ -1462,7 +1484,7 @@ struct Checker {
         for (std::size_t index = 0; index < call.arguments.size(); ++index) {
             auto expr = call.arguments[index].value;
             auto type = fn.expressions[expr].type;
-            if (call.arguments[index].spread && type != Type::Never) type = module.listElements[type.id];
+            if (call.arguments[index].spread && type != Type::Never) type = fn.expressions[expr].boxedSpread ? Type{Type::Any} : module.listElements[type.id];
             actuals.push_back({info.argumentSlots[index] + skip, type, fn.syntax.expressions[expr].span});
         }
         auto types = inferGenericArguments<Type>(target, call, fn.syntax.expressions[id].span, explicitTypes, actuals, expected, source, [&](Type type) { return typeName(module, type); },
@@ -1472,7 +1494,8 @@ struct Checker {
             const auto& argument = actuals[index];
             auto type = symbols.resolve(target, target.parameters[argument.slot].type, types);
             auto expr = call.arguments[index].value;
-            fit(expr, fn.expressions[expr].type, call.arguments[index].spread ? symbols.list(type) : type);
+            auto spread = call.arguments[index].spread.has_value();
+            fitArgument(expr, fn.expressions[expr].type, spread ? symbols.list(type) : type, spread);
         }
         return {std::move(types), exits};
     }
@@ -1510,6 +1533,7 @@ struct Checker {
     ArgumentMatch argumentMatch(ExprId id) const {
         const auto& info = fn.expressions[id];
         if (info.conversion) return {MatchKind::User};
+        if (info.boxedSpread || (info.sourceType && info.type == Type::Any)) return {MatchKind::Box};
         if (info.sourceType) return info.type.kind == Type::Option ? ArgumentMatch{MatchKind::Nullable} : ArgumentMatch{MatchKind::Number, info.type};
         const auto& node = fn.syntax.expressions[id].node;
         if (std::holds_alternative<IntegerLiteral>(node) && info.type != Type::Int) return {MatchKind::Literal, info.type};
@@ -1883,7 +1907,7 @@ struct Checker {
             return binary.op <= Op::Ge ? Type{Type::Bool} : *common;
         }
         right = fit(binary.right, right, left);
-        if (equality && (left.kind == Type::Option || left.kind == Type::Result || left.kind == Type::Enum || left.kind == Type::Closure || left.kind == Type::Variable || (left.kind == Type::Record && !module.aggregates[left.id].syntax.reference))) throw at(source, binary.site, "LYT0006", typeName(module, left) + " 未提供 Eq，不能用 == 或 != 比较");
+        if (equality && (left.kind == Type::Option || left.kind == Type::Result || left.kind == Type::Enum || left.kind == Type::Closure || left.kind == Type::Any || left.kind == Type::Variable || (left.kind == Type::Record && !module.aggregates[left.id].syntax.reference))) throw at(source, binary.site, "LYT0006", typeName(module, left) + " 未提供 Eq，不能用 == 或 != 比较");
         if (binary.op == Op::Add && left == Type::String) return Type::String;
         if (!equality) throw mismatch(module, source, binary.site, Type::Int, left);
         return Type::Bool;

@@ -36,12 +36,11 @@ void reserve(LyraList* list, std::size_t extra) {
     list->capacity = capacity;
 }
 
-void extend(LyraList* list, const LyraList* source) {
-    auto count = source->count;
-    if (!count) return;
-    reserve(list, count);
-    std::memcpy(list->items + list->count, source->items, count * sizeof(*list->items));
-    list->count += count;
+void lockedLists(LyraList* list, const LyraList* source, const auto& work) {
+    auto first = stripe(list), second = stripe(source);
+    lyraRuntime::Lock lower(listLocks[std::min(first, second)]);
+    if (first == second) work();
+    else { lyraRuntime::Lock upper(listLocks[std::max(first, second)]); work(); }
 }
 
 }
@@ -77,8 +76,23 @@ void lyraListAdd(LyraList* list, const void* boxed) {
 }
 
 void lyraListExtend(LyraList* list, const LyraList* source) {
-    auto first = stripe(list), second = stripe(source);
-    lyraRuntime::Lock lower(listLocks[std::min(first, second)]);
-    if (first == second) extend(list, source);
-    else { lyraRuntime::Lock upper(listLocks[std::max(first, second)]); extend(list, source); }
+    lockedLists(list, source, [&] {
+        auto count = source->count;
+        if (!count) return;
+        reserve(list, count);
+        std::memcpy(list->items + list->count, source->items, count * sizeof(*list->items));
+        list->count += count;
+    });
+}
+
+void lyraListExtendAny(LyraList* list, const LyraList* source, const void* type) {
+    struct AnyValue { const void* type; const void* data; };
+    lockedLists(list, source, [&] {
+        auto count = source->count;
+        reserve(list, count);
+        for (std::size_t index = 0; index < count; ++index) {
+            auto value = ::new (lyraGcAlloc(sizeof(AnyValue))) AnyValue{type, source->items[index]};
+            list->items[list->count++] = value;
+        }
+    });
 }

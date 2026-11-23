@@ -5,6 +5,7 @@ module;
 #include <llvm/IR/Intrinsics.h>
 #include <llvm/IR/Module.h>
 #include <llvm/IR/Verifier.h>
+#include <map>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -30,6 +31,7 @@ struct Layouts {
     const CheckedModule& program;
     std::vector<llvm::StructType*> objects;
     std::vector<std::vector<llvm::StructType*>> payloads;
+    mutable std::map<Type, llvm::Constant*> typeTokens{};
     bool workers{};
 
     Layouts(const CheckedModule& program, Builder& builder) : program(program) {
@@ -55,6 +57,13 @@ struct Layouts {
 
     bool reference(Type type) const { return program.aggregates[type.id].syntax.reference; }
 
+    llvm::Constant* typeToken(Builder& builder, Type type) const {
+        auto [entry, inserted] = typeTokens.try_emplace(type);
+        if (inserted) entry->second = new llvm::GlobalVariable(*builder.GetInsertBlock()->getModule(), builder.getInt8Ty(), true,
+            llvm::GlobalValue::PrivateLinkage, builder.getInt8(0), "lyra.type.identity");
+        return entry->second;
+    }
+
     llvm::Type* native(Builder& builder, Type type) const {
         switch (type.kind) {
         case Type::Int: case Type::UInt: return builder.getIntNTy(numberWidth(type));
@@ -64,6 +73,7 @@ struct Layouts {
         case Type::Unit: case Type::Never: return builder.getInt8Ty();
         case Type::String: case Type::Bytes: case Type::Task: case Type::CPtr: case Type::List: case Type::Exception: case Type::Closure: return builder.getPtrTy();
         case Type::Variable: llvm_unreachable("abstract type reached LLVM lowering");
+        case Type::Any: return llvm::StructType::get(builder.getContext(), {builder.getPtrTy(), builder.getPtrTy()});
         case Type::Record: return reference(type) ? static_cast<llvm::Type*>(builder.getPtrTy()) : objects[type.id];
         case Type::Enum: return llvm::StructType::get(builder.getContext(), {builder.getInt32Ty(), builder.getPtrTy()});
         case Type::Option: return llvm::StructType::get(builder.getContext(), {builder.getInt1Ty(), native(builder, program.sumTypes[type.id].success)});
@@ -294,6 +304,10 @@ struct Emitter {
         if (!live() || !info.sourceType) return value;
         if (info.conversion) return callFunction(*info.conversion, {value}, fn.syntax.expressions[id].span);
         if (info.type.kind == Type::Option) return makeSum(info.type, SumTag::Some, value);
+        if (info.type == Type::Any) {
+            auto boxed = builder.CreateInsertValue(llvm::PoisonValue::get(layouts.native(builder, info.type)), layouts.typeToken(builder, *info.sourceType), 0);
+            return builder.CreateInsertValue(boxed, NativeLists{builder}.box(value), 1);
+        }
         return castNumber(value, *info.sourceType, info.type);
     }
 
@@ -640,7 +654,10 @@ struct Emitter {
             auto value = emit(call.arguments[index].value);
             if (!live()) return unit();
             if (variadic && slot == args.size() - 1) {
-                if (call.arguments[index].spread) lists.extend(args[slot], value);
+                if (fn.expressions[call.arguments[index].value].boxedSpread) {
+                    auto type = layouts.program.listElements[fn.expressions[call.arguments[index].value].type.id];
+                    lists.extendAny(args[slot], value, layouts.typeToken(builder, type));
+                } else if (call.arguments[index].spread) lists.extend(args[slot], value);
                 else lists.add(args[slot], value);
             } else args[slot] = value;
         }
@@ -748,6 +765,26 @@ struct Emitter {
         auto pair = builder.CreateCall(checked, {left, right});
         trapIf(builder.CreateExtractValue(pair, 1), site, name + (op == Op::Add ? " overflow (+)" : op == Op::Sub ? " overflow (-)" : " overflow (*)"));
         return builder.CreateExtractValue(pair, 0);
+    }
+
+    Value emitNode(ExprId id, const TypeOperation& operation) {
+        auto value = emit(operation.value);
+        if (!live()) return unit();
+        auto target = *fn.expressions[id].testedType;
+        if (target == Type::Any) return operation.op == TypeOperator::Is ? static_cast<Value>(builder.getTrue()) : makeSum(rawType(id), SumTag::Some, value);
+        auto matches = builder.CreateICmpEQ(builder.CreateExtractValue(value, 0), layouts.typeToken(builder, target));
+        if (operation.op == TypeOperator::Is) return matches;
+        auto converted = label("cast.ok"), merge = label("cast.end"), absent = builder.GetInsertBlock();
+        builder.CreateCondBr(matches, converted, merge);
+        builder.SetInsertPoint(converted);
+        auto type = rawType(id);
+        auto result = makeSum(type, SumTag::Some, builder.CreateLoad(layouts.native(builder, target), builder.CreateExtractValue(value, 1)));
+        builder.CreateBr(merge);
+        builder.SetInsertPoint(merge);
+        auto* option = builder.CreatePHI(layouts.native(builder, type), 2);
+        option->addIncoming(llvm::Constant::getNullValue(option->getType()), absent);
+        option->addIncoming(result, converted);
+        return option;
     }
 
     Value emitNode(ExprId, const Unary& unary) {

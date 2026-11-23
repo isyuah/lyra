@@ -43,6 +43,8 @@ struct RealLiteral { std::string digits; std::optional<unsigned> width; };
 enum class Op { Set, AddSet, SubSet, MulSet, DivSet, RemSet, Or, And, Eq, Ne, Lt, Le, Gt, Ge, Add, Sub, Mul, Div, Rem, Not };
 struct Unary { Op op; Span site; ExprId operand; };
 struct Binary { Op op; Span site; ExprId left, right; };
+enum class TypeOperator { Is, CheckedCast };
+struct TypeOperation { TypeOperator op; ExprId value; Identifier type; Span site; };
 struct Statement { ExprId expression; std::optional<Span> semicolon; };
 struct Block { std::vector<Statement> statements; Span end; };
 struct Binding { Identifier name; bool writable; std::optional<Identifier> annotation; ExprId value; };
@@ -79,7 +81,7 @@ enum class Jump { Break, Continue };
 
 struct Expr {
     Span span;
-    std::variant<IntegerLiteral, RealLiteral, bool, StringLiteral, BytesLiteral, CharLiteral, DisplayValue, TextTemplate, Identifier, This, Call, Member, QualifiedMember, Unary, Binary, Block, Binding, Conditional, While, For, Return, Raise, Attempt, Jump, TaskOp, Blocking, Deferred, EmptyOption, Propagate, Match, ListLiteral, Index, Lambda> node;
+    std::variant<IntegerLiteral, RealLiteral, bool, StringLiteral, BytesLiteral, CharLiteral, DisplayValue, TextTemplate, Identifier, This, Call, Member, QualifiedMember, Unary, Binary, TypeOperation, Block, Binding, Conditional, While, For, Return, Raise, Attempt, Jump, TaskOp, Blocking, Deferred, EmptyOption, Propagate, Match, ListLiteral, Index, Lambda> node;
 };
 
 struct Parameter { Identifier name, type; bool variadic{}; std::optional<ExprId> defaultValue{}; std::vector<Attribute> attributes{}; };

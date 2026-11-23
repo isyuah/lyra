@@ -12,7 +12,7 @@ export import lyra.syntax;
 
 export namespace lyra {
 struct Type {
-    enum Kind { Unit, Int, UInt, Real, Bool, String, Char, Bytes, Never, Record, Enum, Variable, Task, CPtr, Option, Result, List, Exception, Closure };
+    enum Kind { Unit, Int, UInt, Real, Bool, String, Char, Bytes, Never, Record, Enum, Variable, Task, CPtr, Option, Result, List, Exception, Closure, Any };
     Kind kind;
     std::size_t id{};
     constexpr Type(Kind kind = Unit, std::size_t id = 0) : kind(kind), id(id) {}
@@ -29,7 +29,7 @@ struct CheckedPattern {
     std::vector<CheckedPattern> parts{};
 };
 struct IteratorPlan { std::size_t open, next; };
-struct CheckedExpr { Type type; std::size_t target{}; std::vector<std::size_t> argumentSlots{}; Callee callee{}; std::optional<Type> sourceType{}; std::vector<std::size_t> captures{}; std::vector<std::size_t> omittedDefaults{}; std::optional<std::size_t> conversion{}, errorConversion{}, functionRef{}; std::optional<Type> callableType{}; std::optional<IteratorPlan> iterator{}; std::vector<CheckedPattern> patterns{}; std::optional<double> realLiteral{}; bool narrowed{}; std::optional<std::string> boundTrait{}; };
+struct CheckedExpr { Type type; std::size_t target{}; std::vector<std::size_t> argumentSlots{}; Callee callee{}; std::optional<Type> sourceType{}; std::vector<std::size_t> captures{}; std::vector<std::size_t> omittedDefaults{}; std::optional<std::size_t> conversion{}, errorConversion{}, functionRef{}; std::optional<Type> callableType{}; std::optional<IteratorPlan> iterator{}; std::vector<CheckedPattern> patterns{}; std::optional<double> realLiteral{}; bool narrowed{}; std::optional<std::string> boundTrait{}; std::optional<Type> testedType{}; bool boxedSpread{}; };
 struct CheckedFunction {
     Function syntax;
     Type result;

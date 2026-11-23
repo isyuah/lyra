@@ -14,6 +14,7 @@ const void* lyraListGet(const LyraList* list, int64_t index, const char* file, u
 void lyraListSet(LyraList* list, int64_t index, const void* boxed);
 void lyraListAdd(LyraList* list, const void* boxed);
 void lyraListExtend(LyraList* list, const LyraList* source);
+void lyraListExtendAny(LyraList* list, const LyraList* source, const void* type);
 
 #ifdef __cplusplus
 }
