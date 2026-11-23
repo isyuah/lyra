@@ -31,7 +31,8 @@ set_target_properties(lyraRuntime PROPERTIES ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_B
 
 add_executable(lyra compiler/main.cpp compiler/source.cpp compiler/parser.cpp compiler/check.cpp compiler/lowering.cpp compiler/build.cpp)
 target_sources(lyra PRIVATE FILE_SET CXX_MODULES FILES
-    compiler/source.cppm compiler/syntax.cppm compiler/check.cppm compiler/lowering.cppm compiler/build.cppm)
+    compiler/source.cppm compiler/syntax.cppm compiler/check.cppm compiler/lowering.cppm compiler/build.cppm
+    compiler/packages.cppm compiler/modules.cppm)
 add_dependencies(lyra lyraRuntime)
 target_compile_options(lyra PRIVATE -Wall -Wextra -Wpedantic)
 target_include_directories(lyra SYSTEM PRIVATE ${LLVM_INCLUDE_DIRS})
@@ -46,6 +47,9 @@ if(BUILD_TESTING)
     add_test(NAME frontend COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/compiler_cli.py $<TARGET_FILE:lyra> Frontend)
     add_test(NAME native COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/compiler_cli.py $<TARGET_FILE:lyra> Native)
     add_test(NAME objects COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/objects_cli.py $<TARGET_FILE:lyra>)
+    foreach(suite IN ITEMS packages modules)
+        add_test(NAME ${suite} COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/${suite}_cli.py $<TARGET_FILE:lyra>)
+    endforeach()
     foreach(component IN ITEMS managed tasks)
         add_executable(test-${component} tests/runtime_${component}.cpp)
         target_link_libraries(test-${component} PRIVATE lyraRuntime)

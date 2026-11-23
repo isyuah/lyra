@@ -20,11 +20,16 @@ examples/compiler-smoke/pass/build/release/app
 ## 命令与语言子集
 
 ```text
-lyra check <包目录> [--diagnostics=json]
-lyra build <包目录> [-o <产物>] [--release] [--diagnostics=json]
+lyra new <目录> [--name <包名>] [--lib]
+lyra check|build|run|test <包目录> [--locked] [--offline] [--diagnostics=json]
+lyra build <包目录> [-o <产物>] [--release]
+lyra run <包目录> [--release] [-- <程序参数>...]
+lyra lock|fetch <目录> [--locked] [--offline]
+lyra pack <目录> [-o <源码包>|--registry <本地目录>]
 ```
 
-- 两条命令只读取包内 `src` 直属的 `.ly` 文件，作为一个可执行模块，入口为 `fn main(): Unit`。不递归、不需要包清单；同模块函数可前向引用。
+- `lyra.json5` 包中一个目录组成一个模块。`import self.net.port` 从本包导入，`import cfg.defaultPort as port` 从清单中简称为 `cfg` 的库导入。默认私有，`pub import` 可重导出。无清单的单模块冒烟样例只读取 `src` 直属文件。库包可独立 `check`，无需 `main`。
+- `test` 编译并运行每个 `tests/*.ly` 中的 `fn main(): Unit`，用 `import self.<名称>` 访问包的公开 API。workspace 根支持一次检查或测试多个成员。锁、缓存、只读 HTTP(S) 源和脚本边界见[包工具手册](compiler/packages.md)。
 - 支持 `Int`、`Bool`、`Unit`、具名形参、按源码顺序求值的命名实参、`val` / `var`、嵌套作用域、赋值和复合赋值、整数四则与余数、比较、短路 `&&` / `||`、`if` / `else`、`while`、`break`、`continue` 和 `return`。整数溢出或除零在 Debug/Release 都带源码位置报错。普通块以末表达式为值，空块或带末尾分号的块取 `Unit`。
 - `String` 支持 UTF-8、拼接和内容相等；`struct` 按值复制，`class` 保留对象身份，可定义字段、主构造和方法。`gcCollect()` 可主动收集。对象由 BDWGC 管理；编译器安装目录带静态 GC 和 libuv 归档，部署应用不需要安装这两个库。见[对象验收程序](tests/fixtures/objects/src/main.ly)。
 - `check` 不调用 Clang、不创建产物。`build` 默认输出 `<包目录>/build/debug/app`（`-O0`），`--release` 输出 `build/release/app`（`-O2`），`-o` 指定其他路径。类型错误或链接失败都不会覆盖已有产物。

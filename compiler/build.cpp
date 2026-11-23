@@ -90,4 +90,14 @@ void build(const CheckedModule& functions, const std::vector<Source>& sources, c
     emitExecutable(*module, fs::absolute(output), release);
 }
 
+int execute(const fs::path& executable, const std::vector<std::string_view>& arguments) {
+    auto path = fs::absolute(executable).string();
+    std::vector<llvm::StringRef> args{path};
+    for (auto arg : arguments) args.emplace_back(arg);
+    std::string reason;
+    int code = llvm::sys::ExecuteAndWait(path, args, std::nullopt, {}, 0, 0, &reason);
+    if (code < 0) throw Diagnostic{"LYB0003", "程序未正常退出：" + reason};
+    return code;
+}
+
 }
