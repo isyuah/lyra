@@ -72,7 +72,7 @@ void emitExecutable(const llvm::Module& module, const fs::path& output, bool rel
     auto target = "--target=" + module.getTargetTriple();
     runClang(*driver, {target, release ? "-O2" : "-O0", "-c", "-x", "ir", ir, "-o", object}, log);
     auto lib = runtime.parent_path();
-    runClang(*driver, {target, object, runtime.string(), (lib / "libgc.a").string(), (lib / "libuv.a").string(),
+    runClang(*driver, {target, object, runtime.string(), (lib / "libgc.a").string(), (lib / "libuv.a").string(), (lib / "libllhttp.a").string(),
                        "-pthread", "-ldl", "-lrt", "-Wl,--as-needed", "-lsqlite3", "-o", executable.string()}, log);
     fs::rename(executable, output);
 }

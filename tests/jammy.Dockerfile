@@ -11,10 +11,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
 WORKDIR /src
 COPY CMakeLists.txt CMakePresets.json ./
 COPY compiler/ compiler/
+COPY cmake/ cmake/
 COPY runtime/ runtime/
 COPY std/ std/
 COPY tests/ tests/
 COPY examples/compiler-smoke/ examples/compiler-smoke/
+COPY examples/http-sqlite/ examples/http-sqlite/
 RUN sh tests/jammy-smoke.sh build /out
 
 FROM ubuntu:22.04 AS bare-runtime
