@@ -16,8 +16,8 @@
 | 推进域 | `lyraDomainRun(domain)` 在该域驱动 libuv，串行调用就绪的 `step(task, frame)`，返回本次执行的步数。没有就绪任务/活动 libuv 工作时返回；手动门闩未放行的任务可以仍挂起。只在回调外泵循环，域中没有存活任务时再 `lyraDomainDestroy`。 |
 | 等待 | 正在运行的 `step` 调用 `lyraTaskAwait(self, target)`。冷目标在等待者域启动；活跃目标保持原域。返回 `0` 时先前保存好恢复点的回调须立即返回；被唤醒时重新检查取消/结果。返回 `1` 时按 `lyraTaskState(target)` 分别处理完成、失败、取消，再用 `lyraTaskOutcome` 读载荷。等待者总是入**自身**域的队列。 |
 | 手动门闩 | 设置恢复点后调用 `lyraTaskSuspend(self)` 并返回；域线程可用 `lyraTaskWake(task)` 解除本次门闩。真实外部事件应在清理时撤销旧回调，不把上一轮的通知复用到下一次挂起。 |
-| 完成 | `lyraTaskComplete(self, value)`、`lyraTaskFail(self, error)` 保存终态/载荷，唤醒等待者，释放任务帧与运行时强根。`Unit` 可用空指针；其他载荷应存在可追踪的受管理存储中，不能传短命的栈地址。句柄存活时，多次等到同一终态；需要按值复制的结果由调用端读取。 |
-| 取消 | `lyraTaskRequestCancel(task)` 设置请求，唤醒可取消的挂起点。回调在恢复入口用 `lyraTaskCancelRequested` 检查；先执行作用域清理，再 `lyraTaskFinishCancelled`。取消一个等待者会撤销它自己的订阅，不替它取消别人已启动的任务。 |
+| 完成 | `lyraTaskComplete(self, value)`、`lyraTaskFail(self, error)` 等已登记子任务完成后，逆序执行剩余清理，再发布终态并唤醒等待者。`Unit` 可用空指针；其他载荷应存在可追踪的受管理存储中，不能传短命的栈地址。句柄存活时，多次等到同一终态；需要按值复制的结果由调用端读取。 |
+| 取消 | `lyraTaskRequestCancel(task)` 设置请求，唤醒可取消的挂起点。回调在恢复入口用 `lyraTaskCancelRequested` 检查；`lyraTaskFinishCancelled` 与其余退出路径共用任务清理。取消一个等待者会撤销它自己的订阅，不替它取消别人已启动的任务。 |
 
 ### Lyra 源码如何接入
 
@@ -28,6 +28,12 @@ LLVM 后端给每个异步函数生成一个用于创建冷 Task 的普通函数
 `async fn main(): Unit` 和 `async fn main(): Result<Unit,String>` 都由 `lyraTaskRunRoot` 建立串行域并启动。首次 `await`/`spawn` 激活的冷任务登记到当前任务；已启动的目标不改归属。父任务在自己的子任务全部收尾后才进入终态。根入口返回 `Ok({})` 时退出码为 0，`Err(message)` 时先等子任务收尾，再向标准错误输出完整 UTF-8 消息（含内嵌 NUL）和换行，进程非零退出。业务 `Err` 是成功交付的值，不触发组取消。
 
 [源码用例](../tests/async_cli.py)在 Debug 和 `--release` 下验证冷实参求值、未启动 Task、丢弃句柄后的收尾、跨挂起 GC 与赋值顺序、重复读取结果、5,000 层递归等待及上述两种入口。[泛型 Task 用例](../tests/generics_tasks_cli.py)验证跨模块的 `Task<Task<T>>` 与类型诊断。
+
+### 词法清理与显式取消
+
+`defer expr` 或 `defer { ... }` 在执行到该语句时登记回调，退出词法块时后进先出。回调捕获绑定，`defer print(number)` 打印清理时的 `number`；块的返回值则在执行清理前求值。正常块尾、`return`、`?`、`break` 和 `continue` 均按退出范围清理。`defer` 内不能 `await`、`spawn` 或请求取消；同步的阻塞 Worker 也可以在自己的线程上登记清理。
+
+异步函数退出时尚未运行的清理保存在堆帧，等本任务所有子任务（含不可中断的 C 工作）安全结束后执行，再把终态交给等待者。`task.cancel()` 只能直接写在 `async fn` 中；重复请求不重复清理，不会连带取消兄弟。对冷 Task 请求取消后再启动，不会进入函数体，也就不会运行体内未登记的清理。语言层用[源码用例](../tests/defer_cli.py)验证逆序、绑定更新、跨挂起 GC、工作线程中 SQLite 句柄释放与重复等待。
 
 ### 在 Worker 执行同步代码
 
@@ -57,7 +63,7 @@ async fn main(): Unit {
 
 `lyraTaskWatchDisconnect(fd)` 从当前域内的任务注册连接断开通知，不读取或关闭调用者的 fd；Linux 后端使用自持的重复 fd。断连时在所属域请求取消当前任务及其激活的孩子；只有 C 工作已返回后才允许父任务执行取消清理。未捕获的原生任务失败取消仍在运行的兄弟，多个失败用 `lyraTaskFailureCount/At` 按登记顺序遍历。实际 socketpair 断开、取消安全与逆序发生的两个失败由[原生任务用例](../tests/runtime_tasks.cpp)验证。
 
-**当前边界：**多个串行域由同一主线程驱动，原生测试验证跨域等待与恢复归属。显式 CPU 并行域、上下文/deadline、用户代码中的异常抛出与异步原因链、词法 `defer` 清理仍需各自的端到端验收。
+**当前边界：**多个串行域由同一主线程驱动，原生测试验证跨域等待与恢复归属。显式 CPU 并行域、上下文/deadline、普通异常的抛出、异步原因链与清理异常仍需各自的端到端验收。
 
 ## 独立验证（Linux）
 

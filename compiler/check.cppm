@@ -16,7 +16,7 @@ struct Type {
     bool operator==(const Type&) const = default;
 };
 struct Local { Type type; bool writable; std::optional<ExprId> worker{}; bool captured{}; };
-enum class Callee { Function, Constructor, Print, Collect, Sum, ListAdd };
+enum class Callee { Function, Constructor, Print, Collect, Sum, ListAdd, TaskCancel };
 struct CheckedExpr { Type type; std::size_t target{}; std::vector<std::size_t> argumentSlots{}; Callee callee{}; std::optional<Type> sourceType{}; std::vector<std::size_t> captures{}; std::vector<std::size_t> omittedDefaults{}; std::optional<std::size_t> conversion{}, errorConversion{}; };
 struct CheckedFunction {
     Function syntax;
@@ -24,6 +24,7 @@ struct CheckedFunction {
     std::vector<Local> locals;
     std::vector<CheckedExpr> expressions;
     std::vector<std::optional<std::size_t>> defaultFunctions{};
+    std::vector<std::optional<ExprId>> cleanupOwners{};
 };
 struct CheckedAggregate { Aggregate syntax; std::vector<Type> fields; };
 struct SumTypes { Type success, failure; bool operator==(const SumTypes&) const = default; };

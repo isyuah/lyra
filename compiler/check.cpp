@@ -441,6 +441,13 @@ struct Checker {
         if (call.receiver) {
             auto owner = visit(*call.receiver);
             if (owner == Type::Never) return owner;
+            if (owner.kind == Type::Task && call.name.text == "cancel") {
+                if (!workers.empty() || !fn.syntax.isAsync) throw at(source, call.name.span, "LYT0008", "Task.cancel() 只能在 async 函数中调用，不能在 blocking 或 defer 中调用");
+                noTypeArgs();
+                if (!call.arguments.empty()) throw at(source, call.name.span, "LYT0002", "Task.cancel() 不接收实参");
+                info.callee = Callee::TaskCancel;
+                return Type::Unit;
+            }
             if (owner.kind == Type::List && call.name.text == "add") {
                 noTypeArgs();
                 info.callee = Callee::ListAdd;
@@ -503,7 +510,7 @@ struct Checker {
     }
 
     Type infer(ExprId, const TaskOp& op, std::optional<Type> expected, bool) {
-        if (!workers.empty() || !fn.syntax.isAsync) throw at(source, op.site, "LYT0008", "await 和 spawn 只能在 async 函数中使用，不能挂起同步 blocking 块");
+        if (!workers.empty() || !fn.syntax.isAsync) throw at(source, op.site, "LYT0008", "await 和 spawn 只能在 async 函数中使用，不能用于同步的 blocking 或 defer");
         auto operand = inspect(op.operand, op.spawn || !expected ? expected : std::optional(symbols.task(*expected)));
         if (operand.kind == Type::Never) return operand;
         if (operand.kind != Type::Task) throw at(source, fn.syntax.expressions[op.operand].span, "LYT0008", "此处需要 Task，实际是 " + typeName(module, operand));
@@ -520,6 +527,17 @@ struct Checker {
         workers.pop_back();
         loops = previous;
         return symbols.task(result);
+    }
+
+    Type infer(ExprId id, const Deferred& cleanup, auto, bool) {
+        auto owner = currentWorker();
+        if (std::ranges::find(fn.cleanupOwners, owner) == fn.cleanupOwners.end()) fn.cleanupOwners.push_back(owner);
+        workers.push_back({id, fn.locals.size(), Type{Type::Unit}});
+        unsigned previous = std::exchange(loops, 0);
+        visit(cleanup.body, {}, true);
+        loops = previous;
+        workers.pop_back();
+        return Type::Unit;
     }
 
     bool writable(ExprId id) const {

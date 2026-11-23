@@ -38,6 +38,7 @@ struct While { ExprId condition, body; };
 struct Return { std::optional<ExprId> value; };
 struct TaskOp { bool spawn; Span site; ExprId operand; };
 struct Blocking { ExprId body; };
+struct Deferred { ExprId body; };
 struct EmptyOption {};
 struct Propagate { ExprId operand; Span site; };
 struct MatchArm { SumPattern pattern; ExprId value; };
@@ -46,7 +47,7 @@ enum class Jump { Break, Continue };
 
 struct Expr {
     Span span;
-    std::variant<std::int64_t, bool, StringLiteral, Identifier, Call, Member, Unary, Binary, Block, Binding, Conditional, While, Return, Jump, TaskOp, Blocking, EmptyOption, Propagate, Match, ListLiteral, Index> node;
+    std::variant<std::int64_t, bool, StringLiteral, Identifier, Call, Member, Unary, Binary, Block, Binding, Conditional, While, Return, Jump, TaskOp, Blocking, Deferred, EmptyOption, Propagate, Match, ListLiteral, Index> node;
 };
 
 struct Parameter { Identifier name, type; bool variadic{}; std::optional<ExprId> defaultValue{}; };

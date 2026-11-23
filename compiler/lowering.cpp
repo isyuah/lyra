@@ -64,13 +64,33 @@ struct Emitter {
     const Layouts& layouts;
     Builder builder{module.getContext()};
     std::vector<Value> locals{};
-    std::vector<std::pair<Label, Label>> loops{};
+    struct Loop { Label test, done; Value cleanups; };
+    std::vector<Loop> loops{};
     std::optional<ExprId> worker{};
+    llvm::AllocaInst* cleanupHead{};
 
     Label label(const char* name) { return llvm::BasicBlock::Create(module.getContext(), name, native); }
     bool live() const { return builder.GetInsertBlock() != nullptr; }
     Value unit() { return builder.getInt8(0); }
     void end() { builder.ClearInsertionPoint(); }
+
+    bool deferred() const { return worker && std::holds_alternative<Deferred>(fn.syntax.expressions[*worker].node); }
+    ExprId bodyId() const {
+        if (!worker) return fn.syntax.body;
+        const auto& node = fn.syntax.expressions[*worker].node;
+        if (auto cleanup = std::get_if<Deferred>(&node)) return cleanup->body;
+        return std::get<Blocking>(node).body;
+    }
+    Type completionType() const {
+        if (!worker) return fn.result;
+        return deferred() ? Type{Type::Unit} : layouts.program.taskResults[rawType(*worker).id];
+    }
+    Value cleanupMark() { return cleanupHead ? builder.CreateLoad(builder.getPtrTy(), cleanupHead) : nullptr; }
+    void unwind(Value mark = nullptr) { if (cleanupHead) cleanupUntil(builder, cleanupHead, mark); }
+    void leave(Value value) {
+        if (worker || !fn.syntax.isAsync) unwind();
+        builder.CreateRet(value);
+    }
 
     Value cell(std::size_t slot) {
         return fn.locals[slot].captured ? builder.CreateLoad(builder.getPtrTy(), locals[slot]) : locals[slot];
@@ -87,6 +107,7 @@ struct Emitter {
     void run(std::optional<ExprId> workerId = {}) {
         worker = workerId;
         builder.SetInsertPoint(label("entry"));
+        if (std::ranges::find(fn.cleanupOwners, worker) != fn.cleanupOwners.end()) cleanupHead = cleanupStack(builder);
         locals.resize(fn.locals.size());
         for (std::size_t slot = 0; slot < fn.locals.size(); ++slot) {
             const auto& local = fn.locals[slot];
@@ -99,8 +120,8 @@ struct Emitter {
                 builder.CreateStore(&arg, locals[slot]);
             } else initialize(arg.getArgNo(), &arg);
         }
-        auto tail = emit(worker ? std::get<Blocking>(fn.syntax.expressions[*worker].node).body : fn.syntax.body);
-        if (live()) builder.CreateRet(tail);
+        auto tail = emit(bodyId());
+        if (live()) leave(deferred() ? unit() : tail);
     }
 
     Type rawType(ExprId id) const { const auto& info = fn.expressions[id]; return info.sourceType.value_or(info.type); }
@@ -131,7 +152,7 @@ struct Emitter {
         auto slot = fn.expressions[id].target;
         auto* type = layouts.native(builder, rawType(id));
         auto pointer = cell(slot);
-        return fn.locals[slot].captured ? sharedRead(builder, type, pointer) : builder.CreateLoad(type, pointer);
+        return fn.locals[slot].captured && layouts.workers ? sharedRead(builder, type, pointer) : builder.CreateLoad(type, pointer);
     }
 
     Value emitNode(ExprId id, const TaskOp& op) {
@@ -140,14 +161,24 @@ struct Emitter {
         return op.spawn ? asyncSpawn(builder, task) : asyncAwait(builder, layouts.native(builder, rawType(id)), task);
     }
 
-    Value emitNode(ExprId id, const Blocking&) {
+    std::pair<BlockingCode, std::vector<Value>> closure(ExprId id, Type result, llvm::StringRef suffix) {
         const auto& captures = fn.expressions[id].captures;
-        auto result = layouts.program.taskResults[rawType(id).id];
-        auto code = blockingCode(*native, layouts.native(builder, result), captures.size());
+        auto code = blockingCode(*native, layouts.native(builder, result), captures.size(), suffix);
         Emitter{fn, source, module, code.body, functions, layouts}.run(id);
         std::vector<Value> cells;
         for (auto slot : captures) cells.push_back(cell(slot));
+        return {code, std::move(cells)};
+    }
+
+    Value emitNode(ExprId id, const Blocking&) {
+        auto [code, cells] = closure(id, layouts.program.taskResults[rawType(id).id], ".worker");
         return blockingTask(builder, code, cells);
+    }
+
+    Value emitNode(ExprId id, const Deferred&) {
+        auto [code, cells] = closure(id, Type::Unit, ".defer");
+        pushCleanup(builder, cleanupHead, code, cells);
+        return unit();
     }
 
     Value emitNode(ExprId id, const EmptyOption&) { return makeSum(rawType(id), SumTag::None); }
@@ -177,13 +208,13 @@ struct Emitter {
         auto success = label("propagate.value"), failure = label("propagate.return");
         builder.CreateCondBr(builder.CreateExtractValue(value, 0), success, failure);
         builder.SetInsertPoint(failure);
-        auto target = worker ? layouts.program.taskResults[rawType(*worker).id] : fn.result;
+        auto target = completionType();
         Value result = nullptr;
         if (target.kind == Type::Result) {
             result = builder.CreateExtractValue(value, payloadSlot(SumTag::Err));
             if (auto conversion = fn.expressions[id].errorConversion) result = builder.CreateCall(functions[*conversion], {result});
         }
-        builder.CreateRet(makeSum(target, target.kind == Type::Option ? SumTag::None : SumTag::Err, result));
+        leave(makeSum(target, target.kind == Type::Option ? SumTag::None : SumTag::Err, result));
         builder.SetInsertPoint(success);
         return builder.CreateExtractValue(value, 1);
     }
@@ -265,12 +296,14 @@ struct Emitter {
     }
 
     Value emitNode(ExprId id, const Block& block) {
+        auto mark = id == bodyId() ? nullptr : cleanupMark();
         Value tail = unit();
         for (const auto& statement : block.statements) {
             tail = emit(statement.expression);
             if (!live()) break;
             if (statement.semicolon) tail = unit();
         }
+        if (live() && mark) unwind(mark);
         return rawType(id) == Type::Unit ? unit() : tail;
     }
 
@@ -302,6 +335,9 @@ struct Emitter {
             args[slot] = builder.CreateCall(helper, llvm::ArrayRef<Value>(args).take_front(slot));
         }
         switch (info.callee) {
+            case Callee::TaskCancel:
+                builder.CreateCall(module.getOrInsertFunction("lyraTaskRequestCancel", builder.getVoidTy(), builder.getPtrTy()), args);
+                return unit();
             case Callee::ListAdd: lists.add(args[0], args[1]); return unit();
             case Callee::Sum: return makeSum(rawType(id), static_cast<SumTag>(info.target), args[0]);
             case Callee::Print: {
@@ -472,7 +508,7 @@ struct Emitter {
         auto body = label("while.body"), done = label("while.end");
         builder.CreateCondBr(condition, body, done);
         builder.SetInsertPoint(body);
-        loops.emplace_back(test, done);
+        loops.push_back({test, done, cleanupMark()});
         emit(loop.body);
         loops.pop_back();
         if (live()) builder.CreateBr(test);
@@ -482,13 +518,14 @@ struct Emitter {
 
     Value emitNode(ExprId, const Return& ret) {
         auto value = ret.value ? emit(*ret.value) : unit();
-        if (live()) builder.CreateRet(value);
+        if (live()) leave(value);
         end();
         return unit();
     }
 
     Value emitNode(ExprId, Jump jump) {
-        auto [test, done] = loops.back();
+        auto [test, done, mark] = loops.back();
+        unwind(mark);
         builder.CreateBr(jump == Jump::Break ? done : test);
         end();
         return unit();
@@ -517,8 +554,9 @@ std::unique_ptr<llvm::Module> lower(const CheckedModule& program, const std::vec
             continue;
         }
         auto* body = fn.syntax.isAsync ? asyncBody(*factory, layouts.native(builder, fn.result)) : factory;
-        Emitter{fn, sources[fn.syntax.file], *module, body, functions, layouts}.run();
-        if (fn.syntax.isAsync) lowerAsync(*factory, *body);
+        Emitter emitter{fn, sources[fn.syntax.file], *module, body, functions, layouts};
+        emitter.run();
+        if (fn.syntax.isAsync) lowerAsync(*factory, *body, emitter.cleanupHead);
     }
     bool commandLine = module->getFunction("lyraIoArgCount") || module->getFunction("lyraIoArgument");
     auto signature = commandLine ? llvm::FunctionType::get(builder.getInt32Ty(), {builder.getInt32Ty(), builder.getPtrTy()}, false)

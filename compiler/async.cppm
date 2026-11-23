@@ -1,6 +1,8 @@
 module;
 #include <cstdint>
+#include <algorithm>
 #include <span>
+#include <utility>
 #include <vector>
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/InstIterator.h>
@@ -117,30 +119,59 @@ export struct BlockingCode {
     llvm::StructType* environment;
 };
 
-export BlockingCode blockingCode(llvm::Function& owner, llvm::Type* result, std::size_t captures) {
+export BlockingCode blockingCode(llvm::Function& owner, llvm::Type* result, std::size_t captures, llvm::StringRef suffix = ".worker") {
     auto* pointer = llvm::PointerType::getUnqual(owner.getContext());
     auto* signature = llvm::FunctionType::get(result, std::vector<llvm::Type*>(captures, pointer), false);
-    auto* body = llvm::Function::Create(signature, llvm::Function::InternalLinkage, owner.getName() + ".worker", owner.getParent());
+    auto* body = llvm::Function::Create(signature, llvm::Function::InternalLinkage, owner.getName() + suffix, owner.getParent());
     auto* environment = llvm::StructType::create(owner.getContext(), signature->params(), body->getName().str() + ".env");
     return {body, environment};
 }
 
-export llvm::Value* blockingTask(llvm::IRBuilder<>& builder, BlockingCode code, std::span<llvm::Value* const> cells) {
+namespace {
+
+std::pair<llvm::Value*, llvm::Value*> closureThunk(llvm::IRBuilder<>& builder, BlockingCode code, std::span<llvm::Value* const> cells, bool boxResult) {
     auto* pointer = builder.getPtrTy();
-    auto* captured = allocate(builder, code.environment);
+    auto* captured = cells.empty() ? llvm::ConstantPointerNull::get(pointer) : allocate(builder, code.environment);
     for (std::size_t index = 0; index < cells.size(); ++index) builder.CreateStore(cells[index], builder.CreateStructGEP(code.environment, captured, index));
-    auto* thunk = llvm::Function::Create(llvm::FunctionType::get(pointer, {pointer}, false), llvm::Function::InternalLinkage, code.body->getName() + ".call", &moduleAt(builder));
+    auto* thunk = llvm::Function::Create(llvm::FunctionType::get(boxResult ? pointer : builder.getVoidTy(), {pointer}, false), llvm::Function::InternalLinkage, code.body->getName() + ".call", &moduleAt(builder));
     Builder worker(llvm::BasicBlock::Create(builder.getContext(), "capture", thunk));
     std::vector<llvm::Value*> args;
     for (std::size_t index = 0; index < cells.size(); ++index) args.push_back(worker.CreateLoad(pointer, worker.CreateStructGEP(code.environment, thunk->getArg(0), index)));
     auto* value = worker.CreateCall(code.body, args);
-    auto* boxed = allocate(worker, value->getType());
-    worker.CreateStore(value, boxed);
-    worker.CreateRet(boxed);
+    if (boxResult) {
+        auto* boxed = allocate(worker, value->getType());
+        worker.CreateStore(value, boxed);
+        worker.CreateRet(boxed);
+    } else worker.CreateRetVoid();
+    return {thunk, captured};
+}
+
+}
+
+export llvm::Value* blockingTask(llvm::IRBuilder<>& builder, BlockingCode code, std::span<llvm::Value* const> cells) {
+    auto* pointer = builder.getPtrTy();
+    auto [thunk, captured] = closureThunk(builder, code, cells, true);
     return builder.CreateCall(runtime(builder, "lyraTaskBlocking", pointer, {pointer, pointer}), {thunk, captured});
 }
 
-export void lowerAsync(llvm::Function& factory, llvm::Function& body) {
+export llvm::AllocaInst* cleanupStack(llvm::IRBuilder<>& builder) {
+    auto* slot = scratch(builder, builder.getPtrTy());
+    builder.CreateStore(llvm::ConstantPointerNull::get(builder.getPtrTy()), slot);
+    return slot;
+}
+
+export void pushCleanup(llvm::IRBuilder<>& builder, llvm::Value* stack, BlockingCode code, std::span<llvm::Value* const> cells) {
+    auto* pointer = builder.getPtrTy();
+    auto [thunk, captured] = closureThunk(builder, code, cells, false);
+    builder.CreateCall(runtime(builder, "lyraCleanupPush", builder.getVoidTy(), {pointer, pointer, pointer}), {stack, thunk, captured});
+}
+
+export void cleanupUntil(llvm::IRBuilder<>& builder, llvm::Value* stack, llvm::Value* mark = nullptr) {
+    auto* pointer = builder.getPtrTy();
+    builder.CreateCall(runtime(builder, "lyraCleanupUntil", builder.getVoidTy(), {pointer, pointer}), {stack, mark ? mark : llvm::ConstantPointerNull::get(pointer)});
+}
+
+export void lowerAsync(llvm::Function& factory, llvm::Function& body, llvm::AllocaInst* cleanups = nullptr) {
     auto& context = factory.getContext();
     auto& module = *factory.getParent();
     Builder builder(context);
@@ -189,7 +220,13 @@ export void lowerAsync(llvm::Function& factory, llvm::Function& body) {
     builder.SetInsertPoint(llvm::BasicBlock::Create(context, "create.cold", &factory));
     auto* captured = allocate(builder, frameType);
     for (auto& parameter : factory.args()) builder.CreateStore(&parameter, builder.CreateStructGEP(frameType, captured, 1 + parameter.getArgNo()));
-    builder.CreateRet(builder.CreateCall(runtime(builder, "lyraTaskCreate", pointer, {pointer, pointer}), {step, captured}));
+    auto* cold = builder.CreateCall(runtime(builder, "lyraTaskCreate", pointer, {pointer, pointer}), {step, captured});
+    if (cleanups) {
+        auto slot = std::find(slots.begin(), slots.end(), cleanups) - slots.begin();
+        auto* stack = builder.CreateStructGEP(frameType, captured, 1 + factory.arg_size() + slot);
+        builder.CreateCall(runtime(builder, "lyraTaskKeepCleanups", noResult, {pointer, pointer}), {cold, stack});
+    }
+    builder.CreateRet(cold);
 
     auto* dispatch = llvm::BasicBlock::Create(context, "dispatch", step);
     auto* select = llvm::BasicBlock::Create(context, "resume", step);
