@@ -25,7 +25,7 @@ namespace lyra {
 namespace fs = std::filesystem;
 namespace {
 
-struct Symbol { std::string name; bool visible; };
+struct Symbol { std::string name; bool visible; bool callable; bool imported{}; };
 struct Space {
     const ResolvedPackage* package;
     std::map<std::string, Symbol> definitions{};
@@ -42,7 +42,11 @@ struct Linker {
         auto scope = sources[file].moduleId;
         auto& defs = spaces.at(scope).definitions;
         auto name = scope == entry && callable && id.text == "main" ? id.text : scope + "::" + id.text;
-        if (!defs.emplace(id.text, Symbol{name, visible}).second) throw at(sources[file], id.span, "LYN0002", "名称已声明：" + id.text);
+        auto [symbol, inserted] = defs.try_emplace(id.text, Symbol{name, visible, callable});
+        if (!inserted) {
+            if (!callable || !symbol->second.callable || name == "main") throw at(sources[file], id.span, "LYN0002", "名称已声明：" + id.text);
+            symbol->second.visible |= visible;
+        }
         id.text = std::move(name);
     }
 
@@ -68,10 +72,10 @@ struct Linker {
         auto found = spaces.find(target);
         if (found == spaces.end()) throw at(source, name.span, "LYN0003", "导入的源码模块不存在");
         auto& space = found->second;
-        if (auto hit = space.definitions.find(name.text); hit != space.definitions.end() && hit->second.visible) return {hit->second.name, use.isPublic};
+        if (auto hit = space.definitions.find(name.text); hit != space.definitions.end() && hit->second.visible) return {hit->second.name, use.isPublic, hit->second.callable, true};
         if (auto alias = space.imports.find(name.text); alias != space.imports.end() && alias->second->isPublic) {
             auto symbol = resolve(*alias->second, active);
-            return {std::move(symbol.name), use.isPublic};
+            return {std::move(symbol.name), use.isPublic, symbol.callable, true};
         }
         throw at(source, name.span, "LYN0003", "目标模块没有公开声明：" + name.text);
     }
@@ -137,7 +141,10 @@ struct Linker {
             renameType(fn.result);
             for (auto& param : fn.parameters) renameType(param.type);
             auto reference = [&](Identifier& name) {
-                if (auto found = scope.find(name.text); found != scope.end()) name.linked = found->second.name;
+                if (auto found = scope.find(name.text); found != scope.end()) {
+                    name.linked = found->second.name;
+                    name.exportedOnly = found->second.imported;
+                }
                 else if (name.text == "main") name.linked = sources[fn.file].moduleId + "::main";
             };
             auto renamePattern = [&](auto&& self, Pattern& pattern) -> void {

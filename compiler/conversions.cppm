@@ -51,12 +51,13 @@ void registerConversion(std::vector<DirectConversion>& table, const CheckedModul
 }
 
 std::optional<std::size_t> directConversion(const std::vector<DirectConversion>& table, const CheckedModule& module,
-        const std::vector<Source>& sources, Type from, Type to, const Source& use, Span site) {
+        const std::vector<Source>& sources, Type from, Type to, const Source& use, Span site, bool requireUnique = true) {
     std::optional<std::size_t> result;
     for (const auto& conversion : table) {
         if (conversion.source != from || conversion.target != to) continue;
         const auto& fn = module.functions[conversion.function];
         if (!fn.syntax.isPublic && sources[fn.syntax.file].moduleId != use.moduleId) continue;
+        if (!requireUnique) return conversion.function;
         if (result) throw at(use, site, "LYV0002", fn.syntax.parameters.front().type.text + " → " + fn.syntax.result.text + " 存在两条可见的直接 implicit 转换：" + conversionSite(module.functions[*result], sources) + "、" + conversionSite(fn, sources));
         result = conversion.function;
     }

@@ -1,6 +1,7 @@
 module;
 #include <algorithm>
 #include <charconv>
+#include <compare>
 #include <cstdint>
 #include <map>
 #include <optional>
@@ -8,6 +9,7 @@ module;
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <utility>
 #include <variant>
@@ -85,6 +87,64 @@ std::string typeName(const CheckedModule& module, Type type, bool canonical = fa
 
 struct Callable { std::size_t target; std::optional<Function> generic; std::vector<Type> variables; };
 
+struct OverloadKey {
+    std::size_t typeParameters;
+    std::vector<std::pair<std::string, bool>> parameters;
+    bool operator==(const OverloadKey&) const = default;
+};
+
+OverloadKey overloadKey(const Function& syntax) {
+    OverloadKey key{syntax.typeParameters.size(), {}};
+    for (const auto& parameter : syntax.parameters) {
+        auto normalized = mapTypeNames(typeForm(parameter.type.text), [&](const std::string& name) {
+            if (auto slot = genericParameter(syntax, name)) return "$" + std::to_string(*slot);
+            if (auto type = numberType(name)) return numberName(*type);
+            return name;
+        });
+        key.parameters.emplace_back(std::move(normalized), parameter.variadic);
+    }
+    return key;
+}
+
+enum class MatchKind { Exact, Number, Nullable, Literal, User };
+struct ArgumentMatch {
+    MatchKind kind;
+    Type target{};
+
+    std::partial_ordering compare(const ArgumentMatch& other) const {
+        auto rank = [](MatchKind kind) { return kind == MatchKind::Exact ? 0 : kind == MatchKind::User ? 2 : 1; };
+        auto tier = rank(kind) <=> rank(other.kind);
+        if (tier != 0) return tier;
+        if (kind != other.kind) return std::partial_ordering::unordered;
+        if (kind == MatchKind::Literal && target != other.target) return std::partial_ordering::unordered;
+        if (kind == MatchKind::Number && integerType(target) && target.kind == other.target.kind)
+            return numberWidth(target) <=> numberWidth(other.target);
+        return std::partial_ordering::equivalent;
+    }
+};
+
+struct OverloadMatch {
+    std::size_t declaration;
+    std::vector<ArgumentMatch> arguments;
+    bool generic, variadic;
+    std::size_t defaults;
+
+    bool betterThan(const OverloadMatch& other) const {
+        bool better = false;
+        bool exact = true;
+        for (std::size_t index = 0; index < arguments.size(); ++index) {
+            auto order = arguments[index].compare(other.arguments[index]);
+            if (order == std::partial_ordering::unordered || order > 0) return false;
+            better |= order < 0;
+            exact &= arguments[index].kind == MatchKind::Exact;
+        }
+        if (better) return true;
+        if (exact && generic != other.generic) return !generic;
+        if (variadic != other.variadic) return !variadic;
+        return defaults < other.defaults;
+    }
+};
+
 Function defaultFunction(const Function& original, std::size_t slot) {
     auto syntax = original;
     const auto& parameter = original.parameters[slot];
@@ -116,7 +176,8 @@ Function constructorSignature(const Aggregate& record) {
 struct Symbols {
     CheckedModule& module;
     const std::vector<Source>& sources;
-    Names records, functions;
+    Names records;
+    std::unordered_map<std::string, std::vector<std::size_t>> functions;
     std::vector<Names> fields, methods;
     std::vector<Callable> callables;
     std::map<GenericInstanceKey, std::size_t> specializations;
@@ -130,7 +191,67 @@ struct Symbols {
     mutable std::map<std::pair<std::size_t, std::vector<Type>>, Type> recordInstances{};
     mutable unsigned expandingRecord{};
 
+    struct TypeTrial {
+        Symbols& symbols;
+        std::size_t aggregates = symbols.module.aggregates.size(), tasks = symbols.module.taskResults.size(),
+            sums = symbols.module.sumTypes.size(), lists = symbols.module.listElements.size(), signatures = symbols.module.signatures.size();
+        unsigned expanding = symbols.expandingRecord;
+
+        ~TypeTrial() {
+            if (symbols.module.aggregates.size() != aggregates) {
+                std::erase_if(symbols.recordInstances, [&](const auto& entry) { return entry.second.id >= aggregates; });
+                symbols.module.aggregates.resize(aggregates);
+            }
+            symbols.expandingRecord = expanding;
+            symbols.module.taskResults.resize(tasks);
+            symbols.module.sumTypes.resize(sums);
+            symbols.module.listElements.resize(lists);
+            symbols.module.signatures.resize(signatures);
+        }
+    };
+
     const Function& declaration(const Callable& callable) const { return callable.generic ? *callable.generic : module.functions[callable.target].syntax; }
+
+    std::string declarationSite(const Function& syntax) const {
+        const auto& file = sources[syntax.file];
+        auto site = file.origin ? *file.origin : file.site(syntax.name.span);
+        return site.file + ':' + std::to_string(site.start.line) + ':' + std::to_string(site.start.column);
+    }
+
+    std::vector<std::size_t> visibleFunctions(const Source& use, const Identifier& name) const {
+        std::vector<std::size_t> result;
+        if (auto found = functions.find(linkedName(name)); found != functions.end()) for (auto index : found->second) {
+            const auto& syntax = declaration(callables[index]);
+            if (syntax.isPublic || (!name.exportedOnly && sources[syntax.file].moduleId == use.moduleId)) result.push_back(index);
+        }
+        return result;
+    }
+
+    std::string signature(std::size_t index, const std::string& spelling) const {
+        const auto& syntax = declaration(callables[index]);
+        auto format = [](const Identifier& identifier) {
+            return mapTypeNames(typeForm(identifier.text), [](const std::string& name) {
+                auto separator = name.rfind("::");
+                return separator == name.npos ? name : name.substr(separator + 2);
+            });
+        };
+        std::string text = spelling;
+        if (!syntax.typeParameters.empty()) {
+            text += '<';
+            for (const auto& parameter : syntax.typeParameters) {
+                if (&parameter != &syntax.typeParameters.front()) text += ", ";
+                text += parameter.text;
+            }
+            text += '>';
+        }
+        text += '(';
+        for (const auto& parameter : syntax.parameters) {
+            if (&parameter != &syntax.parameters.front()) text += ", ";
+            text += format(parameter.type);
+            if (parameter.variadic) text += "...";
+        }
+        return text + ") @ " + declarationSite(syntax);
+    }
 
     std::optional<RequiredMethod> methodShape(Type receiver, const Callable& candidate, const Source& use) const {
         const auto& record = module.aggregates[receiver.id];
@@ -314,7 +435,7 @@ struct Symbols {
         record.defaultFunctions.resize(record.fields.size());
         for (auto slot : slots) {
             if (record.defaultFunctions[slot]) continue;
-            auto helper = functions.at(fieldDefaultName(record.syntax.name.text, record.syntax.fields[slot].name.text));
+            auto helper = functions.at(fieldDefaultName(record.syntax.name.text, record.syntax.fields[slot].name.text)).front();
             record.defaultFunctions[slot] = record.arguments.empty() ? callables[helper].target : instantiate(helper, record.arguments, source, site);
         }
     }
@@ -341,6 +462,9 @@ struct Checker {
     std::map<ExprId, std::vector<std::optional<Type>>> lambdaHints{};
     std::optional<std::size_t> receiverSlot{};
     std::vector<std::optional<ExprId>> implicitReceivers{};
+    bool probing{};
+
+    bool materializing() const { return variables.empty() && !probing; }
 
     std::optional<ExprId> currentWorker() const { return workers.empty() ? std::nullopt : std::optional(workers.back().id); }
     std::optional<Type> returnType() const { return workers.empty() ? std::optional(fn.result) : workers.back().result; }
@@ -432,7 +556,7 @@ struct Checker {
         if (expected && type != *expected && type != Type::Never) {
             auto site = fn.syntax.expressions[id].span;
             if (!losslessNumber(type, *expected) && (expected->kind != Type::Option || module.sumTypes[expected->id].success != type)) {
-                info.conversion = directConversion(symbols.conversions, module, symbols.sources, type, *expected, source, site);
+                info.conversion = directConversion(symbols.conversions, module, symbols.sources, type, *expected, source, site, !probing);
                 if (!info.conversion) throw mismatch(module, source, site, *expected, type);
             }
             info.sourceType = type;
@@ -494,7 +618,7 @@ struct Checker {
                 const auto& method = symbols.callables[found->second];
                 const auto& syntax = symbols.declaration(method);
                 if (auto shape = symbols.methodShape(type, method, source); shape && shape->parameters.empty() && !shape->asynchronous && shape->result == Type::String) {
-                    if (variables.empty()) fn.expressions[id].target = method.generic ? symbols.instantiate(found->second, record.arguments, source, syntax.name.span) : method.target;
+                    if (materializing()) fn.expressions[id].target = method.generic ? symbols.instantiate(found->second, record.arguments, source, syntax.name.span) : method.target;
                     return Type::String;
                 }
             }
@@ -576,7 +700,7 @@ struct Checker {
         if (operand == Type::Never) return operand;
         if (operand.kind != Type::Option && operand.kind != Type::Result) throw at(source, propagation.site, "LYT0013", "? 需要 Option 或 Result，实际是 " + typeName(module, operand));
         if (operand.kind == Type::Result && target->kind == Type::Result && module.sumTypes[target->id].failure != module.sumTypes[operand.id].failure) {
-            fn.expressions[id].errorConversion = directConversion(symbols.conversions, module, symbols.sources, module.sumTypes[operand.id].failure, module.sumTypes[target->id].failure, source, propagation.site);
+            fn.expressions[id].errorConversion = directConversion(symbols.conversions, module, symbols.sources, module.sumTypes[operand.id].failure, module.sumTypes[target->id].failure, source, propagation.site, !probing);
             if (fn.expressions[id].errorConversion) return module.sumTypes[operand.id].success;
         }
         if (target->kind != operand.kind || (operand.kind == Type::Result && module.sumTypes[target->id].failure != module.sumTypes[operand.id].failure)) {
@@ -760,16 +884,9 @@ struct Checker {
         return fn.locals[*receiverSlot].type;
     }
 
-    Type infer(ExprId id, const Identifier& name, std::optional<Type> expected, bool) {
-        if (auto slot = localSlot(name)) {
-            fn.expressions[id].target = *slot;
-            return fn.locals[*slot].type;
-        }
-        auto found = symbols.functions.find(name.linked.empty() ? name.text : name.linked);
-        if (found == symbols.functions.end()) throw at(source, name.span, "LYN0001", "找不到绑定：" + name.text);
-        const auto& item = symbols.callables[found->second];
+    std::pair<Type, std::vector<Type>> functionValue(std::size_t index, const Identifier& name, std::optional<Type> expected) {
+        const auto& item = symbols.callables[index];
         if (item.generic) {
-            if (expected && expected->kind == Type::Option) expected = module.sumTypes[expected->id].success;
             if (!expected || expected->kind != Type::Closure) throw at(source, name.span, "LYG0002", "泛型函数值需要明确的函数类型：" + name.text);
             const auto& shape = module.signatures[expected->id];
             if (shape.parameters.size() != item.generic->parameters.size()) throw at(source, name.span, "LYT0015", "函数值的形参数量与目标类型不符");
@@ -787,22 +904,54 @@ struct Checker {
             auto types = inferGenericArguments<Type>(*item.generic, Call{name, {}}, name.span, {}, inputs, wanted, source, [&](Type value) { return typeName(module, value); },
                     [&](Type value, const std::string& key, std::size_t slot) { return symbols.project(value, key, slot); }, [](Type, Type) -> std::optional<Type> { return std::nullopt; });
             symbols.requireBounds(*item.generic, types, source, name.span);
-            if (variables.empty()) fn.expressions[id].functionRef = symbols.instantiate(found->second, types, source, name.span);
             std::vector<Type> parameters;
             for (const auto& param : item.generic->parameters) {
                 auto type = symbols.resolve(*item.generic, param.type, types);
                 parameters.push_back(param.variadic ? symbols.list(type) : type);
             }
             auto result = symbols.resolve(*item.generic, item.generic->result, types);
-            auto type = symbols.closure(std::move(parameters), item.generic->isAsync ? symbols.task(result) : result);
-            fn.expressions[id].callableType = type;
-            return type;
+            return {symbols.closure(std::move(parameters), item.generic->isAsync ? symbols.task(result) : result), std::move(types)};
         }
         const auto& target = module.functions[item.target];
         std::vector<Type> parameters;
-        for (std::size_t index = 0; index < target.syntax.parameters.size(); ++index) parameters.push_back(target.locals[index].type);
-        auto type = symbols.closure(std::move(parameters), target.syntax.isAsync ? symbols.task(target.result) : target.result);
-        fn.expressions[id].functionRef = item.target;
+        for (std::size_t slot = 0; slot < target.syntax.parameters.size(); ++slot) parameters.push_back(target.locals[slot].type);
+        return {symbols.closure(std::move(parameters), target.syntax.isAsync ? symbols.task(target.result) : target.result), {}};
+    }
+
+    std::size_t selectFunctionValue(const Identifier& name, std::span<const std::size_t> candidates, std::optional<Type> expected) {
+        std::vector<std::size_t> matches;
+        if (expected && expected->kind == Type::Closure) {
+            for (auto candidate : candidates) {
+                Symbols::TypeTrial transaction{symbols};
+                try {
+                    if (functionValue(candidate, name, expected).first == *expected) matches.push_back(candidate);
+                } catch (const Diagnostic&) {
+                    continue;
+                }
+            }
+            if (std::ranges::any_of(matches, [&](auto index) { return !symbols.callables[index].generic; }))
+                std::erase_if(matches, [&](auto index) { return symbols.callables[index].generic.has_value(); });
+        }
+        if (matches.size() == 1) return matches.front();
+        auto error = at(source, name.span, "LYT0019", !expected || expected->kind != Type::Closure ? "重载函数值需要明确的函数类型：" + name.text :
+            matches.empty() ? "没有重载签名匹配 " + typeName(module, *expected) : "多个重载签名匹配 " + typeName(module, *expected));
+        for (auto index : matches.empty() ? candidates : std::span<const std::size_t>(matches)) error.message += "\n  " + symbols.signature(index, name.text);
+        throw error;
+    }
+
+    Type infer(ExprId id, const Identifier& name, std::optional<Type> expected, bool) {
+        if (auto slot = localSlot(name)) {
+            fn.expressions[id].target = *slot;
+            return fn.locals[*slot].type;
+        }
+        auto candidates = symbols.visibleFunctions(source, name);
+        if (candidates.empty()) throw at(source, name.span, "LYN0001", "找不到绑定：" + name.text);
+        if (expected && expected->kind == Type::Option) expected = module.sumTypes[expected->id].success;
+        auto index = candidates.size() == 1 ? candidates.front() : selectFunctionValue(name, candidates, expected);
+        const auto& item = symbols.callables[index];
+        auto [type, types] = functionValue(index, name, expected);
+        if (!item.generic) fn.expressions[id].functionRef = item.target;
+        else if (materializing()) fn.expressions[id].functionRef = symbols.instantiate(index, types, source, name.span);
         fn.expressions[id].callableType = type;
         return type;
     }
@@ -1046,9 +1195,72 @@ struct Checker {
     Type genericCall(std::size_t declaration, ExprId id, const Call& call, std::optional<Type> expected, std::span<const Type> ownerTypes) {
         const auto& target = *symbols.callables[declaration].generic;
         auto [types, exits] = bindGeneric(id, call, target, expected, ownerTypes);
-        if (variables.empty()) fn.expressions[id].target = symbols.instantiate(declaration, types, source, call.name.span);
+        if (materializing()) fn.expressions[id].target = symbols.instantiate(declaration, types, source, call.name.span);
         auto result = symbols.resolve(target, target.result, types);
         return exits ? Type{Type::Never} : target.isAsync ? symbols.task(result) : result;
+    }
+
+    Type declaredCall(std::size_t declaration, ExprId id, const Call& call, std::optional<Type> expected, std::span<const Type> ownerTypes = {}) {
+        const auto& candidate = symbols.callables[declaration];
+        if (candidate.generic) return genericCall(declaration, id, call, expected, ownerTypes);
+        if (!call.typeArguments.empty()) throw at(source, call.typeArguments.front().span, "LYG0001", "此调用不接受类型实参：" + call.name.text);
+        fn.expressions[id].target = candidate.target;
+        const auto& target = module.functions[candidate.target];
+        bool exits = functionArguments(id, call, target.syntax, [&](auto slot, auto, const auto&) {
+            auto type = target.locals[slot].type;
+            return target.syntax.parameters[slot].variadic ? module.listElements[type.id] : type;
+        });
+        return exits ? Type{Type::Never} : target.syntax.isAsync ? symbols.task(target.result) : target.result;
+    }
+
+    ArgumentMatch argumentMatch(ExprId id) const {
+        const auto& info = fn.expressions[id];
+        if (info.conversion) return {MatchKind::User};
+        if (info.sourceType) return info.type.kind == Type::Option ? ArgumentMatch{MatchKind::Nullable} : ArgumentMatch{MatchKind::Number, info.type};
+        const auto& node = fn.syntax.expressions[id].node;
+        if (std::holds_alternative<IntegerLiteral>(node) && info.type != Type::Int) return {MatchKind::Literal, info.type};
+        if (const auto* real = std::get_if<RealLiteral>(&node); real && !real->width && info.type != Type::Real) return {MatchKind::Literal, info.type};
+        return {MatchKind::Exact};
+    }
+
+    std::size_t selectOverload(ExprId id, const Call& call, std::optional<Type> expected, std::span<const std::size_t> candidates) {
+        auto site = fn.syntax.expressions[id].span;
+        std::vector<OverloadMatch> matches;
+        std::vector<std::pair<std::size_t, std::string>> rejected;
+        for (auto index : candidates) {
+            const auto& item = symbols.callables[index];
+            const auto& syntax = symbols.declaration(item);
+            Symbols::TypeTrial transaction{symbols};
+            auto trial = fn;
+            Checker checker{trial, source, module, symbols, scopes, variables, loops, workers, catchOwners, lambdaHints, receiverSlot, implicitReceivers, true};
+            try {
+                const auto& trialCall = std::get<Call>(trial.syntax.expressions[id].node);
+                checker.declaredCall(index, id, trialCall, expected);
+                OverloadMatch match{index, {}, item.generic.has_value(), !syntax.parameters.empty() && syntax.parameters.back().variadic,
+                    trial.expressions[id].omittedDefaults.size()};
+                for (const auto& argument : trialCall.arguments) match.arguments.push_back(checker.argumentMatch(argument.value));
+                matches.push_back(std::move(match));
+            } catch (const Diagnostic& error) {
+                rejected.emplace_back(index, error.message);
+            }
+        }
+        if (matches.empty()) {
+            auto error = at(source, site, "LYT0019", "没有适用的重载：" + call.name.text);
+            for (const auto& [index, reason] : rejected) error.message += "\n  " + symbols.signature(index, call.name.text) + "：" + reason;
+            throw error;
+        }
+        std::vector<const OverloadMatch*> best;
+        for (const auto& match : matches) if (std::ranges::none_of(matches, [&](const auto& other) { return other.betterThan(match); })) best.push_back(&match);
+        if (best.size() == 1) return best.front()->declaration;
+        auto error = at(source, site, "LYT0019", "调用存在重载歧义：" + call.name.text);
+        for (const auto* match : best) {
+            error.message += "\n  " + symbols.signature(match->declaration, call.name.text);
+            std::string conversions;
+            for (std::size_t index = 0; index < match->arguments.size(); ++index) if (match->arguments[index].kind != MatchKind::Exact)
+                conversions += (conversions.empty() ? "" : "、") + std::to_string(index + 1);
+            if (!conversions.empty()) error.message += "，需适配的实参：" + conversions;
+        }
+        throw error;
     }
 
     Type infer(ExprId id, const Call& call, std::optional<Type> expected, bool) {
@@ -1218,23 +1430,15 @@ struct Checker {
                     visible(decl.file, field.isPublic, call.arguments[index].label.value_or(call.name));
                 }
                 info.target = type.id;
-                if (variables.empty() && !info.omittedDefaults.empty()) symbols.bindFieldDefaults(type, info.omittedDefaults, source, call.name.span);
+                if (materializing() && !info.omittedDefaults.empty()) symbols.bindFieldDefaults(type, info.omittedDefaults, source, call.name.span);
                 return exits ? Type{Type::Never} : type;
             }
         } else {
-            auto found = symbols.functions.find(key);
-            if (found == symbols.functions.end()) throw at(source, call.name.span, "LYN0001", "找不到函数：" + call.name.text);
-            declaration = found->second;
+            auto candidates = symbols.visibleFunctions(source, call.name);
+            if (candidates.empty()) throw at(source, call.name.span, "LYN0001", "找不到函数：" + call.name.text);
+            declaration = candidates.size() == 1 ? candidates.front() : selectOverload(id, call, expected, candidates);
         }
-        if (symbols.callables[declaration].generic) return genericCall(declaration, id, call, expected, ownerTypes);
-        noTypeArgs();
-        info.target = symbols.callables[declaration].target;
-        const auto& target = module.functions[info.target];
-        bool exits = functionArguments(id, call, target.syntax, [&](auto slot, auto, const auto&) {
-            auto type = target.locals[slot].type;
-            return target.syntax.parameters[slot].variadic ? module.listElements[type.id] : type;
-        });
-        return exits ? Type{Type::Never} : target.syntax.isAsync ? symbols.task(target.result) : target.result;
+        return declaredCall(declaration, id, call, expected, ownerTypes);
     }
 
     Type infer(ExprId, const TaskOp& op, std::optional<Type> expected, bool) {
@@ -1420,7 +1624,7 @@ struct Checker {
                 visible(target.file, target.isPublic, {name, site});
                 if (auto shape = symbols.methodShape(owner, entry, source); shape && shape->parameters.empty() && !shape->asynchronous) {
                     std::optional<std::size_t> function;
-                    if (variables.empty()) function = entry.generic ? symbols.instantiate(found->second, record.arguments, source, site) : entry.target;
+                    if (materializing()) function = entry.generic ? symbols.instantiate(found->second, record.arguments, source, site) : entry.target;
                     return {shape->result, function};
                 }
             }
@@ -1541,13 +1745,26 @@ CheckedModule check(Module module, const std::vector<Source>& sources, bool requ
         const auto& source = sources[function.file];
         auto owner = function.owner ? std::optional(symbols.records.at(function.owner->text)) : std::nullopt;
         if (function.initializer) symbols.initializers[*owner] = symbols.callables.size();
-        else {
-            auto& names = !owner ? symbols.functions : function.hasReceiver ? symbols.methods[*owner] : symbols.staticMethods[*owner];
-            bool collision = owner ? symbols.fields[*owner].contains(function.name.text) ||
-                (function.hasReceiver ? symbols.staticMethods[*owner] : symbols.methods[*owner]).contains(function.name.text)
-                : symbols.records.contains(function.name.text) || symbols.enums.contains(function.name.text) || function.name.text == "print" || function.name.text == "gcCollect";
+        else if (owner) {
+            auto& names = function.hasReceiver ? symbols.methods[*owner] : symbols.staticMethods[*owner];
+            bool collision = symbols.fields[*owner].contains(function.name.text) ||
+                (function.hasReceiver ? symbols.staticMethods[*owner] : symbols.methods[*owner]).contains(function.name.text);
             if (collision || !names.emplace(function.name.text, symbols.callables.size()).second)
                 throw at(source, function.name.span, "LYN0002", "函数名已声明：" + function.name.text);
+        } else {
+            const auto& name = function.name.text;
+            if (symbols.records.contains(name) || symbols.enums.contains(name) || name == "print" || name == "gcCollect")
+                throw at(source, function.name.span, "LYN0002", "函数名已声明：" + name);
+            auto& candidates = symbols.functions[name];
+            if (!candidates.empty()) {
+                if (name == "main" || name.ends_with("::main")) throw at(source, function.name.span, "LYN0002", "main 不能重载");
+                auto signature = overloadKey(function);
+                for (auto index : candidates) {
+                    const auto& prior = symbols.declaration(symbols.callables[index]);
+                    if (overloadKey(prior) == signature) throw at(source, function.name.span, "LYN0002", "函数重载的形参类型重复：" + symbols.declarationSite(prior));
+                }
+            }
+            candidates.push_back(symbols.callables.size());
         }
         if (!function.typeParameters.empty()) {
             if (!owner && requireEntry && function.name.text == "main") throw at(source, function.name.span, "LYG0001", "main 不能声明类型形参");

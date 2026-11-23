@@ -14,7 +14,7 @@ export namespace lyra {
 
 using ExprId = std::size_t;
 
-struct Identifier { std::string text; Span span; std::string linked{}; };
+struct Identifier { std::string text; Span span; std::string linked{}; bool exportedOnly{}; };
 struct Attribute { Identifier name; std::optional<Identifier> argument; };
 struct Argument { std::optional<Identifier> label; ExprId value; std::optional<Span> spread{}, trailing{}; };
 struct TypeQualifier { Identifier name; std::vector<Identifier> arguments{}; };
