@@ -4,18 +4,18 @@ Lyra 是一门使用 LLVM AOT 的编译型语言。当前编译器跑通了[第�
 
 ## 从源码构建
 
-在 **x86-64 Linux** 的仓库根目录执行；Windows 开发机先进入 WSL 2 的 Ubuntu 24.04。需要 CMake 3.20+、C++20 工具链、LLVM 18.1 开发包、`clang-18` 和 Python 3（测试）。安装步骤见[原生工具链 RFC](rfc/native-toolchain.md)。
+在 **x86-64 Linux** 的仓库根目录执行；Windows 开发机先进入 WSL 2 的 Ubuntu 24.04。编译器使用 C++23 命名模块，需要 Clang/LLVM 18.1、配套的 `clang-scan-deps-18`、CMake 3.28+、Ninja 1.11+ 和 Python 3（测试）。安装步骤见[原生工具链 RFC](rfc/native-toolchain.md)。
 
 ```sh
-cmake -S . -B build -DCMAKE_C_COMPILER=clang-18 -DCMAKE_CXX_COMPILER=clang++-18 -DLLVM_DIR="$(llvm-config-18 --cmakedir)"
-cmake --build build --parallel
-ctest --test-dir build --output-on-failure
-build/bin/lyra check examples/compiler-smoke/fail --diagnostics=json
-build/bin/lyra build examples/compiler-smoke/pass --release
+cmake --preset dev
+cmake --build --preset dev
+ctest --preset dev
+build/dev/bin/lyra check examples/compiler-smoke/fail --diagnostics=json
+build/dev/bin/lyra build examples/compiler-smoke/pass --release
 examples/compiler-smoke/pass/build/release/app
 ```
 
-`check .../fail` 预期非零退出，在 `;` 处报告 `LYT0001`；最后一条命令应打印 `3` 并正常退出。也可以用 `cmake --install build --prefix <目录>` 安装编译器；`bin/lyra` 和 `lib/liblyraRuntime.a` 保持相对位置。部署**编译好的应用**只需复制产物到约定的 Linux 环境，不用带这两个文件、Clang 或 LLVM。
+`check .../fail` 预期非零退出，在 `;` 处报告 `LYT0001`；最后一条命令应打印 `3` 并正常退出。要构建优化版编译器，把三个 preset 命令中的 `dev` 换成 `release`。用 `cmake --install build/dev --prefix <目录>` 安装工具链；`bin/lyra` 和 `lib/liblyraRuntime.a` 保持相对位置。部署**编译好的应用**只需复制产物到约定的 Linux 环境，不用带这两个文件、Clang 或 LLVM。
 
 ## 命令与语言子集
 

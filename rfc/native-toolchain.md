@@ -15,7 +15,7 @@
 
 ### 首个编译器的实现选择
 
-编译器使用 C++20、CMake 和 CTest；最小运行时用 C11。`check` 和 `build` 共用词法、语法、名称与类型检查，前端不调用 Clang。后端用 LLVM 18 的 C++ `IRBuilder` 构造模块，验证后写临时 IR，由 `clang-18` 生成目标文件并链接 C 运行时。以后若改为进程内生成目标文件，替换模块验证之后的步骤即可。发布的是 Lyra 原生程序，不包含编译器或 LLVM；这个整数切片只动态依赖系统 libc。
+编译器和运行时使用 **C++23、Clang 18、CMake 3.28+ 与 Ninja 1.11+**。源码诊断、语法、类型检查、LLVM lowering 和构建驱动通过 C++ 命名模块暴露接口，CMake `FILE_SET CXX_MODULES` 与 `clang-scan-deps-18` 跟踪依赖。标准库及 LLVM 头在全局模块片段引入；不要求工具链提供 `import std`。`check` 和 `build` 共用前端，前端不调用 Clang。后端用 LLVM 18 的 `IRBuilder` 构造模块，验证后写临时 IR，由 `clang-18` 生成目标文件并链接具有 C ABI 的静态运行时。发布的程序不包含编译器或 LLVM；整数切片只动态依赖系统 libc。
 
 ### 开发机准备：WSL 2 + Ubuntu 24.04
 
@@ -26,7 +26,7 @@
 
    ```sh
    sudo apt update
-   sudo apt install build-essential clang-18 llvm-18 llvm-18-dev cmake
+   sudo apt install build-essential clang-18 clang-tools-18 llvm-18-dev cmake ninja-build python3
    ```
 
 3. 在同一 Ubuntu 终端做一次冒烟检查。`LLVMConfig.cmake` 应可读；IR 编译链接出的程序应返回 `42`：
@@ -44,7 +44,7 @@
    )
    ```
 
-用同一套 `llvm-config-18` 查开发库路径；构建命令和 CTest 用法见[仓库说明](../README.md)。Make 已足够，选用 Ninja 生成器时才需 `ninja-build`。GC 和 SQLite 开发包留到各自原型，不是这一步的前置条件。
+构建和 CTest 使用仓库的 `dev` / `release` preset，见[仓库说明](../README.md)。非系统路径安装的 LLVM 可在配置时传 `-DLLVM_DIR="$(llvm-config-18 --cmakedir)"`。
 
 ## 编译器、Runtime 和 GC
 

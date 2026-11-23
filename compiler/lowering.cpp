@@ -1,10 +1,14 @@
-#include "backend.hpp"
-
+module;
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/Intrinsics.h>
 #include <llvm/IR/Module.h>
 #include <llvm/IR/Verifier.h>
 #include <unordered_map>
+#include <variant>
+#include <vector>
+
+module lyra.lowering;
+import lyra.check;
 
 namespace lyra {
 

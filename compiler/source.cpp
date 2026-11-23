@@ -1,12 +1,15 @@
-#include "frontend.hpp"
-
+module;
 #include <algorithm>
+#include <filesystem>
 #include <fstream>
 #include <iterator>
 #include <llvm/Support/FormatVariadic.h>
 #include <llvm/Support/JSON.h>
 #include <llvm/Support/Unicode.h>
 #include <llvm/Support/raw_ostream.h>
+#include <vector>
+
+module lyra.source;
 
 namespace lyra {
 

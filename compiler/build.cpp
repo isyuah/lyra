@@ -1,7 +1,7 @@
-#include "backend.hpp"
-
+module;
 #include <cerrno>
 #include <cstdlib>
+#include <filesystem>
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/Module.h>
 #include <llvm/Support/FileSystem.h>
@@ -9,6 +9,11 @@
 #include <llvm/Support/Program.h>
 #include <llvm/Support/raw_ostream.h>
 #include <system_error>
+#include <vector>
+
+module lyra.build;
+import lyra.check;
+import lyra.lowering;
 
 namespace lyra {
 namespace fs = std::filesystem;

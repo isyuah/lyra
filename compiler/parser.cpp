@@ -1,8 +1,14 @@
-#include "frontend.hpp"
-
+module;
 #include <charconv>
+#include <cstdint>
 #include <limits>
+#include <optional>
+#include <string>
 #include <string_view>
+#include <variant>
+#include <vector>
+
+module lyra.syntax;
 
 namespace lyra {
 namespace {

@@ -1,6 +1,10 @@
-#include "frontend.hpp"
-
+module;
+#include <string>
 #include <unordered_map>
+#include <variant>
+#include <vector>
+
+module lyra.check;
 
 namespace lyra {
 

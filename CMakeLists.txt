@@ -1,18 +1,30 @@
-cmake_minimum_required(VERSION 3.20)
+cmake_minimum_required(VERSION 3.28)
 project(Lyra LANGUAGES C CXX)
 
 if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" OR NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
     message(FATAL_ERROR "This compiler slice targets x86-64 Linux. On Windows configure it inside WSL.")
 endif()
 
+if(NOT CMAKE_GENERATOR STREQUAL "Ninja" OR NOT CMAKE_CXX_COMPILER_ID STREQUAL "Clang" OR
+   CMAKE_CXX_COMPILER_VERSION VERSION_LESS 18 OR NOT CMAKE_CXX_COMPILER_VERSION VERSION_LESS 19)
+    message(FATAL_ERROR "Use cmake --preset dev or release (Ninja and Clang 18 required).")
+endif()
+execute_process(COMMAND "${CMAKE_MAKE_PROGRAM}" --version OUTPUT_VARIABLE ninjaVersion OUTPUT_STRIP_TRAILING_WHITESPACE COMMAND_ERROR_IS_FATAL ANY)
+if(ninjaVersion VERSION_LESS 1.11)
+    message(FATAL_ERROR "C++ module dependency scanning requires Ninja 1.11 or newer.")
+endif()
+set(CMAKE_CXX_STANDARD 23)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
 find_package(LLVM 18.1 REQUIRED CONFIG)
-add_library(lyraRuntime STATIC runtime/core.c)
-target_compile_features(lyraRuntime PRIVATE c_std_11)
-set_target_properties(lyraRuntime PROPERTIES C_EXTENSIONS OFF ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib")
+add_library(lyraRuntime STATIC runtime/core.cpp)
+set_target_properties(lyraRuntime PROPERTIES ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib")
 
 add_executable(lyra compiler/main.cpp compiler/source.cpp compiler/parser.cpp compiler/check.cpp compiler/lowering.cpp compiler/build.cpp)
+target_sources(lyra PRIVATE FILE_SET CXX_MODULES FILES
+    compiler/source.cppm compiler/syntax.cppm compiler/check.cppm compiler/lowering.cppm compiler/build.cppm)
 add_dependencies(lyra lyraRuntime)
-target_compile_features(lyra PRIVATE cxx_std_20)
 target_compile_options(lyra PRIVATE -Wall -Wextra -Wpedantic)
 target_include_directories(lyra SYSTEM PRIVATE ${LLVM_INCLUDE_DIRS})
 target_link_libraries(lyra PRIVATE LLVM)
