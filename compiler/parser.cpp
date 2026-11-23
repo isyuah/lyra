@@ -138,7 +138,7 @@ public:
                 bool decorator = text(consume()) == "@";
                 auto name = identifier();
                 std::optional<Identifier> argument;
-                if (is("(")) { consume(); argument = identifier(); require(")"); }
+                if (is("(")) { consume(); argument = metadataValue(); require(")"); }
                 module.expansions.push_back({file, std::move(name), std::move(argument), decorator, false, 0});
             }
             bool pub = visibility();
@@ -190,6 +190,34 @@ private:
         if (item.kind == Kind::Escaped) word = word.substr(1, word.size() - 2);
         return {std::string(word), item.span};
     }
+    Identifier stringLiteral() {
+        auto item = consume();
+        auto literal = text(item);
+        std::string result;
+        for (std::size_t offset = 1; offset + 1 < literal.size(); ++offset) {
+            auto byte = literal[offset];
+            if (byte == '\\') {
+                byte = literal[++offset];
+                switch (byte) { case 'n': byte = '\n'; break; case 'r': byte = '\r'; break; case 't': byte = '\t'; break; case '0': byte = '\0'; break; }
+            }
+            result.push_back(byte);
+        }
+        return {std::move(result), item.span};
+    }
+    Identifier metadataValue() { return token.kind == Kind::String ? stringLiteral() : identifier(); }
+    std::vector<Attribute> attributes() {
+        std::vector<Attribute> result;
+        while (is("[")) {
+            consume();
+            Attribute attribute{identifier(), {}};
+            if (std::ranges::any_of(result, [&](const auto& other) { return other.name.text == attribute.name.text; }))
+                throw at(source, attribute.name.span, "LYM0003", "重复标记：" + attribute.name.text);
+            if (is("(")) { consume(); attribute.argument = metadataValue(); require(")"); }
+            require("]");
+            result.push_back(std::move(attribute));
+        }
+        return result;
+    }
     ExprId add(Span span, auto node) {
         nodes.push_back({span, std::move(node)});
         return nodes.size() - 1;
@@ -232,12 +260,12 @@ private:
 
     bool visibility() { if (!is("pub")) return false; consume(); return true; }
 
-    Field field(bool pub) {
+    Field field(bool pub, std::vector<Attribute> marks) {
         if (!is("var") && !is("val")) throw at(source, token.span, "LYP0001", "字段声明需要 val 或 var");
         bool writable = text(consume()) == "var";
         auto name = identifier();
         require(":");
-        return {std::move(name), type(), writable, pub};
+        return {std::move(name), type(), writable, pub, std::move(marks)};
     }
 
     void aggregate(Module& module, bool pub) {
@@ -247,7 +275,8 @@ private:
         if (primary) {
             consume();
             while (!is(")")) {
-                decl.fields.push_back(field(visibility()));
+                auto marks = attributes();
+                decl.fields.push_back(field(visibility(), std::move(marks)));
                 if (!is(",")) break;
                 consume();
             }
@@ -256,9 +285,12 @@ private:
         if (!primary || is("{")) {
             require("{");
             while (!is("}")) {
+                auto marks = attributes();
                 bool publicMember = visibility();
-                if (is("fn") || is("async") || is("extern")) module.functions.push_back(function(decl.name, publicMember));
-                else decl.fields.push_back(field(publicMember));
+                if (is("fn") || is("async") || is("extern")) {
+                    if (!marks.empty()) throw at(source, marks.front().name.span, "LYM0003", "此处的标记只适用于字段和形参");
+                    module.functions.push_back(function(decl.name, publicMember));
+                } else decl.fields.push_back(field(publicMember, std::move(marks)));
                 if (is(";")) consume();
                 else if (!is("}") && !token.newlineBefore) throw at(source, token.span, "LYP0001", "成员之间需要换行或分号");
             }
@@ -290,9 +322,11 @@ private:
         while (!is(")")) {
             if (!parameters.empty() && parameters.back().variadic) throw at(source, token.span, "LYP0001", "变长形参必须放在最后");
             if (is("...")) throw at(source, token.span, "LYP0001", "变长形参写在类型之后，例如 values: Int...");
+            auto marks = attributes();
             auto parameter = identifier();
             require(":");
             Parameter item{std::move(parameter), type()};
+            item.attributes = std::move(marks);
             if (is("...")) { consume(); item.variadic = true; }
             if (is("=")) {
                 if (item.variadic) throw at(source, token.span, "LYP0001", "变长形参不能设置默认值");
@@ -461,18 +495,8 @@ private:
             return add({start, end}, std::move(literal));
         }
         if (token.kind == Kind::String) {
-            auto item = consume();
-            auto literal = text(item);
-            std::string result;
-            for (std::size_t offset = 1; offset + 1 < literal.size(); ++offset) {
-                auto byte = literal[offset];
-                if (byte == '\\') {
-                    byte = literal[++offset];
-                    switch (byte) { case 'n': byte = '\n'; break; case 'r': byte = '\r'; break; case 't': byte = '\t'; break; case '0': byte = '\0'; break; }
-                }
-                result.push_back(byte);
-            }
-            return add(item.span, StringLiteral{std::move(result)});
+            auto literal = stringLiteral();
+            return add(literal.span, StringLiteral{std::move(literal.text)});
         }
         if (token.kind == Kind::Number || (is("-") && next.kind == Kind::Number)) {
             bool negative = is("-");

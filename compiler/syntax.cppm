@@ -15,6 +15,7 @@ export namespace lyra {
 using ExprId = std::size_t;
 
 struct Identifier { std::string text; Span span; };
+struct Attribute { Identifier name; std::optional<Identifier> argument; };
 struct Argument { std::optional<Identifier> label; ExprId value; std::optional<Span> spread{}; };
 struct Call {
     Identifier name;
@@ -53,7 +54,7 @@ struct Expr {
     std::variant<std::int64_t, bool, StringLiteral, Identifier, Call, Member, Unary, Binary, Block, Binding, Conditional, While, Return, Raise, Attempt, Jump, TaskOp, Blocking, Deferred, EmptyOption, Propagate, Match, ListLiteral, Index> node;
 };
 
-struct Parameter { Identifier name, type; bool variadic{}; std::optional<ExprId> defaultValue{}; };
+struct Parameter { Identifier name, type; bool variadic{}; std::optional<ExprId> defaultValue{}; std::vector<Attribute> attributes{}; };
 struct Function {
     std::size_t file;
     Identifier name;
@@ -69,7 +70,7 @@ struct Function {
     bool conversion{};
 };
 
-struct Field { Identifier name, type; bool writable; bool isPublic{}; };
+struct Field { Identifier name, type; bool writable; bool isPublic{}; std::vector<Attribute> attributes{}; };
 struct Aggregate { std::size_t file; Identifier name; bool reference; std::vector<Field> fields; bool isPublic{}; };
 struct Import { std::size_t file; bool isPublic; std::vector<Identifier> path; Identifier alias; };
 struct Expansion { std::size_t file; Identifier name; std::optional<Identifier> argument; bool decorator; bool record; std::size_t target; };

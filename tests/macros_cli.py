@@ -132,6 +132,23 @@ fn main(): Unit {
     print(show("{\"rows\":[[1,true]]}"))
 }''', ['{"rows":[[1,null],[],[2]],"labels":["a","b"]}', '{"rows":[]}', '$.rows[0][1]: expected Int'])
 
+    def test_attributes_generate_a_typed_adapter_without_changing_direct_calls(self):
+        (self.src / '.macros/post.ly').write_text('''fn post(target: String, route: String): String {
+    if !fieldHasAttribute(0, "path") || fieldType(0) != "Int" { return macroFail("expected Int path") }
+    val key = macroQuote(fieldAttributeValue(1, "query"))
+    "fn adapt(request: Request): String { " + target + "(request." + fieldName(0) + ", request.query(" + key + ")) }\\nfn route(): String { " + macroQuote(route) + " }"
+}''')
+        self.native('''struct Request(val id: Int) { fn query(self, key: String): String { key + "!" } }
+#post("/teams/{id}")
+@trace
+fn show([path] id: Int, [query("tag")] text: String): String { print(id); text }
+fn main(): Unit { print(route()); print(adapt(Request(7))); print(show(8, "direct")) }''',
+                    ['/teams/{id}', 'trace: show', '7', 'tag!', 'trace: show', '8', 'direct'])
+        self.macro('"fn mappedName(): String { " + macroQuote(fieldAttributeValue(0, "key")) + " }"')
+        self.native('#make\nstruct Envelope([key("external")] pub val name: String)\nfn main(): Unit { print(mappedName()) }', ['external'])
+        (self.src / 'main.ly').write_text('fn work([path][path] id: Int): Int { id }\nfn main(): Unit {}')
+        self.diagnostic('LYM0003', 'path')
+
 
 if __name__ == '__main__':
     unittest.main()

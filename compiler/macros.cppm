@@ -29,6 +29,8 @@ constexpr auto prelude = R"(fn fieldCount(): Int { 0 }
 fn fieldName(index: Int): String { "" }
 fn fieldType(index: Int): String { "" }
 fn fieldPublic(index: Int): Bool { false }
+fn fieldHasAttribute(index: Int, name: String): Bool { false }
+fn fieldAttributeValue(index: Int, name: String): String { "" }
 fn targetKind(): String { "" }
 fn targetBody(): String { "" }
 fn optionInner(typeName: String): String { "" }
@@ -99,6 +101,12 @@ struct Machine {
         const auto& field = fields[index];
         if (name == "fieldName") return field.name.text;
         if (name == "fieldType") return field.type.text;
+        if (name == "fieldHasAttribute" || name == "fieldAttributeValue") {
+            auto found = std::ranges::find_if(field.attributes, [&](const auto& mark) { return mark.name.text == std::get<std::string>(args[1]); });
+            if (name == "fieldHasAttribute") return found != field.attributes.end();
+            if (found == field.attributes.end()) error("字段或形参缺少标记：" + std::get<std::string>(args[1]));
+            return found->argument ? found->argument->text : std::string{};
+        }
         return field.isPublic;
     }
 
@@ -233,7 +241,7 @@ void expandMacros(Module& syntax, std::vector<Source>& sources, const std::map<s
         if (prefix.record) fields = syntax.aggregates[prefix.target].fields;
         else {
             auto& fn = syntax.functions[prefix.target];
-            for (const auto& param : fn.parameters) fields.push_back({param.name, param.type, false, true});
+            for (const auto& param : fn.parameters) fields.push_back({param.name, param.type, false, true, param.attributes});
             if (!fn.foreignSymbol) { auto span = fn.expressions[fn.body].span; bodyText = source.text.substr(span.begin, span.end - span.begin); }
         }
         auto generated = expand(source, prefix, packages.at(source.moduleId), name.text, fields, prefix.record ? (syntax.aggregates[prefix.target].reference ? "class" : "struct") : "fn", bodyText, inputs);
