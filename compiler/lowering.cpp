@@ -44,6 +44,8 @@ struct Layouts {
         case Type::String: case Type::Task: case Type::CPtr: return builder.getPtrTy();
         case Type::Variable: llvm_unreachable("abstract type reached LLVM lowering");
         case Type::Record: return reference(type) ? static_cast<llvm::Type*>(builder.getPtrTy()) : objects[type.id];
+        case Type::Option: return llvm::StructType::get(builder.getContext(), {builder.getInt1Ty(), native(builder, program.sumTypes[type.id].success)});
+        case Type::Result: return llvm::StructType::get(builder.getContext(), {builder.getInt1Ty(), native(builder, program.sumTypes[type.id].success), native(builder, program.sumTypes[type.id].failure)});
         }
         llvm_unreachable("invalid Lyra type");
     }
@@ -73,8 +75,18 @@ struct Emitter {
         if (live()) builder.CreateRet(tail);
     }
 
+    Type rawType(ExprId id) const { const auto& info = fn.expressions[id]; return info.liftedFrom.value_or(info.type); }
+
+    Value makeSum(Type type, SumTag tag, Value payload = nullptr) {
+        Value value = llvm::Constant::getNullValue(layouts.native(builder, type));
+        value = builder.CreateInsertValue(value, builder.getInt1(successTag(tag)), 0);
+        return payload ? builder.CreateInsertValue(value, payload, payloadSlot(tag)) : value;
+    }
+
     Value emit(ExprId id) {
-        return std::visit([&](const auto& node) { return emitNode(id, node); }, fn.syntax.expressions[id].node);
+        auto value = std::visit([&](const auto& node) { return emitNode(id, node); }, fn.syntax.expressions[id].node);
+        const auto& info = fn.expressions[id];
+        return live() && info.liftedFrom ? makeSum(info.type, SumTag::Some, value) : value;
     }
 
     Value emitNode(ExprId, std::int64_t value) { return builder.getInt64(value); }
@@ -87,13 +99,57 @@ struct Emitter {
         return global;
     }
     Value emitNode(ExprId id, const Identifier&) {
-        return builder.CreateLoad(layouts.native(builder, fn.expressions[id].type), locals[fn.expressions[id].target]);
+        return builder.CreateLoad(layouts.native(builder, rawType(id)), locals[fn.expressions[id].target]);
     }
 
     Value emitNode(ExprId id, const TaskOp& op) {
         auto task = emit(op.operand);
         if (!live()) return unit();
-        return op.spawn ? asyncSpawn(builder, task) : asyncAwait(builder, layouts.native(builder, fn.expressions[id].type), task);
+        return op.spawn ? asyncSpawn(builder, task) : asyncAwait(builder, layouts.native(builder, rawType(id)), task);
+    }
+
+    Value emitNode(ExprId id, const EmptyOption&) { return makeSum(rawType(id), SumTag::None); }
+
+    Value emitNode(ExprId, const Propagate& propagation) {
+        auto value = emit(propagation.operand);
+        if (!live()) return unit();
+        auto success = label("propagate.value"), failure = label("propagate.return");
+        builder.CreateCondBr(builder.CreateExtractValue(value, 0), success, failure);
+        builder.SetInsertPoint(failure);
+        builder.CreateRet(fn.result.kind == Type::Option ? makeSum(fn.result, SumTag::None) : makeSum(fn.result, SumTag::Err, builder.CreateExtractValue(value, payloadSlot(SumTag::Err))));
+        builder.SetInsertPoint(success);
+        return builder.CreateExtractValue(value, 1);
+    }
+
+    Value emitNode(ExprId id, const Match& match) {
+        auto subject = emit(match.subject);
+        if (!live()) return unit();
+        auto done = label("match.end");
+        std::vector<std::pair<Value, Label>> values;
+        for (std::size_t index = 0; index < match.arms.size(); ++index) {
+            const auto& arm = match.arms[index];
+            auto armBody = label("match.arm"), next = label("match.next");
+            Value payload = subject, selected = builder.getTrue();
+            for (auto step : arm.pattern.tags) {
+                auto success = builder.CreateExtractValue(payload, 0);
+                selected = builder.CreateAnd(selected, successTag(step.tag) ? success : builder.CreateNot(success));
+                if (step.tag != SumTag::None) payload = builder.CreateExtractValue(payload, payloadSlot(step.tag));
+            }
+            builder.CreateCondBr(selected, armBody, next);
+            builder.SetInsertPoint(armBody);
+            if (arm.pattern.binding) builder.CreateStore(payload, locals[fn.expressions[id].argumentSlots[index]]);
+            auto value = emit(arm.value);
+            if (live()) { values.emplace_back(value, builder.GetInsertBlock()); builder.CreateBr(done); }
+            builder.SetInsertPoint(next);
+        }
+        builder.CreateUnreachable();
+        if (values.empty()) { done->eraseFromParent(); end(); return unit(); }
+        builder.SetInsertPoint(done);
+        auto result = rawType(id);
+        if (result == Type::Unit) return unit();
+        auto value = builder.CreatePHI(layouts.native(builder, result), values.size());
+        for (auto [incoming, block] : values) value->addIncoming(incoming, block);
+        return value;
     }
 
     Value address(ExprId id) {
@@ -113,7 +169,7 @@ struct Emitter {
         auto slot = static_cast<unsigned>(fn.expressions[id].target);
         if (!layouts.reference(owner)) return builder.CreateExtractValue(object, slot);
         auto field = builder.CreateStructGEP(layouts.objects[owner.id], object, slot);
-        return builder.CreateLoad(layouts.native(builder, fn.expressions[id].type), field);
+        return builder.CreateLoad(layouts.native(builder, rawType(id)), field);
     }
 
     Value emitNode(ExprId id, const Binding& binding) {
@@ -129,7 +185,7 @@ struct Emitter {
             if (!live()) break;
             if (statement.semicolon) tail = unit();
         }
-        return fn.expressions[id].type == Type::Unit ? unit() : tail;
+        return rawType(id) == Type::Unit ? unit() : tail;
     }
 
     Value emitNode(ExprId id, const Call& call) {
@@ -145,6 +201,7 @@ struct Emitter {
             if (!live()) return unit();
         }
         switch (info.callee) {
+            case Callee::Sum: return makeSum(rawType(id), static_cast<SumTag>(info.target), args[0]);
             case Callee::Print: {
                 bool string = fn.expressions[call.arguments[0].value].type == Type::String;
                 builder.CreateCall(module.getOrInsertFunction(string ? "lyraPrintString" : "lyraPrintInt", builder.getVoidTy(), args[0]->getType()), args);
@@ -208,6 +265,16 @@ struct Emitter {
 
     Value emitNode(ExprId, const Binary& binary) {
         auto op = binary.op;
+        if (op == Op::Eq || op == Op::Ne) {
+            bool emptyLeft = std::holds_alternative<EmptyOption>(fn.syntax.expressions[binary.left].node);
+            bool emptyRight = std::holds_alternative<EmptyOption>(fn.syntax.expressions[binary.right].node);
+            if (emptyLeft || emptyRight) {
+                auto value = emit(emptyLeft ? binary.right : binary.left);
+                if (!live()) return unit();
+                auto tag = builder.CreateExtractValue(value, 0);
+                return op == Op::Eq ? builder.CreateNot(tag) : tag;
+            }
+        }
         if (op <= Op::RemSet) {
             if (fn.expressions[binary.left].type == Type::Never) return emit(binary.left);
             auto slot = address(binary.left);
@@ -277,7 +344,7 @@ struct Emitter {
         if (falseEnd) builder.CreateBr(join);
         if (!trueEnd && !falseEnd) { join->eraseFromParent(); end(); return unit(); }
         builder.SetInsertPoint(join);
-        auto type = fn.expressions[id].type;
+        auto type = rawType(id);
         if (type == Type::Unit) return unit();
         auto value = builder.CreatePHI(layouts.native(builder, type), 2);
         if (trueEnd) value->addIncoming(trueValue, trueEnd);

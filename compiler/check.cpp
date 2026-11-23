@@ -1,5 +1,6 @@
 module;
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <map>
 #include <optional>
@@ -32,6 +33,8 @@ std::string typeName(const CheckedModule& module, Type type) {
         case Type::Record: return module.aggregates[type.id].syntax.name.text;
         case Type::Variable: return module.variableNames[type.id];
         case Type::Task: return "Task<" + typeName(module, module.taskResults[type.id]) + ">";
+        case Type::Option: return "Option<" + typeName(module, module.sumTypes[type.id].success) + ">";
+        case Type::Result: return "Result<" + typeName(module, module.sumTypes[type.id].success) + "," + typeName(module, module.sumTypes[type.id].failure) + ">";
     }
     throw std::logic_error("invalid Lyra type");
 }
@@ -54,17 +57,41 @@ struct Symbols {
         return {Type::Task, index};
     }
 
+    Type sum(Type::Kind kind, Type success, Type failure = Type::Unit) const {
+        auto& types = module.sumTypes;
+        SumTypes fields{success, failure};
+        auto found = std::find(types.begin(), types.end(), fields);
+        auto index = static_cast<std::size_t>(found - types.begin());
+        if (found == types.end()) types.push_back(fields);
+        return {kind, index};
+    }
+
+    std::optional<Type> project(Type value, const std::string& name, std::size_t slot) const {
+        if (name == "Task" && value.kind == Type::Task && slot == 0) return module.taskResults[value.id];
+        if (name == "Option" && value.kind == Type::Option && slot == 0) return module.sumTypes[value.id].success;
+        if (name == "Result" && value.kind == Type::Result && slot < 2) return slot ? module.sumTypes[value.id].failure : module.sumTypes[value.id].success;
+        return std::nullopt;
+    }
+
+    Type resolveForm(const TypeForm& form, const Source& source, Span span, const Function* signature, std::span<const Type> types) const {
+        auto child = [&](std::size_t slot) { return resolveForm(form.arguments[slot], source, span, signature, types); };
+        if (form.arguments.size() == 1 && form.name == "Task") return task(child(0));
+        if (form.arguments.size() == 1 && form.name == "Option") return sum(Type::Option, child(0));
+        if (form.arguments.size() == 2 && form.name == "Result") return sum(Type::Result, child(0), child(1));
+        if (form.arguments.empty()) {
+            if (signature) if (auto parameter = genericParameter(*signature, form.name)) return types[*parameter];
+            for (Type type : {Type::Int, Type::Bool, Type::String, Type::Unit, Type::CPtr}) if (form.name == typeName(module, type)) return type;
+            if (auto found = records.find(form.name); found != records.end()) return {Type::Record, found->second};
+        }
+        throw at(source, span, "LYT0003", "找不到类型或类型实参数量不符：" + form.name);
+    }
+
     Type resolve(const Source& source, const Identifier& name) const {
-        if (name.text.starts_with("Task<") && name.text.ends_with('>')) return task(resolve(source, {name.text.substr(5, name.text.size() - 6), name.span}));
-        for (Type type : {Type::Int, Type::Bool, Type::String, Type::Unit, Type::CPtr}) if (name.text == typeName(module, type)) return type;
-        if (auto found = records.find(name.text); found != records.end()) return {Type::Record, found->second};
-        throw at(source, name.span, "LYT0003", "找不到类型：" + name.text);
+        return resolveForm(typeForm(name.text), source, name.span, nullptr, {});
     }
 
     Type resolve(const Function& signature, const Identifier& name, std::span<const Type> types) const {
-        if (name.text.starts_with("Task<") && name.text.ends_with('>')) return task(resolve(signature, {name.text.substr(5, name.text.size() - 6), name.span}, types));
-        if (auto parameter = genericParameter(signature, name.text)) return types[*parameter];
-        return resolve(sources[signature.file], name);
+        return resolveForm(typeForm(name.text), sources[signature.file], name.span, &signature, types);
     }
 
     CheckedFunction prepare(Function syntax, std::span<const Type> arguments = {}) const {
@@ -115,16 +142,80 @@ struct Checker {
     }
 
     Type visit(ExprId id, std::optional<Type> expected = {}, bool discard = false) {
+        auto type = inspect(id, expected, discard);
+        return fit(id, type, expected);
+    }
+
+    Type inspect(ExprId id, std::optional<Type> hint, bool discard = false) {
         const auto& expr = fn.syntax.expressions[id];
+        return fn.expressions[id].type = std::visit([&](const auto& node) { return infer(id, node, hint, discard); }, expr.node);
+    }
+
+    Type fit(ExprId id, Type type, std::optional<Type> expected) {
         auto& info = fn.expressions[id];
-        auto type = std::visit([&](const auto& node) { return infer(id, node, expected, discard); }, expr.node);
-        if (expected && type != *expected && type != Type::Never) throw mismatch(module, source, expr.span, *expected, type);
+        if (expected && type != *expected && type != Type::Never) {
+            if (expected->kind != Type::Option || module.sumTypes[expected->id].success != type) throw mismatch(module, source, fn.syntax.expressions[id].span, *expected, type);
+            info.liftedFrom = type;
+            type = *expected;
+        }
         return info.type = type;
     }
 
     Type infer(ExprId, std::int64_t, auto, bool) { return Type::Int; }
     Type infer(ExprId, bool, auto, bool) { return Type::Bool; }
     Type infer(ExprId, const StringLiteral&, auto, bool) { return Type::String; }
+
+    Type infer(ExprId id, const EmptyOption&, std::optional<Type> expected, bool) {
+        if (!expected || expected->kind != Type::Option) throw at(source, fn.syntax.expressions[id].span, "LYT0010", "None/null 需要明确的 Option 目标类型");
+        return *expected;
+    }
+
+    Type infer(ExprId, const Propagate& propagation, std::optional<Type> expected, bool) {
+        std::optional<Type> hint;
+        if (expected && (fn.result.kind == Type::Option || fn.result.kind == Type::Result)) hint = symbols.sum(fn.result.kind, *expected, module.sumTypes[fn.result.id].failure);
+        auto operand = inspect(propagation.operand, hint);
+        if (operand == Type::Never) return operand;
+        if (operand.kind != Type::Option && operand.kind != Type::Result) throw at(source, propagation.site, "LYT0013", "? 需要 Option 或 Result，实际是 " + typeName(module, operand));
+        if (fn.result.kind != operand.kind || (operand.kind == Type::Result && module.sumTypes[fn.result.id].failure != module.sumTypes[operand.id].failure)) {
+            throw at(source, propagation.site, "LYT0013", "? 无法将 " + typeName(module, operand) + " 的失败传播到 " + typeName(module, fn.result));
+        }
+        return module.sumTypes[operand.id].success;
+    }
+
+    Type infer(ExprId id, const Match& match, std::optional<Type> expected, bool discard) {
+        auto subject = visit(match.subject);
+        if (subject == Type::Never) return subject;
+        if (subject.kind != Type::Option && subject.kind != Type::Result) throw at(source, fn.syntax.expressions[match.subject].span, "LYT0011", "match 需要 Option 或 Result，实际是 " + typeName(module, subject));
+        std::vector<const SumPattern*> patterns;
+        std::optional<Type> result;
+        for (const auto& arm : match.arms) {
+            auto payload = subject;
+            for (auto [tag, span] : arm.pattern.tags) {
+                if (payload.kind != (optionTag(tag) ? Type::Option : Type::Result)) throw at(source, span, "LYT0011", std::string(tagName(tag)) + " 不能匹配 " + typeName(module, payload));
+                const auto& fields = module.sumTypes[payload.id];
+                payload = successTag(tag) ? fields.success : fields.failure;
+            }
+            scopes.emplace_back();
+            auto slot = fn.locals.size();
+            if (const auto& binding = arm.pattern.binding) {
+                declare({binding->name, binding->span}, slot);
+                fn.locals.push_back({payload, false});
+            }
+            fn.expressions[id].argumentSlots.push_back(slot);
+            auto value = visit(arm.value, discard ? std::nullopt : result ? result : expected, discard);
+            if (value != Type::Never && !result) result = discard ? Type::Unit : value;
+            scopes.pop_back();
+            patterns.push_back(&arm.pattern);
+        }
+        auto cases = [&](Type type) -> std::optional<std::array<SumCase<Type>, 2>> {
+            if (type.kind != Type::Result && type.kind != Type::Option) return std::nullopt;
+            const auto& fields = module.sumTypes[type.id];
+            if (type.kind == Type::Option) return std::array{SumCase<Type>{SumTag::None, Type::Unit}, SumCase<Type>{SumTag::Some, fields.success}};
+            return std::array{SumCase<Type>{SumTag::Ok, fields.success}, SumCase<Type>{SumTag::Err, fields.failure}};
+        };
+        if (auto missing = missingPattern(subject, patterns, cases)) throw at(source, fn.syntax.expressions[id].span, "LYT0012", "match 未穷尽，缺少分支：" + *missing);
+        return result.value_or(Type::Never);
+    }
 
     Type infer(ExprId id, const Identifier& name, auto, bool) {
         for (auto scope = scopes.rbegin(); scope != scopes.rend(); ++scope) {
@@ -200,7 +291,7 @@ struct Checker {
         bool exits = arguments(id, call, target.parameters.size() - skip,
                 [&](auto slot) -> const auto& { return target.parameters[slot + skip].name.text; }, [&](auto slot) -> std::optional<Type> {
                     const auto& annotation = target.parameters[slot + skip].type;
-                    if (genericPattern(target, annotation.text)) return explicitTypes.empty() ? std::nullopt : std::optional(symbols.resolve(target, annotation, explicitTypes));
+                    if (genericPattern(target, typeForm(annotation.text))) return explicitTypes.empty() ? std::nullopt : std::optional(symbols.resolve(target, annotation, explicitTypes));
                     return symbols.resolve(symbols.sources[target.file], annotation);
                 });
         auto& info = fn.expressions[id];
@@ -211,7 +302,11 @@ struct Checker {
         }
         if (target.isAsync && expected) expected = expected->kind == Type::Task ? std::optional(module.taskResults[expected->id]) : std::nullopt;
         auto types = inferGenericArguments<Type>(target, call, fn.syntax.expressions[id].span, explicitTypes, actuals, expected, source, [&](Type type) { return typeName(module, type); },
-                [&](Type value) -> std::optional<Type> { return value.kind == Type::Task ? std::optional(module.taskResults[value.id]) : std::nullopt; });
+                [&](Type value, const std::string& name, std::size_t slot) { return symbols.project(value, name, slot); });
+        for (std::size_t index = 0; index < actuals.size(); ++index) {
+            const auto& argument = actuals[index];
+            fit(call.arguments[index].value, argument.type, symbols.resolve(target, target.parameters[argument.slot].type, types));
+        }
         if (variables.empty()) info.target = symbols.instantiate(declaration, types, source, call.name.span);
         auto result = symbols.resolve(target, target.result, types);
         return exits ? Type{Type::Never} : target.isAsync ? symbols.task(result) : result;
@@ -228,6 +323,21 @@ struct Checker {
             const auto& item = symbols.callables[declaration];
             const auto& method = item.generic ? *item.generic : module.functions[item.target].syntax;
             visible(method.file, method.isPublic, call.name);
+        } else if (auto tag = sumTag(call.name.text); tag && *tag != SumTag::None) {
+            noTypeArgs();
+            if (call.arguments.size() != 1 || call.arguments[0].label) throw at(source, call.name.span, "LYT0002", call.name.text + " 需要一个位置实参");
+            auto kind = optionTag(*tag) ? Type::Option : Type::Result;
+            if (expected && expected->kind == Type::Option && kind == Type::Result) expected = module.sumTypes[expected->id].success;
+            if (expected && expected->kind != kind) expected.reset();
+            if (!expected && kind == Type::Result) throw at(source, call.name.span, "LYT0010", call.name.text + " 需要明确的 Result 目标类型");
+            std::optional<Type> payload;
+            if (expected) payload = successTag(*tag) ? module.sumTypes[expected->id].success : module.sumTypes[expected->id].failure;
+            auto value = visit(call.arguments[0].value, payload);
+            info.callee = Callee::Sum;
+            info.target = static_cast<std::size_t>(*tag);
+            info.argumentSlots.push_back(0);
+            if (value == Type::Never) return value;
+            return expected ? *expected : symbols.sum(kind, value);
         } else if (call.name.text == "print") {
             noTypeArgs();
             info.callee = Callee::Print;
@@ -266,7 +376,7 @@ struct Checker {
 
     Type infer(ExprId, const TaskOp& op, std::optional<Type> expected, bool) {
         if (!fn.syntax.isAsync) throw at(source, op.site, "LYT0008", "await 和 spawn 只能在 async 函数中使用");
-        auto operand = visit(op.operand, op.spawn || !expected ? expected : std::optional(symbols.task(*expected)));
+        auto operand = inspect(op.operand, op.spawn || !expected ? expected : std::optional(symbols.task(*expected)));
         if (operand.kind == Type::Never) return operand;
         if (operand.kind != Type::Task) throw at(source, fn.syntax.expressions[op.operand].span, "LYT0008", "此处需要 Task，实际是 " + typeName(module, operand));
         return op.spawn ? operand : module.taskResults[operand.id];
@@ -301,10 +411,18 @@ struct Checker {
             return type;
         }
         bool equality = binary.op == Op::Eq || binary.op == Op::Ne;
+        bool emptyLeft = std::holds_alternative<EmptyOption>(fn.syntax.expressions[binary.left].node);
+        bool emptyRight = std::holds_alternative<EmptyOption>(fn.syntax.expressions[binary.right].node);
+        if (equality && (emptyLeft || emptyRight)) {
+            auto other = visit(emptyLeft ? binary.right : binary.left);
+            if (other == Type::Never) return other;
+            visit(emptyLeft ? binary.left : binary.right, other);
+            return Type::Bool;
+        }
         auto left = visit(binary.left, equality || binary.op == Op::Add ? std::nullopt : std::optional(Type::Int));
         auto right = visit(binary.right, left == Type::Never ? std::nullopt : std::optional(left));
         if (left == Type::Never || right == Type::Never) return Type::Never;
-        if (equality && (left.kind == Type::Variable || (left.kind == Type::Record && !module.aggregates[left.id].syntax.reference))) throw at(source, binary.site, "LYT0006", typeName(module, left) + " 未提供 Eq，不能用 == 或 != 比较");
+        if (equality && (left.kind == Type::Option || left.kind == Type::Result || left.kind == Type::Variable || (left.kind == Type::Record && !module.aggregates[left.id].syntax.reference))) throw at(source, binary.site, "LYT0006", typeName(module, left) + " 未提供 Eq，不能用 == 或 != 比较");
         if (binary.op == Op::Add && left == Type::String) return Type::String;
         if (binary.op == Op::Add && left != Type::Int) throw mismatch(module, source, binary.site, Type::Int, left);
         return binary.op <= Op::Ge ? Type::Bool : Type::Int;
@@ -398,10 +516,16 @@ CheckedModule check(Module module, const std::vector<Source>& sources, bool requ
         marks[id] = Mark::Visiting;
         const auto& record = checked.aggregates[id];
         for (std::size_t slot = 0; slot < record.fields.size(); ++slot) {
-            auto field = record.fields[slot];
-            if (field.kind != Type::Record || checked.aggregates[field.id].syntax.reference) continue;
-            if (marks[field.id] == Mark::Visiting) throw at(sources[record.syntax.file], record.syntax.fields[slot].type.span, "LYT0007", "值字段形成无限大小的内联布局：" + record.syntax.name.text + " → " + typeName(checked, field));
-            visit(visit, field.id);
+            auto descend = [&](auto&& self, Type field) -> void {
+                if (field.kind == Type::Option || field.kind == Type::Result) {
+                    self(self, checked.sumTypes[field.id].success);
+                    if (field.kind == Type::Result) self(self, checked.sumTypes[field.id].failure);
+                } else if (field.kind == Type::Record && !checked.aggregates[field.id].syntax.reference) {
+                    if (marks[field.id] == Mark::Visiting) throw at(sources[record.syntax.file], record.syntax.fields[slot].type.span, "LYT0007", "值字段形成无限大小的内联布局：" + record.syntax.name.text + " → " + typeName(checked, field));
+                    visit(visit, field.id);
+                }
+            };
+            descend(descend, record.fields[slot]);
         }
         marks[id] = Mark::Done;
     };

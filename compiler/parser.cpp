@@ -56,7 +56,7 @@ public:
         Kind kind;
         if (isLetter(current) || isDigit(current)) {
             while (offset < text.size() && (isLetter(text[offset]) || isDigit(text[offset]))) ++offset;
-            constexpr std::string_view keywords[] = {"fn", "val", "var", "if", "else", "while", "return", "break", "continue", "true", "false", "struct", "class", "pub", "import", "as", "async", "await", "spawn", "extern"};
+            constexpr std::string_view keywords[] = {"fn", "val", "var", "if", "else", "while", "return", "break", "continue", "true", "false", "struct", "class", "pub", "import", "as", "async", "await", "spawn", "extern", "match", "null"};
             auto word = text.substr(start, offset - start);
             kind = isDigit(current) ? Kind::Number : std::ranges::find(keywords, word) == std::end(keywords) ? Kind::Name : Kind::Keyword;
         } else if (current == '"') {
@@ -79,9 +79,9 @@ public:
             kind = Kind::Escaped;
         } else {
             kind = Kind::Symbol;
-            constexpr std::string_view doubles[] = {"+=", "-=", "*=", "/=", "%=", "==", "!=", "<=", ">=", "&&", "||"};
+            constexpr std::string_view doubles[] = {"+=", "-=", "*=", "/=", "%=", "==", "!=", "<=", ">=", "&&", "||", "=>", "?.", "??"};
             if (std::ranges::find(doubles, text.substr(start, 2)) != std::end(doubles)) ++offset;
-            else if (std::string_view("(){},.:;+-*/%=<>!#@").find(current) == text.npos) {
+            else if (std::string_view("(){},.:;+-*/%=<>!#@?").find(current) == text.npos) {
                 while (offset < text.size() && (static_cast<unsigned char>(text[offset]) & 0xc0) == 0x80) ++offset;
                 throw at(source, {start, offset}, "LYL0001", "此处不是受支持的 Lyra 记号");
             }
@@ -196,12 +196,14 @@ private:
 
     Identifier type() {
         auto name = identifier();
-        if (name.text == "Task" && is("<")) {
+        if (is("<")) {
             consume();
-            auto result = type();
-            name.text += "<" + result.text + ">";
+            name.text += '<' + type().text;
+            while (is(",")) { consume(); name.text += ',' + type().text; }
             name.span.end = require(">").span.end;
+            name.text += '>';
         }
+        while (is("?")) { name.span.end = consume().span.end; name.text = "Option<" + name.text + ">"; }
         return name;
     }
 
@@ -222,7 +224,7 @@ private:
             auto word = text(current);
             if (word == ">" && !--depth) { current = look.next(); return text(current) == "(" && !current.newlineBefore; }
             if (word == "<") ++depth;
-            else if (word != ">" && word != "," && current.kind != Kind::Name && current.kind != Kind::Escaped) return false;
+            else if (word != ">" && word != "," && word != "?" && current.kind != Kind::Name && current.kind != Kind::Escaped) return false;
             current = look.next();
         }
     }
@@ -364,9 +366,15 @@ private:
         return left;
     }
 
-    ExprId primary(bool inParens) {
+    ExprId primary(bool inParens, bool propagate = true) {
         auto value = atom(inParens);
-        while (is(".")) {
+        while (true) {
+            if (propagate && is("?") && (inParens || !token.newlineBefore)) {
+                auto site = consume().span;
+                value = add({nodes[value].span.begin, site.end}, Propagate{value, site});
+                continue;
+            }
+            if (!is(".")) break;
             consume();
             auto name = identifier();
             auto begin = nodes[value].span.begin;
@@ -374,6 +382,27 @@ private:
             else { auto end = name.span.end; value = add({begin, end}, Member{value, std::move(name)}); }
         }
         return value;
+    }
+
+    SumPattern pattern() {
+        SumPattern result{token.span, {}, {}};
+        std::size_t open = 0;
+        for (;;) {
+            bool escaped = token.kind == Kind::Escaped;
+            auto name = identifier();
+            result.span.end = name.span.end;
+            auto tag = escaped ? std::nullopt : sumTag(name.text);
+            if (!tag) {
+                if (name.text != "_" || escaped) result.binding = PatternBinding{std::move(name.text), name.span};
+                break;
+            }
+            result.tags.push_back({*tag, name.span});
+            if (*tag == SumTag::None) break;
+            require("(");
+            ++open;
+        }
+        while (open > 0) { --open; result.span.end = require(")").span.end; }
+        return result;
     }
 
     ExprId call(std::size_t begin, Identifier name, std::optional<ExprId> receiver) {
@@ -415,7 +444,7 @@ private:
         }
         if (is("await") || is("spawn")) {
             auto op = consume();
-            auto operand = primary(inParens);
+            auto operand = primary(inParens, false);
             return add({start, nodes[operand].span.end}, TaskOp{text(op) == "spawn", op.span, operand});
         }
         if (is("-") || is("!")) {
@@ -426,6 +455,21 @@ private:
         if (is("true") || is("false")) {
             auto item = consume();
             return add(item.span, text(item) == "true");
+        }
+        if (is("null") || is("None")) return add(consume().span, EmptyOption{});
+        if (is("match")) {
+            consume();
+            Match match{expression(), {}};
+            require("{");
+            while (!is("}")) {
+                auto branch = pattern();
+                require("=>");
+                match.arms.push_back({std::move(branch), statement()});
+                if (!is(",")) break;
+                consume();
+            }
+            auto end = require("}").span.end;
+            return add({start, end}, std::move(match));
         }
         if (is("if")) {
             consume();

@@ -9,15 +9,15 @@ export import lyra.syntax;
 
 export namespace lyra {
 struct Type {
-    enum Kind { Unit, Int, Bool, String, Never, Record, Variable, Task, CPtr };
+    enum Kind { Unit, Int, Bool, String, Never, Record, Variable, Task, CPtr, Option, Result };
     Kind kind;
     std::size_t id{};
     constexpr Type(Kind kind = Unit, std::size_t id = 0) : kind(kind), id(id) {}
     bool operator==(const Type&) const = default;
 };
 struct Local { Type type; bool writable; };
-enum class Callee { Function, Constructor, Print, Collect };
-struct CheckedExpr { Type type; std::size_t target{}; std::vector<std::size_t> argumentSlots{}; Callee callee{}; };
+enum class Callee { Function, Constructor, Print, Collect, Sum };
+struct CheckedExpr { Type type; std::size_t target{}; std::vector<std::size_t> argumentSlots{}; Callee callee{}; std::optional<Type> liftedFrom{}; };
 struct CheckedFunction {
     Function syntax;
     Type result;
@@ -25,6 +25,7 @@ struct CheckedFunction {
     std::vector<CheckedExpr> expressions;
 };
 struct CheckedAggregate { Aggregate syntax; std::vector<Type> fields; };
-struct CheckedModule { std::deque<CheckedFunction> functions; std::optional<std::size_t> entry; std::vector<CheckedAggregate> aggregates; std::vector<std::string> variableNames; std::vector<Type> taskResults; };
+struct SumTypes { Type success, failure; bool operator==(const SumTypes&) const = default; };
+struct CheckedModule { std::deque<CheckedFunction> functions; std::optional<std::size_t> entry; std::vector<CheckedAggregate> aggregates; std::vector<std::string> variableNames; std::vector<Type> taskResults; std::vector<SumTypes> sumTypes; };
 CheckedModule check(Module module, const std::vector<Source>& sources, bool requireEntry = true);
 }

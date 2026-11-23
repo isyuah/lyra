@@ -8,6 +8,7 @@ module;
 
 export module lyra.syntax;
 export import lyra.source;
+export import lyra.sums;
 
 export namespace lyra {
 
@@ -34,11 +35,15 @@ struct Conditional { ExprId condition, yes; std::optional<ExprId> no; };
 struct While { ExprId condition, body; };
 struct Return { std::optional<ExprId> value; };
 struct TaskOp { bool spawn; Span site; ExprId operand; };
+struct EmptyOption {};
+struct Propagate { ExprId operand; Span site; };
+struct MatchArm { SumPattern pattern; ExprId value; };
+struct Match { ExprId subject; std::vector<MatchArm> arms; };
 enum class Jump { Break, Continue };
 
 struct Expr {
     Span span;
-    std::variant<std::int64_t, bool, StringLiteral, Identifier, Call, Member, Unary, Binary, Block, Binding, Conditional, While, Return, Jump, TaskOp> node;
+    std::variant<std::int64_t, bool, StringLiteral, Identifier, Call, Member, Unary, Binary, Block, Binding, Conditional, While, Return, Jump, TaskOp, EmptyOption, Propagate, Match> node;
 };
 
 struct Parameter { Identifier name, type; };
