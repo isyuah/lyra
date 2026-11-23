@@ -13,6 +13,7 @@ module lyra.lowering;
 import lyra.check;
 import lyra.async;
 import lyra.foreign;
+import lyra.collections;
 
 namespace lyra {
 namespace {
@@ -44,7 +45,7 @@ struct Layouts {
         case Type::Int: return builder.getInt64Ty();
         case Type::Bool: return builder.getInt1Ty();
         case Type::Unit: case Type::Never: return builder.getInt8Ty();
-        case Type::String: case Type::Task: case Type::CPtr: return builder.getPtrTy();
+        case Type::String: case Type::Task: case Type::CPtr: case Type::List: return builder.getPtrTy();
         case Type::Variable: llvm_unreachable("abstract type reached LLVM lowering");
         case Type::Record: return reference(type) ? static_cast<llvm::Type*>(builder.getPtrTy()) : objects[type.id];
         case Type::Option: return llvm::StructType::get(builder.getContext(), {builder.getInt1Ty(), native(builder, program.sumTypes[type.id].success)});
@@ -150,6 +151,25 @@ struct Emitter {
 
     Value emitNode(ExprId id, const EmptyOption&) { return makeSum(rawType(id), SumTag::None); }
 
+    Value emitNode(ExprId, const ListLiteral& literal) {
+        NativeLists lists{builder};
+        auto result = lists.create();
+        for (auto element : literal.elements) {
+            auto value = emit(element);
+            if (!live()) return unit();
+            lists.add(result, value);
+        }
+        return result;
+    }
+
+    Value emitNode(ExprId id, const Index& index) {
+        auto list = emit(index.receiver);
+        if (!live()) return unit();
+        auto offset = emit(index.offset);
+        if (!live()) return unit();
+        return builder.CreateLoad(layouts.native(builder, rawType(id)), NativeLists{builder}.get(list, offset, source, index.site));
+    }
+
     Value emitNode(ExprId, const Propagate& propagation) {
         auto value = emit(propagation.operand);
         if (!live()) return unit();
@@ -193,20 +213,38 @@ struct Emitter {
         return value;
     }
 
-    Value address(ExprId id) {
+    struct Place {
+        Value pointer{}, list{}, index{};
+        Type element{};
+        Span site{};
+        std::vector<unsigned> path{};
+    };
+
+    Place address(ExprId id) {
         const auto& node = fn.syntax.expressions[id].node;
-        if (std::holds_alternative<Identifier>(node)) return cell(fn.expressions[id].target);
+        if (std::holds_alternative<Identifier>(node)) return {cell(fn.expressions[id].target)};
+        if (auto indexed = std::get_if<Index>(&node)) {
+            auto list = emit(indexed->receiver);
+            if (!live()) return {};
+            auto offset = emit(indexed->offset);
+            if (!live()) return {};
+            return {NativeLists{builder}.get(list, offset, source, indexed->site), list, offset, rawType(id), indexed->site};
+        }
         const auto& member = std::get<Member>(node);
         auto owner = fn.expressions[member.receiver].type;
-        auto base = layouts.reference(owner) ? emit(member.receiver) : address(member.receiver);
-        if (!live()) return nullptr;
-        return builder.CreateStructGEP(layouts.objects[owner.id], base, fn.expressions[id].target);
+        auto place = layouts.reference(owner) ? Place{emit(member.receiver)} : address(member.receiver);
+        if (!live()) return {};
+        auto slot = static_cast<unsigned>(fn.expressions[id].target);
+        place.pointer = builder.CreateStructGEP(layouts.objects[owner.id], place.pointer, slot);
+        if (place.list) place.path.push_back(slot);
+        return place;
     }
 
     Value emitNode(ExprId id, const Member& member) {
         auto object = emit(member.receiver);
         if (!live()) return unit();
         auto owner = fn.expressions[member.receiver].type;
+        if (owner.kind == Type::List) return NativeLists{builder}.size(object);
         auto slot = static_cast<unsigned>(fn.expressions[id].target);
         if (!layouts.reference(owner)) return builder.CreateExtractValue(object, slot);
         auto field = builder.CreateStructGEP(layouts.objects[owner.id], object, slot);
@@ -233,16 +271,32 @@ struct Emitter {
     Value emitNode(ExprId id, const Call& call) {
         const auto& info = fn.expressions[id];
         auto skip = static_cast<std::size_t>(call.receiver.has_value());
-        std::vector<Value> args(call.arguments.size() + skip);
+        Value receiver = nullptr;
         if (call.receiver) {
-            args[0] = emit(*call.receiver);
+            receiver = emit(*call.receiver);
             if (!live()) return unit();
         }
+        auto* target = info.callee == Callee::Function ? &layouts.program.functions[info.target] : nullptr;
+        std::vector<Value> args(target ? target->syntax.parameters.size() : call.arguments.size() + skip);
+        if (receiver) args[0] = receiver;
+        bool variadic = target && !target->syntax.parameters.empty() && target->syntax.parameters.back().variadic;
+        NativeLists lists{builder};
+        if (variadic) args.back() = lists.create();
         for (std::size_t index = 0; index < call.arguments.size(); ++index) {
-            args[info.argumentSlots[index] + skip] = emit(call.arguments[index].value);
+            auto slot = info.argumentSlots[index] + skip;
+            auto value = emit(call.arguments[index].value);
             if (!live()) return unit();
+            if (variadic && slot == args.size() - 1) {
+                if (call.arguments[index].spread) lists.extend(args[slot], value);
+                else lists.add(args[slot], value);
+            } else args[slot] = value;
+        }
+        for (auto slot : info.omittedDefaults) {
+            auto helper = functions[*target->defaultFunctions[slot]];
+            args[slot] = builder.CreateCall(helper, llvm::ArrayRef<Value>(args).take_front(slot));
         }
         switch (info.callee) {
+            case Callee::ListAdd: lists.add(args[0], args[1]); return unit();
             case Callee::Sum: return makeSum(rawType(id), static_cast<SumTag>(info.target), args[0]);
             case Callee::Print: {
                 bool string = fn.expressions[call.arguments[0].value].type == Type::String;
@@ -319,19 +373,26 @@ struct Emitter {
         }
         if (op <= Op::RemSet) {
             if (fn.expressions[binary.left].type == Type::Never) return emit(binary.left);
-            auto slot = address(binary.left);
+            auto place = address(binary.left);
             if (!live()) return unit();
             auto type = fn.expressions[binary.left].type;
-            auto shared = layouts.workers && (!std::holds_alternative<Identifier>(fn.syntax.expressions[binary.left].node) || fn.locals[fn.expressions[binary.left].target].captured);
-            auto left = op == Op::Set ? nullptr : shared ? sharedRead(builder, layouts.native(builder, type), slot) : builder.CreateLoad(layouts.native(builder, type), slot);
+            auto shared = !place.list && layouts.workers && (!std::holds_alternative<Identifier>(fn.syntax.expressions[binary.left].node) || fn.locals[fn.expressions[binary.left].target].captured);
+            auto left = op == Op::Set ? nullptr : shared ? sharedRead(builder, layouts.native(builder, type), place.pointer) : builder.CreateLoad(layouts.native(builder, type), place.pointer);
             auto right = emit(binary.right);
             if (!live()) return unit();
             constexpr Op compound[] = {Op::Add, Op::Sub, Op::Mul, Op::Div, Op::Rem};
             if (op != Op::Set) {
                 right = type == Type::String ? concatenate(left, right) : arithmetic(compound[static_cast<int>(op) - 1], left, right, binary.site);
             }
-            if (shared) sharedWrite(builder, right, slot);
-            else builder.CreateStore(right, slot);
+            if (place.list) {
+                NativeLists lists{builder};
+                if (!place.path.empty()) {
+                    auto latest = lists.get(place.list, place.index, source, place.site);
+                    right = builder.CreateInsertValue(builder.CreateLoad(layouts.native(builder, place.element), latest), right, place.path);
+                }
+                lists.set(place.list, place.index, right);
+            } else if (shared) sharedWrite(builder, right, place.pointer);
+            else builder.CreateStore(right, place.pointer);
             return unit();
         }
         auto left = emit(binary.left);

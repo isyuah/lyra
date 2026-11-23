@@ -15,7 +15,7 @@ export namespace lyra {
 using ExprId = std::size_t;
 
 struct Identifier { std::string text; Span span; };
-struct Argument { std::optional<Identifier> label; ExprId value; };
+struct Argument { std::optional<Identifier> label; ExprId value; std::optional<Span> spread{}; };
 struct Call {
     Identifier name;
     std::vector<Argument> arguments;
@@ -23,6 +23,8 @@ struct Call {
     std::vector<Identifier> typeArguments{};
 };
 struct Member { ExprId receiver; Identifier name; };
+struct ListLiteral { std::vector<ExprId> elements; };
+struct Index { ExprId receiver, offset; Span site; };
 struct StringLiteral { std::string bytes; };
 
 enum class Op { Set, AddSet, SubSet, MulSet, DivSet, RemSet, Or, And, Eq, Ne, Lt, Le, Gt, Ge, Add, Sub, Mul, Div, Rem, Not };
@@ -44,10 +46,10 @@ enum class Jump { Break, Continue };
 
 struct Expr {
     Span span;
-    std::variant<std::int64_t, bool, StringLiteral, Identifier, Call, Member, Unary, Binary, Block, Binding, Conditional, While, Return, Jump, TaskOp, Blocking, EmptyOption, Propagate, Match> node;
+    std::variant<std::int64_t, bool, StringLiteral, Identifier, Call, Member, Unary, Binary, Block, Binding, Conditional, While, Return, Jump, TaskOp, Blocking, EmptyOption, Propagate, Match, ListLiteral, Index> node;
 };
 
-struct Parameter { Identifier name, type; };
+struct Parameter { Identifier name, type; bool variadic{}; std::optional<ExprId> defaultValue{}; };
 struct Function {
     std::size_t file;
     Identifier name;

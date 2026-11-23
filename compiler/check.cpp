@@ -17,6 +17,7 @@ module;
 module lyra.check;
 import lyra.generics;
 import lyra.foreign;
+import lyra.collections;
 
 namespace lyra {
 namespace {
@@ -34,6 +35,7 @@ std::string typeName(const CheckedModule& module, Type type) {
         case Type::Record: return module.aggregates[type.id].syntax.name.text;
         case Type::Variable: return module.variableNames[type.id];
         case Type::Task: return "Task<" + typeName(module, module.taskResults[type.id]) + ">";
+        case Type::List: return "List<" + typeName(module, module.listElements[type.id]) + ">";
         case Type::Option: return "Option<" + typeName(module, module.sumTypes[type.id].success) + ">";
         case Type::Result: return "Result<" + typeName(module, module.sumTypes[type.id].success) + "," + typeName(module, module.sumTypes[type.id].failure) + ">";
     }
@@ -41,6 +43,20 @@ std::string typeName(const CheckedModule& module, Type type) {
 }
 
 struct Callable { std::size_t target; std::optional<Function> generic; std::vector<Type> variables; };
+
+Function defaultFunction(const Function& original, std::size_t slot) {
+    auto syntax = original;
+    const auto& parameter = original.parameters[slot];
+    syntax.name.text = (original.owner ? original.owner->text + "." : "") + original.name.text + "$default$" + parameter.name.text;
+    syntax.name.span = parameter.name.span;
+    syntax.body = *parameter.defaultValue;
+    syntax.result = parameter.type;
+    syntax.owner.reset();
+    syntax.isAsync = false;
+    syntax.parameters.resize(slot);
+    for (auto& earlier : syntax.parameters) earlier.defaultValue.reset();
+    return syntax;
+}
 
 struct Symbols {
     CheckedModule& module;
@@ -50,13 +66,15 @@ struct Symbols {
     std::vector<Callable> callables;
     std::map<GenericInstanceKey, std::size_t> specializations;
 
-    Type task(Type result) const {
-        auto& types = module.taskResults;
+    Type unaryType(Type::Kind kind, std::vector<Type>& types, Type result) const {
         auto found = std::find(types.begin(), types.end(), result);
         auto index = static_cast<std::size_t>(found - types.begin());
         if (found == types.end()) types.push_back(result);
-        return {Type::Task, index};
+        return {kind, index};
     }
+
+    Type task(Type result) const { return unaryType(Type::Task, module.taskResults, result); }
+    Type list(Type element) const { return unaryType(Type::List, module.listElements, element); }
 
     Type sum(Type::Kind kind, Type success, Type failure = Type::Unit) const {
         auto& types = module.sumTypes;
@@ -69,6 +87,7 @@ struct Symbols {
 
     std::optional<Type> project(Type value, const std::string& name, std::size_t slot) const {
         if (name == "Task" && value.kind == Type::Task && slot == 0) return module.taskResults[value.id];
+        if (name == "List" && value.kind == Type::List && slot == 0) return module.listElements[value.id];
         if (name == "Option" && value.kind == Type::Option && slot == 0) return module.sumTypes[value.id].success;
         if (name == "Result" && value.kind == Type::Result && slot < 2) return slot ? module.sumTypes[value.id].failure : module.sumTypes[value.id].success;
         return std::nullopt;
@@ -77,6 +96,7 @@ struct Symbols {
     Type resolveForm(const TypeForm& form, const Source& source, Span span, const Function* signature, std::span<const Type> types) const {
         auto child = [&](std::size_t slot) { return resolveForm(form.arguments[slot], source, span, signature, types); };
         if (form.arguments.size() == 1 && form.name == "Task") return task(child(0));
+        if (form.arguments.size() == 1 && form.name == "List") return list(child(0));
         if (form.arguments.size() == 1 && form.name == "Option") return sum(Type::Option, child(0));
         if (form.arguments.size() == 2 && form.name == "Result") return sum(Type::Result, child(0), child(1));
         if (form.arguments.empty()) {
@@ -98,9 +118,21 @@ struct Symbols {
     CheckedFunction prepare(Function syntax, std::span<const Type> arguments = {}) const {
         auto result = resolve(syntax, syntax.result, arguments);
         std::vector<Local> locals;
-        for (const auto& param : syntax.parameters) locals.push_back({resolve(syntax, param.type, arguments), false});
+        for (const auto& param : syntax.parameters) {
+            auto type = resolve(syntax, param.type, arguments);
+            locals.push_back({param.variadic ? list(type) : type, false});
+        }
         std::vector<CheckedExpr> expressions(syntax.expressions.size());
         return {std::move(syntax), result, std::move(locals), std::move(expressions)};
+    }
+
+    void addConcrete(CheckedFunction function) {
+        auto& target = module.functions.emplace_back(std::move(function));
+        target.defaultFunctions.resize(target.syntax.parameters.size());
+        for (std::size_t slot = 0; slot < target.syntax.parameters.size(); ++slot) if (target.syntax.parameters[slot].defaultValue) {
+            target.defaultFunctions[slot] = module.functions.size();
+            module.functions.push_back(prepare(defaultFunction(target.syntax, slot)));
+        }
     }
 
     std::size_t instantiate(std::size_t declaration, const std::vector<Type>& arguments, const Source& source, Span site) {
@@ -109,7 +141,7 @@ struct Symbols {
         if (auto found = specializations.find(key); found != specializations.end()) return found->second;
         if (specializations.size() >= 4096) throw at(source, site, "LYG0004", "此编译单元的泛型函数实例超过 4096 个");
         auto index = module.functions.size();
-        module.functions.push_back(prepare(specializeGeneric(*callables[declaration].generic, key.arguments)));
+        addConcrete(prepare(specializeGeneric(*callables[declaration].generic, key.arguments)));
         specializations.emplace(std::move(key), index);
         return index;
     }
@@ -170,6 +202,29 @@ struct Checker {
     Type infer(ExprId, std::int64_t, auto, bool) { return Type::Int; }
     Type infer(ExprId, bool, auto, bool) { return Type::Bool; }
     Type infer(ExprId, const StringLiteral&, auto, bool) { return Type::String; }
+
+    Type infer(ExprId id, const ListLiteral& literal, std::optional<Type> expected, bool) {
+        if (expected && expected->kind == Type::Option) expected = module.sumTypes[expected->id].success;
+        std::optional<Type> element;
+        if (expected && expected->kind == Type::List) element = module.listElements[expected->id];
+        bool exits = false;
+        for (auto item : literal.elements) {
+            auto value = visit(item, element);
+            if (value == Type::Never) exits = true;
+            else if (!element) element = value;
+        }
+        if (exits) return Type::Never;
+        if (!element) throw at(source, fn.syntax.expressions[id].span, "LYT0014", "空列表需要明确的 List<T> 目标类型");
+        return symbols.list(*element);
+    }
+
+    Type infer(ExprId, const Index& index, auto, bool) {
+        auto list = visit(index.receiver);
+        auto offset = visit(index.offset, Type::Int);
+        if (list == Type::Never || offset == Type::Never) return Type::Never;
+        if (list.kind != Type::List) throw at(source, index.site, "LYT0014", "下标需要 List，实际是 " + typeName(module, list));
+        return module.listElements[list.id];
+    }
 
     Type infer(ExprId id, const EmptyOption&, std::optional<Type> expected, bool) {
         if (!expected || expected->kind != Type::Option) throw at(source, fn.syntax.expressions[id].span, "LYT0010", "None/null 需要明确的 Option 目标类型");
@@ -259,6 +314,7 @@ struct Checker {
         std::vector<bool> filled(count);
         bool named = false, exits = false;
         for (const auto& arg : call.arguments) {
+            if (arg.spread) throw at(source, *arg.spread, "LYT0002", "没有可接收展开元素的变长形参");
             auto slot = info.argumentSlots.size();
             if (arg.label) {
                 named = true;
@@ -268,6 +324,44 @@ struct Checker {
             filled[slot] = true;
             info.argumentSlots.push_back(slot);
             exits |= visit(arg.value, getType(slot)) == Type::Never;
+        }
+        return exits;
+    }
+
+    template<class GetType>
+    bool functionArguments(ExprId id, const Call& call, const Function& target, GetType getType) {
+        auto skip = static_cast<std::size_t>(call.receiver.has_value());
+        std::vector<ParameterShape> parameters;
+        for (auto slot = skip; slot < target.parameters.size(); ++slot) {
+            const auto& parameter = target.parameters[slot];
+            parameters.push_back({parameter.name.text, parameter.defaultValue.has_value(), parameter.variadic});
+        }
+        std::vector<ArgumentShape> arguments;
+        for (const auto& argument : call.arguments) {
+            std::optional<std::string_view> name;
+            auto span = argument.spread.value_or(fn.syntax.expressions[argument.value].span);
+            if (argument.label) { name = argument.label->text; span = argument.label->span; }
+            arguments.push_back({name, argument.spread.has_value(), span});
+        }
+        auto plan = bindArguments(parameters, arguments, source, call.name.span, call.name.text);
+        auto& info = fn.expressions[id];
+        for (auto slot : plan.defaults) info.omittedDefaults.push_back(slot + skip);
+        bool exits = false;
+        for (std::size_t index = 0; index < call.arguments.size(); ++index) {
+            auto selected = plan.explicitSlots[index];
+            info.argumentSlots.push_back(selected.index);
+            std::optional<Type> type = getType(selected.index + skip);
+            if (type && selected.mode == ArgumentMode::Spread) type = symbols.list(*type);
+            auto expr = call.arguments[index].value;
+            auto inferred = inspect(expr, type);
+            if (selected.mode == ArgumentMode::Item && type && inferred.kind == Type::List && module.listElements[inferred.id] == *type) {
+                auto error = mismatch(module, source, arguments[index].site, *type, inferred);
+                error.hint = "若要逐项传入列表，请在实参前写 ...。";
+                throw error;
+            }
+            auto value = fit(expr, inferred, type);
+            if (value == Type::Never) exits = true;
+            else if (selected.mode == ArgumentMode::Spread && value.kind != Type::List) throw at(source, arguments[index].site, "LYT0001", "展开需要 List，实际是 " + typeName(module, value));
         }
         return exits;
     }
@@ -287,6 +381,7 @@ struct Checker {
     Type infer(ExprId id, const Member& member, auto, bool) {
         auto owner = visit(member.receiver);
         if (owner == Type::Never) return owner;
+        if (owner.kind == Type::List && member.name.text == "size") return Type::Int;
         auto field = memberIndex(owner, member.name, symbols.fields);
         fn.expressions[id].target = field;
         const auto& record = module.aggregates[owner.id];
@@ -302,9 +397,8 @@ struct Checker {
             throw at(source, call.name.span, "LYG0001", call.name.text + " 需要 " + std::to_string(target.typeParameters.size()) + " 个类型实参");
         }
         auto skip = static_cast<std::size_t>(call.receiver.has_value());
-        bool exits = arguments(id, call, target.parameters.size() - skip,
-                [&](auto slot) -> const auto& { return target.parameters[slot + skip].name.text; }, [&](auto slot) -> std::optional<Type> {
-                    const auto& annotation = target.parameters[slot + skip].type;
+        bool exits = functionArguments(id, call, target, [&](auto slot) -> std::optional<Type> {
+                    const auto& annotation = target.parameters[slot].type;
                     if (genericPattern(target, typeForm(annotation.text))) return explicitTypes.empty() ? std::nullopt : std::optional(symbols.resolve(target, annotation, explicitTypes));
                     return symbols.resolve(symbols.sources[target.file], annotation);
                 });
@@ -312,14 +406,18 @@ struct Checker {
         std::vector<GenericArgument<Type>> actuals;
         for (std::size_t index = 0; index < call.arguments.size(); ++index) {
             auto expr = call.arguments[index].value;
-            actuals.push_back({info.argumentSlots[index] + skip, fn.expressions[expr].type, fn.syntax.expressions[expr].span});
+            auto type = fn.expressions[expr].type;
+            if (call.arguments[index].spread && type != Type::Never) type = module.listElements[type.id];
+            actuals.push_back({info.argumentSlots[index] + skip, type, fn.syntax.expressions[expr].span});
         }
         if (target.isAsync && expected) expected = expected->kind == Type::Task ? std::optional(module.taskResults[expected->id]) : std::nullopt;
         auto types = inferGenericArguments<Type>(target, call, fn.syntax.expressions[id].span, explicitTypes, actuals, expected, source, [&](Type type) { return typeName(module, type); },
                 [&](Type value, const std::string& name, std::size_t slot) { return symbols.project(value, name, slot); });
         for (std::size_t index = 0; index < actuals.size(); ++index) {
             const auto& argument = actuals[index];
-            fit(call.arguments[index].value, argument.type, symbols.resolve(target, target.parameters[argument.slot].type, types));
+            auto type = symbols.resolve(target, target.parameters[argument.slot].type, types);
+            auto expr = call.arguments[index].value;
+            fit(expr, fn.expressions[expr].type, call.arguments[index].spread ? symbols.list(type) : type);
         }
         if (variables.empty()) info.target = symbols.instantiate(declaration, types, source, call.name.span);
         auto result = symbols.resolve(target, target.result, types);
@@ -333,13 +431,18 @@ struct Checker {
         if (call.receiver) {
             auto owner = visit(*call.receiver);
             if (owner == Type::Never) return owner;
+            if (owner.kind == Type::List && call.name.text == "add") {
+                noTypeArgs();
+                info.callee = Callee::ListAdd;
+                return arguments(id, call, 1, [](auto) { return "value"; }, [&](auto) { return module.listElements[owner.id]; }) ? Type::Never : Type::Unit;
+            }
             declaration = memberIndex(owner, call.name, symbols.methods);
             const auto& item = symbols.callables[declaration];
             const auto& method = item.generic ? *item.generic : module.functions[item.target].syntax;
             visible(method.file, method.isPublic, call.name);
         } else if (auto tag = sumTag(call.name.text); tag && *tag != SumTag::None) {
             noTypeArgs();
-            if (call.arguments.size() != 1 || call.arguments[0].label) throw at(source, call.name.span, "LYT0002", call.name.text + " 需要一个位置实参");
+            if (call.arguments.size() != 1 || call.arguments[0].label || call.arguments[0].spread) throw at(source, call.name.span, "LYT0002", call.name.text + " 需要一个位置实参");
             auto kind = optionTag(*tag) ? Type::Option : Type::Result;
             if (expected && expected->kind == Type::Option && kind == Type::Result) expected = module.sumTypes[expected->id].success;
             if (expected && expected->kind != kind) expected.reset();
@@ -382,9 +485,10 @@ struct Checker {
         noTypeArgs();
         info.target = symbols.callables[declaration].target;
         const auto& target = module.functions[info.target];
-        auto skip = static_cast<std::size_t>(call.receiver.has_value());
-        bool exits = arguments(id, call, target.syntax.parameters.size() - skip,
-                [&](auto slot) -> const auto& { return target.syntax.parameters[slot + skip].name.text; }, [&](auto slot) { return target.locals[slot + skip].type; });
+        bool exits = functionArguments(id, call, target.syntax, [&](auto slot) {
+            auto type = target.locals[slot].type;
+            return target.syntax.parameters[slot].variadic ? module.listElements[type.id] : type;
+        });
         return exits ? Type{Type::Never} : target.syntax.isAsync ? symbols.task(target.result) : target.result;
     }
 
@@ -410,9 +514,12 @@ struct Checker {
 
     bool writable(ExprId id) const {
         const auto& expr = fn.syntax.expressions[id];
+        if (std::holds_alternative<Index>(expr.node)) return true;
         if (std::holds_alternative<Identifier>(expr.node)) return fn.locals[fn.expressions[id].target].writable;
         if (auto member = std::get_if<Member>(&expr.node)) {
-            const auto& owner = module.aggregates[fn.expressions[member->receiver].type.id].syntax;
+            auto type = fn.expressions[member->receiver].type;
+            if (type.kind != Type::Record) return false;
+            const auto& owner = module.aggregates[type.id].syntax;
             return owner.fields[fn.expressions[id].target].writable && (owner.reference || writable(member->receiver));
         }
         return false;
@@ -588,9 +695,13 @@ CheckedModule check(Module module, const std::vector<Source>& sources, bool requ
             checked.entry = checked.functions.size();
         }
         symbols.callables.push_back({checked.functions.size(), {}, {}});
-        checked.functions.push_back(std::move(concrete));
+        symbols.addConcrete(std::move(concrete));
     }
     for (const auto& callable : symbols.callables) if (callable.generic) {
+        for (std::size_t slot = 0; slot < callable.generic->parameters.size(); ++slot) if (callable.generic->parameters[slot].defaultValue) {
+            auto helper = symbols.prepare(defaultFunction(*callable.generic, slot), callable.variables);
+            Checker{helper, sources[helper.syntax.file], checked, symbols, {}, callable.variables}.run();
+        }
         auto body = symbols.prepare(*callable.generic, callable.variables);
         Checker{body, sources[body.syntax.file], checked, symbols, {}, callable.variables}.run();
     }

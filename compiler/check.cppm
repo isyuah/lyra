@@ -9,23 +9,24 @@ export import lyra.syntax;
 
 export namespace lyra {
 struct Type {
-    enum Kind { Unit, Int, Bool, String, Never, Record, Variable, Task, CPtr, Option, Result };
+    enum Kind { Unit, Int, Bool, String, Never, Record, Variable, Task, CPtr, Option, Result, List };
     Kind kind;
     std::size_t id{};
     constexpr Type(Kind kind = Unit, std::size_t id = 0) : kind(kind), id(id) {}
     bool operator==(const Type&) const = default;
 };
 struct Local { Type type; bool writable; std::optional<ExprId> worker{}; bool captured{}; };
-enum class Callee { Function, Constructor, Print, Collect, Sum };
-struct CheckedExpr { Type type; std::size_t target{}; std::vector<std::size_t> argumentSlots{}; Callee callee{}; std::optional<Type> liftedFrom{}; std::vector<std::size_t> captures{}; };
+enum class Callee { Function, Constructor, Print, Collect, Sum, ListAdd };
+struct CheckedExpr { Type type; std::size_t target{}; std::vector<std::size_t> argumentSlots{}; Callee callee{}; std::optional<Type> liftedFrom{}; std::vector<std::size_t> captures{}; std::vector<std::size_t> omittedDefaults{}; };
 struct CheckedFunction {
     Function syntax;
     Type result;
     std::vector<Local> locals;
     std::vector<CheckedExpr> expressions;
+    std::vector<std::optional<std::size_t>> defaultFunctions{};
 };
 struct CheckedAggregate { Aggregate syntax; std::vector<Type> fields; };
 struct SumTypes { Type success, failure; bool operator==(const SumTypes&) const = default; };
-struct CheckedModule { std::deque<CheckedFunction> functions; std::optional<std::size_t> entry; std::vector<CheckedAggregate> aggregates; std::vector<std::string> variableNames; std::vector<Type> taskResults; std::vector<SumTypes> sumTypes; };
+struct CheckedModule { std::deque<CheckedFunction> functions; std::optional<std::size_t> entry; std::vector<CheckedAggregate> aggregates; std::vector<std::string> variableNames; std::vector<Type> taskResults; std::vector<SumTypes> sumTypes; std::vector<Type> listElements; };
 CheckedModule check(Module module, const std::vector<Source>& sources, bool requireEntry = true);
 }

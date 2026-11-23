@@ -80,8 +80,9 @@ public:
         } else {
             kind = Kind::Symbol;
             constexpr std::string_view doubles[] = {"+=", "-=", "*=", "/=", "%=", "==", "!=", "<=", ">=", "&&", "||", "=>", "?.", "??"};
-            if (std::ranges::find(doubles, text.substr(start, 2)) != std::end(doubles)) ++offset;
-            else if (std::string_view("(){},.:;+-*/%=<>!#@?").find(current) == text.npos) {
+            if (text.substr(start, 3) == "...") offset += 2;
+            else if (std::ranges::find(doubles, text.substr(start, 2)) != std::end(doubles)) ++offset;
+            else if (std::string_view("()[]{},.:;+-*/%=<>!#@?").find(current) == text.npos) {
                 while (offset < text.size() && (static_cast<unsigned char>(text[offset]) & 0xc0) == 0x80) ++offset;
                 throw at(source, {start, offset}, "LYL0001", "此处不是受支持的 Lyra 记号");
             }
@@ -285,9 +286,18 @@ private:
             if (!is(")")) require(",");
         }
         while (!is(")")) {
+            if (!parameters.empty() && parameters.back().variadic) throw at(source, token.span, "LYP0001", "变长形参必须放在最后");
+            if (is("...")) throw at(source, token.span, "LYP0001", "变长形参写在类型之后，例如 values: Int...");
             auto parameter = identifier();
             require(":");
-            parameters.push_back({std::move(parameter), type()});
+            Parameter item{std::move(parameter), type()};
+            if (is("...")) { consume(); item.variadic = true; }
+            if (is("=")) {
+                if (item.variadic) throw at(source, token.span, "LYP0001", "变长形参不能设置默认值");
+                consume(); item.defaultValue = expression(true);
+            }
+            if (foreign && (item.variadic || item.defaultValue)) throw at(source, item.name.span, "LYF0001", "extern 形参不支持变长或默认值");
+            parameters.push_back(std::move(item));
             if (!is(",")) break;
             consume();
         }
@@ -369,6 +379,13 @@ private:
     ExprId primary(bool inParens, bool propagate = true, bool trailingBlock = true) {
         auto value = atom(inParens, trailingBlock);
         while (true) {
+            if (is("[") && (inParens || !token.newlineBefore)) {
+                auto site = consume().span;
+                auto offset = expression(true);
+                auto end = require("]").span.end;
+                value = add({nodes[value].span.begin, end}, Index{value, offset, site});
+                continue;
+            }
             if (propagate && is("?") && (inParens || !token.newlineBefore)) {
                 auto site = consume().span;
                 value = add({nodes[value].span.begin, site.end}, Propagate{value, site});
@@ -412,7 +429,9 @@ private:
         while (!is(")")) {
             std::optional<Identifier> label;
             if (text(next) == ":") { label = identifier(); consume(); }
-            node.arguments.push_back({std::move(label), expression(true)});
+            std::optional<Span> spread;
+            if (is("...")) spread = consume().span;
+            node.arguments.push_back({std::move(label), expression(true), spread});
             if (!is(",")) break;
             consume();
         }
@@ -422,6 +441,17 @@ private:
 
     ExprId atom(bool inParens, bool trailingBlock) {
         auto start = token.span.begin;
+        if (is("[")) {
+            consume();
+            ListLiteral literal;
+            while (!is("]")) {
+                literal.elements.push_back(expression(true));
+                if (!is(",")) break;
+                consume();
+            }
+            auto end = require("]").span.end;
+            return add({start, end}, std::move(literal));
+        }
         if (token.kind == Kind::String) {
             auto item = consume();
             auto literal = text(item);
