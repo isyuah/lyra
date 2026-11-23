@@ -33,11 +33,12 @@ struct Binding { Identifier name; bool writable; std::optional<Identifier> annot
 struct Conditional { ExprId condition, yes; std::optional<ExprId> no; };
 struct While { ExprId condition, body; };
 struct Return { std::optional<ExprId> value; };
+struct TaskOp { bool spawn; Span site; ExprId operand; };
 enum class Jump { Break, Continue };
 
 struct Expr {
     Span span;
-    std::variant<std::int64_t, bool, StringLiteral, Identifier, Call, Member, Unary, Binary, Block, Binding, Conditional, While, Return, Jump> node;
+    std::variant<std::int64_t, bool, StringLiteral, Identifier, Call, Member, Unary, Binary, Block, Binding, Conditional, While, Return, Jump, TaskOp> node;
 };
 
 struct Parameter { Identifier name, type; };
@@ -51,12 +52,16 @@ struct Function {
     std::optional<Identifier> owner{};
     bool isPublic{};
     std::vector<Identifier> typeParameters{};
+    bool isAsync{};
+    std::optional<Identifier> foreignSymbol{};
 };
 
 struct Field { Identifier name, type; bool writable; bool isPublic{}; };
 struct Aggregate { std::size_t file; Identifier name; bool reference; std::vector<Field> fields; bool isPublic{}; };
 struct Import { std::size_t file; bool isPublic; std::vector<Identifier> path; Identifier alias; };
-struct Module { std::vector<Function> functions; std::vector<Aggregate> aggregates; std::vector<Import> imports; };
+struct Expansion { std::size_t file; Identifier name; std::optional<Identifier> argument; bool decorator; bool record; std::size_t target; };
+struct Module { std::vector<Function> functions; std::vector<Aggregate> aggregates; std::vector<Import> imports; std::vector<Expansion> expansions; };
 Module parse(const std::vector<Source>& sources);
+void parseFile(Module& module, const Source& source, std::size_t file);
 
 }

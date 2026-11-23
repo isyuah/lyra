@@ -56,7 +56,7 @@ public:
         Kind kind;
         if (isLetter(current) || isDigit(current)) {
             while (offset < text.size() && (isLetter(text[offset]) || isDigit(text[offset]))) ++offset;
-            constexpr std::string_view keywords[] = {"fn", "val", "var", "if", "else", "while", "return", "break", "continue", "true", "false", "struct", "class", "pub", "import", "as"};
+            constexpr std::string_view keywords[] = {"fn", "val", "var", "if", "else", "while", "return", "break", "continue", "true", "false", "struct", "class", "pub", "import", "as", "async", "await", "spawn", "extern"};
             auto word = text.substr(start, offset - start);
             kind = isDigit(current) ? Kind::Number : std::ranges::find(keywords, word) == std::end(keywords) ? Kind::Name : Kind::Keyword;
         } else if (current == '"') {
@@ -81,7 +81,7 @@ public:
             kind = Kind::Symbol;
             constexpr std::string_view doubles[] = {"+=", "-=", "*=", "/=", "%=", "==", "!=", "<=", ">=", "&&", "||"};
             if (std::ranges::find(doubles, text.substr(start, 2)) != std::end(doubles)) ++offset;
-            else if (std::string_view("(){},.:;+-*/%=<>!").find(current) == text.npos) {
+            else if (std::string_view("(){},.:;+-*/%=<>!#@").find(current) == text.npos) {
                 while (offset < text.size() && (static_cast<unsigned char>(text[offset]) & 0xc0) == 0x80) ++offset;
                 throw at(source, {start, offset}, "LYL0001", "此处不是受支持的 Lyra 记号");
             }
@@ -132,7 +132,21 @@ public:
 
     void appendTo(Module& module) {
         while (token.kind != Kind::End) {
+            auto firstPrefix = module.expansions.size();
+            while (is("#") || is("@")) {
+                bool decorator = text(consume()) == "@";
+                auto name = identifier();
+                std::optional<Identifier> argument;
+                if (is("(")) { consume(); argument = identifier(); require(")"); }
+                module.expansions.push_back({file, std::move(name), std::move(argument), decorator, false, 0});
+            }
             bool pub = visibility();
+            for (auto index = firstPrefix; index < module.expansions.size(); ++index) {
+                auto& prefix = module.expansions[index];
+                if (is("import")) throw at(source, prefix.name.span, "LYM0001", "不能修饰 import");
+                prefix.record = is("struct") || is("class");
+                prefix.target = prefix.record ? module.aggregates.size() : module.functions.size();
+            }
             if (is("import")) {
                 consume();
                 std::vector<Identifier> path{identifier()};
@@ -180,10 +194,21 @@ private:
         return nodes.size() - 1;
     }
 
-    std::vector<Identifier> typeList() {
+    Identifier type() {
+        auto name = identifier();
+        if (name.text == "Task" && is("<")) {
+            consume();
+            auto result = type();
+            name.text += "<" + result.text + ">";
+            name.span.end = require(">").span.end;
+        }
+        return name;
+    }
+
+    std::vector<Identifier> typeList(bool declarations = false) {
         require("<");
-        std::vector<Identifier> result{identifier()};
-        while (is(",")) { consume(); result.push_back(identifier()); }
+        std::vector<Identifier> result{declarations ? identifier() : type()};
+        while (is(",")) { consume(); result.push_back(declarations ? identifier() : type()); }
         require(">");
         return result;
     }
@@ -192,11 +217,12 @@ private:
         if (!is("<") || token.span.begin != name.span.end) return false;
         auto look = lexer;
         auto current = next;
-        for (;;) {
-            if (current.kind != Kind::Name && current.kind != Kind::Escaped) return false;
-            current = look.next();
-            if (text(current) == ">") { current = look.next(); return text(current) == "(" && !current.newlineBefore; }
-            if (text(current) != ",") return false;
+        unsigned depth = 1;
+        while (true) {
+            auto word = text(current);
+            if (word == ">" && !--depth) { current = look.next(); return text(current) == "(" && !current.newlineBefore; }
+            if (word == "<") ++depth;
+            else if (word != ">" && word != "," && current.kind != Kind::Name && current.kind != Kind::Escaped) return false;
             current = look.next();
         }
     }
@@ -208,7 +234,7 @@ private:
         bool writable = text(consume()) == "var";
         auto name = identifier();
         require(":");
-        return {std::move(name), identifier(), writable, pub};
+        return {std::move(name), type(), writable, pub};
     }
 
     void aggregate(Module& module, bool pub) {
@@ -228,7 +254,7 @@ private:
             require("{");
             while (!is("}")) {
                 bool publicMember = visibility();
-                if (is("fn")) module.functions.push_back(function(decl.name, publicMember));
+                if (is("fn") || is("async") || is("extern")) module.functions.push_back(function(decl.name, publicMember));
                 else decl.fields.push_back(field(publicMember));
                 if (is(";")) consume();
                 else if (!is("}") && !token.newlineBefore) throw at(source, token.span, "LYP0001", "成员之间需要换行或分号");
@@ -239,9 +265,16 @@ private:
     }
 
     Function function(std::optional<Identifier> owner, bool pub) {
+        bool isAsync = false, foreign = false;
+        if (is("async") || is("extern")) {
+            isAsync = is("async"); foreign = !isAsync;
+            consume();
+            if (is("async") || is("extern")) throw at(source, token.span, "LYF0001", "声明只能使用一个 async 或 extern 修饰符");
+        }
         require("fn");
         auto name = identifier();
-        auto typeParameters = is("<") ? typeList() : std::vector<Identifier>{};
+        auto typeParameters = is("<") ? typeList(true) : std::vector<Identifier>{};
+        if (foreign && (owner || !typeParameters.empty())) throw at(source, name.span, "LYF0001", "extern 不支持方法或泛型");
         require("(");
         std::vector<Parameter> parameters;
         if (owner) {
@@ -252,15 +285,20 @@ private:
         while (!is(")")) {
             auto parameter = identifier();
             require(":");
-            parameters.push_back({std::move(parameter), identifier()});
+            parameters.push_back({std::move(parameter), type()});
             if (!is(",")) break;
             consume();
         }
         require(")");
         require(":");
-        auto result = identifier();
+        auto result = type();
+        if (foreign) {
+            require(";");
+            auto symbol = name;
+            return {file, std::move(name), std::move(parameters), std::move(result), {}, 0, {}, pub, {}, false, std::move(symbol)};
+        }
         auto body = block();
-        return {file, std::move(name), std::move(parameters), std::move(result), std::exchange(nodes, {}), body, std::move(owner), pub, std::move(typeParameters)};
+        return {file, std::move(name), std::move(parameters), std::move(result), std::exchange(nodes, {}), body, std::move(owner), pub, std::move(typeParameters), isAsync};
     }
 
     ExprId block() {
@@ -287,7 +325,7 @@ private:
             bool writable = text(consume()) == "var";
             auto name = identifier();
             std::optional<Identifier> annotation;
-            if (is(":")) { consume(); annotation = identifier(); }
+            if (is(":")) { consume(); annotation = type(); }
             require("=");
             auto value = expression();
             return add({start, nodes[value].span.end}, Binding{std::move(name), writable, std::move(annotation), value});
@@ -375,6 +413,11 @@ private:
             auto digits = consume().span;
             return add({start, digits.end}, integer(source, digits, negative));
         }
+        if (is("await") || is("spawn")) {
+            auto op = consume();
+            auto operand = primary(inParens);
+            return add({start, nodes[operand].span.end}, TaskOp{text(op) == "spawn", op.span, operand});
+        }
         if (is("-") || is("!")) {
             auto item = consume();
             auto operand = primary(inParens);
@@ -415,6 +458,10 @@ Module parse(const std::vector<Source>& sources) {
     Module functions;
     for (std::size_t index = 0; index < sources.size(); ++index) Parser(sources[index], index).appendTo(functions);
     return functions;
+}
+
+void parseFile(Module& module, const Source& source, std::size_t file) {
+    Parser(source, file).appendTo(module);
 }
 
 }

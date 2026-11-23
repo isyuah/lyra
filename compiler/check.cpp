@@ -14,6 +14,7 @@ module;
 
 module lyra.check;
 import lyra.generics;
+import lyra.foreign;
 
 namespace lyra {
 namespace {
@@ -27,8 +28,10 @@ std::string typeName(const CheckedModule& module, Type type) {
         case Type::Unit: return "Unit";
         case Type::Never: return "Never";
         case Type::String: return "String";
+        case Type::CPtr: return "CPtr";
         case Type::Record: return module.aggregates[type.id].syntax.name.text;
         case Type::Variable: return module.variableNames[type.id];
+        case Type::Task: return "Task<" + typeName(module, module.taskResults[type.id]) + ">";
     }
     throw std::logic_error("invalid Lyra type");
 }
@@ -43,13 +46,23 @@ struct Symbols {
     std::vector<Callable> callables;
     std::map<GenericInstanceKey, std::size_t> specializations;
 
+    Type task(Type result) const {
+        auto& types = module.taskResults;
+        auto found = std::find(types.begin(), types.end(), result);
+        auto index = static_cast<std::size_t>(found - types.begin());
+        if (found == types.end()) types.push_back(result);
+        return {Type::Task, index};
+    }
+
     Type resolve(const Source& source, const Identifier& name) const {
-        for (Type type : {Type::Int, Type::Bool, Type::String, Type::Unit}) if (name.text == typeName(module, type)) return type;
+        if (name.text.starts_with("Task<") && name.text.ends_with('>')) return task(resolve(source, {name.text.substr(5, name.text.size() - 6), name.span}));
+        for (Type type : {Type::Int, Type::Bool, Type::String, Type::Unit, Type::CPtr}) if (name.text == typeName(module, type)) return type;
         if (auto found = records.find(name.text); found != records.end()) return {Type::Record, found->second};
         throw at(source, name.span, "LYT0003", "找不到类型：" + name.text);
     }
 
     Type resolve(const Function& signature, const Identifier& name, std::span<const Type> types) const {
+        if (name.text.starts_with("Task<") && name.text.ends_with('>')) return task(resolve(signature, {name.text.substr(5, name.text.size() - 6), name.span}, types));
         if (auto parameter = genericParameter(signature, name.text)) return types[*parameter];
         return resolve(sources[signature.file], name);
     }
@@ -97,6 +110,7 @@ struct Checker {
     void run() {
         scopes.emplace_back();
         for (std::size_t index = 0; index < fn.syntax.parameters.size(); ++index) declare(fn.syntax.parameters[index].name, index);
+        if (fn.syntax.foreignSymbol) return;
         visit(fn.syntax.body, fn.result);
     }
 
@@ -186,7 +200,7 @@ struct Checker {
         bool exits = arguments(id, call, target.parameters.size() - skip,
                 [&](auto slot) -> const auto& { return target.parameters[slot + skip].name.text; }, [&](auto slot) -> std::optional<Type> {
                     const auto& annotation = target.parameters[slot + skip].type;
-                    if (auto parameter = genericParameter(target, annotation.text)) return explicitTypes.empty() ? std::nullopt : std::optional(explicitTypes[*parameter]);
+                    if (genericPattern(target, annotation.text)) return explicitTypes.empty() ? std::nullopt : std::optional(symbols.resolve(target, annotation, explicitTypes));
                     return symbols.resolve(symbols.sources[target.file], annotation);
                 });
         auto& info = fn.expressions[id];
@@ -195,9 +209,12 @@ struct Checker {
             auto expr = call.arguments[index].value;
             actuals.push_back({info.argumentSlots[index] + skip, fn.expressions[expr].type, fn.syntax.expressions[expr].span});
         }
-        auto types = inferGenericArguments<Type>(target, call, fn.syntax.expressions[id].span, explicitTypes, actuals, expected, source, [&](Type type) { return typeName(module, type); });
+        if (target.isAsync && expected) expected = expected->kind == Type::Task ? std::optional(module.taskResults[expected->id]) : std::nullopt;
+        auto types = inferGenericArguments<Type>(target, call, fn.syntax.expressions[id].span, explicitTypes, actuals, expected, source, [&](Type type) { return typeName(module, type); },
+                [&](Type value) -> std::optional<Type> { return value.kind == Type::Task ? std::optional(module.taskResults[value.id]) : std::nullopt; });
         if (variables.empty()) info.target = symbols.instantiate(declaration, types, source, call.name.span);
-        return exits ? Type{Type::Never} : symbols.resolve(target, target.result, types);
+        auto result = symbols.resolve(target, target.result, types);
+        return exits ? Type{Type::Never} : target.isAsync ? symbols.task(result) : result;
     }
 
     Type infer(ExprId id, const Call& call, std::optional<Type> expected, bool) {
@@ -244,7 +261,15 @@ struct Checker {
         auto skip = static_cast<std::size_t>(call.receiver.has_value());
         bool exits = arguments(id, call, target.syntax.parameters.size() - skip,
                 [&](auto slot) -> const auto& { return target.syntax.parameters[slot + skip].name.text; }, [&](auto slot) { return target.locals[slot + skip].type; });
-        return exits ? Type{Type::Never} : target.result;
+        return exits ? Type{Type::Never} : target.syntax.isAsync ? symbols.task(target.result) : target.result;
+    }
+
+    Type infer(ExprId, const TaskOp& op, std::optional<Type> expected, bool) {
+        if (!fn.syntax.isAsync) throw at(source, op.site, "LYT0008", "await 和 spawn 只能在 async 函数中使用");
+        auto operand = visit(op.operand, op.spawn || !expected ? expected : std::optional(symbols.task(*expected)));
+        if (operand.kind == Type::Never) return operand;
+        if (operand.kind != Type::Task) throw at(source, fn.syntax.expressions[op.operand].span, "LYT0008", "此处需要 Task，实际是 " + typeName(module, operand));
+        return op.spawn ? operand : module.taskResults[operand.id];
     }
 
     bool writable(ExprId id) const {
@@ -342,11 +367,15 @@ struct Checker {
 }
 
 CheckedModule check(Module module, const std::vector<Source>& sources, bool requireEntry) {
+    if (!module.expansions.empty()) {
+        auto& use = module.expansions.front();
+        throw at(sources[use.file], use.name.span, "LYM0001", "声明前缀未展开：" + use.name.text);
+    }
     CheckedModule checked{};
     Symbols symbols{checked, sources, {}, {}, {}, {}, {}, {}};
     for (auto& decl : module.aggregates) {
         auto id = checked.aggregates.size();
-        for (Type builtin : {Type::Int, Type::Bool, Type::String, Type::Unit, Type::Never}) {
+        for (Type builtin : {Type::Int, Type::Bool, Type::String, Type::Unit, Type::Never, Type::CPtr}) {
             if (decl.name.text == typeName(checked, builtin)) throw at(sources[decl.file], decl.name.span, "LYN0002", "类型名与内置类型冲突：" + decl.name.text);
         }
         if (decl.name.text == "print" || decl.name.text == "gcCollect" || !symbols.records.emplace(decl.name.text, id).second) throw at(sources[decl.file], decl.name.span, "LYN0002", "类型名称已声明：" + decl.name.text);
@@ -414,6 +443,7 @@ CheckedModule check(Module module, const std::vector<Source>& sources, bool requ
         auto& fn = checked.functions[index];
         Checker{fn, sources[fn.syntax.file], checked, symbols, {}}.run();
     }
+    validateForeignDeclarations(checked, sources);
     if (requireEntry && !checked.entry) throw Diagnostic{"LYN0001", "可执行包缺少入口 fn main(): Unit"};
     return checked;
 }

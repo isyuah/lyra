@@ -9,6 +9,7 @@ module;
 #include <vector>
 
 export module lyra.modules;
+import lyra.generics;
 import lyra.packages;
 import lyra.syntax;
 
@@ -49,13 +50,17 @@ struct Linker {
         const auto& first = use.path.front();
         if (use.path.size() < 2) throw at(source, first.span, "LYN0003", "import 需要包、可选模块路径和声明名");
         auto package = from.id;
-        if (first.text != "self") {
+        std::size_t firstDir = 1;
+        if (first.text == "std" && use.path.size() >= 3) {
+            package = "$std/" + use.path[1].text;
+            firstDir = 2;
+        } else if (first.text != "self") {
             auto found = from.dependencies.find(first.text);
             if (found == from.dependencies.end()) throw at(source, first.span, "LYN0003", "清单没有此依赖简称：" + first.text);
             package = found->second;
         }
         auto target = prefixes.at(package);
-        for (std::size_t index = 1; index + 1 < use.path.size(); ++index) target += '/' + use.path[index].text;
+        for (auto index = firstDir; index + 1 < use.path.size(); ++index) target += '/' + use.path[index].text;
         auto& name = use.path.back();
         auto found = spaces.find(target);
         if (found == spaces.end()) throw at(source, name.span, "LYN0003", "导入的源码模块不存在");
@@ -86,7 +91,9 @@ struct Linker {
         }
         for (auto& record : syntax.aggregates) {
             const auto& scope = spaces.at(sources[record.file].moduleId).definitions;
-            for (auto& field : record.fields) if (auto found = scope.find(field.type.text); found != scope.end()) field.type.text = found->second.name;
+            for (auto& field : record.fields) field.type.text = mapTypeNames(typeForm(field.type.text), [&](const std::string& name) {
+                auto found = scope.find(name); return found == scope.end() ? name : found->second.name;
+            });
         }
         for (auto& fn : syntax.functions) {
             const auto& scope = spaces.at(sources[fn.file].moduleId).definitions;
@@ -94,7 +101,10 @@ struct Linker {
                 if (auto found = scope.find(name.text); found != scope.end()) name.text = found->second.name;
             };
             auto renameType = [&](Identifier& name) {
-                if (std::none_of(fn.typeParameters.begin(), fn.typeParameters.end(), [&](const auto& parameter) { return parameter.text == name.text; })) rename(name);
+                name.text = mapTypeNames(typeForm(name.text), [&](const std::string& part) {
+                    if (genericParameter(fn, part)) return part;
+                    auto found = scope.find(part); return found == scope.end() ? part : found->second.name;
+                });
             };
             if (fn.owner) rename(*fn.owner);
             renameType(fn.result);
@@ -134,8 +144,10 @@ Compilation loadProgram(const PackageGraph& graph, const std::string& entry, con
         auto package = packages.at(id);
         auto directory = package->root / "src";
         std::vector<fs::path> paths;
-        for (const auto& item : fs::recursive_directory_iterator(directory)) {
-            if (item.is_regular_file() && item.path().extension() == ".ly") paths.push_back(item.path());
+        for (auto item = fs::recursive_directory_iterator(directory); item != fs::recursive_directory_iterator{}; ++item) {
+            if (item->is_directory() && item->path().filename().string().starts_with('.')) { item.disable_recursion_pending(); continue; }
+            if (item->is_symlink()) throw Diagnostic{"LYI0001", "源码不允许符号链接：" + item->path().string()};
+            if (item->is_regular_file() && item->path().extension() == ".ly") paths.push_back(item->path());
         }
         std::sort(paths.begin(), paths.end());
         for (const auto& path : paths) {
@@ -153,6 +165,26 @@ Compilation loadProgram(const PackageGraph& graph, const std::string& entry, con
         program.sources.push_back(loadSource(*testFile, root));
     }
     program.syntax = parse(program.sources);
+    std::map<std::string, ResolvedPackage> bundled;
+    auto standard = fs::canonical("/proc/self/exe").parent_path().parent_path() / "share" / "lyra" / "std";
+    for (std::size_t index = 0; index < program.syntax.imports.size(); ++index) {
+        const auto& use = program.syntax.imports[index];
+        if (use.path.size() < 3 || use.path[0].text != "std") continue;
+        auto name = use.path[1].text;
+        auto key = "$std/" + name;
+        if (bundled.contains(key)) continue;
+        auto packageRoot = standard / name;
+        if (!fs::is_directory(packageRoot / "src")) throw at(program.sources[use.file], use.path[1].span, "LYN0003", "找不到随工具链安装的标准包：" + name);
+        auto& package = bundled.emplace(key, ResolvedPackage{key, name, "builtin", packageRoot, {}, true}).first->second;
+        prefixes.emplace(key, key);
+        spaces.emplace(key, Space{&package});
+        auto loaded = loadSources(packageRoot);
+        for (auto& source : loaded) {
+            source.moduleId = key;
+            program.sources.push_back(std::move(source));
+            parseFile(program.syntax, program.sources.back(), program.sources.size() - 1);
+        }
+    }
     Linker{program.sources, spaces, prefixes, root}.rewrite(program.syntax);
     return program;
 }

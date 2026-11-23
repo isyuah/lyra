@@ -30,7 +30,12 @@ Diagnostic at(const Source& source, Span span, std::string code, std::string mes
     auto lineStart = source.lineStarts[start.line - 1];
     auto lineEnd = source.text.find_first_of("\r\n", lineStart);
     Site site{source.path.string(), start, source.position(span.end), source.text.substr(lineStart, lineEnd - lineStart), lineStart};
-    return {std::move(code), std::move(message), std::move(site)};
+    Diagnostic error{std::move(code), std::move(message), std::move(site)};
+    if (source.origin) {
+        const auto& [path, position] = *source.origin;
+        error.message += "（展开于 " + path.string() + ":" + std::to_string(position.line) + ":" + std::to_string(position.column) + "）";
+    }
+    return error;
 }
 
 static llvm::json::Object jsonPosition(Position position) {
@@ -84,10 +89,15 @@ std::vector<Source> loadSources(const fs::path& package) {
 Source loadSource(const fs::path& path, std::string moduleId) {
     std::ifstream input(path, std::ios::binary);
     if (!input) throw Diagnostic{"LYI0001", "无法打开源码：" + path.string()};
-    Source source{path, {}, {0}, std::move(moduleId)};
+    std::string text;
     char buffer[8192];
-    while (input.read(buffer, sizeof buffer) || input.gcount() > 0) source.text.append(buffer, input.gcount());
+    while (input.read(buffer, sizeof buffer) || input.gcount() > 0) text.append(buffer, input.gcount());
     if (!input.eof() || input.bad()) throw Diagnostic{"LYI0001", "读取源码失败：" + path.string()};
+    return sourceText(path, std::move(text), std::move(moduleId));
+}
+
+Source sourceText(const fs::path& path, std::string text, std::string moduleId) {
+    Source source{path, std::move(text), {0}, std::move(moduleId)};
     for (std::size_t index = 0; index < source.text.size(); ++index) {
         if (source.text[index] == '\n' || (source.text[index] == '\r' && (index + 1 == source.text.size() || source.text[index + 1] != '\n'))) source.lineStarts.push_back(index + 1);
     }

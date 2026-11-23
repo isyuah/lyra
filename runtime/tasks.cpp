@@ -13,6 +13,7 @@ struct LyraDomain {
     LyraTask *last;
     size_t live;
     size_t steps;
+    bool failed;
 };
 
 struct LyraTask {
@@ -109,6 +110,7 @@ void finish(LyraTask *task, LyraTaskState state, void *outcome) {
     task->state = state;
     task->frame = nullptr;
     task->step = nullptr;
+    if (state == LYRA_TASK_FAILED) task->domain->failed = true;
     while (auto *waiter = task->firstWaiter) {
         detachWaiter(waiter);
         enqueue(waiter);
@@ -163,6 +165,22 @@ void lyraTaskStart(LyraDomain *domain, LyraTask *task) {
     enqueue(task);
 }
 
+LyraTask *lyraTaskSpawn(LyraTask *parent, LyraTask *target) {
+    lyraTaskStart(parent->domain, target);
+    return target;
+}
+
+int lyraTaskRunRoot(LyraTask *task) {
+    auto *domain = lyraDomainCreate();
+    lyraTaskStart(domain, task);
+    lyraDomainRun(domain);
+    require(domain->live == 0, "no runnable work can complete the root task group");
+    int status = task->state == LYRA_TASK_COMPLETED && !domain->failed ? EXIT_SUCCESS : EXIT_FAILURE;
+    if (status != EXIT_SUCCESS) fputs("Lyra runtime: async entry or child failed or was cancelled\n", stderr);
+    lyraDomainDestroy(domain);
+    return status;
+}
+
 int lyraTaskAwait(LyraTask *waiter, LyraTask *target) {
     require(waiter->state == LYRA_TASK_RUNNING && waiter != target, "invalid task wait");
     if (waiter->cancelRequested) {
@@ -176,6 +194,20 @@ int lyraTaskAwait(LyraTask *waiter, LyraTask *target) {
     waiter->waitingOn = target;
     waiter->state = LYRA_TASK_SUSPENDED;
     return 0;
+}
+
+int lyraTaskAwaitValue(LyraTask *waiter, LyraTask *target) {
+    if (!lyraTaskAwait(waiter, target)) return 0;
+    if (target->state == LYRA_TASK_FAILED) {
+        lyraTaskFail(waiter, target->outcome);
+        return 0;
+    }
+    if (target->state == LYRA_TASK_CANCELLED) {
+        lyraTaskRequestCancel(waiter);
+        lyraTaskFinishCancelled(waiter);
+        return 0;
+    }
+    return 1;
 }
 
 void lyraTaskSuspend(LyraTask *task) {

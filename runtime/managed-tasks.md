@@ -1,6 +1,6 @@
 # 原生 GC 与 Task 接口
 
-本页面向编译器后端和原生库作者，描述 [managed.h](managed.h)、[tasks.h](tasks.h) 的实验性 C ABI。实现为 C++23；可直接用 C 链接器链接。这里的 C++ 测试运行手写的任务状态机，不把它们算作 Lyra 源码端对 `class`、闭包、`async` 或 `blocking` 的验收。
+本页面向编译器后端和原生库作者，描述 [managed.h](managed.h)、[tasks.h](tasks.h) 的实验性 C ABI，以及 LLVM 后端用它生成的 Task 状态机。C++ 测试直接驱动 Runtime；下文列出的源码测试另从 `.ly` 文件构建并运行可执行程序。
 
 ## M2：谁保活对象？
 
@@ -19,13 +19,23 @@
 | 完成 | `lyraTaskComplete(self, value)`、`lyraTaskFail(self, error)` 保存终态/载荷，唤醒等待者，释放任务帧与运行时强根。`Unit` 可用空指针；其他载荷应存在可追踪的受管理存储中，不能传短命的栈地址。句柄存活时，多次等到同一终态；需要按值复制的结果由调用端读取。 |
 | 取消 | `lyraTaskRequestCancel(task)` 设置请求，唤醒可取消的挂起点。回调在恢复入口用 `lyraTaskCancelRequested` 检查；先执行作用域清理，再 `lyraTaskFinishCancelled`。取消一个等待者会撤销它自己的订阅，不替它取消别人已启动的任务。 |
 
+### Lyra 源码如何接入
+
+`async fn work(value: Int): Int` 的函数体返回 `Int`，调用表达式 `work(4)` 则返回 `Task<Int>`。调用时求值实参并保存在受 GC 扫描的堆帧中，不运行函数体。`await` 和 `spawn` 只能写在 `async fn` 中；`spawn` 在当前域启动并返回原句柄，`await` 观察此次任务的结果。不写 `await` 的 `spawn` 仍由异步入口的根域等到结束；只创建未启动的 Task 则不运行。
+
+LLVM 后端给每个异步函数生成一个用于创建冷 Task 的普通函数，以及一个根据恢复点分派的 `step` 回调。局部变量、赋值目标、已求值的实参和跨基本块使用的临时值保存在堆帧上。等待就绪时直接读取结果，否则保存恢复点并返回调度循环；恢复后重新观察终态，不需要嵌套执行事件循环。一次完成值装入受管理的结果盒：重复 `await` 得到独立的 Struct 值或同一 Class 引用。
+
+`async fn main(): Unit` 由 `lyraTaskRunRoot` 建立串行域并启动。现有[源码用例](../tests/async_cli.py)在 Debug 和 `--release` 下验证冷实参求值、未启动 Task、丢弃句柄后的收尾、跨挂起 GC 与赋值顺序、重复读取结果及 5,000 层递归等待。[泛型 Task 用例](../tests/generics_tasks_cli.py)验证跨模块的 `Task<Task<T>>` 与类型诊断。`Result<Unit, E>` 入口、嵌套任务组失败时取消兄弟，以及完整异步异常链仍是后续验收项。
+
+### 原生阻塞工作
+
 `lyraTaskBlock(self, work, nativeData)` 将同步 C 回调交给 libuv 进程级有界线程池，当前任务挂起，同域仍能执行其他步骤。存有 GC 引用的工作载荷须用 `lyraGcAlloc` 分配；运行时在操作期间保活载荷并注册 Worker，允许原生封装分配对象、复制结果（如 [SQLite 文本](sqlite.md)）。普通 `malloc` 载荷内部仍不扫描。工作线程不调用 Task API；不要同时无同步地修改同一个 C/C++ 字段。被接纳的工作运行中收到取消时，仍等 C 返回才在所属域恢复清理；提交前已经取消则不发起工作。可以用 `UV_THREADPOOL_SIZE=1` 重跑测试，验证不需要额外 Worker 解围。
 
-**当前边界：**多个串行域由同一主线程驱动，可验证跨域等待与恢复归属；显式 CPU 并行域、跨线程 Task API、结构化任务组与上下文/deadline、编译器生成的异常/异步栈与取消清理还需各自的端到端验收。
+**当前边界：**多个串行域由同一主线程驱动，原生测试可验证跨域等待与恢复归属。源码端显式 CPU 并行域、`blocking` 块、上下文/deadline 和取消清理还需各自的端到端验收。
 
 ## 独立验证（Linux）
 
-开发依赖为 Ubuntu `libgc-dev`、`libuv1-dev`、Clang 18。只需 GC 的目标不引入 libuv。三个运行时源分别生成归档成员；纯整数程序不引用 `managed`/`tasks` 符号，即使链接命令列出带 `--as-needed` 的两库，ELF 也无需它们。用 GC/Task 的程序可显式动态链接两库，或在目标构建环境中静态打入相应归档再检查 `DT_NEEDED`。
+以下两个原生测试需要 Ubuntu `libgc-dev`、`libuv1-dev`、Clang 18。运行时各源码分别生成归档成员；纯整数程序不引用 `managed`/`tasks` 符号，即使链接命令列出带 `--as-needed` 的两库，ELF 也无需它们。用 GC/Task 的程序可显式动态链接两库，或在目标构建环境中静态打入相应归档再检查 `DT_NEEDED`。
 
 ```sh
 out=$(mktemp -d)

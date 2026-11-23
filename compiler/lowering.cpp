@@ -10,6 +10,8 @@ module;
 
 module lyra.lowering;
 import lyra.check;
+import lyra.async;
+import lyra.foreign;
 
 namespace lyra {
 namespace {
@@ -39,7 +41,7 @@ struct Layouts {
         case Type::Int: return builder.getInt64Ty();
         case Type::Bool: return builder.getInt1Ty();
         case Type::Unit: case Type::Never: return builder.getInt8Ty();
-        case Type::String: return builder.getPtrTy();
+        case Type::String: case Type::Task: case Type::CPtr: return builder.getPtrTy();
         case Type::Variable: llvm_unreachable("abstract type reached LLVM lowering");
         case Type::Record: return reference(type) ? static_cast<llvm::Type*>(builder.getPtrTy()) : objects[type.id];
         }
@@ -86,6 +88,12 @@ struct Emitter {
     }
     Value emitNode(ExprId id, const Identifier&) {
         return builder.CreateLoad(layouts.native(builder, fn.expressions[id].type), locals[fn.expressions[id].target]);
+    }
+
+    Value emitNode(ExprId id, const TaskOp& op) {
+        auto task = emit(op.operand);
+        if (!live()) return unit();
+        return op.spawn ? asyncSpawn(builder, task) : asyncAwait(builder, layouts.native(builder, fn.expressions[id].type), task);
     }
 
     Value address(ExprId id) {
@@ -320,17 +328,30 @@ std::unique_ptr<llvm::Module> lower(const CheckedModule& program, const std::vec
     for (const auto& fn : program.functions) {
         std::vector<llvm::Type*> params;
         for (std::size_t index = 0; index < fn.syntax.parameters.size(); ++index) params.push_back(layouts.native(builder, fn.locals[index].type));
-        auto signature = llvm::FunctionType::get(layouts.native(builder, fn.result), params, false);
+        auto signature = llvm::FunctionType::get(fn.syntax.isAsync ? builder.getPtrTy() : layouts.native(builder, fn.result), params, false);
         functions.push_back(llvm::Function::Create(signature, llvm::Function::InternalLinkage, "lyra.fn." + fn.syntax.name.text, *module));
     }
     for (std::size_t index = 0; index < functions.size(); ++index) {
         const auto& fn = program.functions[index];
-        Emitter{fn, sources[fn.syntax.file], *module, functions[index], functions, layouts}.run();
+        auto* factory = functions[index];
+        if (fn.syntax.foreignSymbol) {
+            emitForeign(fn, sources[fn.syntax.file], *factory);
+            continue;
+        }
+        auto* body = fn.syntax.isAsync ? asyncBody(*factory, layouts.native(builder, fn.result)) : factory;
+        Emitter{fn, sources[fn.syntax.file], *module, body, functions, layouts}.run();
+        if (fn.syntax.isAsync) lowerAsync(*factory, *body);
     }
-    auto main = llvm::Function::Create(llvm::FunctionType::get(builder.getInt32Ty(), false), llvm::Function::ExternalLinkage, "main", *module);
+    bool commandLine = module->getFunction("lyraIoArgCount") || module->getFunction("lyraIoArgument");
+    auto signature = commandLine ? llvm::FunctionType::get(builder.getInt32Ty(), {builder.getInt32Ty(), builder.getPtrTy()}, false)
+                                 : llvm::FunctionType::get(builder.getInt32Ty(), false);
+    auto main = llvm::Function::Create(signature, llvm::Function::ExternalLinkage, "main", *module);
     builder.SetInsertPoint(llvm::BasicBlock::Create(context, "entry", main));
-    builder.CreateCall(functions[program.entry.value()]);
-    builder.CreateRet(builder.getInt32(0));
+    if (commandLine) builder.CreateCall(module->getOrInsertFunction("lyraIoSetArgs", builder.getVoidTy(), builder.getInt32Ty(), builder.getPtrTy()), {main->getArg(0), main->getArg(1)});
+    auto entry = program.entry.value();
+    auto result = builder.CreateCall(functions[entry]);
+    if (program.functions[entry].syntax.isAsync) builder.CreateRet(asyncEntry(builder, result));
+    else builder.CreateRet(builder.getInt32(0));
     std::string reason;
     llvm::raw_string_ostream log(reason);
     if (llvm::verifyModule(*module, &log)) throw Diagnostic{"LYB0001", "编译器生成的 LLVM 模块无效：" + reason};

@@ -11,6 +11,7 @@ extern "C" {
 size_t lyraStringLength(const void* string);
 const char* lyraStringBytes(const void* string);
 const void* lyraStringFromBytes(const char* bytes, size_t length);
+uint8_t lyraUtf8Valid(const char* bytes, size_t length);
 const void* lyraStringConcat(const void* left, const void* right);
 uint8_t lyraStringEqual(const void* left, const void* right);
 void lyraPrintString(const void* value);

@@ -21,29 +21,42 @@ case "$mode" in
                 profile=release
                 set -- --release
             fi
-            for sample in integer objects; do
+            for sample in integer objects stdio sqlite; do
                 case "$sample" in
                     integer) package=examples/compiler-smoke/pass; app="$apps/$profile" ;;
                     objects) package=tests/fixtures/objects; app="$apps/objects-$profile" ;;
+                    stdio|sqlite) package="tests/fixtures/$sample"; app="$apps/$sample-$profile" ;;
                 esac
                 "build/$preset/bin/lyra" build "$package" "$@" -o "$app"
                 dynamic=$(readelf -dW "$app")
                 needed=$(printf '%s\n' "$dynamic" | sed -n 's/.*(NEEDED).*\[\([^]]*\)\].*/\1/p')
                 printf '%s DT_NEEDED: %s\n' "$app" "$needed"
-                test "$needed" = libc.so.6
+                if [ "$sample" = sqlite ]; then
+                    test "$(printf '%s\n' "$needed" | sort)" = "$(printf '%s\n' libc.so.6 libsqlite3.so.0)"
+                else
+                    test "$needed" = libc.so.6
+                fi
             done
         done
         ;;
-    verify)
+    verify|verify-sqlite)
         scratch=$(mktemp -d)
-        for sample in integer objects; do
+        if [ "$mode" = verify ]; then samples='integer objects stdio'; else samples=sqlite; fi
+        for sample in $samples; do
             case "$sample" in
                 integer) prefix=; printf '3\n' > "$scratch/expected" ;;
                 objects) prefix=objects-; printf '持有\nA\000B\n1\n2\n' > "$scratch/expected" ;;
+                stdio) prefix=stdio-; printf '输入\n' > "$scratch/expected" ;;
+                sqlite) prefix=sqlite-; printf 'SQLite: 文本\n' > "$scratch/expected" ;;
             esac
             for profile in debug release; do
                 app="$apps/$prefix$profile"
-                "$app" > "$scratch/stdout" 2> "$scratch/stderr"
+                if [ "$sample" = stdio ]; then
+                    "$app" "$scratch/file" < "$scratch/expected" > "$scratch/stdout" 2> "$scratch/stderr"
+                    rm "$scratch/file"
+                else
+                    "$app" > "$scratch/stdout" 2> "$scratch/stderr"
+                fi
                 cmp "$scratch/expected" "$scratch/stdout"
                 test ! -s "$scratch/stderr"
                 printf '%s: exact stdout matched, exit=0, stderr empty (%s)\n' "$app" "$PRETTY_NAME"
@@ -52,5 +65,5 @@ case "$mode" in
         rm "$scratch/expected" "$scratch/stdout" "$scratch/stderr"
         rmdir "$scratch"
         ;;
-    *) printf 'usage: %s build|verify APP_DIR\n' "$0" >&2; exit 2 ;;
+    *) printf 'usage: %s build|verify|verify-sqlite APP_DIR\n' "$0" >&2; exit 2 ;;
 esac
