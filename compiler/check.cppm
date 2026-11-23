@@ -41,9 +41,9 @@ struct CheckedFunction {
     std::vector<SourceAnchor> calls{};
 };
 struct CheckedAggregate { Aggregate syntax; std::vector<Type> fields; std::size_t declaration; std::vector<Type> arguments; bool abstract; std::vector<std::optional<std::size_t>> defaultFunctions{}; };
-struct CheckedEnum { Enumeration syntax; std::vector<std::vector<Type>> payloads; };
+struct CheckedEnum { Enumeration syntax; std::vector<std::vector<Type>> payloads; std::size_t declaration; std::vector<Type> arguments; bool abstract; };
 struct SumTypes { Type success, failure; bool operator==(const SumTypes&) const = default; };
 struct FunctionShape { std::vector<Type> parameters; Type result; bool operator==(const FunctionShape&) const = default; };
-struct CheckedModule { std::deque<CheckedFunction> functions; std::optional<std::size_t> entry; std::deque<CheckedAggregate> aggregates; std::vector<std::string> variableNames; std::vector<Type> taskResults; std::vector<SumTypes> sumTypes; std::vector<Type> listElements; std::deque<FunctionShape> signatures{}; std::vector<CheckedEnum> enums{}; std::vector<NameReference> references{}; };
+struct CheckedModule { std::deque<CheckedFunction> functions; std::optional<std::size_t> entry; std::deque<CheckedAggregate> aggregates; std::vector<std::string> variableNames; std::vector<Type> taskResults; std::vector<SumTypes> sumTypes; std::vector<Type> listElements; std::deque<FunctionShape> signatures{}; std::deque<CheckedEnum> enums{}; std::vector<NameReference> references{}; };
 CheckedModule check(Module module, const std::vector<Source>& sources, bool requireEntry = true);
 }

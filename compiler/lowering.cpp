@@ -44,6 +44,7 @@ struct Layouts {
         }
         for (const auto& item : program.enums) {
             auto& cases = payloads.emplace_back();
+            if (item.abstract) continue;
             for (const auto& payload : item.payloads) {
                 std::vector<llvm::Type*> fields;
                 for (auto field : payload) fields.push_back(native(builder, field));
@@ -549,6 +550,8 @@ struct Emitter {
         if (place.list) place.path.push_back(slot);
         return place;
     }
+
+    Value emitNode(ExprId id, const QualifiedMember&) { return makeVariant(id); }
 
     Value emitNode(ExprId id, const Member& member) {
         if (fn.expressions[id].callee == Callee::Variant) return makeVariant(id);

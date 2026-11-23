@@ -126,6 +126,42 @@ fn main(): Unit {
         diagnostic, = json.loads(self.command('check', self.app, '--diagnostics=json', ok=False).stderr)
         self.assertEqual(diagnostic['code'], 'LYN0003')
 
+    def test_generic_enum_reexport_construct_and_match(self):
+        (self.lib / 'src/net/load.ly').write_text('''
+pub struct Entry<Item>(pub val value: Item)
+pub enum Load<Item> { Pending, Ready(entry: Entry<Item>, next: Load<Item>), Failed(String) }
+pub fn ready<Item>(item: Item): Load<Item> { Load.Ready(Entry(item), Load<Item>.Pending) }
+''')
+        (self.lib / 'src/lib.ly').write_text('pub import self.net.Load as LoadState\n')
+        imports = '''import cfg.LoadState as State
+import cfg.net.Entry
+import cfg.net.ready
+'''
+        self.source.write_text(imports + '''fn head<Item>(state: State<Item>): Item? {
+    match state { State.Pending => None, Ready(entry: Entry(value: value), next: _) => Some(value), Failed(_) => None }
+}
+fn main(): Unit {
+    val pending: State<String> = State.Pending
+    val inferred = State.Ready(Entry(41), State.Pending)
+    val explicit = State<Int>.Ready(Entry(42), State<Int>.Pending)
+    print(head(inferred) ?? 0)
+    print(head(explicit) ?? 0)
+    print(head(ready("ok")) ?? "missing")
+    print(head(pending) ?? "pending")
+}
+''')
+        for options in ((), ('--release',)):
+            self.assertEqual(self.command('run', self.app, *options).stdout, '41\n42\nok\npending\n')
+        for body, code, detail in (
+            ('fn main(): Unit { val unresolved = State.Pending }', 'LYG0002', 'Item'),
+            ('fn read(state: State<Int>): Int { match state { Pending => 0, Ready(_, _) => 1 } }\nfn main(): Unit {}', 'LYT0012', 'Failed'),
+            ('fn main(): Unit { val invalid: State<Bool> = ready(42) }', 'LYT0001', 'Load<Int>'),
+        ):
+            self.source.write_text(imports + body)
+            error, = json.loads(self.command('check', self.app, '--diagnostics=json', ok=False).stderr)
+            self.assertEqual(error['code'], code)
+            self.assertIn(detail, error['message'])
+
 
 if __name__ == '__main__':
     unittest.main()

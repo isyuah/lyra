@@ -120,7 +120,7 @@ struct Linker {
             });
         };
         for (auto& record : syntax.aggregates) for (auto& field : record.fields) renameTypeIn(record.file, field.type, record.typeParameters);
-        for (auto& item : syntax.enums) for (auto& entry : item.cases) for (auto& field : entry.fields) renameTypeIn(item.file, field.type);
+        for (auto& item : syntax.enums) for (auto& entry : item.cases) for (auto& field : entry.fields) renameTypeIn(item.file, field.type, item.typeParameters);
         for (auto& trait : syntax.traits) for (auto& method : trait.methods) {
             renameTypeIn(trait.file, method.result);
             for (auto& parameter : method.parameters) renameTypeIn(trait.file, parameter.type);
@@ -138,7 +138,7 @@ struct Linker {
             };
             if (fn.owner) rename(*fn.owner);
             for (auto& bound : fn.bounds) rename(bound.trait);
-            renameType(fn.result);
+            if (!fn.result.text.empty()) renameType(fn.result);
             for (auto& param : fn.parameters) renameType(param.type);
             auto reference = [&](Identifier& name) {
                 if (auto found = scope.find(name.text); found != scope.end()) {
@@ -156,11 +156,14 @@ struct Linker {
             };
             for (auto& expr : fn.expressions) {
                 if (auto* name = std::get_if<Identifier>(&expr.node)) reference(*name);
+                auto renameQualifier = [&](TypeQualifier& owner) {
+                    reference(owner.name);
+                    for (auto& type : owner.arguments) renameType(type);
+                };
+                if (auto* member = std::get_if<QualifiedMember>(&expr.node)) renameQualifier(member->owner);
                 if (auto* call = std::get_if<Call>(&expr.node)) {
-                    if (call->typeOwner) {
-                        reference(call->typeOwner->name);
-                        for (auto& type : call->typeOwner->arguments) renameType(type);
-                    } else if (!call->receiver && !call->function) reference(call->name);
+                    if (call->typeOwner) renameQualifier(*call->typeOwner);
+                    else if (!call->receiver && !call->function) reference(call->name);
                     for (auto& type : call->typeArguments) renameType(type);
                 }
                 if (auto* binding = std::get_if<Binding>(&expr.node); binding && binding->annotation) renameType(*binding->annotation);

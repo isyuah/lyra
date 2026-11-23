@@ -127,6 +127,7 @@ Function specializeGeneric(Function result, const std::vector<std::string>& type
             for (auto& param : lambda->parameters) if (param.type) substitute(*param.type);
             if (lambda->result) substitute(*lambda->result);
         }
+        if (auto member = std::get_if<QualifiedMember>(&expression.node)) for (auto& type : member->owner.arguments) substitute(type);
         if (auto call = std::get_if<Call>(&expression.node)) {
             if (call->typeOwner) for (auto& type : call->typeOwner->arguments) substitute(type);
             for (auto& type : call->typeArguments) substitute(type);

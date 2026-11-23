@@ -27,6 +27,7 @@ struct Call {
     std::optional<TypeQualifier> typeOwner{};
 };
 struct Member { ExprId receiver; Identifier name; };
+struct QualifiedMember { TypeQualifier owner; Identifier name; };
 struct This {};
 struct ListLiteral { std::vector<ExprId> elements; };
 struct Index { ExprId receiver, offset; Span site; };
@@ -77,7 +78,7 @@ enum class Jump { Break, Continue };
 
 struct Expr {
     Span span;
-    std::variant<IntegerLiteral, RealLiteral, bool, StringLiteral, BytesLiteral, CharLiteral, DisplayValue, TextTemplate, Identifier, This, Call, Member, Unary, Binary, Block, Binding, Conditional, While, For, Return, Raise, Attempt, Jump, TaskOp, Blocking, Deferred, EmptyOption, Propagate, Match, ListLiteral, Index, Lambda> node;
+    std::variant<IntegerLiteral, RealLiteral, bool, StringLiteral, BytesLiteral, CharLiteral, DisplayValue, TextTemplate, Identifier, This, Call, Member, QualifiedMember, Unary, Binary, Block, Binding, Conditional, While, For, Return, Raise, Attempt, Jump, TaskOp, Blocking, Deferred, EmptyOption, Propagate, Match, ListLiteral, Index, Lambda> node;
 };
 
 struct Parameter { Identifier name, type; bool variadic{}; std::optional<ExprId> defaultValue{}; std::vector<Attribute> attributes{}; };
@@ -108,7 +109,7 @@ std::string fieldDefaultName(const std::string& record, const std::string& field
 struct Aggregate { std::size_t file; Identifier name; bool reference; std::vector<Field> fields; bool isPublic{}; std::vector<Identifier> typeParameters{}; };
 struct EnumField { std::optional<Identifier> name; Identifier type; };
 struct EnumCase { Identifier name; std::vector<EnumField> fields; };
-struct Enumeration { std::size_t file; Identifier name; std::vector<EnumCase> cases; bool isPublic; };
+struct Enumeration { std::size_t file; Identifier name; std::vector<EnumCase> cases; bool isPublic; std::vector<Identifier> typeParameters{}; };
 struct Import { std::size_t file; bool isPublic; std::vector<Identifier> path; Identifier alias; };
 struct Expansion { std::size_t file; Identifier name; std::optional<Identifier> argument; bool decorator; bool record; std::size_t target; };
 struct MacroArgument { Span span; std::optional<std::string> literal; };

@@ -456,9 +456,18 @@ private:
 
     bool visibility() { if (!is("pub")) return false; consume(); return true; }
 
+    std::vector<Identifier> typeParameters() {
+        if (!is("<")) return {};
+        consume();
+        std::vector<Identifier> parameters{identifier()};
+        while (is(",")) { consume(); parameters.push_back(identifier()); }
+        require(">");
+        return parameters;
+    }
+
     Enumeration enumeration(bool pub) {
         require("enum");
-        Enumeration result{file, identifier(), {}, pub};
+        Enumeration result{file, identifier(), {}, pub, typeParameters()};
         require("{");
         if (is("}")) throw at(source, token.span, "LYP0001", "enum 至少声明一个分支");
         while (!is("}")) {
@@ -526,13 +535,7 @@ private:
 
     void aggregate(Module& module, bool pub) {
         bool reference = text(consume()) == "class";
-        Aggregate decl{file, identifier(), reference, {}, pub};
-        if (is("<")) {
-            consume();
-            decl.typeParameters.push_back(identifier());
-            while (is(",")) { consume(); decl.typeParameters.push_back(identifier()); }
-            require(">");
-        }
+        Aggregate decl{file, identifier(), reference, {}, pub, typeParameters()};
         bool primary = is("(");
         std::optional<std::size_t> initializer;
         if (primary) {
@@ -1059,7 +1062,8 @@ private:
                 auto method = identifier();
                 if (explicitTypes(method) || (is("(") && (inParens || !token.newlineBefore))) return call(start, std::move(method), {}, {}, std::move(owner));
                 if (trailingBlock && is("{") && !token.newlineBefore) return add({start, method.span.end}, Call{std::move(method), {}, {}, {}, {}, std::move(owner)});
-                throw at(source, token.span, "LYP0001", "静态方法调用需要参数列表或尾部 lambda");
+                auto end = method.span.end;
+                return add({start, end}, QualifiedMember{std::move(owner), std::move(method)});
             }
             if (suffix != TypeSuffix::Call && (!is("(") || (token.newlineBefore && !inParens))) { auto span = name.span; return add(span, std::move(name)); }
             return call(start, std::move(name), {});
