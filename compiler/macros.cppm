@@ -7,6 +7,7 @@ module;
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -246,7 +247,7 @@ std::string expand(const Source& source, const Expansion& prefix, const MacroPac
 
 void parsePackageFile(Module& syntax, Source& source, std::size_t file, const MacroPackage& package, std::vector<fs::path>& inputs) {
     const auto limit = source.text.size() + 4 * byteLimit;
-    for (unsigned depth = 0; source.text.contains('#'); ++depth) {
+    for (unsigned depth = 0; source.text.find('#') != std::string::npos; ++depth) {
         Module scratch;
         std::vector<ExpressionExpansion> calls;
         parseFile(scratch, source, file, &calls);
