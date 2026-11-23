@@ -51,6 +51,10 @@ Site Source::site(Span span) const {
     return previous ? previous->site(beforeExpansion(*this, span)) : rawSite(*this, span);
 }
 
+Site Source::userSite(Span span) const {
+    return origin ? *origin : site(span);
+}
+
 Position Source::position(std::size_t offset) const {
     return previous ? site({offset, offset}).start : rawPosition(*this, offset);
 }

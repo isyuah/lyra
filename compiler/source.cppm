@@ -16,6 +16,14 @@ struct Span {
     bool operator==(const Span&) const = default;
 };
 
+struct SourceAnchor {
+    std::size_t file;
+    Span span;
+    bool operator==(const SourceAnchor&) const = default;
+};
+
+struct NameReference { SourceAnchor use, declaration; };
+
 struct Position {
     std::size_t offset, line, column;
 };
@@ -40,6 +48,7 @@ struct Source {
 
     Position position(std::size_t offset) const;
     Site site(Span span) const;
+    Site userSite(Span span) const;
     std::size_t hygieneAt(Span span) const;
     std::optional<Site> generatedSite(Span span) const;
 };

@@ -213,8 +213,7 @@ struct Symbols {
     const Function& declaration(const Callable& callable) const { return callable.generic ? *callable.generic : module.functions[callable.target].syntax; }
 
     std::string declarationSite(const Function& syntax) const {
-        const auto& file = sources[syntax.file];
-        auto site = file.origin ? *file.origin : file.site(syntax.name.span);
+        auto site = sources[syntax.file].userSite(syntax.name.span);
         return site.file + ':' + std::to_string(site.start.line) + ':' + std::to_string(site.start.column);
     }
 
@@ -476,6 +475,15 @@ struct Checker {
 
     void declare(const Identifier& name, std::size_t slot) {
         if (!scopes.back().emplace(localKey(name), slot).second) throw at(source, name.span, "LYN0002", "名称已在此作用域声明：" + name.text);
+        if (!name.text.starts_with('$')) fn.locals[slot].declaration = name.span;
+    }
+
+    void refer(const Identifier& name, std::size_t file, Span span) {
+        fn.references.push_back({{fn.syntax.file, name.span}, {file, span}});
+    }
+
+    void referLocal(const Identifier& name, std::size_t slot) {
+        if (auto declaration = fn.locals[slot].declaration) refer(name, fn.syntax.file, *declaration);
     }
 
     std::optional<std::size_t> lookupLocal(const Identifier& name) const {
@@ -646,8 +654,8 @@ struct Checker {
         if (const auto& binding = attempt.binding) {
             if (symbols.resolve(fn.syntax, binding->type, variables) != Type::Exception) throw at(source, binding->type.span, "LYE0002", "当前仅支持捕获普通异常根类型 Exception");
             auto slot = fn.locals.size();
-            declare(binding->name, slot);
             fn.locals.push_back({Type::Exception, false, currentWorker()});
+            declare(binding->name, slot);
             fn.expressions[id].target = slot;
         }
         catchOwners.push_back(currentWorker());
@@ -734,6 +742,9 @@ struct Checker {
     }
 
     CheckedPattern variantPattern(const Pattern& pattern, Type subject, const PatternName& name, std::size_t index) {
+        const auto& syntax = module.enums[subject.id].syntax;
+        refer(name.name, syntax.file, syntax.cases[index].name.span);
+        if (name.owner) refer(*name.owner, syntax.file, syntax.name.span);
         const auto& item = module.enums[subject.id];
         const auto& entry = item.syntax.cases[index];
         const auto& fields = item.payloads[index];
@@ -782,6 +793,7 @@ struct Checker {
             if (subject.kind != Type::Record || module.aggregates[subject.id].declaration != found->second)
                 throw at(source, name.span, "LYT0011", name.text + " 不能匹配 " + typeName(module, subject));
             const auto& owner = module.aggregates[subject.id];
+            refer(name, owner.syntax.file, owner.syntax.name.span);
             CheckedPattern result{PatternConstructor(PatternProduct{}), std::vector<CheckedPattern>(owner.fields.size())};
             std::vector<bool> used(owner.fields.size());
             for (std::size_t index = 0; index < named.labels->size(); ++index) {
@@ -791,13 +803,14 @@ struct Checker {
                 if (used[slot]) throw at(source, field->span, "LYN0002", "解构模式重复指定字段：" + field->text);
                 used[slot] = true;
                 visible(owner.syntax.file, owner.syntax.fields[slot].isPublic, *field);
+                refer(*field, owner.syntax.file, owner.syntax.fields[slot].name.span);
                 result.parts[slot] = checkPattern(pattern.parts[index], owner.fields[slot]);
             }
             return result;
         }
         auto slot = fn.locals.size();
-        declare(name, slot);
         fn.locals.push_back({subject, false, currentWorker()});
+        declare(name, slot);
         return {PatternSlot{slot}};
     }
 
@@ -942,6 +955,7 @@ struct Checker {
     Type infer(ExprId id, const Identifier& name, std::optional<Type> expected, bool) {
         if (auto slot = localSlot(name)) {
             fn.expressions[id].target = *slot;
+            referLocal(name, *slot);
             return fn.locals[*slot].type;
         }
         auto candidates = symbols.visibleFunctions(source, name);
@@ -950,6 +964,8 @@ struct Checker {
         auto index = candidates.size() == 1 ? candidates.front() : selectFunctionValue(name, candidates, expected);
         const auto& item = symbols.callables[index];
         auto [type, types] = functionValue(index, name, expected);
+        const auto& syntax = symbols.declaration(item);
+        refer(name, syntax.file, syntax.name.span);
         if (!item.generic) fn.expressions[id].functionRef = item.target;
         else if (materializing()) fn.expressions[id].functionRef = symbols.instantiate(index, types, source, name.span);
         fn.expressions[id].callableType = type;
@@ -981,8 +997,8 @@ struct Checker {
             if (!type) throw at(source, name.span, "LYT0015", "无法推断 lambda 形参类型：" + name.text);
             parameters.push_back(*type);
             auto slot = fn.locals.size();
-            declare(name, slot);
             fn.locals.push_back({*type, false, id});
+            declare(name, slot);
             fn.expressions[id].argumentSlots.push_back(slot);
         }
         auto tail = visit(lambda.body, result);
@@ -999,8 +1015,8 @@ struct Checker {
         if (binding.annotation) annotation = symbols.resolve(fn.syntax, *binding.annotation, variables);
         auto value = visit(binding.value, annotation);
         auto slot = fn.locals.size();
-        declare(binding.name, slot);
         fn.locals.push_back({annotation.value_or(value), binding.writable, currentWorker()});
+        declare(binding.name, slot);
         fn.expressions[id].target = slot;
         return value == Type::Never ? Type::Never : Type::Unit;
     }
@@ -1090,7 +1106,11 @@ struct Checker {
     std::optional<Type> enumNamespace(ExprId receiver) {
         auto* name = std::get_if<Identifier>(&fn.syntax.expressions[receiver].node);
         if (name && !lookupLocal(*name) && !implicitMember(*name))
-            if (auto item = symbols.enums.find(linkedName(*name)); item != symbols.enums.end()) return Type{Type::Enum, item->second};
+            if (auto item = symbols.enums.find(linkedName(*name)); item != symbols.enums.end()) {
+                const auto& syntax = module.enums[item->second].syntax;
+                refer(*name, syntax.file, syntax.name.span);
+                return Type{Type::Enum, item->second};
+            }
         return std::nullopt;
     }
 
@@ -1103,7 +1123,9 @@ struct Checker {
     Type infer(ExprId id, const Member& member, auto, bool) {
         if (auto item = enumNamespace(member.receiver)) {
             auto index = variantIndex(*item, member.name);
-            if (!module.enums[item->id].payloads[index].empty()) throw at(source, member.name.span, "LYT0002", "带载荷的分支需要传入实参：" + member.name.text);
+            const auto& declaration = module.enums[item->id];
+            if (!declaration.payloads[index].empty()) throw at(source, member.name.span, "LYT0002", "带载荷的分支需要传入实参：" + member.name.text);
+            refer(member.name, declaration.syntax.file, declaration.syntax.cases[index].name.span);
             auto& info = fn.expressions[id];
             info.callee = Callee::Variant;
             info.target = index;
@@ -1120,6 +1142,7 @@ struct Checker {
         fn.expressions[id].target = field;
         const auto& record = module.aggregates[owner.id];
         visible(record.syntax.file, record.syntax.fields[field].isPublic, member.name);
+        refer(member.name, record.syntax.file, record.syntax.fields[field].name.span);
         return record.fields[field];
     }
 
@@ -1202,6 +1225,8 @@ struct Checker {
 
     Type declaredCall(std::size_t declaration, ExprId id, const Call& call, std::optional<Type> expected, std::span<const Type> ownerTypes = {}) {
         const auto& candidate = symbols.callables[declaration];
+        const auto& syntax = symbols.declaration(candidate);
+        if (!syntax.initializer) refer(call.name, syntax.file, syntax.name.span);
         if (candidate.generic) return genericCall(declaration, id, call, expected, ownerTypes);
         if (!call.typeArguments.empty()) throw at(source, call.typeArguments.front().span, "LYG0001", "此调用不接受类型实参：" + call.name.text);
         fn.expressions[id].target = candidate.target;
@@ -1278,7 +1303,11 @@ struct Checker {
         };
         if (call.function) return invoke(visit(*call.function));
         const auto& key = call.name.linked.empty() ? call.name.text : call.name.linked;
-        if (!call.receiver && !call.typeOwner) if (auto local = localSlot(call.name)) { info.target = *local; return invoke(fn.locals[*local].type); }
+        if (!call.receiver && !call.typeOwner) if (auto local = localSlot(call.name)) {
+            info.target = *local;
+            referLocal(call.name, *local);
+            return invoke(fn.locals[*local].type);
+        }
         std::size_t declaration;
         std::span<const Type> ownerTypes;
         if (call.typeOwner) {
@@ -1286,6 +1315,8 @@ struct Checker {
             auto named = symbols.records.find(linkedName(qualifier.name));
             if (named == symbols.records.end()) throw at(source, qualifier.name.span, "LYT0003", "静态方法需要可见的 Struct 或 Class 类型");
             auto owner = named->second;
+            const auto& definition = symbols.recordDeclarations[owner];
+            refer(qualifier.name, definition.file, definition.name.span);
             auto member = symbols.staticMethods[owner].find(call.name.text);
             if (member == symbols.staticMethods[owner].end()) {
                 if (symbols.methods[owner].contains(call.name.text) || symbols.fields[owner].contains(call.name.text))
@@ -1308,6 +1339,7 @@ struct Checker {
                 noTypeArgs();
                 auto index = variantIndex(*item, call.name);
                 const auto& decl = module.enums[item->id];
+                refer(call.name, decl.syntax.file, decl.syntax.cases[index].name.span);
                 info.callee = Callee::Variant;
                 info.target = index;
                 bool exits = arguments(id, call, decl.payloads[index].size(), [&](auto slot) -> std::string_view {
@@ -1349,6 +1381,7 @@ struct Checker {
                 const auto& fields = symbols.fields[decl.declaration];
                 if (auto field = fields.find(call.name.text); field != fields.end()) {
                     visible(decl.syntax.file, decl.syntax.fields[field->second].isPublic, call.name);
+                    refer(call.name, decl.syntax.file, decl.syntax.fields[field->second].name.span);
                     info.target = field->second;
                     return invoke(decl.fields[info.target]);
                 }
@@ -1406,6 +1439,7 @@ struct Checker {
             return Type::Unit;
         } else if (auto record = symbols.records.find(key); record != symbols.records.end()) {
             const auto& decl = symbols.recordDeclarations[record->second];
+            refer(call.name, decl.file, decl.name.span);
             if (expected && expected->kind == Type::Option) expected = module.sumTypes[expected->id].success;
             if (auto initializer = symbols.initializers[record->second]) {
                 declaration = *initializer;
@@ -1657,8 +1691,8 @@ struct Checker {
         }
         scopes.emplace_back();
         auto slot = fn.locals.size();
-        declare(loop.item, slot);
         fn.locals.push_back({element, false, currentWorker()});
+        declare(loop.item, slot);
         fn.expressions[id].target = slot;
         ++loops;
         visit(loop.body, {}, true);
@@ -1792,17 +1826,23 @@ CheckedModule check(Module module, const std::vector<Source>& sources, bool requ
         symbols.addConcrete(std::move(concrete));
     }
     for (std::size_t index = 0; index < checked.functions.size(); ++index) if (checked.functions[index].syntax.conversion) registerConversion(symbols.conversions, checked, sources, index);
+    auto rememberReferences = [&](const CheckedFunction& fn) {
+        checked.references.insert(checked.references.end(), fn.references.begin(), fn.references.end());
+    };
     for (const auto& callable : symbols.callables) if (callable.generic) {
         for (std::size_t slot = 0; slot < callable.generic->parameters.size(); ++slot) if (callable.generic->parameters[slot].defaultValue) {
             auto helper = symbols.prepare(defaultFunction(*callable.generic, slot), callable.variables);
             Checker{helper, sources[helper.syntax.file], checked, symbols, {}, callable.variables}.run();
+            rememberReferences(helper);
         }
         auto body = symbols.prepare(*callable.generic, callable.variables);
         Checker{body, sources[body.syntax.file], checked, symbols, {}, callable.variables}.run();
+        rememberReferences(body);
     }
     for (std::size_t index = 0; index < checked.functions.size(); ++index) {
         auto& fn = checked.functions[index];
         Checker{fn, sources[fn.syntax.file], checked, symbols, {}}.run();
+        rememberReferences(fn);
     }
     enum class Mark { Unseen, Visiting, Done };
     std::vector<Mark> marks(checked.aggregates.size());

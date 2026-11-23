@@ -73,6 +73,7 @@ val name: String? = absent()
 
 - **已定：** 在声明前缀位置，`[path]` 是标记，`@trace` 是函数装饰器，`#derive(Json)` 是声明宏调用；在表达式位置，`#query(...)` 是表达式宏调用，`items[index]` 仍是索引。宏种类必须与使用位置匹配。见[元编程与数据交换](metaprogramming-data.md#f1-macro-inputs)。
 - **已定：** 标识符区分大小写，首版为 ASCII 字母或 `_` 开头，后接 ASCII 字母、数字或 `_`，关键字作名字用反引号转义。Lyra 自有 API 和示例采用驼峰：函数、方法、参数、局部值、字段用 `lowerCamelCase`（`getUser`、`teamId`），类型、trait 和枚举分支用 `UpperCamelCase`（`Request`、`Some`）。这是命名风格，不是让词法器拒绝下划线；C ABI 原符号如 `sqlite3_open` 不改名，SQL 和 JSON 的外部键名也不受影响。
+- 当前保留词为 `fn val var if else while for in return break continue true false struct class enum trait pub import as async await spawn extern match null implicit defer throw try catch this static`。`init` 仅在对象声明体内引入构造器；`blocking` 仅在表达式中紧随同一行块时引入阻塞操作；`it` 只在单参尾部 lambda 内自动绑定。裸表达式 `None` 表示空值，同名绑定可用反引号引用；在模式中按被匹配的类型解析，反引号可以强制把裸名称当绑定。
 - **已定：** `//` 行注释及 `/* ... */` 块注释。块注释不嵌套，遇到首个 `*/` 结束；到文件末尾未闭合，定位开头的 `/*`。注释不拼接两侧 token，内部的换行参与和普通空白相同的换行规则。
 - **已定：** `Int`/`UInt` 为 64 位；支持十进制、`0x`、`0b`、`0o` 和数字分隔符 `_`。无后缀浮点默认 `Float64`。双引号为字符串，单引号为单个 Unicode 标量。`${expr}` 在匹配的 `}` 结束；内部的字符串和花括号按表达式解析，而不是遇到第一个 `}` 就截断。插值按 `Display` 的 `toString` 检查，失败定位到插值内的表达式。
 - 字符和普通字符串支持 `\n`、`\r`、`\t`、`\0`、`\\`、转义引号和 `\u{1F642}`（1–6 个十六进制数字，必须是 Unicode 标量）；字符串中可写 `\${` 输出字面量 `${`。只有插值表达式和原始字面量可跨行。
@@ -99,7 +100,7 @@ val name: String? = absent()
 
 1. 成员 `.`、安全访问 `?.`、索引 `[]`、调用 `()`（含类型实参与尾部 lambda），从左向右接成链。
 2. 前缀 `await`、`spawn`，从右向左。
-3. 后缀传播 `?`。要对传播后或等待后的值继续选成员，可用括号写明接收者。
+3. 后缀传播 `?`。传播直接作用于前面的值；对传播后或等待后的值再接成员、索引或调用，写作 `(value?).member`、`(await task()).member`。
 4. 前缀 `!`、`-`，从右向左。
 5. `*`、`/`、`%`。
 6. `+`、`-`。
@@ -109,6 +110,8 @@ val name: String? = absent()
 10. `=` 与复合赋值（如 `+=`）；不连写赋值，结果为 `Unit`。
 
 `?.`、`??` 是完整记号，类型位置的 `T?` 是可空类型，都不是对表达式重复使用传播符。
+
+`-1.toInt8Checked()` 先检查 `1.toInt8Checked()`，而一元负号不接受它的可空结果。负数本身作为接收者时写 `(-1).toInt8Checked()`。当负号直接作用于字面量时按带符号的值检查范围，因此 `-9223372036854775808` 和在 `Int8` 位置写 `-128` 都合法。
 
 对 `record: Record?`，假设 `id: Int`、`name: String?`、`details: Option<Option<String>>`。`record?.id` 是 `Int?`，`record?.name` 是 `String?` 而不是额外套一层；若成员本来就是 Option，安全访问直接保留那个值。因此 `record?.details` 仍是 `Option<Option<String>>`：接收者为空产生 `None`；成员值为 `Some(None)` 则结果仍是 `Some(None)`。`??` 只拆掉左值的最外层：`Some(None) ?? Some("default")` 在明确的嵌套类型下得到 `None`，不会执行默认表达式。接收者不是 Option 时使用 `?.`，或对非 Option 使用 `??`，都是类型错误。
 

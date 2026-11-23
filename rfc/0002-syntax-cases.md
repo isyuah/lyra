@@ -2,6 +2,8 @@
 
 这些是 [RFC-0002](0002-syntax.md) 的测试输入设计，不是测试运行报告。每行是独立用例；`↵` 表示源码中的真实换行。所有用例适用于 Debug / Release。正例看类型、结果或可观察的副作用；反例检查错误原因及主源码位置，不锁死文案。
 
+[语法命令行用例](../tests/syntax_cli.py)直接验证关键字与反引号、LF/CRLF、调用尖括号、列表展开和前后缀优先级。拒绝用例使用原始 UTF-8 字节范围定位 token。
+
 ## 一个回调，加多少个实参？
 
 沿用正文的两个函数：`visit` 的末尾形参是 `values: Int...`；`visitList` 的 `values: List<Int>` 是固定形参。`printInt` 记录传入的整数，`ids: List<Int>` 含 `2, 5`。`makeIds()` 记录一次调用并返回 `ids`。
@@ -81,6 +83,8 @@ fn lookup<Key, Value>(key: Key): Value? { null }
 | S2-022 | `val value = await (findUser(7)?)` | 在 `?` 报实际为 `Task<Result<User?, DbError>>`，应先 `await`。 |
 | S2-023 | `defer await findUser(7)` | 在 `await` 报同步清理不能挂起，即使外层函数是异步也一样。 |
 | S2-024 | `fn scaled(): Int { val _slot2 = 1_000; _slot2 + 2 * 3 }`；另测 `val count = 2 /* note` | 前者返回 `1006`；后者在 `/*` 报块注释未闭合。 |
+| S2-036 | `-1.toInt8Checked()`；另测 `(-1).toInt8Checked()` 和 `-9223372036854775808` | 首例的成员调用先结合，一元负号收到 `Int8?` 而出错；后两例分别得到 `Some(-1)` 和最小 `Int`。 |
+| S2-037 | `identity<Int> (7)`；另测 `value? .size` | 首例的 `>` 未与 `(` 相邻，不能识别为泛型调用；后者提示用 `(value?).size` 明确接收者。 |
 
 **S2-025 · 提前返回只退出当前 lambda。** `readInt()` 总返回 `Err`，`note` 记录字符串。下面的 `probe()` 须返回 `9`，并依次记录 `second, first, after`。把 `Ok(readInt()?)` 换成 `return Ok(3)` 后，同样记录三项并返回 `3`。外层声明返回 `Int`，并不是 `?` 或 `return Ok(3)` 要匹配的返回类型。
 

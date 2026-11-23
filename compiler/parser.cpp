@@ -227,8 +227,8 @@ bool realSpelling(std::string_view text) {
     return !basedInteger(text) && (text.find_first_of(".eE") != text.npos || text.ends_with("f32") || text.ends_with("f64"));
 }
 
-RealLiteral real(const Source& source, Span span, std::string_view text, bool negative) {
-    RealLiteral result{negative ? "-" : "", {}};
+RealLiteral real(const Source& source, Span span, std::string_view text) {
+    RealLiteral result{};
     if (text.ends_with("f32") || text.ends_with("f64")) {
         result.width = text.ends_with("f32") ? 32 : 64;
         text.remove_suffix(3);
@@ -405,11 +405,12 @@ private:
         return name;
     }
 
-    std::vector<Identifier> typeList() {
+    std::vector<Identifier> typeList(std::size_t* end = nullptr) {
         require("<");
         std::vector<Identifier> result{type()};
         while (is(",")) { consume(); result.push_back(type()); }
-        require(">");
+        auto close = require(">").span.end;
+        if (end) *end = close;
         return result;
     }
 
@@ -446,10 +447,11 @@ private:
     TypeSuffix typeSuffix(std::size_t nameEnd) const {
         if (!is("<") || token.span.begin != nameEnd) return TypeSuffix::None;
         Parser look(*this, Lookahead{});
-        try { look.typeList(); }
+        std::size_t end;
+        try { look.typeList(&end); }
         catch (const Diagnostic&) { return TypeSuffix::None; }
         if (look.is(".")) return TypeSuffix::Qualifier;
-        return look.is("(") && !look.token.newlineBefore ? TypeSuffix::Call : TypeSuffix::None;
+        return look.is("(") && look.token.span.begin == end ? TypeSuffix::Call : TypeSuffix::None;
     }
 
     bool visibility() { if (!is("pub")) return false; consume(); return true; }
@@ -720,7 +722,7 @@ private:
     }
 
     ExprId expression(bool inParens = false, int minRank = 1, bool trailingBlock = true) {
-        auto left = primary(inParens, true, trailingBlock);
+        auto left = prefix(inParens, trailingBlock);
         int previous = 0;
         while (inParens || !token.newlineBefore) {
             if (is("??") && minRank <= 2) {
@@ -742,7 +744,41 @@ private:
         return left;
     }
 
-    ExprId primary(bool inParens, bool propagate = true, bool trailingBlock = true) {
+    ExprId prefix(bool inParens, bool trailingBlock) {
+        if (is("-") || is("!")) {
+            auto op = consume();
+            auto nextToken = token;
+            auto operand = prefix(inParens, trailingBlock);
+            auto& value = nodes[operand];
+            auto span = Span{op.span.begin, value.span.end};
+            if (text(op) == "-" && nextToken.kind == Kind::Number && nextToken.span == value.span) {
+                if (auto* integer = std::get_if<IntegerLiteral>(&value.node)) integer->negative = true;
+                else std::get<RealLiteral>(value.node).digits.insert(0, 1, '-');
+                value.span = span;
+                return operand;
+            }
+            return add(span, Unary{text(op) == "!" ? Op::Not : Op::Sub, op.span, operand});
+        }
+        auto value = taskOperand(inParens, trailingBlock);
+        bool propagated = false;
+        while (is("?") && (inParens || !token.newlineBefore)) {
+            auto site = consume().span;
+            value = add({nodes[value].span.begin, site.end}, Propagate{value, site});
+            propagated = true;
+        }
+        if (propagated && (is(".") || is("?.") || ((inParens || !token.newlineBefore) && (is("(") || is("[")))))
+            throw at(source, token.span, "LYP0001", "继续使用传播后的值时，请给接收者加括号，例如 (value?).member");
+        return value;
+    }
+
+    ExprId taskOperand(bool inParens, bool trailingBlock) {
+        if (!is("await") && !is("spawn")) return postfix(inParens, trailingBlock);
+        auto op = consume();
+        auto operand = taskOperand(inParens, trailingBlock);
+        return add({op.span.begin, nodes[operand].span.end}, TaskOp{text(op) == "spawn", op.span, operand});
+    }
+
+    ExprId postfix(bool inParens, bool trailingBlock) {
         auto value = tailArgument(atom(inParens, trailingBlock), trailingBlock);
         while (true) {
             if (is("(") && (inParens || !token.newlineBefore)) {
@@ -755,11 +791,6 @@ private:
                 auto offset = expression(true);
                 auto end = require("]").span.end;
                 value = add({nodes[value].span.begin, end}, Index{value, offset, site});
-                continue;
-            }
-            if (propagate && is("?") && (inParens || !token.newlineBefore)) {
-                auto site = consume().span;
-                value = add({nodes[value].span.begin, site.end}, Propagate{value, site});
                 continue;
             }
             if (!is(".") && !is("?.")) break;
@@ -954,23 +985,10 @@ private:
         if (token.kind == Kind::Char) { auto item = consume(); return add(item.span, character(item)); }
         if (token.kind == Kind::Bytes) { auto item = consume(); return add(item.span, BytesLiteral{decodeLiteral(source, item)}); }
         if (token.kind == Kind::TextHead) return textTemplate();
-        if (token.kind == Kind::Number || (is("-") && next.kind == Kind::Number)) {
-            bool negative = is("-");
-            if (negative) consume();
+        if (token.kind == Kind::Number) {
             auto literal = consume();
-            auto span = Span{start, literal.span.end};
-            if (realSpelling(text(literal))) return add(span, real(source, span, text(literal), negative));
-            return add(span, integer(source, literal.span, negative));
-        }
-        if (is("await") || is("spawn")) {
-            auto op = consume();
-            auto operand = primary(inParens, false, trailingBlock);
-            return add({start, nodes[operand].span.end}, TaskOp{text(op) == "spawn", op.span, operand});
-        }
-        if (is("-") || is("!")) {
-            auto item = consume();
-            auto operand = primary(inParens, true, trailingBlock);
-            return add({start, nodes[operand].span.end}, Unary{text(item) == "!" ? Op::Not : Op::Sub, item.span, operand});
+            if (realSpelling(text(literal))) return add(literal.span, real(source, literal.span, text(literal)));
+            return add(literal.span, integer(source, literal.span, false));
         }
         if (is("true") || is("false")) {
             auto item = consume();
@@ -1020,7 +1038,7 @@ private:
             auto condition = expression(false, 1, false);
             auto yes = block();
             std::optional<ExprId> no;
-            if (is("else")) { consume(); no = is("if") ? primary(false) : block(); }
+            if (is("else")) { consume(); no = is("if") ? atom(false, trailingBlock) : block(); }
             return add({start, nodes[no.value_or(yes)].span.end}, Conditional{condition, yes, no});
         }
         if (trailingBlock && is("blocking") && text(next) == "{" && !next.newlineBefore) {
