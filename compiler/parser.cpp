@@ -79,7 +79,7 @@ public:
             kind = Kind::Escaped;
         } else {
             kind = Kind::Symbol;
-            constexpr std::string_view doubles[] = {"+=", "-=", "*=", "/=", "%=", "==", "!=", "<=", ">=", "&&", "||", "=>", "?.", "??"};
+            constexpr std::string_view doubles[] = {"+=", "-=", "*=", "/=", "%=", "==", "!=", "<=", ">=", "&&", "||", "=>", "?.", "??", "->"};
             if (text.substr(start, 3) == "...") offset += 2;
             else if (std::ranges::find(doubles, text.substr(start, 2)) != std::end(doubles)) ++offset;
             else if (std::string_view("()[]{},.:;+-*/%=<>!#@?").find(current) == text.npos) {
@@ -170,6 +170,9 @@ private:
     std::vector<ExpressionExpansion>* macros;
     std::vector<Expr> nodes;
 
+    struct Lookahead {};
+    Parser(const Parser& parser, Lookahead) : source(parser.source), file(parser.file), lexer(parser.lexer), token(parser.token), next(parser.next), macros(nullptr) {}
+
     Token consume() {
         auto previous = token;
         token = next;
@@ -225,6 +228,27 @@ private:
     }
 
     Identifier type() {
+        if (is("(")) {
+            auto start = consume().span.begin;
+            std::vector<Identifier> parameters;
+            if (!is(")")) {
+                parameters.push_back(type());
+                while (is(",")) { consume(); parameters.push_back(type()); }
+            }
+            auto end = require(")").span.end;
+            if (is("->")) {
+                consume();
+                auto result = type();
+                std::string key = "$fn<";
+                for (const auto& param : parameters) key += param.text + ',';
+                return {key + result.text + '>', {start, result.span.end}};
+            }
+            if (parameters.size() != 1) throw at(source, {start, end}, "LYP0001", "函数类型在形参列表后需要 -> 返回类型");
+            auto name = std::move(parameters.front());
+            name.span = {start, end};
+            while (is("?")) { name.span.end = consume().span.end; name.text = "Option<" + name.text + ">"; }
+            return name;
+        }
         auto name = identifier();
         if (is("<")) {
             consume();
@@ -245,18 +269,14 @@ private:
         return result;
     }
 
-    bool explicitTypes(const Identifier& name) const {
-        if (!is("<") || token.span.begin != name.span.end) return false;
-        auto look = lexer;
-        auto current = next;
-        unsigned depth = 1;
-        while (true) {
-            auto word = text(current);
-            if (word == ">" && !--depth) { current = look.next(); return text(current) == "(" && !current.newlineBefore; }
-            if (word == "<") ++depth;
-            else if (word != ">" && word != "," && word != "?" && current.kind != Kind::Name && current.kind != Kind::Escaped) return false;
-            current = look.next();
-        }
+    bool explicitTypes(const Identifier& name) const { return explicitTypesAfter(name.span.end); }
+
+    bool explicitTypesAfter(std::size_t nameEnd) const {
+        if (!is("<") || token.span.begin != nameEnd) return false;
+        Parser look(*this, Lookahead{});
+        try { look.typeList(); }
+        catch (const Diagnostic&) { return false; }
+        return look.is("(") && !look.token.newlineBefore;
     }
 
     bool visibility() { if (!is("pub")) return false; consume(); return true; }
@@ -321,7 +341,7 @@ private:
             if (!is(")")) require(",");
         }
         while (!is(")")) {
-            if (!parameters.empty() && parameters.back().variadic) throw at(source, token.span, "LYP0001", "变长形参必须放在最后");
+            if (!parameters.empty() && parameters.back().variadic) throw at(source, token.span, "LYP0001", "变长形参 " + parameters.back().name.text + " 必须放在最后");
             if (is("...")) throw at(source, token.span, "LYP0001", "变长形参写在类型之后，例如 values: Int...");
             auto marks = attributes();
             auto parameter = identifier();
@@ -462,8 +482,13 @@ private:
     }
 
     ExprId primary(bool inParens, bool propagate = true, bool trailingBlock = true) {
-        auto value = atom(inParens, trailingBlock);
+        auto value = tailArgument(atom(inParens, trailingBlock), trailingBlock);
         while (true) {
+            if (is("(") && (inParens || !token.newlineBefore)) {
+                auto site = token.span;
+                value = tailArgument(call(nodes[value].span.begin, {"()", site}, {}, value), trailingBlock);
+                continue;
+            }
             if (is("[") && (inParens || !token.newlineBefore)) {
                 auto site = consume().span;
                 auto offset = expression(true);
@@ -486,6 +511,7 @@ private:
             if (safe) { payload = hidden("some", site); value = add(site, *payload); }
             if (explicitTypes(name) || (is("(") && (inParens || !token.newlineBefore))) value = call(begin, std::move(name), value);
             else { auto end = name.span.end; value = add({begin, end}, Member{value, std::move(name)}); }
+            value = tailArgument(value, trailingBlock);
             if (safe) {
                 auto span = nodes[value].span;
                 value = optional(subject, std::move(*payload), value, add(site, EmptyOption{}), site, span, OptionalForm::Access);
@@ -515,10 +541,58 @@ private:
         return result;
     }
 
-    ExprId call(std::size_t begin, Identifier name, std::optional<ExprId> receiver) {
+    ExprId tailArgument(ExprId callee, bool allowed) {
+        if (!allowed || !is("{") || token.newlineBefore) return callee;
+        auto begin = nodes[callee].span.begin;
+        if (auto name = std::get_if<Identifier>(&nodes[callee].node)) callee = add(nodes[callee].span, Call{*name, {}});
+        else if (auto member = std::get_if<Member>(&nodes[callee].node)) callee = add(nodes[callee].span, Call{member->name, {}, member->receiver});
+        else if (!std::holds_alternative<Call>(nodes[callee].node)) return callee;
+        auto brace = token.span;
+        auto body = block();
+        auto value = add(nodes[body].span, Lambda{{}, {}, body, true});
+        std::get<Call>(nodes[callee].node).arguments.push_back({{}, value, {}, brace});
+        nodes[callee].span = {begin, nodes[body].span.end};
+        return callee;
+    }
+
+    bool lambdaHead() const {
+        if (next.kind != Kind::Name && next.kind != Kind::Escaped && text(next) != ")") return false;
+        auto look = lexer;
+        auto current = next;
+        unsigned depth = 1;
+        while (current.kind != Kind::End) {
+            if (text(current) == "(") ++depth;
+            if (text(current) == ")" && !--depth) {
+                auto after = text(look.next());
+                return after == "=>" || after == ":";
+            }
+            current = look.next();
+        }
+        return false;
+    }
+
+    ExprId lambda() {
+        auto start = require("(").span.begin;
+        Lambda literal{{}, {}, 0, false};
+        while (!is(")")) {
+            LambdaParameter parameter{identifier(), {}};
+            if (is(":")) { consume(); parameter.type = type(); }
+            literal.parameters.push_back(std::move(parameter));
+            if (!is(",")) break;
+            consume();
+        }
+        require(")");
+        if (is(":")) { consume(); literal.result = type(); }
+        require("=>");
+        literal.body = block();
+        auto end = nodes[literal.body].span.end;
+        return add({start, end}, std::move(literal));
+    }
+
+    ExprId call(std::size_t begin, Identifier name, std::optional<ExprId> receiver, std::optional<ExprId> function = {}) {
         auto types = is("<") ? typeList() : std::vector<Identifier>{};
         require("(");
-        Call node{std::move(name), {}, receiver, std::move(types)};
+        Call node{std::move(name), {}, receiver, std::move(types), function};
         while (!is(")")) {
             std::optional<Identifier> label;
             if (text(next) == ":") { label = identifier(); consume(); }
@@ -662,6 +736,7 @@ private:
             return call(start, std::move(name), {});
         }
         if (is("(")) {
+            if (lambdaHead()) return lambda();
             consume();
             auto value = expression(true);
             auto close = require(")").span;

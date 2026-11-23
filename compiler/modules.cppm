@@ -124,16 +124,22 @@ struct Linker {
             if (fn.owner) rename(*fn.owner);
             renameType(fn.result);
             for (auto& param : fn.parameters) renameType(param.type);
+            auto reference = [&](Identifier& name) {
+                if (auto found = scope.find(name.text); found != scope.end()) name.linked = found->second.name;
+                else if (name.text == "main") name.linked = sources[fn.file].moduleId + "::main";
+            };
             for (auto& expr : fn.expressions) {
+                if (auto* name = std::get_if<Identifier>(&expr.node)) reference(*name);
                 if (auto* call = std::get_if<Call>(&expr.node)) {
-                    if (!call->receiver) {
-                        if (call->name.text == "main" && !scope.contains("main")) throw at(sources[fn.file], call->name.span, "LYN0001", "找不到函数：main");
-                        rename(call->name);
-                    }
+                    if (!call->receiver && !call->function) reference(call->name);
                     for (auto& type : call->typeArguments) renameType(type);
                 }
                 if (auto* binding = std::get_if<Binding>(&expr.node); binding && binding->annotation) renameType(*binding->annotation);
                 if (auto* attempt = std::get_if<Attempt>(&expr.node); attempt && attempt->binding) renameType(attempt->binding->type);
+                if (auto* lambda = std::get_if<Lambda>(&expr.node)) {
+                    for (auto& param : lambda->parameters) if (param.type) renameType(*param.type);
+                    if (lambda->result) renameType(*lambda->result);
+                }
             }
         }
     }

@@ -14,14 +14,15 @@ export namespace lyra {
 
 using ExprId = std::size_t;
 
-struct Identifier { std::string text; Span span; };
+struct Identifier { std::string text; Span span; std::string linked{}; };
 struct Attribute { Identifier name; std::optional<Identifier> argument; };
-struct Argument { std::optional<Identifier> label; ExprId value; std::optional<Span> spread{}; };
+struct Argument { std::optional<Identifier> label; ExprId value; std::optional<Span> spread{}, trailing{}; };
 struct Call {
     Identifier name;
     std::vector<Argument> arguments;
     std::optional<ExprId> receiver{};
     std::vector<Identifier> typeArguments{};
+    std::optional<ExprId> function{};
 };
 struct Member { ExprId receiver; Identifier name; bool iterationExtent{}; };
 struct ListLiteral { std::vector<ExprId> elements; };
@@ -43,6 +44,8 @@ struct Attempt { ExprId body, handler; std::optional<CatchBinding> binding; };
 struct TaskOp { bool spawn; Span site; ExprId operand; };
 struct Blocking { ExprId body; };
 struct Deferred { ExprId body; };
+struct LambdaParameter { Identifier name; std::optional<Identifier> type; };
+struct Lambda { std::vector<LambdaParameter> parameters; std::optional<Identifier> result; ExprId body; bool implicit; };
 struct EmptyOption {};
 struct Propagate { ExprId operand; Span site; };
 struct MatchArm { SumPattern pattern; ExprId value; };
@@ -52,7 +55,7 @@ enum class Jump { Break, Continue };
 
 struct Expr {
     Span span;
-    std::variant<std::int64_t, bool, StringLiteral, Identifier, Call, Member, Unary, Binary, Block, Binding, Conditional, While, Return, Raise, Attempt, Jump, TaskOp, Blocking, Deferred, EmptyOption, Propagate, Match, ListLiteral, Index> node;
+    std::variant<std::int64_t, bool, StringLiteral, Identifier, Call, Member, Unary, Binary, Block, Binding, Conditional, While, Return, Raise, Attempt, Jump, TaskOp, Blocking, Deferred, EmptyOption, Propagate, Match, ListLiteral, Index, Lambda> node;
 };
 
 struct Parameter { Identifier name, type; bool variadic{}; std::optional<ExprId> defaultValue{}; std::vector<Attribute> attributes{}; };

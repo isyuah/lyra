@@ -14,6 +14,7 @@ import lyra.check;
 import lyra.async;
 import lyra.foreign;
 import lyra.collections;
+import lyra.closures;
 import lyra.exceptions;
 
 namespace lyra {
@@ -46,7 +47,7 @@ struct Layouts {
         case Type::Int: return builder.getInt64Ty();
         case Type::Bool: return builder.getInt1Ty();
         case Type::Unit: case Type::Never: return builder.getInt8Ty();
-        case Type::String: case Type::Task: case Type::CPtr: case Type::List: case Type::Exception: return builder.getPtrTy();
+        case Type::String: case Type::Task: case Type::CPtr: case Type::List: case Type::Exception: case Type::Closure: return builder.getPtrTy();
         case Type::Variable: llvm_unreachable("abstract type reached LLVM lowering");
         case Type::Record: return reference(type) ? static_cast<llvm::Type*>(builder.getPtrTy()) : objects[type.id];
         case Type::Option: return llvm::StructType::get(builder.getContext(), {builder.getInt1Ty(), native(builder, program.sumTypes[type.id].success)});
@@ -80,14 +81,17 @@ struct Emitter {
     void end() { builder.ClearInsertionPoint(); }
 
     bool deferred() const { return worker && std::holds_alternative<Deferred>(fn.syntax.expressions[*worker].node); }
+    bool lambda() const { return worker && std::holds_alternative<Lambda>(fn.syntax.expressions[*worker].node); }
     ExprId bodyId() const {
         if (!worker) return fn.syntax.body;
         const auto& node = fn.syntax.expressions[*worker].node;
         if (auto cleanup = std::get_if<Deferred>(&node)) return cleanup->body;
+        if (auto literal = std::get_if<Lambda>(&node)) return literal->body;
         return std::get<Blocking>(node).body;
     }
     Type completionType() const {
         if (!worker) return fn.result;
+        if (lambda()) return layouts.program.signatures[rawType(*worker).id].result;
         return deferred() ? Type{Type::Unit} : layouts.program.taskResults[rawType(*worker).id];
     }
     Value cleanupMark() { return cleanupHead ? builder.CreateLoad(builder.getPtrTy(), cleanupHead) : nullptr; }
@@ -148,6 +152,18 @@ struct Emitter {
         return fn.locals[slot].captured ? builder.CreateLoad(builder.getPtrTy(), locals[slot]) : locals[slot];
     }
 
+    Value read(std::size_t slot) {
+        auto* type = layouts.native(builder, fn.locals[slot].type);
+        auto address = cell(slot);
+        return fn.locals[slot].captured && layouts.workers ? sharedRead(builder, type, address) : builder.CreateLoad(type, address);
+    }
+
+    llvm::FunctionType* signature(const FunctionShape& shape) {
+        std::vector<llvm::Type*> parameters;
+        for (auto type : shape.parameters) parameters.push_back(layouts.native(builder, type));
+        return NativeClosures{builder}.signature(layouts.native(builder, shape.result), parameters, shape.result.kind == Type::Task);
+    }
+
     void initialize(std::size_t slot, Value value) {
         if (fn.locals[slot].captured) {
             auto address = asyncCell(builder, value->getType());
@@ -166,7 +182,15 @@ struct Emitter {
             const auto& local = fn.locals[slot];
             if (local.worker == worker) locals[slot] = builder.CreateAlloca(local.captured ? builder.getPtrTy() : layouts.native(builder, local.type));
         }
-        for (auto& arg : native->args()) {
+        if (lambda()) {
+            const auto& literal = fn.expressions[*worker];
+            for (std::size_t index = 0; index < literal.captures.size(); ++index) {
+                auto slot = literal.captures[index];
+                locals[slot] = builder.CreateAlloca(builder.getPtrTy());
+                builder.CreateStore(NativeClosures{builder}.capture(native->getArg(0), literal.captures.size(), index), locals[slot]);
+            }
+            for (std::size_t index = 0; index < literal.argumentSlots.size(); ++index) initialize(literal.argumentSlots[index], native->getArg(index + 1));
+        } else for (auto& arg : native->args()) {
             if (!asyncBody() && arg.getArgNo() + 1 == native->arg_size()) break;
             if (worker) {
                 auto slot = fn.expressions[*worker].captures[arg.getArgNo()];
@@ -203,10 +227,22 @@ struct Emitter {
         return global;
     }
     Value emitNode(ExprId id, const Identifier&) {
-        auto slot = fn.expressions[id].target;
-        auto* type = layouts.native(builder, rawType(id));
-        auto pointer = cell(slot);
-        return fn.locals[slot].captured && layouts.workers ? sharedRead(builder, type, pointer) : builder.CreateLoad(type, pointer);
+        const auto& info = fn.expressions[id];
+        if (info.functionRef) {
+            const auto& syntax = layouts.program.functions[*info.functionRef].syntax;
+            const auto& shape = layouts.program.signatures[rawType(id).id];
+            return NativeClosures{builder}.named(functions[*info.functionRef], signature(shape), shape.parameters.size(), syntax.isAsync, syntax.foreignSymbol.has_value());
+        }
+        return read(info.target);
+    }
+
+    Value emitNode(ExprId id, const Lambda&) {
+        NativeClosures closures{builder};
+        auto* code = closures.function(signature(layouts.program.signatures[rawType(id).id]), native->getName() + ".lambda");
+        Emitter{fn, source, module, code, functions, layouts}.run(id);
+        std::vector<Value> cells;
+        for (auto slot : fn.expressions[id].captures) cells.push_back(cell(slot));
+        return closures.close(code, cells);
     }
 
     Value emitNode(ExprId id, const TaskOp& op) {
@@ -367,6 +403,32 @@ struct Emitter {
 
     Value emitNode(ExprId id, const Call& call) {
         const auto& info = fn.expressions[id];
+        if (info.callee == Callee::Indirect) {
+            Value closure;
+            if (call.function) closure = emit(*call.function);
+            else if (call.receiver) {
+                auto object = emit(*call.receiver);
+                if (!live()) return unit();
+                auto owner = fn.expressions[*call.receiver].type;
+                if (layouts.reference(owner)) {
+                    auto address = builder.CreateStructGEP(layouts.objects[owner.id], object, info.target);
+                    closure = layouts.workers ? sharedRead(builder, builder.getPtrTy(), address) : builder.CreateLoad(builder.getPtrTy(), address);
+                } else closure = builder.CreateExtractValue(object, info.target);
+            } else closure = read(info.target);
+            if (!live()) return unit();
+            std::vector<Value> args;
+            for (const auto& arg : call.arguments) {
+                args.push_back(emit(arg.value));
+                if (!live()) return unit();
+            }
+            NativeClosures nativeCall{builder};
+            const auto& shape = layouts.program.signatures[info.callableType->id];
+            auto site = shape.result.kind == Type::Task ? nativeCall.location(source, call.name.span) : nullptr;
+            auto value = nativeCall.invoke(signature(shape), closure, args, site, errorSlot);
+            guard(builder.CreateLoad(builder.getPtrTy(), errorSlot), handlers.size(), call.name.span, "call");
+            if (shape.result == Type::Never) { builder.CreateUnreachable(); end(); }
+            return value;
+        }
         auto skip = static_cast<std::size_t>(call.receiver.has_value());
         Value receiver = nullptr;
         if (call.receiver) {
@@ -392,6 +454,7 @@ struct Emitter {
             args[slot] = callFunction(*target->defaultFunctions[slot], llvm::ArrayRef<Value>(args).take_front(slot), call.name.span);
         }
         switch (info.callee) {
+            case Callee::Indirect: llvm_unreachable("indirect call already emitted");
             case Callee::Exception: return NativeExceptions{builder}.create(args.front());
             case Callee::TaskCancel:
                 builder.CreateCall(module.getOrInsertFunction("lyraTaskRequestCancel", builder.getVoidTy(), builder.getPtrTy()), args);

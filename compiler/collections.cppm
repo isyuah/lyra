@@ -15,7 +15,7 @@ export namespace lyra {
 
 enum class ArgumentMode { Fixed, Item, Spread };
 struct ParameterShape { std::string_view name; bool defaulted, variadic; };
-struct ArgumentShape { std::optional<std::string_view> label; bool spread; Span site; };
+struct ArgumentShape { std::optional<std::string_view> label; bool spread; Span site; bool trailing{}; };
 struct ArgumentSlot { std::size_t index; ArgumentMode mode; };
 struct CallPlan {
     std::vector<ArgumentSlot> explicitSlots;
@@ -28,19 +28,26 @@ CallPlan bindArguments(std::span<const ParameterShape> parameters, std::span<con
     CallPlan plan;
     if (!parameters.empty() && parameters.back().variadic) plan.variadic = parameters.size() - 1;
     auto fixed = plan.variadic.value_or(parameters.size());
-    std::vector<bool> filled(fixed);
+    std::vector<std::optional<Span>> filled(fixed);
     std::size_t position = 0;
     bool named = false;
     for (const auto& arg : arguments) {
-        if (arg.label) {
+        if (arg.label || arg.trailing) {
             named = true;
-            std::size_t slot = 0;
-            while (slot < parameters.size() && parameters[slot].name != *arg.label) ++slot;
-            if (slot == parameters.size()) throw at(source, arg.site, "LYT0002", "未知的命名实参：" + std::string(*arg.label));
-            if (slot == plan.variadic) throw at(source, arg.site, "LYT0002", "变长形参只接收位置实参：" + std::string(*arg.label));
-            if (filled[slot]) throw at(source, arg.site, "LYT0002", "重复绑定形参：" + std::string(*arg.label));
+            std::size_t slot = arg.trailing ? parameters.size() - 1 : 0;
+            if (arg.label) {
+                while (slot < parameters.size() && parameters[slot].name != *arg.label) ++slot;
+                if (slot == parameters.size()) throw at(source, arg.site, "LYT0002", "未知的命名实参：" + std::string(*arg.label));
+                if (slot == plan.variadic) throw at(source, arg.site, "LYT0002", "变长形参只接收位置实参：" + std::string(*arg.label));
+            }
+            if (filled[slot]) {
+                auto error = at(source, arg.site, "LYT0002", "重复绑定形参：" + (parameters[slot].name.empty() ? std::string("末尾函数形参") : std::string(parameters[slot].name)));
+                auto previous = source.origin ? *source.origin : source.site(*filled[slot]);
+                error.hint = "先前的实参位于 " + previous.file + ':' + std::to_string(previous.start.line) + ':' + std::to_string(previous.start.column);
+                throw error;
+            }
             if (arg.spread) throw at(source, arg.site, "LYT0002", "展开只能填入变长形参");
-            filled[slot] = true;
+            filled[slot] = arg.site;
             plan.explicitSlots.push_back({slot, ArgumentMode::Fixed});
         } else {
             if (named) throw at(source, arg.site, "LYT0002", "位置实参须在命名实参之前");
@@ -49,7 +56,7 @@ CallPlan bindArguments(std::span<const ParameterShape> parameters, std::span<con
                 position = fixed;
             }
             if (position < fixed) {
-                filled[position] = true;
+                filled[position] = arg.site;
                 plan.explicitSlots.push_back({position++, ArgumentMode::Fixed});
             } else if (plan.variadic) {
                 plan.explicitSlots.push_back({*plan.variadic, arg.spread ? ArgumentMode::Spread : ArgumentMode::Item});
