@@ -69,7 +69,7 @@ class Installed(unittest.TestCase):
             for relative, content in files.items():
                 write(library / relative, content)
             write(library / 'inputs/unlisted.txt', 'not for distribution')
-            write(library / 'src/lib.ly', '#declare\n@trace\npub fn banner(): String { title() }')
+            write(library / 'src/lib.ly', '#declare\n@trace\npub fn banner(): String { title() + ":" + #stamp() }')
             registry = root / 'registry'
             run(compiler, 'pack', library, '--registry', registry)
 
@@ -116,7 +116,7 @@ fn main(): Unit { print(label()); print(score()) }
             write(app / 'tests/contract.ly', '''import self.label
 import self.score
 import std.io.assert
-fn main(): Unit { assert(label() == "relocated: 打包时的标题", "wrong installed input"); assert(score() == 42, "wrong C ABI result") }
+fn main(): Unit { assert(label() == "relocated: 打包时的标题:v1", "wrong installed input"); assert(score() == 42, "wrong C ABI result") }
 ''')
             blocked = root / 'offline guard' / 'curl'
             write(blocked, '#!/bin/sh\n: > "$LYRA_NETWORK_CALLED"\nexit 97\n')
@@ -129,7 +129,7 @@ fn main(): Unit { assert(label() == "relocated: 打包时的标题", "wrong inst
                 args = (*frozen_args, *mode, '--link', archive)
                 self.assertIn('ok release/consumer/contract.ly', run(compiler, 'test', app, *args).stdout)
                 result = run(compiler, 'run', app, *args)
-                self.assertEqual((result.stdout.splitlines(), result.stderr), (['trace: banner', 'relocated: 打包时的标题', '42'], ''))
+                self.assertEqual((result.stdout.splitlines(), result.stderr), (['trace: banner', 'relocated: 打包时的标题:v1', '42'], ''))
             self.assertEqual(lock.read_bytes(), frozen)
             shutil.rmtree(cache)
             error = run(compiler, 'fetch', app, *frozen_args, good=False)
