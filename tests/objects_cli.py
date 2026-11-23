@@ -102,6 +102,65 @@ fn main(): Unit {
         self.assertEqual(diagnostic["code"], "LYT0007")
         self.assertIn("Outer", diagnostic["message"])
 
+    def test_explicit_initializer_uses_the_same_binding_and_gc_rules(self):
+        (self.package / "lyra.json5").write_text('{name:"test/objects", version:"0.1.0"}')
+        models = self.src / "models"
+        models.mkdir()
+        (models / "box.ly").write_text('''
+pub class Box<Item> {
+    val value: Item
+    pub val name: String
+    var tag: String?
+
+    pub init(value: Item, name: String = "default", early: Bool = false) {
+        self.value = value
+        self.tag = None
+        if early { self.name = "early"; return }
+        match name { "" => { self.name = "empty" }, _ => { self.name = name } }
+        defer { self.tag = Some(self.name) }
+    }
+
+    pub fn read(self): Item { self.value }
+    pub fn label(self): String { self.tag ?? self.name }
+}
+''', encoding="utf-8")
+        self.run_source('''
+import self.models.Box as ItemBox
+class User(val name: String)
+fn main(): Unit {
+    val first = ItemBox(User("存活"))
+    val alias = first
+    val early = ItemBox(early: true, value: 5)
+    val third: ItemBox<Int> = ItemBox(value: 7, name: "")
+    gcCollect()
+    print(alias.read().name)
+    print(first.label())
+    print(early.label())
+    print(third.label())
+}
+''', "存活\ndefault\nearly\nempty\n".encode())
+
+    def test_initialization_paths_and_escape_are_checked_statically(self):
+        for body, message in (
+            ('if condition { self.text = "maybe" }', "结束 init"),
+            ('if condition { return }; self.text = "late"', "结束 init"),
+            ('self.text = self.text', "尚未"),
+            ('publish(self); self.text = "late"', "使用 self"),
+            ('val callback = () => { self.text }; self.text = "late"', "捕获 self"),
+            ('if condition { self.text = "first" }; self.text = "second"', "只能初始化一次"),
+            ('while condition { self.text = "loop" }; self.text = "done"', "不能在循环"),
+            ('try { self.text = "try" } catch { self.text = "catch" }', "try 主体"),
+        ):
+            with self.subTest(body=body):
+                self.main.write_text('class Item { val text: String; init(condition: Bool) { ' + body
+                                     + ' } }\nfn publish(item: Item): Unit {}\nfn main(): Unit {}', encoding="utf-8")
+                result = subprocess.run([COMPILER, "check", self.package, "--diagnostics=json"],
+                                        capture_output=True, timeout=10)
+                self.assertNotEqual(result.returncode, 0)
+                error, = json.loads(result.stderr)
+                self.assertEqual(error["code"], "LYT0017")
+                self.assertIn(message, error["message"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -505,10 +505,17 @@ private:
         }
         if (!primary || is("{")) {
             require("{");
+            bool initialized = false;
             while (!is("}")) {
                 auto marks = attributes();
                 bool publicMember = visibility();
-                if (is("fn") || is("async") || is("extern")) {
+                if (is("init")) {
+                    if (!reference || primary || initialized)
+                        throw at(source, token.span, "LYP0001", "仅没有主构造参数列表的 class 可以声明一个 init 构造函数");
+                    if (!marks.empty()) throw at(source, marks.front().name.span, "LYM0003", "此处的标记只适用于字段和形参");
+                    initialized = true;
+                    module.functions.push_back(function(decl.name, publicMember, decl.typeParameters, true));
+                } else if (is("fn") || is("async") || is("extern")) {
                     if (!marks.empty()) throw at(source, marks.front().name.span, "LYM0003", "此处的标记只适用于字段和形参");
                     module.functions.push_back(function(decl.name, publicMember, decl.typeParameters));
                 } else decl.fields.push_back(field(publicMember, std::move(marks)));
@@ -520,7 +527,7 @@ private:
         module.aggregates.push_back(std::move(decl));
     }
 
-    Function function(std::optional<Identifier> owner, bool pub, const std::vector<Identifier>& enclosing = {}) {
+    Function function(std::optional<Identifier> owner, bool pub, const std::vector<Identifier>& enclosing = {}, bool initializer = false) {
         bool isAsync = false, foreign = false;
         if (is("async") || is("extern")) {
             isAsync = is("async"); foreign = !isAsync;
@@ -528,12 +535,13 @@ private:
             if (is("async") || is("extern")) throw at(source, token.span, "LYF0001", "声明只能使用一个 async 或 extern 修饰符");
         }
         bool conversion = is("implicit");
-        auto keyword = require(conversion ? "implicit" : "fn");
+        auto keyword = require(initializer ? "init" : conversion ? "implicit" : "fn");
         if (conversion && (owner || isAsync || foreign)) throw at(source, keyword.span, "LYV0001", "implicit 必须是顶层同步转换");
-        auto name = conversion ? Identifier{"$implicit" + std::to_string(file) + "_" + std::to_string(keyword.span.begin), keyword.span} : identifier();
+        auto name = initializer ? Identifier{"$init$" + owner->text, keyword.span}
+                  : conversion ? Identifier{"$implicit" + std::to_string(file) + "_" + std::to_string(keyword.span.begin), keyword.span} : identifier();
         auto typeParameters = enclosing;
         std::vector<Bound> bounds;
-        if (is("<")) {
+        if (!initializer && is("<")) {
             consume();
             for (;;) {
                 typeParameters.push_back(identifier());
@@ -546,9 +554,9 @@ private:
         if (foreign && (owner || !typeParameters.empty())) throw at(source, name.span, "LYF0001", "extern 不支持方法或泛型");
         require("(");
         std::vector<Parameter> parameters;
+        Identifier selfType;
         if (owner) {
-            auto self = require("self");
-            auto selfType = *owner;
+            selfType = *owner;
             if (!enclosing.empty()) {
                 selfType.text += '<';
                 for (std::size_t index = 0; index < enclosing.size(); ++index) {
@@ -557,8 +565,11 @@ private:
                 }
                 selfType.text += '>';
             }
-            parameters.push_back({{"self", self.span}, std::move(selfType)});
-            if (!is(")")) require(",");
+            if (!initializer) {
+                auto self = require("self");
+                parameters.push_back({{"self", self.span}, std::move(selfType)});
+                if (!is(")")) require(",");
+            }
         }
         while (!is(")")) {
             if (!parameters.empty() && parameters.back().variadic) throw at(source, token.span, "LYP0001", "变长形参 " + parameters.back().name.text + " 必须放在最后");
@@ -580,15 +591,15 @@ private:
         }
         require(")");
         if (conversion && (!typeParameters.empty() || parameters.size() != 1 || parameters.front().defaultValue || parameters.front().variadic)) throw at(source, keyword.span, "LYV0001", "implicit 需要一个无默认值的普通形参");
-        require(":");
-        auto result = type();
+        if (!initializer) require(":");
+        auto result = initializer ? std::move(selfType) : type();
         if (foreign) {
             require(";");
             auto symbol = name;
             return {file, std::move(name), std::move(parameters), std::move(result), {}, 0, {}, pub, {}, false, std::move(symbol)};
         }
         auto body = block();
-        return {file, std::move(name), std::move(parameters), std::move(result), std::exchange(nodes, {}), body, std::move(owner), pub, std::move(typeParameters), isAsync, {}, conversion, std::move(bounds)};
+        return {file, std::move(name), std::move(parameters), std::move(result), std::exchange(nodes, {}), body, std::move(owner), pub, std::move(typeParameters), isAsync, {}, conversion, std::move(bounds), initializer};
     }
 
     ExprId block() {

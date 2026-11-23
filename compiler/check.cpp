@@ -21,6 +21,7 @@ import lyra.traits;
 import lyra.collections;
 import lyra.patterns;
 import lyra.numbers;
+import lyra.initialization;
 
 namespace lyra {
 namespace {
@@ -93,6 +94,7 @@ Function defaultFunction(const Function& original, std::size_t slot) {
     syntax.result = parameter.type;
     syntax.owner.reset();
     syntax.isAsync = false;
+    syntax.initializer = false;
     syntax.parameters.resize(slot);
     for (auto& earlier : syntax.parameters) earlier.defaultValue.reset();
     return syntax;
@@ -123,6 +125,7 @@ struct Symbols {
     Names enums{};
     std::vector<Names> variants{};
     std::vector<Aggregate> recordDeclarations{};
+    std::vector<std::optional<std::size_t>> initializers{};
     mutable std::map<std::pair<std::size_t, std::vector<Type>>, Type> recordInstances{};
     mutable unsigned expandingRecord{};
 
@@ -342,7 +345,12 @@ struct Checker {
         scopes.emplace_back();
         for (std::size_t index = 0; index < fn.syntax.parameters.size(); ++index) declare(fn.syntax.parameters[index].name, index);
         if (fn.syntax.foreignSymbol) return;
-        visit(fn.syntax.body, fn.result);
+        if (fn.syntax.initializer) {
+            declare({"self", fn.syntax.name.span}, fn.locals.size());
+            fn.locals.push_back({fn.result, false});
+            visit(fn.syntax.body, {}, true);
+            checkInitialization(fn, module.aggregates[fn.result.id], source);
+        } else visit(fn.syntax.body, fn.result);
     }
 
     Type visit(ExprId id, std::optional<Type> expected = {}, bool discard = false) {
@@ -1088,23 +1096,29 @@ struct Checker {
             if (!call.arguments.empty()) throw at(source, call.name.span, "LYT0002", "gcCollect 不接收实参");
             return Type::Unit;
         } else if (auto record = symbols.records.find(key); record != symbols.records.end()) {
-            info.callee = Callee::Constructor;
             const auto& decl = symbols.recordDeclarations[record->second];
-            for (const auto& field : decl.fields) visible(decl.file, field.isPublic, call.name);
-            if (!decl.typeParameters.empty()) {
-                if (expected && expected->kind == Type::Option) expected = module.sumTypes[expected->id].success;
-                auto init = constructorSignature(decl);
-                auto [types, exits] = bindGeneric(id, call, init, expected);
-                auto type = symbols.recordType(record->second, std::move(types), source, call.name.span);
+            if (expected && expected->kind == Type::Option) expected = module.sumTypes[expected->id].success;
+            if (auto initializer = symbols.initializers[record->second]) {
+                declaration = *initializer;
+                const auto& ctor = symbols.declaration(symbols.callables[declaration]);
+                visible(ctor.file, ctor.isPublic, call.name);
+            } else {
+                info.callee = Callee::Constructor;
+                for (const auto& field : decl.fields) visible(decl.file, field.isPublic, call.name);
+                if (!decl.typeParameters.empty()) {
+                    auto init = constructorSignature(decl);
+                    auto [types, exits] = bindGeneric(id, call, init, expected);
+                    auto type = symbols.recordType(record->second, std::move(types), source, call.name.span);
+                    info.target = type.id;
+                    return exits ? Type{Type::Never} : type;
+                }
+                noTypeArgs();
+                auto type = symbols.recordType(record->second, {}, source, call.name.span);
                 info.target = type.id;
+                const auto& instance = module.aggregates[type.id];
+                bool exits = arguments(id, call, instance.fields.size(), [&](auto slot) -> const auto& { return decl.fields[slot].name.text; }, [&](auto slot) { return instance.fields[slot]; });
                 return exits ? Type{Type::Never} : type;
             }
-            noTypeArgs();
-            auto type = symbols.recordType(record->second, {}, source, call.name.span);
-            info.target = type.id;
-            const auto& instance = module.aggregates[type.id];
-            bool exits = arguments(id, call, instance.fields.size(), [&](auto slot) -> const auto& { return decl.fields[slot].name.text; }, [&](auto slot) { return instance.fields[slot]; });
-            return exits ? Type{Type::Never} : type;
         } else {
             auto found = symbols.functions.find(key);
             if (found == symbols.functions.end()) throw at(source, call.name.span, "LYN0001", "找不到函数：" + call.name.text);
@@ -1179,7 +1193,10 @@ struct Checker {
             const auto& place = fn.syntax.expressions[binary.left];
             auto type = visit(binary.left);
             if (type == Type::Never) { visit(binary.right); return type; }
-            if (!writable(binary.left)) throw at(source, place.span, "LYT0004", "不能给此位置赋值；需要 var 绑定或可写字段");
+            auto* member = std::get_if<Member>(&place.node);
+            bool initialize = fn.syntax.initializer && workers.empty() && binary.op == Op::Set && member &&
+                isInitializerSelf(fn, member->receiver);
+            if (!initialize && !writable(binary.left)) throw at(source, place.span, "LYT0004", "不能给此位置赋值；需要 var 绑定或可写字段");
             if (binary.op != Op::Set && !numericType(type) && !(binary.op == Op::AddSet && type == Type::String)) throw mismatch(module, source, place.span, Type::Int, type);
             return visit(binary.right, type) == Type::Never ? Type::Never : Type::Unit;
         }
@@ -1267,6 +1284,10 @@ struct Checker {
     }
 
     Type infer(ExprId id, const Return& ret, std::optional<Type>, bool) {
+        if (fn.syntax.initializer && workers.empty()) {
+            if (ret.value) throw at(source, fn.syntax.expressions[id].span, "LYT0017", "init 只能用不带值的 return；构造结果始终是 self");
+            return Type::Never;
+        }
         auto target = returnType();
         auto value = ret.value ? visit(*ret.value, target) : Type{Type::Unit};
         if (target && value != Type::Never && *target != value) throw mismatch(module, source, fn.syntax.expressions[id].span, *target, value);
@@ -1377,6 +1398,7 @@ CheckedModule check(Module module, const std::vector<Source>& sources, bool requ
     }
     symbols.fields.resize(symbols.recordDeclarations.size());
     symbols.methods.resize(symbols.recordDeclarations.size());
+    symbols.initializers.resize(symbols.recordDeclarations.size());
     symbols.variants.resize(checked.enums.size());
     for (std::size_t id = 0; id < symbols.recordDeclarations.size(); ++id) {
         const auto& syntax = symbols.recordDeclarations[id];
@@ -1415,10 +1437,12 @@ CheckedModule check(Module module, const std::vector<Source>& sources, bool requ
     for (auto& function : module.functions) {
         const auto& source = sources[function.file];
         auto owner = function.owner ? std::optional(symbols.records.at(function.owner->text)) : std::nullopt;
-        auto& names = owner ? symbols.methods[*owner] : symbols.functions;
-        bool collision = owner ? symbols.fields[*owner].contains(function.name.text) : symbols.records.contains(function.name.text) || symbols.enums.contains(function.name.text) || function.name.text == "print" || function.name.text == "gcCollect";
-        if (collision || !names.emplace(function.name.text, symbols.callables.size()).second) {
-            throw at(source, function.name.span, "LYN0002", "函数名已声明：" + function.name.text);
+        if (function.initializer) symbols.initializers[*owner] = symbols.callables.size();
+        else {
+            auto& names = owner ? symbols.methods[*owner] : symbols.functions;
+            bool collision = owner ? symbols.fields[*owner].contains(function.name.text) : symbols.records.contains(function.name.text) || symbols.enums.contains(function.name.text) || function.name.text == "print" || function.name.text == "gcCollect";
+            if (collision || !names.emplace(function.name.text, symbols.callables.size()).second)
+                throw at(source, function.name.span, "LYN0002", "函数名已声明：" + function.name.text);
         }
         if (!function.typeParameters.empty()) {
             if (!owner && requireEntry && function.name.text == "main") throw at(source, function.name.span, "LYG0001", "main 不能声明类型形参");

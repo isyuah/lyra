@@ -95,6 +95,7 @@ struct Function {
     std::optional<Identifier> foreignSymbol{};
     bool conversion{};
     std::vector<Bound> bounds{};
+    bool initializer{};
 };
 
 struct Field { Identifier name, type; bool writable; bool isPublic{}; std::vector<Attribute> attributes{}; };

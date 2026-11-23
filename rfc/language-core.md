@@ -47,7 +47,21 @@ first.owner.name = "Ada"   // 通过 Class 引用修改对象
 
 可变 `List` 赋值共享同一个集合；经一个别名修改元素，其他别名能看到。闭包捕获绑定本身，不暗中复制当前值；首版 `return` 不从调用该闭包的外层函数返回。Class 默认按对象身份相等，这里的身份不是可观察的固定地址；Struct 未实现 `Eq` 则不能用 `==` 比较。
 
-Struct 按值内联的布局不能成环（包括经 `Option` 或其他内联载荷形成的环）；经 Class 或显式间接引用形成的递归可以。简单主构造写 `class Badge(val title: String)`，`Badge("NEW").title` 是 `"NEW"`；复杂初始化可写显式构造函数。Class 允许多个构造函数、私有构造函数和静态工厂；所有非空字段就绪前 `this` 不得逃逸。
+Struct 按值内联的布局不能成环（包括经 `Option` 或其他内联载荷形成的环）；经 Class 或显式间接引用形成的递归可以。简单主构造写 `class Badge(val title: String)`，`Badge("NEW").title` 是 `"NEW"`。需要计算字段时，可以不写主构造参数列表，改在类里定义一个 `init`：
+
+```lyra
+pub class Badge {
+    val title: String
+    pub init(label: String = "NEW") {
+        self.title = if label == "" { "NEW" } else { label }
+    }
+    pub fn label(self): String { self.title }
+}
+```
+
+调用写 `Badge()` 或 `Badge(label: "Beta")`。`init` 默认模块私有，`pub init` 可以公开构造而不公开字段。实参、默认值及泛型推断遵守普通调用规则。`init` 正常结束或执行不带值的 `return` 时返回同一个新对象。
+
+所有字段（包括可空字段）必须在每条正常返回路径上初始化；`val` 字段只能写一次。可直接读已初始化的字段，但调用 `self` 的方法、传递或捕获 `self` 要等所有字段就绪。抛异常而未返回对象的路径无需完成初始化。`if`、`match` 的分支可分别赋值；首版不在可能重复执行或非本地中断的循环、模式守卫、被 `catch` 保护的 `try` 块中首次初始化字段，可先在局部变量计算结果再赋值。多个构造函数和静态方法入口留待后续；其他创建方式可先写普通工厂函数。
 
 ## 类型契约
 

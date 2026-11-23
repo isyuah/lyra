@@ -213,9 +213,12 @@ struct Emitter {
                 builder.CreateStore(&arg, locals[slot]);
             } else initialize(arg.getArgNo(), &arg);
         }
+        if (initializer()) initialize(fn.syntax.parameters.size(), asyncCell(builder, layouts.objects[fn.result.id]));
         auto tail = emit(bodyId());
-        if (live()) leave(deferred() ? unit() : tail);
+        if (live()) leave(initializer() ? read(fn.syntax.parameters.size()) : deferred() ? unit() : tail);
     }
+
+    bool initializer() const { return !worker && fn.syntax.initializer; }
 
     Type rawType(ExprId id) const { const auto& info = fn.expressions[id]; return info.sourceType.value_or(info.type); }
 
@@ -954,7 +957,7 @@ struct Emitter {
     }
 
     Value emitNode(ExprId, const Return& ret) {
-        auto value = ret.value ? emit(*ret.value) : unit();
+        auto value = initializer() ? read(fn.syntax.parameters.size()) : ret.value ? emit(*ret.value) : unit();
         if (live()) leave(value);
         end();
         return unit();
