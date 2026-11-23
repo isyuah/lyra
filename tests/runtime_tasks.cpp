@@ -193,6 +193,7 @@ struct DisconnectCase {
     int sockets[2];
     NativeGate gate;
     LyraTask *handler{}, *blocked{};
+    LyraCleanup *cleanups{};
     bool observed{}, closed{};
 };
 
@@ -226,6 +227,12 @@ void observeDisconnect(LyraTask *self, void *storage) {
 void watchedHandler(LyraTask *self, void *storage) {
     auto *test = static_cast<DisconnectCase *>(storage);
     if (!test->blocked) {
+        lyraCleanupPush(&test->cleanups, [](void *environment) {
+            auto *closing = static_cast<DisconnectCase *>(environment);
+            check(closing->gate.returned && closing->observed && !closing->closed, "defer closed a resource before opaque native work ended");
+            close(closing->sockets[0]);
+            closing->closed = true;
+        }, test);
         check(lyraTaskWatchDisconnect(test->sockets[0]), "owner could not watch a socket");
         test->blocked = lyraTaskBlocking(queuedClosure, test);
         check(!lyraTaskAwait(self, test->blocked), "cold blocking closure was already done");
@@ -233,8 +240,6 @@ void watchedHandler(LyraTask *self, void *storage) {
     }
     check(lyraTaskCancelRequested(self) && test->observed && test->gate.returned, "cleanup ran early or missed disconnect");
     check(lyraTaskState(test->blocked) == LYRA_TASK_CANCELLED, "blocking work did not complete cancellation");
-    close(test->sockets[0]);
-    test->closed = true;
     lyraTaskFinishCancelled(self);
 }
 
@@ -242,6 +247,8 @@ struct GroupCase {
     LyraTask *early;
     unsigned order;
     Counter causes[2];
+    LyraCleanup *cleanups;
+    unsigned cleaned;
 };
 
 void firstFailure(LyraTask *self, void *storage) {
@@ -259,6 +266,11 @@ void secondFailure(LyraTask *self, void *storage) {
 
 void failGroup(LyraTask *self, void *storage) {
     auto *test = static_cast<GroupCase *>(storage);
+    lyraCleanupPush(&test->cleanups, [](void *environment) {
+        auto *closing = static_cast<GroupCase *>(environment);
+        check(closing->order == 2, "failure cleanup did not wait for the other child");
+        ++closing->cleaned;
+    }, test);
     test->early = lyraTaskSpawn(self, lyraTaskCreate(firstFailure, test));
     lyraTaskSpawn(self, lyraTaskCreate(secondFailure, test));
     lyraTaskComplete(self, nullptr);
@@ -321,6 +333,14 @@ int main() {
     lyraDomainRun(origin);
     check(counter == 2, "two serial tasks did not both update the counter");
 
+    auto *selfCancel = lyraTaskCreate([](LyraTask *self, void *) {
+        lyraTaskRequestCancel(self);
+        lyraTaskComplete(self, nullptr);
+    }, nullptr);
+    lyraTaskStart(origin, selfCancel);
+    lyraDomainRun(origin);
+    check(lyraTaskState(selfCancel) == LYRA_TASK_CANCELLED, "normal return swallowed a pending cancellation");
+
     auto *ticket = static_cast<NativeTicket *>(calloc(1, sizeof(NativeTicket)));
     handOff(origin, ticket);
     lyraDomainRun(origin);
@@ -344,6 +364,7 @@ int main() {
     DisconnectCase disconnected{};
     check(socketpair(AF_UNIX, SOCK_STREAM, 0, disconnected.sockets) == 0, "cannot create test sockets");
     disconnected.handler = lyraTaskCreate(watchedHandler, &disconnected);
+    lyraTaskKeepCleanups(disconnected.handler, &disconnected.cleanups);
     lyraTaskStart(origin, disconnected.handler);
     lyraTaskStart(origin, lyraTaskCreate(observeDisconnect, &disconnected));
     lyraDomainRun(origin);
@@ -353,9 +374,10 @@ int main() {
 
     GroupCase group{};
     auto *parent = lyraTaskCreate(failGroup, &group);
+    lyraTaskKeepCleanups(parent, &group.cleanups);
     lyraTaskStart(origin, parent);
     lyraDomainRun(origin);
-    check(lyraTaskState(parent) == LYRA_TASK_FAILED && lyraTaskFailureCount(parent) == 2, "unobserved child failures were lost");
+    check(lyraTaskState(parent) == LYRA_TASK_FAILED && lyraTaskFailureCount(parent) == 2 && group.cleaned == 1, "unobserved failure or group cleanup was lost");
     check(lyraTaskFailureAt(parent, 0) == &group.causes[0] && lyraTaskFailureAt(parent, 1) == &group.causes[1],
           "failures were reported by completion instead of registration");
     lyraDomainDestroy(other);

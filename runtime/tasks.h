@@ -2,6 +2,7 @@
 #define LYRA_RUNTIME_TASKS_H
 
 #include <stddef.h>
+#include "managed.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -23,6 +24,7 @@ size_t lyraDomainRun(LyraDomain *domain);
 void lyraDomainDestroy(LyraDomain *domain);
 
 LyraTask *lyraTaskCreate(LyraTaskStep step, void *frame);
+void lyraTaskKeepCleanups(LyraTask *task, LyraCleanup **stack);
 LyraTask *lyraTaskBlocking(LyraBlockingBody body, void *environment);
 void lyraTaskSharedCopy(void *destination, const void *source, size_t bytes);
 int lyraTaskWatchDisconnect(int socketFd);

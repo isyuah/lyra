@@ -32,6 +32,7 @@ struct LyraTask {
     void *outcome;
     LyraDomain *domain;
     LyraGcRoot *activeRoot;
+    LyraCleanup **cleanups;
     LyraTask *nextReady;
     LyraTask *firstWaiter;
     LyraTask *nextWaiter;
@@ -176,16 +177,24 @@ void finish(LyraTask *task, LyraTaskState state, void *outcome) {
         return;
     }
     for (;;) {
-        task->state = task->pendingState;
-        if (task->state == LYRA_TASK_FAILED) {
+        auto terminal = task->pendingState;
+        if (terminal == LYRA_TASK_FAILED) {
             bool included = false;
             for (auto *cause = task->failures; cause; cause = cause->next) included |= cause->cause == task->outcome;
             if (!included) addFailure(task, 0, task->outcome);
         }
-        if (task->failures && task->state != LYRA_TASK_CANCELLED) {
-            task->state = LYRA_TASK_FAILED;
+        if (task->failures && terminal != LYRA_TASK_CANCELLED) {
+            terminal = LYRA_TASK_FAILED;
             task->outcome = task->failures->cause;
         }
+        if (task->cleanups) {
+            auto *previous = currentTask;
+            currentTask = task;
+            lyraCleanupUntil(task->cleanups, nullptr);
+            currentTask = previous;
+            task->cleanups = nullptr;
+        }
+        task->state = terminal;
         task->frame = nullptr;
         task->step = nullptr;
         while (auto *watch = task->watches) {
@@ -271,6 +280,10 @@ LyraTask *lyraTaskCreate(LyraTaskStep step, void *frame) {
     task->frame = frame;
     task->state = LYRA_TASK_COLD;
     return task;
+}
+
+void lyraTaskKeepCleanups(LyraTask *task, LyraCleanup **stack) {
+    task->cleanups = stack;
 }
 
 LyraTask *lyraTaskBlocking(LyraBlockingBody body, void *environment) {
@@ -389,7 +402,8 @@ void lyraTaskBlock(LyraTask *task, LyraNativeWork work, void *nativeData) {
 }
 
 void lyraTaskComplete(LyraTask *task, void *value) {
-    finish(task, LYRA_TASK_COMPLETED, value);
+    if (task->cancelRequested) finish(task, LYRA_TASK_CANCELLED, nullptr);
+    else finish(task, LYRA_TASK_COMPLETED, value);
 }
 
 void lyraTaskFail(LyraTask *task, void *error) {

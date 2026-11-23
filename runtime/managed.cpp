@@ -11,6 +11,12 @@ struct LyraGcRoot {
     void *value;
 };
 
+struct LyraCleanup {
+    LyraCleanupCall call;
+    void *environment;
+    LyraCleanup *next;
+};
+
 namespace {
 
 pthread_once_t initialization = PTHREAD_ONCE_INIT;
@@ -56,6 +62,18 @@ void *lyraGcRootGet(const LyraGcRoot *root) {
 
 void lyraGcRootDrop(LyraGcRoot *root) {
     GC_FREE(root);
+}
+
+void lyraCleanupPush(LyraCleanup **stack, LyraCleanupCall call, void *environment) {
+    *stack = ::new (lyraGcAlloc(sizeof(LyraCleanup))) LyraCleanup{call, environment, *stack};
+}
+
+void lyraCleanupUntil(LyraCleanup **stack, const LyraCleanup *mark) {
+    while (*stack != mark) {
+        auto *top = *stack;
+        *stack = top->next;
+        top->call(top->environment);
+    }
 }
 
 int lyraGcEnterWorker() {
