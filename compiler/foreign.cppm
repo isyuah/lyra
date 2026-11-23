@@ -62,11 +62,17 @@ void emitForeign(const CheckedFunction& fn, const Source& source, llvm::Function
     builder.SetInsertPoint(llvm::BasicBlock::Create(module.getContext(), "ffi", &wrapper));
     std::vector<llvm::Type*> parameters;
     std::vector<llvm::Value*> values;
+    std::vector<llvm::AllocaInst*> stringRoots;
     for (auto& argument : wrapper.args()) {
         auto type = fn.locals[argument.getArgNo()].type;
         auto raw = cType(type, builder);
         parameters.push_back(raw);
         values.push_back(type == Type::Bool ? builder.CreateZExt(&argument, raw) : &argument);
+        if (type == Type::String) {
+            auto root = builder.CreateAlloca(raw, nullptr, "borrowed.string");
+            builder.CreateStore(&argument, root, true);
+            stringRoots.push_back(root);
+        }
     }
     const auto& symbol = *fn.syntax.foreignSymbol;
     auto signature = llvm::FunctionType::get(cType(fn.result, builder), parameters, false);
@@ -78,6 +84,7 @@ void emitForeign(const CheckedFunction& fn, const Source& source, llvm::Function
         result->addParamAttr(slot, llvm::Attribute::ZExt);
     }
     if (fn.result == Type::Bool) { foreign->addRetAttr(llvm::Attribute::ZExt); result->addRetAttr(llvm::Attribute::ZExt); }
+    for (auto root : stringRoots) builder.CreateLoad(builder.getPtrTy(), root, true);
     if (fn.result == Type::Unit) builder.CreateRet(builder.getInt8(0));
     else if (fn.result == Type::Bool) builder.CreateRet(builder.CreateIsNotNull(result));
     else builder.CreateRet(result);

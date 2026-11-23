@@ -17,7 +17,7 @@ build/dev/bin/lyra build examples/compiler-smoke/pass --release
 examples/compiler-smoke/pass/build/release/app
 ```
 
-`check .../fail` 预期非零退出，在 `;` 处报告 `LYT0001`；最后一条命令应打印 `3` 并正常退出。要构建优化版编译器，把三个 preset 命令中的 `dev` 换成 `release`。用 `cmake --install build/dev --prefix <目录>` 安装工具链，保留安装树的 `bin/`、`lib/`、`share/lyra/std/`。首次构建需要构建机上的 GC、libuv、SQLite、Jansson 开发包；CMake 下载并校验固定版本的 llhttp，已有源码时可设 `-DLYRA_LLHTTP_SOURCE_DIR=...` 离线配置。部署**编译好的应用**只需复制产物到约定的 Linux 环境，不用带工具链。
+`check .../fail` 预期非零退出，在 `;` 处报告 `LYT0001`；最后一条命令应打印 `3` 并正常退出。要构建优化版编译器，把三个 preset 命令中的 `dev` 换成 `release`。用 `cmake --install build/dev --prefix <目录>` 安装工具链，搬迁时整体复制前缀，包含 `bin/`、`lib/`、`share/` 和给 C 适配器使用的 `include/`。首次构建需要构建机上的 GC、libuv、SQLite、Jansson 开发包；CMake 下载并校验固定版本的 llhttp，已有源码时可设 `-DLYRA_LLHTTP_SOURCE_DIR=...` 离线配置。部署**编译好的应用**只需复制产物到约定的 Linux 环境，不用带工具链。
 
 ### 试跑一个完整项目
 

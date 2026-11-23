@@ -12,6 +12,7 @@ WORKDIR /src
 COPY CMakeLists.txt CMakePresets.json ./
 COPY compiler/ compiler/
 COPY cmake/ cmake/
+COPY include/ include/
 COPY runtime/ runtime/
 COPY std/ std/
 COPY tests/ tests/

@@ -101,28 +101,64 @@ class Installed(unittest.TestCase):
             shutil.rmtree(registry)
 
             native = root / 'native fixture'
-            write(native / 'scale.c', '#include <stdint.h>\nint64_t distributionScale(int64_t number) { return number * 7; }\n')
-            obj = native / 'scale.o'
-            archive = native / 'lib scale.a'
-            run('clang-18', '-c', native / 'scale.c', '-o', obj)
+            write(native / 'read.c', '''#define _XOPEN_SOURCE 700
+#include <lyra/string.h>
+#include <pthread.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+
+static pthread_once_t once = PTHREAD_ONCE_INIT;
+static pthread_barrier_t gate;
+static void initGate(void) { if (pthread_barrier_init(&gate, NULL, 2)) abort(); }
+void distributionMeet(void) {
+    if (pthread_once(&once, initGate)) abort();
+    int status = pthread_barrier_wait(&gate);
+    if (status != 0 && status != PTHREAD_BARRIER_SERIAL_THREAD) abort();
+}
+
+int64_t distributionRead(const LyraString *value, const LyraString *empty, int64_t number) {
+    static const unsigned char expected[] = {0xe4, 0xb8, 0xad, 0, 'x', 0};
+    LyraStringView text = lyraStringView(value);
+    LyraStringView blank = lyraStringView(empty);
+    LyraStringView absent = lyraStringView(NULL);
+    int emptyViewsMatch = blank.data && blank.size == 0 && !absent.data && absent.size == 0;
+    volatile uintptr_t maskedAddress = ~(uintptr_t)text.data;
+    distributionMeet();
+    distributionMeet();
+    const char *data = (const char *)~maskedAddress;
+    if (!emptyViewsMatch || !data || text.size != sizeof(expected) || memcmp(data, expected, text.size)) return -1;
+    return number * 7;
+}
+''')
+            obj = native / 'read.o'
+            archive = native / 'lib fixture.a'
+            run('clang-18', '-std=c11', '-O2', '-pthread', '-Wall', '-Wextra', '-Werror', '-I', prefix / 'include', '-c', native / 'read.c', '-o', obj)
             run('ar', 'rcs', archive, obj)
             write(app / 'src/main.ly', '''import catalog.banner
 import std.installprobe.identity
-extern fn distributionScale(number: Int): Int;
+extern fn distributionRead(value: String, empty: String, number: Int): Int;
+extern fn distributionMeet(): Unit;
 pub fn label(): String { identity() + ": " + banner() }
-pub fn score(): Int { distributionScale(6) }
-fn main(): Unit { print(label()); print(score()) }
+pub async fn score(): Int {
+    val reading = spawn blocking { distributionRead("中" + "\\0x\\0", "", 6) }
+    await blocking { distributionMeet() }
+    gcCollect()
+    distributionMeet()
+    await reading
+}
+async fn main(): Unit { print(label()); print(await score()) }
 ''')
             write(app / 'tests/contract.ly', '''import self.label
 import self.score
 import std.io.assert
-fn main(): Unit { assert(label() == "relocated: 打包时的标题:v1", "wrong installed input"); assert(score() == 42, "wrong C ABI result") }
+async fn main(): Unit { assert(label() == "relocated: 打包时的标题:v1", "wrong installed input"); assert(await score() == 42, "wrong C ABI result") }
 ''')
             blocked = root / 'offline guard' / 'curl'
             write(blocked, '#!/bin/sh\n: > "$LYRA_NETWORK_CALLED"\nexit 97\n')
             blocked.chmod(0o755)
             attempted = root / 'network was requested'
-            environment.update(PATH=str(blocked.parent) + os.pathsep + environment['PATH'], LYRA_NETWORK_CALLED=str(attempted))
+            environment.update(PATH=str(blocked.parent) + os.pathsep + environment['PATH'], LYRA_NETWORK_CALLED=str(attempted), UV_THREADPOOL_SIZE='2')
             frozen_args = ('--offline', '--locked')
             run(compiler, 'fetch', app, *frozen_args)
             for mode in ([], ['--release']):

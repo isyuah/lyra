@@ -81,8 +81,8 @@ async fn main(): Unit {
 
 ```sh
 out=$(mktemp -d)
-clang++-18 -std=c++23 -O2 -I runtime runtime/managed.cpp runtime/exceptions.cpp runtime/strings.cpp tests/runtime_managed.cpp $(pkg-config --cflags --libs bdw-gc) -o "$out/managed"
-clang++-18 -std=c++23 -O2 -I runtime runtime/managed.cpp runtime/tasks.cpp runtime/strings.cpp runtime/context.cpp runtime/exceptions.cpp tests/runtime_tasks.cpp $(pkg-config --cflags --libs bdw-gc libuv) -o "$out/tasks"
+clang++-18 -std=c++23 -O2 -I runtime -I include runtime/managed.cpp runtime/exceptions.cpp runtime/strings.cpp tests/runtime_managed.cpp $(pkg-config --cflags --libs bdw-gc) -o "$out/managed"
+clang++-18 -std=c++23 -O2 -I runtime -I include runtime/managed.cpp runtime/tasks.cpp runtime/strings.cpp runtime/context.cpp runtime/exceptions.cpp tests/runtime_tasks.cpp $(pkg-config --cflags --libs bdw-gc libuv) -o "$out/tasks"
 "$out/managed" && "$out/tasks" && UV_THREADPOOL_SIZE=1 "$out/tasks"
 readelf -d "$out/tasks" | grep NEEDED
 ```

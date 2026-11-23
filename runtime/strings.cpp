@@ -1,5 +1,6 @@
 #include "managed.h"
 #include "strings.h"
+#include <lyra/string.h>
 
 #include <cstddef>
 #include <cstdint>
@@ -16,6 +17,11 @@ std::size_t lyraStringLength(const void* string) {
 
 const char* lyraStringBytes(const void* string) {
     return static_cast<const char*>(string) + sizeof(std::size_t);
+}
+
+LyraStringView lyraStringView(const LyraString* value) {
+    if (!value) return {nullptr, 0};
+    return {lyraStringBytes(value), lyraStringLength(value)};
 }
 
 uint8_t lyraUtf8Valid(const char* bytes, std::size_t size) {
