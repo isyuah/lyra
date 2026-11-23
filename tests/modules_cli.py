@@ -212,6 +212,36 @@ import cfg.net.box
             self.assertEqual(error['code'], code)
             self.assertIn(detail, error['message'])
 
+    def test_public_signature_cannot_export_a_private_type_or_constraint(self):
+        lib = self.lib / 'src/net/types.ly'
+        self.source.write_text('import cfg.make as aliased\nfn main(): Unit {}')
+        (self.lib / 'src/lib.ly').write_text('pub import self.net.build as make\n')
+        declarations = '''struct Hidden(val value: Int)
+trait Internal { fn read(): Int }
+pub struct Box<Item>(pub val item: Item)
+'''
+        for leak, detail in (
+            ('pub fn build<T>(value: T): List<(Hidden) -> Box<T>> { [] }', 'Hidden'),
+            ('pub fn build(value: Box<Hidden>?): Unit {}', 'Hidden'),
+            ('pub fn build<T: Internal>(value: T): Unit {}', 'Internal'),
+            ('pub enum Leak<Item> { Value(Result<Item,Hidden>) }', 'Hidden'),
+            ('pub class Leak<Item>(pub val field: Box<Hidden>)', 'Hidden'),
+            ('pub trait Leak { fn hidden(): Hidden }', 'Hidden'),
+            ('pub extension Leak for Hidden { fn read(): Int { value } }', 'Hidden'),
+        ):
+            with self.subTest(leak=leak):
+                entry = '' if leak.startswith('pub fn build') else 'pub fn build(): Unit {}\n'
+                lib.write_text(declarations + entry + leak)
+                error, = json.loads(self.command('check', self.app, '--diagnostics=json', ok=False).stderr)
+                self.assertEqual(error['code'], 'LYN0003')
+                self.assertIn(detail, error['message'])
+                self.assertIn('types.ly', error['file'])
+        lib.write_text(declarations + '''pub class Counter(val state: Hidden) { pub fn read(): Int { state.value } }
+pub fn build(): Counter { Counter(Hidden(42)) }
+''')
+        self.source.write_text('import cfg.make as aliased\nfn main(): Unit { print(aliased().read()) }')
+        self.assertEqual(self.command('run', self.app).stdout, '42\n')
+
 
 if __name__ == '__main__':
     unittest.main()

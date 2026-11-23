@@ -45,5 +45,6 @@ struct CheckedEnum { Enumeration syntax; std::vector<std::vector<Type>> payloads
 struct SumTypes { Type success, failure; bool operator==(const SumTypes&) const = default; };
 struct FunctionShape { std::vector<Type> parameters; Type result; bool operator==(const FunctionShape&) const = default; };
 struct CheckedModule { std::deque<CheckedFunction> functions; std::optional<std::size_t> entry; std::deque<CheckedAggregate> aggregates; std::vector<std::string> variableNames; std::vector<Type> taskResults; std::vector<SumTypes> sumTypes; std::vector<Type> listElements; std::deque<FunctionShape> signatures{}; std::deque<CheckedEnum> enums{}; std::vector<NameReference> references{}; };
+std::optional<Type> hiddenType(const CheckedModule& module, Type type);
 CheckedModule check(Module module, const std::vector<Source>& sources, bool requireEntry = true);
 }

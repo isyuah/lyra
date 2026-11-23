@@ -25,25 +25,8 @@ void registerConversion(std::vector<DirectConversion>& table, const CheckedModul
         if (type.kind == Type::Enum) return sources[module.enums[type.id].syntax.file].moduleId == site.moduleId;
         return false;
     };
-    auto publicType = [&](auto&& self, Type type) -> bool {
-        if (type.kind == Type::Record) {
-            const auto& record = module.aggregates[type.id];
-            return record.syntax.isPublic && std::ranges::all_of(record.arguments, [&](Type argument) { return self(self, argument); });
-        }
-        if (type.kind == Type::Enum) {
-            const auto& item = module.enums[type.id];
-            return item.syntax.isPublic && std::ranges::all_of(item.arguments, [&](Type argument) { return self(self, argument); });
-        }
-        if (type.kind == Type::List) return self(self, module.listElements[type.id]);
-        if (type.kind == Type::Task) return self(self, module.taskResults[type.id]);
-        if (type.kind == Type::Option || type.kind == Type::Result) {
-            const auto& fields = module.sumTypes[type.id];
-            return self(self, fields.success) && (type.kind == Type::Option || self(self, fields.failure));
-        }
-        return true;
-    };
     if (source == target || (!owner(source) && !owner(target))) throw at(site, fn.syntax.name.span, "LYV0001", "implicit 的源或目标类型必须由本模块定义，且不能是同一类型");
-    if (fn.syntax.isPublic && (!publicType(publicType, source) || !publicType(publicType, target))) throw at(site, fn.syntax.name.span, "LYV0001", "pub implicit 的两端类型必须公开");
+    if (fn.syntax.isPublic && (hiddenType(module, source) || hiddenType(module, target))) throw at(site, fn.syntax.name.span, "LYV0001", "pub implicit 的两端类型必须公开");
     for (const auto& conversion : table) {
         const auto& existing = module.functions[conversion.function];
         if (conversion.source == source && conversion.target == target && sources[existing.syntax.file].moduleId == site.moduleId) {

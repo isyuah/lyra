@@ -24,6 +24,7 @@ H 由作者委托设计。顺序是先证明**写错能指出原因、写对能�
 | M0–M1：工具链、诊断与核心 | `cmake --preset dev` 使用 Clang 18、C++23 命名模块和 Ninja。[前端与原生用例](../tests/compiler_cli.py)覆盖分号返回 `Unit`、副作用顺序、溢出和失败时不覆盖产物。[语法用例](../tests/syntax_cli.py)在 Windows 和 Linux 验证换行、反引号、泛型尖括号与 `await`/`?`/负号优先级。 |
 | M2：数据与 GC | [对象测试](../tests/objects_cli.py)检查值复制和引用身份；[文本测试](../tests/text_cli.py)检查 Unicode、无损字节转换和跨 `await` 的插值。[原生任务测试](../tests/runtime_tasks.cpp)让 GC 在任务挂起期间运行；恢复后能读到同一对象。 |
 | M3：类型、集合与调用 | [泛型](../tests/generics_cli.py)、[集合](../tests/collections_cli.py)、[和类型](../tests/sums_cli.py)、[隐式转换](../tests/conversions_cli.py)以及[可空与遍历](../tests/sugar_cli.py)分别核对推断、默认值、展开、空值层数、提前返回和转换歧义。[普通函数重载](../tests/overloads_cli.py)核对逐实参排序、胜出后才报转换歧义、默认值只执行一次、函数值和跨包公开候选。 |
+| M3：泛型对象与公开 API | [对象](../tests/objects_cli.py)核对实例/静态方法重载和结构约束分派；[模块](../tests/modules_cli.py)核对跨包泛型枚举、扩展组导入和优先级，以及嵌套签名的私有类型检查。 |
 | 日常类型推断 | [返回推断与可空收窄](../tests/inference_cli.py)检查私有函数、泛型方法、递归需标注、短路和提前返回，以及跨 `await` 读取同一局部快照。 |
 | M4：模块、包与工具分发 | [安装验收](../tests/installed_cli.py)搬迁完整工具链、发布库、锁定并拉取源码，移走注册中心和生产者源码，在仓库外用离线缓存原生编译并执行。 |
 | M5：异步、异常与收尾 | [词法清理](../tests/defer_cli.py)、[异常](../tests/exceptions_cli.py)和[Context](../tests/context_cli.py)区分完成值、普通异常和取消，检查阻塞池、任务树及 `await` 的源位置。 |

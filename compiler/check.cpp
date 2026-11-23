@@ -26,6 +26,38 @@ import lyra.numbers;
 import lyra.initialization;
 
 namespace lyra {
+
+std::optional<Type> hiddenType(const CheckedModule& module, Type type) {
+    auto arguments = [&](std::span<const Type> types) -> std::optional<Type> {
+        for (auto nested : types) if (auto hidden = hiddenType(module, nested)) return hidden;
+        return {};
+    };
+    switch (type.kind) {
+        case Type::Record: {
+            const auto& record = module.aggregates[type.id];
+            return record.syntax.isPublic ? arguments(record.arguments) : std::optional(type);
+        }
+        case Type::Enum: {
+            const auto& item = module.enums[type.id];
+            return item.syntax.isPublic ? arguments(item.arguments) : std::optional(type);
+        }
+        case Type::List: return hiddenType(module, module.listElements[type.id]);
+        case Type::Task: return hiddenType(module, module.taskResults[type.id]);
+        case Type::Option: return hiddenType(module, module.sumTypes[type.id].success);
+        case Type::Result: {
+            const auto& sum = module.sumTypes[type.id];
+            if (auto hidden = hiddenType(module, sum.success)) return hidden;
+            return hiddenType(module, sum.failure);
+        }
+        case Type::Closure: {
+            const auto& shape = module.signatures[type.id];
+            if (auto hidden = arguments(shape.parameters)) return hidden;
+            return hiddenType(module, shape.result);
+        }
+        default: return {};
+    }
+}
+
 namespace {
 
 using Names = std::unordered_map<std::string, std::size_t>;
@@ -2015,6 +2047,15 @@ CheckedModule check(Module module, const std::vector<Source>& sources, bool requ
     }
     CheckedModule checked{};
     Symbols symbols{checked, sources, {}, {}, {}, {}, {}, {}};
+    auto expose = [&](Type type, const Source& source, Span site) {
+        if (auto hidden = hiddenType(checked, type)) throw at(source, site, "LYN0003", "公开签名不能暴露模块私有类型：" + typeName(checked, *hidden));
+    };
+    auto exposeBounds = [&](const auto& syntax) {
+        for (const auto& bound : syntax.bounds) {
+            const auto& trait = *std::ranges::find(module.traits, bound.trait.text, [](const Trait& item) { return item.name.text; });
+            if (!trait.isPublic) throw at(sources[syntax.file], bound.trait.span, "LYN0003", "公开签名不能暴露模块私有约束：" + bound.trait.text);
+        }
+    };
     auto reserveType = [&](const auto& decl, Names& names, std::size_t index) {
         const auto& declaration = decl.name.text;
         auto separator = declaration.rfind("::");
@@ -2077,11 +2118,20 @@ CheckedModule check(Module module, const std::vector<Source>& sources, bool requ
             const auto& field = syntax.fields[slot];
             if (!symbols.fields[id].emplace(field.name.text, slot).second) throw at(source, field.name.span, "LYN0002", "字段重复：" + field.name.text);
         }
-        symbols.recordType(id, typeVariables(syntax), source, syntax.name.span);
+        auto type = symbols.recordType(id, typeVariables(syntax), source, syntax.name.span);
+        if (syntax.isPublic) {
+            exposeBounds(syntax);
+            for (std::size_t slot = 0; slot < syntax.fields.size(); ++slot) if (syntax.fields[slot].isPublic)
+                expose(checked.aggregates[type.id].fields[slot], source, syntax.fields[slot].type.span);
+        }
     }
     for (const auto& trait : module.traits) {
         const auto& source = sources[trait.file];
-        symbols.contracts.define(trait, source, [&](const Identifier& type) { return symbols.resolve(source, type); });
+        symbols.contracts.define(trait, source, [&](const Identifier& type) {
+            auto resolved = symbols.resolve(source, type);
+            if (trait.isPublic) expose(resolved, source, type.span);
+            return resolved;
+        });
     }
     for (std::size_t id = 0; id < symbols.enumDeclarations.size(); ++id) {
         const auto& syntax = symbols.enumDeclarations[id];
@@ -2094,7 +2144,13 @@ CheckedModule check(Module module, const std::vector<Source>& sources, bool requ
                 if (field.name && !labels.insert(field.name->text).second) throw at(source, field.name->span, "LYN0002", "枚举分支载荷名重复：" + field.name->text);
             }
         }
-        symbols.enumType(id, typeVariables(syntax), source, syntax.name.span);
+        auto type = symbols.enumType(id, typeVariables(syntax), source, syntax.name.span);
+        if (syntax.isPublic) {
+            exposeBounds(syntax);
+            for (std::size_t index = 0; index < syntax.cases.size(); ++index)
+                for (std::size_t slot = 0; slot < syntax.cases[index].fields.size(); ++slot)
+                    expose(checked.enums[type.id].payloads[index][slot], source, syntax.cases[index].fields[slot].type.span);
+        }
     }
     for (const auto& group : symbols.extensionDeclarations) {
         const auto& source = sources[group.file];
@@ -2108,8 +2164,22 @@ CheckedModule check(Module module, const std::vector<Source>& sources, bool requ
         for (const auto& parameter : group.typeParameters) if (!used.contains(parameter.text))
             throw at(source, parameter.span, "LYG0002", "扩展组类型形参必须出现在接收者类型中：" + parameter.text);
         auto variables = typeVariables(group);
-        symbols.resolveWith(form, source, group.receiver.span, group.typeParameters, [&](auto slot) { return variables[slot]; });
+        auto receiver = symbols.resolveWith(form, source, group.receiver.span, group.typeParameters, [&](auto slot) { return variables[slot]; }).value();
+        if (group.isPublic) {
+            exposeBounds(group);
+            expose(receiver, source, group.receiver.span);
+        }
     }
+    auto exposeFunction = [&](const CheckedFunction& function) {
+        const auto& syntax = function.syntax;
+        if (!syntax.isPublic || syntax.conversion) return;
+        if (syntax.owner && !symbols.recordDeclarations[symbols.records.at(syntax.owner->text)].isPublic) return;
+        const auto& source = sources[syntax.file];
+        exposeBounds(syntax);
+        expose(function.result, source, syntax.result.span);
+        for (auto slot = static_cast<std::size_t>(syntax.hasReceiver); slot < syntax.parameters.size(); ++slot)
+            expose(function.locals[slot].type, source, syntax.parameters[slot].type.span);
+    };
     auto addOverload = [&](std::vector<std::size_t>& candidates, const Function& function, const Source& source) {
         auto signature = overloadKey(function);
         for (auto index : candidates) {
@@ -2147,6 +2217,7 @@ CheckedModule check(Module module, const std::vector<Source>& sources, bool requ
             continue;
         }
         auto concrete = symbols.prepare(std::move(function));
+        exposeFunction(concrete);
         const auto& syntax = concrete.syntax;
         if (!owner && !group && requireEntry && syntax.name.text == "main") {
             if (!syntax.parameters.empty()) throw at(source, syntax.name.span, "LYT0002", "main 不能接收形参");
@@ -2191,6 +2262,7 @@ CheckedModule check(Module module, const std::vector<Source>& sources, bool requ
         auto syntax = *callable.generic;
         syntax.result = symbols.resultAnnotation(callable, sources[syntax.file], syntax.name.span);
         auto body = symbols.prepare(std::move(syntax), callable.variables);
+        exposeFunction(body);
         Checker{body, sources[body.syntax.file], checked, symbols, {}, callable.variables}.run();
         rememberContracts(body);
         rememberReferences(body);
