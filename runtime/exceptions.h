@@ -11,7 +11,9 @@ extern "C" {
 
 typedef struct LyraException LyraException;
 const LyraException* lyraExceptionCreate(const void* message);
+const LyraException* lyraExceptionCreateTyped(const void* message, const void* type, const char* name);
 const void* lyraExceptionMessage(const LyraException* error);
+const void* lyraExceptionType(const LyraException* error);
 int lyraExceptionSame(const LyraException* left, const LyraException* right);
 const LyraException* lyraExceptionRaise(const LyraException* error, const char* file, uint64_t line, uint64_t column);
 const LyraException* lyraExceptionFrame(const LyraException* error, const char* role, const char* file, uint64_t line, uint64_t column);

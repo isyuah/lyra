@@ -84,6 +84,7 @@ struct Linker {
         for (auto& trait : syntax.traits) declare(trait.file, trait.name, trait.isPublic, false);
         for (auto& record : syntax.aggregates) declare(record.file, record.name, record.isPublic, false);
         for (auto& item : syntax.enums) declare(item.file, item.name, item.isPublic, false);
+        for (auto& item : syntax.exceptions) declare(item.file, item.name, item.isPublic, false);
         for (auto& extension : syntax.extensions) declare(extension.file, extension.name, extension.isPublic, false, true);
         for (auto& fn : syntax.functions) if (!fn.owner && !fn.extensionGroup) declare(fn.file, fn.name, fn.isPublic, true);
         std::map<std::size_t, std::map<std::string, const Import*>> generatedImports;
@@ -186,7 +187,7 @@ struct Linker {
                 }
                 if (auto* binding = std::get_if<Binding>(&expr.node); binding && binding->annotation) renameType(*binding->annotation);
                 if (auto* operation = std::get_if<TypeOperation>(&expr.node)) renameType(operation->type);
-                if (auto* attempt = std::get_if<Attempt>(&expr.node); attempt && attempt->binding) renameType(attempt->binding->type);
+                if (auto* attempt = std::get_if<Attempt>(&expr.node)) for (auto& arm : attempt->arms) if (arm.binding) renameType(arm.binding->type);
                 if (auto* match = std::get_if<Match>(&expr.node)) for (auto& arm : match->arms) renamePattern(renamePattern, arm.pattern);
                 if (auto* lambda = std::get_if<Lambda>(&expr.node)) {
                     for (auto& param : lambda->parameters) if (param.type) renameType(*param.type);

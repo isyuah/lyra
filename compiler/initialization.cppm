@@ -119,7 +119,10 @@ struct Flow {
 
     bool walk(ExprId, const Attempt& attempt, State& state, bool restricted) const {
         auto next = branch(attempt.body, state, true);
-        merge(next, branch(attempt.handler, state, restricted));
+        for (const auto& arm : attempt.arms) {
+            auto entered = state;
+            if (!arm.guard || eval(*arm.guard, entered, true)) merge(next, branch(arm.body, std::move(entered), restricted));
+        }
         return join(state, std::move(next));
     }
 

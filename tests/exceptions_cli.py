@@ -158,12 +158,48 @@ fn call(): Result<Int,String> {
 fn main(): Unit { call(); }
 ''', ['newer cleanup', 'older cleanup'], ['Exception: newer cleanup', 'main.ly:2:', 'suppressed Exception: older cleanup'])
 
+    def test_typed_catches_filter_in_source_order_and_keep_identity(self):
+        (self.package / 'src/errors').mkdir()
+        (self.package / 'src/errors/types.ly').write_text('pub exception Missing\npub exception Invalid\n')
+        self.executable('''import self.errors.Missing as MissingEntry
+import self.errors.Invalid
+fn wrongGuard(): Bool { print("wrong guard"); true }
+async fn reject(error: MissingEntry): Bool {
+    await blocking { gcCollect() }
+    print(error.message); false
+}
+async fn main(): Unit {
+    val original = MissingEntry(message: "checked")
+    val value = try { throw original }
+    catch wrong: Invalid if wrongGuard() { 0 }
+    catch problem: MissingEntry if await reject(problem) { 1 }
+    catch problem: MissingEntry { if problem == original { 42 } else { 2 } }
+    catch { 3 }
+    print(value)
+    val root: Exception = original
+    try {
+        try { throw root } catch wrong: Invalid {}
+    } catch problem: Exception { print(problem == original) }
+}''', ['checked', '42', 'true'])
+
+    def test_typed_exception_survives_rethrow_and_suppression(self):
+        self.executable('''exception Missing
+exception Cleanup
+fn leaf(): Unit {
+    defer { throw Cleanup("secondary") }
+    throw Missing("primary")
+}
+fn relay(): Unit { try { leaf() } catch problem: Missing if problem.message == "primary" { throw } }
+fn main(): Unit { relay() }
+''', [], ['Missing: primary', 'main.ly:5:5', 'suppressed Cleanup: secondary', 'main.ly:4:'])
+
     def test_diagnostics_reject_illegal_rethrow_and_types(self):
         cases = (
             ('fn main(): Unit { throw }', 'LYE0001', 'throw'),
             ('fn main(): Unit { throw 5 }', 'LYT0001', '5'),
             ('fn main(): Unit { try {} catch problem: Int {} }', 'LYE0002', 'Int'),
-            ('fn main(): Unit { try {} catch problem: Exception if true {} }', 'LYE0002', 'if'),
+            ('fn main(): Unit { try {} catch problem: Exception if 123 {} }', 'LYT0001', '123'),
+            ('fn main(): Unit { try {} catch problem: Exception {} catch {} }', 'LYE0002', 'catch {}'),
             ('fn main(): Unit { try {} catch problem: Exception {}; print(problem.message) }', 'LYN0001', 'problem.message'),
             ('fn main(): Unit { try {} catch { defer { throw } } }', 'LYE0001', 'throw'),
         )

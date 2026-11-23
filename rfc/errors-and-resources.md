@@ -22,7 +22,7 @@ fn startServer(): Result<Server, Error> {
 
 普通异常的根类型是 `Exception`。可以按类型捕获并加过滤条件，`catch { ... }` 兜底捕获普通异常，不吞掉取消。catch 中单独写 `throw` 会原样重抛当前异常，保留最初抛出的位置。首版 `throws` 只作文档提示，不改变函数类型，也不强制调用者捕获。`Result::Err` 不会因为携带相同的错误类型就自动抛出。未处理异常到达入口时，运行时输出原因、源位置和异步调用链，并以非零状态退出。稳定错误类型或 kind 是契约，自然语言文案不是。
 
-原生编译器已支持 `catch reason: Exception { ... }` 和无绑定的 `catch { ... }`；诊断会区分当前不支持的过滤条件和在 catch 外使用的裸 `throw`。见[异常传递、清理与可运行示例](../compiler/exception-unwinding.md)。
+用 `exception MissingEntry` 声明 `Exception` 的具名子类型，通过 `MissingEntry("missing")` 创建；`pub` 允许导入此类型。这只引入异常类别，不引入普通 Class 继承。`catch reason: MissingEntry if condition { ... }` 先按类型匹配，再用绑定求布尔条件；条件为假继续匹配下一分支。无过滤的根类型捕获或 `catch { ... }` 须放在最后。未匹配的异常原样向外传递。见[异常传递、清理与可运行示例](../compiler/exception-unwinding.md)。
 
 段错误、进程被操作系统终止及运行时损坏不是普通 `catch` 的恢复路径。**暂定的首版 OOM 策略**：只有显式可失败的分配 API 可以用 `Result` 报告本次分配失败；普通对象分配、字符串拼接、集合自动增长等隐式分配耗尽内存时终止。无可恢复 `panic`，需要强制终止时用标准库 `abort`。
 
@@ -81,5 +81,5 @@ alias.readAll()   // 已关闭错误；不会拿旧句柄去读
 ## 仍开放
 
 - `Error` 接口的具体继承、错误原因链 API、类型检查与展示接口。
-- catch 过滤条件的具体拼写，以及文档工具如何展示 `throws`。
+- `throws` 文档标记及其展示方式。
 - 可失败分配 API 的最小范围，以及多个清理失败的完整诊断数据结构。

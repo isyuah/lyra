@@ -7,6 +7,7 @@ module;
 #include <llvm/IR/Verifier.h>
 #include <map>
 #include <span>
+#include <string_view>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -331,6 +332,7 @@ struct Emitter {
         if (!live() || !info.sourceType) return value;
         if (info.conversion) return callFunction(*info.conversion, {value}, fn.syntax.expressions[id].span);
         if (info.type.kind == Type::Option) return makeSum(info.type, SumTag::Some, value);
+        if (info.type == Type::Exception && info.sourceType->kind == Type::Exception) return value;
         if (info.type == Type::Any) {
             auto boxed = builder.CreateInsertValue(llvm::PoisonValue::get(layouts.native(builder, info.type)), layouts.typeToken(builder, *info.sourceType), 0);
             return builder.CreateInsertValue(boxed, NativeLists{builder}.box(value), 1);
@@ -605,7 +607,7 @@ struct Emitter {
             auto symbol = owner == Type::String && member.name.text == "size" ? "lyraStringScalarCount" : "lyraStringLength";
             return builder.CreateCall(module.getOrInsertFunction(symbol, builder.getInt64Ty(), builder.getPtrTy()), {object});
         }
-        if (owner == Type::Exception) return NativeExceptions{builder}.message(object);
+        if (owner.kind == Type::Exception) return NativeExceptions{builder}.message(object);
         auto slot = static_cast<unsigned>(fn.expressions[id].target);
         if (!layouts.reference(owner)) return builder.CreateExtractValue(object, slot);
         auto field = builder.CreateStructGEP(layouts.objects[owner.id], object, slot);
@@ -708,7 +710,14 @@ struct Emitter {
                 guard(builder.CreateLoad(pointer, errorSlot), handlers.size(), call.name.span, "call");
                 return value;
             }
-            case Callee::Exception: return NativeExceptions{builder}.create(args.front());
+            case Callee::Exception: {
+                auto type = rawType(id);
+                if (!type.id) return NativeExceptions{builder}.create(args.front());
+                const auto& name = layouts.program.exceptions[type.id - 1].name.text;
+                auto separator = name.rfind("::");
+                return NativeExceptions{builder}.create(args.front(), layouts.typeToken(builder, type),
+                    std::string_view(name).substr(separator == name.npos ? 0 : separator + 2));
+            }
             case Callee::TaskCancel:
                 builder.CreateCall(module.getOrInsertFunction("lyraTaskRequestCancel", builder.getVoidTy(), builder.getPtrTy()), args);
                 return unit();
@@ -912,7 +921,7 @@ struct Emitter {
         auto right = emit(binary.right);
         if (!live()) return unit();
         auto type = fn.expressions[binary.left].type;
-        if (type == Type::Exception) {
+        if (type.kind == Type::Exception) {
             auto same = NativeExceptions{builder}.same(left, right);
             return op == Op::Eq ? same : builder.CreateNot(same);
         }
@@ -1085,24 +1094,49 @@ struct Emitter {
         handlers.push_back({landing, cleanupMark()});
         auto value = emit(attempt.body);
         handlers.pop_back();
-        auto normal = builder.GetInsertBlock();
-        if (normal) builder.CreateBr(done);
+        std::vector<std::pair<Value, Label>> values;
+        auto finish = [&](Value result) {
+            if (!live()) return;
+            values.emplace_back(result, builder.GetInsertBlock());
+            builder.CreateBr(done);
+        };
+        finish(value);
         builder.SetInsertPoint(landing);
         auto error = builder.CreateLoad(builder.getPtrTy(), errorSlot);
-        builder.CreateStore(NativeExceptions{builder}.none(), errorSlot);
-        if (attempt.binding) initialize(fn.expressions[id].target, error);
-        caught.push_back(error);
-        auto fallback = emit(attempt.handler);
-        caught.pop_back();
-        auto handled = builder.GetInsertBlock();
-        if (handled) builder.CreateBr(done);
-        if (!normal && !handled) { done->eraseFromParent(); end(); return unit(); }
+        NativeExceptions exceptions{builder};
+        builder.CreateStore(exceptions.none(), errorSlot);
+        const auto& checked = fn.expressions[id].catches;
+        for (std::size_t slot = 0; slot < attempt.arms.size(); ++slot) {
+            const auto& arm = attempt.arms[slot];
+            const auto& plan = checked[slot];
+            auto next = plan.type.id || arm.guard ? label("catch.next") : nullptr;
+            if (plan.type.id) {
+                auto typed = label("catch.typed");
+                builder.CreateCondBr(exceptions.matches(error, layouts.typeToken(builder, plan.type)), typed, next);
+                builder.SetInsertPoint(typed);
+            }
+            if (plan.local) initialize(*plan.local, error);
+            caught.push_back(error);
+            if (arm.guard) {
+                auto accepted = emit(*arm.guard);
+                if (live()) {
+                    auto handler = label("catch.handle");
+                    builder.CreateCondBr(accepted, handler, next);
+                    builder.SetInsertPoint(handler);
+                }
+            }
+            if (live()) finish(emit(arm.body));
+            caught.pop_back();
+            if (!next) { end(); break; }
+            builder.SetInsertPoint(next);
+        }
+        if (live()) propagate(error, handlers.size());
+        if (values.empty()) { done->eraseFromParent(); end(); return unit(); }
         builder.SetInsertPoint(done);
         auto type = rawType(id);
         if (type == Type::Unit) return unit();
-        auto result = builder.CreatePHI(layouts.native(builder, type), 2);
-        if (normal) result->addIncoming(value, normal);
-        if (handled) result->addIncoming(fallback, handled);
+        auto result = builder.CreatePHI(layouts.native(builder, type), values.size());
+        for (const auto& [output, block] : values) result->addIncoming(output, block);
         return result;
     }
 

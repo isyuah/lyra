@@ -23,33 +23,42 @@ void location(FILE* stream, Location point) {
 
 }
 
-struct LyraException { const void* message; Location origin; const Frame* trace; const Suppressed* suppressed; const LyraException* identity; };
+struct LyraException { const void* message; const void* type; const char* name; Location origin; const Frame* trace; const Suppressed* suppressed; const LyraException* identity; };
 
 const LyraException* lyraExceptionCreate(const void* message) {
-    auto error = managed<LyraException>(message, Location{}, nullptr, nullptr, nullptr);
+    return lyraExceptionCreateTyped(message, nullptr, "Exception");
+}
+
+const LyraException* lyraExceptionCreateTyped(const void* message, const void* type, const char* name) {
+    auto error = managed<LyraException>(message, type, name, Location{}, nullptr, nullptr, nullptr);
     error->identity = error;
     return error;
 }
 
 const void* lyraExceptionMessage(const LyraException* error) { return error->message; }
+const void* lyraExceptionType(const LyraException* error) { return error->type; }
 int lyraExceptionSame(const LyraException* left, const LyraException* right) { return left->identity == right->identity; }
 
 const LyraException* lyraExceptionRaise(const LyraException* error, const char* file, std::uint64_t line, std::uint64_t column) {
     if (error->origin.file) return error;
-    return managed<LyraException>(error->message, Location{file, line, column}, error->trace, error->suppressed, error->identity);
+    auto located = managed<LyraException>(*error);
+    located->origin = {file, line, column};
+    return located;
 }
 
 const LyraException* lyraExceptionFrame(const LyraException* error, const char* role, const char* file, std::uint64_t line, std::uint64_t column) {
-    auto trace = managed<Frame>(role, Location{file, line, column}, error->trace);
-    return managed<LyraException>(error->message, error->origin, trace, error->suppressed, error->identity);
+    auto traced = managed<LyraException>(*error);
+    traced->trace = managed<Frame>(role, Location{file, line, column}, error->trace);
+    return traced;
 }
 
 std::size_t lyraExceptionSuppressedCount(const LyraException* error) { return error->suppressed ? error->suppressed->count : 0; }
 
 const LyraException* lyraExceptionSuppress(const LyraException* primary, const LyraException* additional) {
     if (!primary) return additional;
-    auto chain = managed<Suppressed>(additional, primary->suppressed, lyraExceptionSuppressedCount(primary) + 1);
-    return managed<LyraException>(primary->message, primary->origin, primary->trace, chain, primary->identity);
+    auto merged = managed<LyraException>(*primary);
+    merged->suppressed = managed<Suppressed>(additional, primary->suppressed, lyraExceptionSuppressedCount(primary) + 1);
+    return merged;
 }
 
 void lyraExceptionWrite(const LyraException* error, FILE* stream) {
@@ -58,7 +67,8 @@ void lyraExceptionWrite(const LyraException* error, FILE* stream) {
     Pending first{error, nullptr};
     for (const Pending* pending = &first; pending;) {
         auto item = pending->error;
-        std::fputs(pending == &first ? "Exception: " : "suppressed Exception: ", stream);
+        if (pending != &first) std::fputs("suppressed ", stream);
+        std::fprintf(stream, "%s: ", item->name);
         pending = pending->next;
         std::fwrite(lyraStringBytes(item->message), 1, lyraStringLength(item->message), stream);
         std::fputc('\n', stream);

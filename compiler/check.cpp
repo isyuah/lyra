@@ -50,6 +50,7 @@ std::optional<Type> hiddenType(const CheckedModule& module, Type type) {
             return hiddenType(module, sum.failure);
         }
         case Type::Dyn: return module.traits[type.id].isPublic ? std::nullopt : std::optional(type);
+        case Type::Exception: return !type.id || module.exceptions[type.id - 1].isPublic ? std::nullopt : std::optional(type);
         case Type::Closure: {
             const auto& shape = module.signatures[type.id];
             if (auto hidden = arguments(shape.parameters)) return hidden;
@@ -80,7 +81,12 @@ std::string typeName(const CheckedModule& module, Type type, bool canonical = fa
         case Type::String: return "String";
         case Type::Char: return "Char";
         case Type::Bytes: return "Bytes";
-        case Type::Exception: return "Exception";
+        case Type::Exception: {
+            if (!type.id) return "Exception";
+            const auto& full = module.exceptions[type.id - 1].name.text;
+            auto separator = full.rfind("::");
+            return canonical || separator == full.npos ? full : full.substr(separator + 2);
+        }
         case Type::CPtr: return "CPtr";
         case Type::Any: return "Any";
         case Type::Dyn: {
@@ -148,7 +154,7 @@ OverloadKey overloadKey(const Function& syntax) {
     return key;
 }
 
-enum class MatchKind { Exact, Number, Nullable, Literal, User, Box };
+enum class MatchKind { Exact, Number, Nullable, Literal, Upcast, User, Box };
 struct ArgumentMatch {
     MatchKind kind;
     Type target{};
@@ -232,6 +238,7 @@ struct Symbols {
     std::vector<DirectConversion> conversions{};
     StructuralContracts contracts{};
     Names traitNames{};
+    Names exceptionTypes{};
     Names enums{};
     std::vector<Names> variants{};
     std::vector<Enumeration> enumDeclarations{};
@@ -543,6 +550,7 @@ struct Symbols {
                 return Type{Type::Dyn, trait->second};
             }
             for (Type type : scalarTypes) if (form.name == typeName(module, type)) return type;
+            if (auto exception = exceptionTypes.find(form.name); exception != exceptionTypes.end()) return Type{Type::Exception, exception->second + 1};
         }
         std::vector<Type> arguments;
         for (const auto& part : form.arguments) {
@@ -815,7 +823,8 @@ struct Checker {
         auto& info = fn.expressions[id];
         if (expected && type != *expected && type != Type::Never) {
             auto site = fn.syntax.expressions[id].span;
-            if (*expected != Type::Any && !losslessNumber(type, *expected) && (expected->kind != Type::Option || module.sumTypes[expected->id].success != type)) {
+            auto exceptionUpcast = type.kind == Type::Exception && *expected == Type::Exception;
+            if (*expected != Type::Any && !exceptionUpcast && !losslessNumber(type, *expected) && (expected->kind != Type::Option || module.sumTypes[expected->id].success != type)) {
                 info.conversion = directConversion(symbols.conversions, module, symbols.sources, type, *expected, source, site, !probing);
                 if (!info.conversion) throw mismatch(module, source, site, *expected, type);
             }
@@ -944,24 +953,43 @@ struct Checker {
 
     Type infer(ExprId id, const Attempt& attempt, std::optional<Type> expected, bool discard) {
         auto entry = present;
-        auto normal = visit(attempt.body, discard ? std::nullopt : expected, discard);
-        auto normalFacts = std::exchange(present, std::move(entry));
-        scopes.emplace_back();
-        if (const auto& binding = attempt.binding) {
-            if (symbols.resolve(fn.syntax, binding->type, variables) != Type::Exception) throw at(source, binding->type.span, "LYE0002", "当前仅支持捕获普通异常根类型 Exception");
-            auto slot = fn.locals.size();
-            fn.locals.push_back({Type::Exception, false, currentWorker()});
-            declare(binding->name, slot);
-            fn.expressions[id].target = slot;
+        auto result = visit(attempt.body, discard ? std::nullopt : expected, discard);
+        auto exits = result == Type::Never ? std::optional<Present>{} : std::optional(present);
+        std::set<Type> covered;
+        for (const auto& arm : attempt.arms) {
+            present = entry;
+            scopes.emplace_back();
+            auto type = arm.binding ? symbols.resolve(fn.syntax, arm.binding->type, variables) : Type{Type::Exception};
+            if (type.kind != Type::Exception) throw at(source, arm.binding->type.span, "LYE0002", "catch 需要 Exception 或其具名子类型");
+            if (covered.contains(Type::Exception) || covered.contains(type)) throw at(source, arm.site, "LYE0002", "此 catch 已被前面的无过滤捕获覆盖");
+            if (!arm.guard) covered.insert(type);
+            std::optional<std::size_t> local;
+            if (arm.binding) {
+                if (type.id) {
+                    const auto& declaration = module.exceptions[type.id - 1];
+                    refer(arm.binding->type, declaration.file, declaration.name.span);
+                }
+                local = fn.locals.size();
+                fn.locals.push_back({type, false, currentWorker()});
+                declare(arm.binding->name, *local);
+            }
+            fn.expressions[id].catches.push_back({type, local});
+            catchOwners.push_back(currentWorker());
+            bool reaches = !arm.guard || visit(*arm.guard, Type::Bool) != Type::Never;
+            if (arm.guard && reaches) {
+                auto facts = definitelyPresent(*arm.guard, true);
+                present.insert(facts.begin(), facts.end());
+            }
+            auto recovered = visit(arm.body, discard ? std::nullopt : result != Type::Never ? std::optional(result) : expected, discard);
+            catchOwners.pop_back();
+            scopes.pop_back();
+            if (reaches && recovered != Type::Never) {
+                if (result == Type::Never) result = recovered;
+                exits = exits ? bothPaths(*exits, present) : present;
+            }
         }
-        catchOwners.push_back(currentWorker());
-        auto recovered = visit(attempt.handler, discard ? std::nullopt : normal != Type::Never ? std::optional(normal) : expected, discard);
-        catchOwners.pop_back();
-        scopes.pop_back();
-        if (normal == Type::Never && recovered == Type::Never) return Type::Never;
-        if (recovered == Type::Never) present = std::move(normalFacts);
-        else if (normal != Type::Never) present = bothPaths(present, normalFacts);
-        return discard ? Type{Type::Unit} : normal == Type::Never ? recovered : normal;
+        present = exits.value_or(std::move(entry));
+        return result != Type::Never && discard ? Type{Type::Unit} : result;
     }
 
     Type infer(ExprId id, const ListLiteral& literal, std::optional<Type> expected, bool) {
@@ -1464,7 +1492,7 @@ struct Checker {
         if (owner == Type::String && (member.name.text == "size" || member.name.text == "byteSize")) return Type::Int;
         if (owner == Type::Bytes && member.name.text == "size") return Type::Int;
         if (owner == Type::Char && member.name.text == "codePoint") return number(Type::UInt, 32);
-        if (owner == Type::Exception && member.name.text == "message") return Type::String;
+        if (owner.kind == Type::Exception && member.name.text == "message") return Type::String;
         auto field = memberIndex(owner, member.name, symbols.fields);
         fn.expressions[id].target = field;
         const auto& record = module.aggregates[owner.id];
@@ -1577,6 +1605,7 @@ struct Checker {
         const auto& info = fn.expressions[id];
         if (info.conversion) return {MatchKind::User};
         if (info.boxedSpread || (info.sourceType && info.type == Type::Any)) return {MatchKind::Box};
+        if (info.sourceType && info.type == Type::Exception) return {MatchKind::Upcast};
         if (info.sourceType) return info.type.kind == Type::Option ? ArgumentMatch{MatchKind::Nullable} : ArgumentMatch{MatchKind::Number, info.type};
         const auto& node = fn.syntax.expressions[id].node;
         if (std::holds_alternative<IntegerLiteral>(node) && info.type != Type::Int) return {MatchKind::Literal, info.type};
@@ -1797,6 +1826,12 @@ struct Checker {
             noTypeArgs();
             info.callee = Callee::Exception;
             return arguments(id, call, 1, [](auto) { return "message"; }, [](auto) { return Type{Type::String}; }) ? Type::Never : Type::Exception;
+        } else if (auto named = symbols.exceptionTypes.find(key); named != symbols.exceptionTypes.end()) {
+            noTypeArgs();
+            const auto& type = module.exceptions[named->second];
+            refer(call.name, type.file, type.name.span);
+            info.callee = Callee::Exception;
+            return arguments(id, call, 1, [](auto) { return "message"; }, [](auto) { return Type{Type::String}; }) ? Type{Type::Never} : Type{Type::Exception, named->second + 1};
         } else if (key == "print") {
             noTypeArgs();
             info.callee = Callee::Print;
@@ -1961,6 +1996,11 @@ struct Checker {
             fit(binary.left, left, *common);
             fit(binary.right, right, *common);
             return binary.op <= Op::Ge ? Type{Type::Bool} : *common;
+        }
+        if (equality && left.kind == Type::Exception && right.kind == Type::Exception) {
+            fit(binary.left, left, Type::Exception);
+            fit(binary.right, right, Type::Exception);
+            return Type::Bool;
         }
         right = fit(binary.right, right, left);
         if (equality && (left.kind == Type::Option || left.kind == Type::Result || left.kind == Type::Enum || left.kind == Type::Closure || left.kind == Type::Any || left.kind == Type::Dyn || left.kind == Type::Variable || (left.kind == Type::Record && !module.aggregates[left.id].syntax.reference))) throw at(source, binary.site, "LYT0006", typeName(module, left) + " 未提供 Eq，不能用 == 或 != 比较");
@@ -2155,6 +2195,10 @@ CheckedModule check(Module module, const std::vector<Source>& sources, bool requ
         if (symbols.records.contains(decl.name.text)) throw at(sources[decl.file], decl.name.span, "LYN0002", "类型名称已声明：" + decl.name.text);
         reserveType(decl, symbols.enums, symbols.enumDeclarations.size());
         symbols.enumDeclarations.push_back(std::move(decl));
+    }
+    for (auto& decl : module.exceptions) {
+        reserveType(decl, symbols.exceptionTypes, checked.exceptions.size());
+        checked.exceptions.push_back(std::move(decl));
     }
     symbols.fields.resize(symbols.recordDeclarations.size());
     symbols.methods.resize(symbols.recordDeclarations.size());

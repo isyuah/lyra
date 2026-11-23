@@ -123,7 +123,7 @@ Function specializeGeneric(Function result, const std::vector<std::string>& type
     for (auto& expression : result.expressions) {
         if (auto binding = std::get_if<Binding>(&expression.node); binding && binding->annotation) substitute(*binding->annotation);
         if (auto operation = std::get_if<TypeOperation>(&expression.node)) substitute(operation->type);
-        if (auto attempt = std::get_if<Attempt>(&expression.node); attempt && attempt->binding) substitute(attempt->binding->type);
+        if (auto attempt = std::get_if<Attempt>(&expression.node)) for (auto& arm : attempt->arms) if (arm.binding) substitute(arm.binding->type);
         if (auto lambda = std::get_if<Lambda>(&expression.node)) {
             for (auto& param : lambda->parameters) if (param.type) substitute(*param.type);
             if (lambda->result) substitute(*lambda->result);

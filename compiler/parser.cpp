@@ -279,6 +279,14 @@ public:
                 extension(module, pub);
                 continue;
             }
+            if (is("exception")) {
+                if (firstPrefix != module.expansions.size()) throw at(source, module.expansions[firstPrefix].name.span, "LYM0001", "此版本不能修饰异常声明");
+                consume();
+                module.exceptions.push_back({file, identifier(), pub});
+                if (is(";")) consume();
+                else if (token.kind != Kind::End && !token.newlineBefore) throw at(source, token.span, "LYP0001", "异常声明后需要换行或分号");
+                continue;
+            }
             for (auto index = firstPrefix; index < module.expansions.size(); ++index) {
                 auto& prefix = module.expansions[index];
                 if (is("import")) throw at(source, prefix.name.span, "LYM0001", "不能修饰 import");
@@ -1050,18 +1058,21 @@ private:
         }
         if (is("try")) {
             consume();
-            auto body = block();
-            require("catch");
-            std::optional<CatchBinding> binding;
-            if (!is("{")) {
-                auto name = identifier();
-                require(":");
-                binding = CatchBinding{std::move(name), type()};
-            }
-            if (is("if")) throw at(source, token.span, "LYE0002", "当前尚不支持 catch 过滤条件");
-            auto handler = block();
-            if (is("catch")) throw at(source, token.span, "LYE0002", "Exception 兜底捕获之后不能再写 catch 分支");
-            return add({start, nodes[handler].span.end}, Attempt{body, handler, std::move(binding)});
+            Attempt attempt{block(), {}};
+            do {
+                auto site = require("catch").span;
+                std::optional<CatchBinding> binding;
+                std::optional<ExprId> guard;
+                if (!is("{")) {
+                    auto name = identifier();
+                    require(":");
+                    binding = CatchBinding{std::move(name), type()};
+                    if (is("if")) { consume(); guard = expression(false, 1, false); }
+                }
+                attempt.arms.push_back({site, std::move(binding), guard, block()});
+            } while (is("catch"));
+            auto end = nodes[attempt.arms.back().body].span.end;
+            return add({start, end}, std::move(attempt));
         }
         if (is("match")) {
             consume();

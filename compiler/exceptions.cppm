@@ -25,6 +25,18 @@ struct NativeExceptions {
         return builder.CreateCall(module().getOrInsertFunction("lyraExceptionCreate", pointer, pointer), {message});
     }
 
+    llvm::Value* create(llvm::Value* message, llvm::Value* type, llvm::StringRef name) const {
+        auto pointer = builder.getPtrTy();
+        auto create = module().getOrInsertFunction("lyraExceptionCreateTyped", pointer, pointer, pointer, pointer);
+        return builder.CreateCall(create, {message, type, builder.CreateGlobalStringPtr(name)});
+    }
+
+    llvm::Value* matches(llvm::Value* error, llvm::Value* type) const {
+        auto pointer = builder.getPtrTy();
+        auto actual = builder.CreateCall(module().getOrInsertFunction("lyraExceptionType", pointer, pointer), {error});
+        return builder.CreateICmpEQ(actual, type);
+    }
+
     llvm::Value* message(llvm::Value* error) const {
         auto pointer = builder.getPtrTy();
         return builder.CreateCall(module().getOrInsertFunction("lyraExceptionMessage", pointer, pointer), {error});
