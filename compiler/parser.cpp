@@ -2,7 +2,6 @@ module;
 #include <charconv>
 #include <algorithm>
 #include <cstdint>
-#include <limits>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -28,6 +27,7 @@ bool isLetter(char value) {
 }
 
 bool isDigit(char value) { return value >= '0' && value <= '9'; }
+bool basedInteger(std::string_view value) { return value.starts_with("0x") || value.starts_with("0o") || value.starts_with("0b"); }
 
 class Lexer {
 public:
@@ -54,11 +54,24 @@ public:
         if (offset == text.size()) return {Kind::End, {start, start}, newline};
         char current = text[offset++];
         Kind kind;
-        if (isLetter(current) || isDigit(current)) {
+        if (isDigit(current)) {
+            kind = Kind::Number;
+            if (!basedInteger(text.substr(start))) {
+                auto digits = [&] { while (offset < text.size() && (isDigit(text[offset]) || text[offset] == '_')) ++offset; };
+                digits();
+                if (offset + 1 < text.size() && text[offset] == '.' && isDigit(text[offset + 1])) { ++offset; digits(); }
+                if (offset < text.size() && (text[offset] == 'e' || text[offset] == 'E')) {
+                    ++offset;
+                    if (offset < text.size() && (text[offset] == '-' || text[offset] == '+')) ++offset;
+                    digits();
+                }
+            }
+            while (offset < text.size() && (isLetter(text[offset]) || isDigit(text[offset]))) ++offset;
+        } else if (isLetter(current)) {
             while (offset < text.size() && (isLetter(text[offset]) || isDigit(text[offset]))) ++offset;
             constexpr std::string_view keywords[] = {"fn", "val", "var", "if", "else", "while", "for", "in", "return", "break", "continue", "true", "false", "struct", "class", "trait", "pub", "import", "as", "async", "await", "spawn", "extern", "match", "null", "implicit", "defer", "throw", "try", "catch"};
             auto word = text.substr(start, offset - start);
-            kind = isDigit(current) ? Kind::Number : std::ranges::find(keywords, word) == std::end(keywords) ? Kind::Name : Kind::Keyword;
+            kind = std::ranges::find(keywords, word) == std::end(keywords) ? Kind::Name : Kind::Keyword;
         } else if (current == '"') {
             kind = Kind::String;
             while (offset < text.size() && text[offset] != '"') {
@@ -96,7 +109,7 @@ private:
     std::size_t offset = 0;
 };
 
-std::int64_t integer(const Source& source, Span digits, bool negative) {
+IntegerLiteral integer(const Source& source, Span digits, bool negative) {
     auto word = std::string_view(source.text).substr(digits.begin, digits.end - digits.begin);
     int base = 10;
     if (word.starts_with("0x")) base = 16;
@@ -111,13 +124,28 @@ std::int64_t integer(const Source& source, Span digits, bool negative) {
     std::uint64_t number = 0;
     auto end = magnitude.data() + magnitude.size();
     auto [stopped, error] = std::from_chars(magnitude.data(), end, number, base);
-    constexpr auto limit = static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max());
-    if (error == std::errc::result_out_of_range || number > limit + negative) {
-        throw at(source, digits, "LYL0002", "整数字面量超出 64 位 Int 的范围");
-    }
+    if (error == std::errc::result_out_of_range) throw at(source, digits, "LYL0002", "整数字面量超出 64 位整数范围");
     if (error != std::errc{} || stopped != end) throw at(source, digits, "LYL0002", "无效的整数字面量");
-    if (number == limit + 1) return std::numeric_limits<std::int64_t>::min();
-    return negative ? -static_cast<std::int64_t>(number) : static_cast<std::int64_t>(number);
+    return {number, negative};
+}
+
+bool realSpelling(std::string_view text) {
+    return !basedInteger(text) && (text.find_first_of(".eE") != text.npos || text.ends_with("f32") || text.ends_with("f64"));
+}
+
+RealLiteral real(const Source& source, Span span, std::string_view text, bool negative) {
+    RealLiteral result{negative ? "-" : "", {}};
+    if (text.ends_with("f32") || text.ends_with("f64")) {
+        result.width = text.ends_with("f32") ? 32 : 64;
+        text.remove_suffix(3);
+    }
+    for (std::size_t index = 0; index < text.size(); ++index) {
+        auto value = text[index];
+        if (value != '_') result.digits += value;
+        else if (!index || index + 1 == text.size() || !isDigit(text[index - 1]) || !isDigit(text[index + 1]))
+            throw at(source, span, "LYL0002", "浮点字面量的 _ 必须在数字之间");
+    }
+    return result;
 }
 
 struct Infix { std::string_view text; int rank; Op op; };
@@ -556,8 +584,10 @@ private:
         if (token.kind == Kind::Number || (is("-") && next.kind == Kind::Number)) {
             bool negative = is("-");
             if (negative) consume();
-            auto digits = consume().span;
-            return {{site.begin, digits.end}, integer(source, digits, negative)};
+            auto literal = consume();
+            auto span = Span{site.begin, literal.span.end};
+            if (realSpelling(text(literal))) throw at(source, span, "LYT0011", "浮点匹配请使用守卫条件");
+            return {span, integer(source, literal.span, negative)};
         }
         if (token.kind == Kind::String) {
             auto literal = stringLiteral();
@@ -692,7 +722,7 @@ private:
         expansion.argumentsSpan.end = close.begin;
         expansion.span.end = close.end;
         macros->push_back(std::move(expansion));
-        return add({begin, close.end}, std::int64_t{0});
+        return add({begin, close.end}, IntegerLiteral{});
     }
 
     ExprId atom(bool inParens, bool trailingBlock) {
@@ -716,8 +746,10 @@ private:
         if (token.kind == Kind::Number || (is("-") && next.kind == Kind::Number)) {
             bool negative = is("-");
             if (negative) consume();
-            auto digits = consume().span;
-            return add({start, digits.end}, integer(source, digits, negative));
+            auto literal = consume();
+            auto span = Span{start, literal.span.end};
+            if (realSpelling(text(literal))) return add(span, real(source, span, text(literal), negative));
+            return add(span, integer(source, literal.span, negative));
         }
         if (is("await") || is("spawn")) {
             auto op = consume();

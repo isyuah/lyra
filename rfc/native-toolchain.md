@@ -108,6 +108,8 @@ LLVM 是代码生成后端，不是语言运行时或 GC。Lyra Runtime 实现�
 
 第一版通过显式 `extern` 声明绑定 C 标量、指针和不透明句柄。字符串按每个 C 接口的契约明确传长度或使用终止符；SQLite 文本在下一次 step 或 finalize 使原缓冲失效前复制为 Lyra 字符串。首个绑定是按需导入的官方 SQLite 包：打开连接、准备/执行语句、绑定值、迭代结果、确定性关闭 statement 和 connection。C 保存 Lyra 闭包、外部线程反向回调和任意 C 头文件自动导入不纳入首版。
 
+数值类型按位宽与符号对应 C 的 `intN_t` / `uintN_t`，`Float32` 对应 `float`，`Float64` 对应 `double`。Linux 上使用浮点 `%` 的程序可能另依赖系统 `libm.so.6`；整数和不用该运算的程序无需引入它。
+
 项目自己的 C 库可在 `lyra build`、`run`、`test` 上重复传 `--link /path/to/libexample.a`（也可传目标文件或共享库）。输入按命令行顺序交给 Clang，不执行包内脚本。`check` 只检查签名；链接阶段验证符号能否解析。`Int` 对应 `int64_t`，`Bool` 对应 `uint8_t`，`CPtr` 对应不透明指针；Lyra `String` 是带长度的运行时句柄，不是 `char*`。使用共享库时要在目标机提供相同 ABI；`lyra.lock` 锁定 Lyra 源码包，不代为分发原生库。
 
 用安装树的 `include/` 编译 C 适配器即可读取 `String`。例如，Lyra 声明 `extern fn writeText(text: String): Int;`，C 实现如下：

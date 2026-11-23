@@ -8,6 +8,7 @@ module;
 
 export module lyra.foreign;
 import lyra.check;
+import lyra.numbers;
 
 export namespace lyra {
 void validateForeign(const CheckedFunction& function, const Source& source);
@@ -19,17 +20,24 @@ namespace lyra {
 namespace {
 
 bool abiType(Type type) {
-    return type == Type::Int || type == Type::Bool || type == Type::String || type == Type::CPtr;
+    return numericType(type) || type == Type::Bool || type == Type::String || type == Type::CPtr;
 }
 
 llvm::Type* cType(Type type, llvm::IRBuilder<>& builder) {
     switch (type.kind) {
-        case Type::Int: return builder.getInt64Ty();
+        case Type::Int: case Type::UInt: return builder.getIntNTy(numberWidth(type));
+        case Type::Real: return numberWidth(type) == 32 ? builder.getFloatTy() : builder.getDoubleTy();
         case Type::Bool: return builder.getInt8Ty();
         case Type::Unit: return builder.getVoidTy();
         case Type::CPtr: case Type::String: return builder.getPtrTy();
         default: llvm_unreachable("unsupported foreign ABI type");
     }
+}
+
+llvm::Attribute::AttrKind extension(Type type) {
+    if (type == Type::Bool || (type.kind == Type::UInt && numberWidth(type) < 32)) return llvm::Attribute::ZExt;
+    if (type.kind == Type::Int && numberWidth(type) < 32) return llvm::Attribute::SExt;
+    return llvm::Attribute::None;
 }
 
 }
@@ -38,7 +46,7 @@ void validateForeign(const CheckedFunction& fn, const Source& source) {
     const auto& symbol = *fn.syntax.foreignSymbol;
     if (symbol.text == "main" || symbol.text == "wmain" || symbol.text.starts_with("llvm.")) throw at(source, symbol.span, "LYF0001", "不能绑定此保留 C 符号：" + symbol.text);
     for (std::size_t slot = 0; slot < fn.syntax.parameters.size(); ++slot) {
-        if (!abiType(fn.locals[slot].type)) throw at(source, fn.syntax.parameters[slot].type.span, "LYF0001", "extern 形参只支持 Int、Bool、String 句柄或 CPtr");
+        if (!abiType(fn.locals[slot].type)) throw at(source, fn.syntax.parameters[slot].type.span, "LYF0001", "extern 形参只支持数值、Bool、String 句柄或 CPtr");
     }
     if (fn.result != Type::Unit && !abiType(fn.result)) throw at(source, fn.syntax.result.span, "LYF0001", "此返回类型没有可用的 C ABI");
 }
@@ -79,11 +87,11 @@ void emitForeign(const CheckedFunction& fn, const Source& source, llvm::Function
     if (auto previous = module.getFunction(symbol.text); previous && previous->getFunctionType() != signature) throw at(source, symbol.span, "LYF0001", "此符号的 C ABI 签名冲突：" + symbol.text);
     auto foreign = llvm::cast<llvm::Function>(module.getOrInsertFunction(symbol.text, signature).getCallee());
     auto result = builder.CreateCall(foreign, values);
-    for (unsigned slot = 0; slot < parameters.size(); ++slot) if (fn.locals[slot].type == Type::Bool) {
-        foreign->addParamAttr(slot, llvm::Attribute::ZExt);
-        result->addParamAttr(slot, llvm::Attribute::ZExt);
+    for (unsigned slot = 0; slot < parameters.size(); ++slot) if (auto attr = extension(fn.locals[slot].type); attr != llvm::Attribute::None) {
+        foreign->addParamAttr(slot, attr);
+        result->addParamAttr(slot, attr);
     }
-    if (fn.result == Type::Bool) { foreign->addRetAttr(llvm::Attribute::ZExt); result->addRetAttr(llvm::Attribute::ZExt); }
+    if (auto attr = extension(fn.result); attr != llvm::Attribute::None) { foreign->addRetAttr(attr); result->addRetAttr(attr); }
     for (auto root : stringRoots) builder.CreateLoad(builder.getPtrTy(), root, true);
     if (fn.result == Type::Unit) builder.CreateRet(builder.getInt8(0));
     else if (fn.result == Type::Bool) builder.CreateRet(builder.CreateIsNotNull(result));

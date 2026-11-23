@@ -66,20 +66,23 @@ bool genericPattern(const Function& declaration, const TypeForm& form) {
 
 template<class Type> struct GenericArgument { std::size_t slot; Type type; Span span; };
 
-template<class Type, class TypeName, class Project>
+template<class Type, class TypeName, class Project, class Common>
 std::vector<Type> inferGenericArguments(const Function& declaration, const Call& call, Span site,
         std::span<const Type> explicitTypes, std::span<const GenericArgument<Type>> arguments,
-        std::optional<Type> expected, const Source& source, TypeName name, Project project) {
+        std::optional<Type> expected, const Source& source, TypeName name, Project project, Common common) {
     const auto& parameters = declaration.typeParameters;
     if (!explicitTypes.empty() && explicitTypes.size() != parameters.size()) {
         throw at(source, call.name.span, "LYG0001", call.name.text + " 需要 " + std::to_string(parameters.size()) + " 个类型实参，实际为 " + std::to_string(explicitTypes.size()));
     }
     std::vector<std::optional<Type>> bound(parameters.size());
     for (std::size_t index = 0; index < explicitTypes.size(); ++index) bound[index] = explicitTypes[index];
-    auto unify = [&](auto&& self, const TypeForm& form, Type value, Span span, bool fromResult) -> void {
+    auto unify = [&](auto&& self, const TypeForm& form, Type value, Span span, bool fromResult, bool widen) -> void {
         if (auto index = genericParameter(declaration, form.name)) {
             if (!bound[*index]) bound[*index] = value;
             else if (!fromResult && *bound[*index] != value) {
+                if (widen && explicitTypes.empty()) {
+                    if (auto joined = common(*bound[*index], value)) { bound[*index] = *joined; return; }
+                }
                 auto previous = name(*bound[*index]); auto actual = name(value);
                 auto error = at(source, span, "LYT0001", "类型参数 " + parameters[*index].text + " 已确定为 " + previous + "，此实参为 " + actual);
                 error.expected = previous; error.actual = actual; throw error;
@@ -89,7 +92,7 @@ std::vector<Type> inferGenericArguments(const Function& declaration, const Call&
         for (std::size_t slot = 0; slot < form.arguments.size(); ++slot) {
             auto element = project(value, form.name, slot);
             if (!element && !fromResult && form.name == "Option") element = value;
-            if (element) self(self, form.arguments[slot], *element, span, fromResult);
+            if (element) self(self, form.arguments[slot], *element, span, fromResult, false);
             else if (!fromResult) {
                 auto annotation = mapTypeNames(form, [](const auto& part) { return part; });
                 auto error = at(source, span, "LYT0001", "期望 " + annotation + "，实际是 " + name(value));
@@ -99,9 +102,9 @@ std::vector<Type> inferGenericArguments(const Function& declaration, const Call&
     };
     for (const auto& argument : arguments) {
         if (argument.type == Type::Never) continue;
-        unify(unify, typeForm(declaration.parameters[argument.slot].type.text), argument.type, argument.span, false);
+        unify(unify, typeForm(declaration.parameters[argument.slot].type.text), argument.type, argument.span, false, true);
     }
-    if (expected && *expected != Type::Never) unify(unify, typeForm(declaration.result.text), *expected, site, true);
+    if (expected && *expected != Type::Never) unify(unify, typeForm(declaration.result.text), *expected, site, true, false);
     std::vector<Type> types;
     for (std::size_t index = 0; index < bound.size(); ++index) {
         if (!bound[index]) {

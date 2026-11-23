@@ -1,5 +1,6 @@
 module;
 #include <algorithm>
+#include <charconv>
 #include <cstdint>
 #include <map>
 #include <optional>
@@ -19,6 +20,7 @@ import lyra.conversions;
 import lyra.traits;
 import lyra.collections;
 import lyra.patterns;
+import lyra.numbers;
 
 namespace lyra {
 namespace {
@@ -29,7 +31,7 @@ std::string typeName(const CheckedModule& module, Type type, bool canonical = fa
     auto name = [&](Type nested) { return typeName(module, nested, canonical); };
     switch (type.kind) {
         case Type::Bool: return "Bool";
-        case Type::Int: return "Int";
+        case Type::Int: case Type::UInt: case Type::Real: return numberName(type);
         case Type::Unit: return "Unit";
         case Type::Never: return "Never";
         case Type::String: return "String";
@@ -145,7 +147,8 @@ struct Symbols {
     std::optional<Type> resolveWith(const TypeForm& form, const Source& source, Span span, const Function* signature, const Lookup& lookup) const {
         if (form.arguments.empty()) {
             if (signature) if (auto parameter = genericParameter(*signature, form.name)) return lookup(*parameter);
-            for (Type type : {Type::Int, Type::Bool, Type::String, Type::Unit, Type::CPtr, Type::Exception}) if (form.name == typeName(module, type)) return type;
+            if (auto type = numberType(form.name)) return type;
+            for (Type type : {Type::Bool, Type::String, Type::Unit, Type::CPtr, Type::Exception}) if (form.name == typeName(module, type)) return type;
             if (auto found = records.find(form.name); found != records.end()) return Type{Type::Record, found->second};
         } else {
             std::vector<Type> arguments;
@@ -264,7 +267,7 @@ struct Checker {
         auto& info = fn.expressions[id];
         if (expected && type != *expected && type != Type::Never) {
             auto site = fn.syntax.expressions[id].span;
-            if (expected->kind != Type::Option || module.sumTypes[expected->id].success != type) {
+            if (!losslessNumber(type, *expected) && (expected->kind != Type::Option || module.sumTypes[expected->id].success != type)) {
                 info.conversion = directConversion(symbols.conversions, module, symbols.sources, type, *expected, source, site);
                 if (!info.conversion) throw mismatch(module, source, site, *expected, type);
             }
@@ -274,7 +277,41 @@ struct Checker {
         return info.type = type;
     }
 
-    Type infer(ExprId, std::int64_t, auto, bool) { return Type::Int; }
+    std::optional<Type> numericHint(std::optional<Type> type) const {
+        if (type && type->kind == Type::Option) type = module.sumTypes[type->id].success;
+        return type && numericType(*type) ? type : std::nullopt;
+    }
+
+    void checkIntegerLiteral(Span span, Type type, IntegerLiteral literal) const {
+        if (!represents(type, literal)) throw at(source, span, "LYL0002", "整数字面量超出 " + numberName(type) + " 的范围");
+    }
+
+    Type infer(ExprId id, IntegerLiteral literal, std::optional<Type> expected, bool) {
+        auto type = numericHint(expected).value_or(Type::Int);
+        if (type.kind == Type::Real) {
+            double magnitude = numberWidth(type) == 32 ? static_cast<double>(static_cast<float>(literal.magnitude)) : static_cast<double>(literal.magnitude);
+            fn.expressions[id].realLiteral = literal.negative ? -magnitude : magnitude;
+        } else checkIntegerLiteral(fn.syntax.expressions[id].span, type, literal);
+        return type;
+    }
+
+    Type infer(ExprId id, const RealLiteral& literal, std::optional<Type> expected, bool) {
+        auto target = numericHint(expected);
+        auto width = literal.width.value_or(target && target->kind == Type::Real ? numberWidth(*target) : 64);
+        auto type = number(Type::Real, width);
+        const auto* start = literal.digits.data();
+        const auto* end = start + literal.digits.size();
+        auto parse = [&](auto real) {
+            auto [stopped, error] = std::from_chars(start, end, real);
+            if (error != std::errc{} || stopped != end) {
+                auto message = error == std::errc::result_out_of_range ? "浮点字面量超出 " + numberName(type) + " 的范围" : "无效的浮点字面量";
+                throw at(source, fn.syntax.expressions[id].span, "LYL0002", message);
+            }
+            return static_cast<double>(real);
+        };
+        fn.expressions[id].realLiteral = width == 32 ? parse(float{}) : parse(double{});
+        return type;
+    }
     Type infer(ExprId, bool, auto, bool) { return Type::Bool; }
     Type infer(ExprId, const StringLiteral&, auto, bool) { return Type::String; }
 
@@ -396,11 +433,15 @@ struct Checker {
             return result;
         }
         if (std::holds_alternative<std::monostate>(node)) return {};
-        auto literal = std::holds_alternative<bool>(node) ? Type::Bool : std::holds_alternative<std::int64_t>(node) ? Type::Int : Type::String;
+        if (auto* literal = std::get_if<IntegerLiteral>(&node)) {
+            if (!integerType(subject)) throw at(source, pattern.span, "LYT0011", "整数字面量不能匹配 " + typeName(module, subject));
+            checkIntegerLiteral(pattern.span, subject, *literal);
+            return {integerBits(*literal)};
+        }
+        auto literal = std::holds_alternative<bool>(node) ? Type::Bool : Type::String;
         if (subject != literal)
             throw at(source, pattern.span, "LYT0011", typeName(module, literal) + " 字面量不能匹配 " + typeName(module, subject));
         if (auto* flag = std::get_if<bool>(&node)) return {PatternConstructor(*flag)};
-        if (auto* number = std::get_if<std::int64_t>(&node)) return {*number};
         return {std::get<StringLiteral>(node)};
     }
 
@@ -486,7 +527,7 @@ struct Checker {
             auto wanted = std::optional(shape.result);
             if (item.generic->isAsync) wanted = shape.result.kind == Type::Task ? std::optional(module.taskResults[shape.result.id]) : std::nullopt;
             auto types = inferGenericArguments<Type>(*item.generic, Call{name, {}}, name.span, {}, inputs, wanted, source, [&](Type value) { return typeName(module, value); },
-                    [&](Type value, const std::string& key, std::size_t slot) { return symbols.project(value, key, slot); });
+                    [&](Type value, const std::string& key, std::size_t slot) { return symbols.project(value, key, slot); }, [](Type, Type) -> std::optional<Type> { return std::nullopt; });
             symbols.requireBounds(*item.generic, types, source, name.span);
             if (variables.empty()) fn.expressions[id].functionRef = symbols.instantiate(found->second, types, source, name.span);
             std::vector<Type> parameters;
@@ -699,7 +740,7 @@ struct Checker {
             actuals.push_back({info.argumentSlots[index] + skip, type, fn.syntax.expressions[expr].span});
         }
         auto types = inferGenericArguments<Type>(target, call, fn.syntax.expressions[id].span, explicitTypes, actuals, expected, source, [&](Type type) { return typeName(module, type); },
-                [&](Type value, const std::string& name, std::size_t slot) { return symbols.project(value, name, slot); });
+                [&](Type value, const std::string& name, std::size_t slot) { return symbols.project(value, name, slot); }, commonInteger);
         symbols.requireBounds(target, types, source, call.name.span);
         for (std::size_t index = 0; index < actuals.size(); ++index) {
             const auto& argument = actuals[index];
@@ -732,6 +773,17 @@ struct Checker {
         if (call.receiver) {
             auto owner = visit(*call.receiver);
             if (owner == Type::Never) return owner;
+            if (numericType(owner) && call.name.text.starts_with("to")) {
+                auto name = std::string_view(call.name.text).substr(2);
+                bool checked = name.ends_with("Checked");
+                if (checked) name.remove_suffix(7);
+                if (auto target = numberType(name); target && (checked ? integerType(*target) : target->kind == Type::Real)) {
+                    noTypeArgs();
+                    if (!call.arguments.empty()) throw at(source, call.name.span, "LYT0002", call.name.text + " 不接收实参");
+                    info.callee = checked ? Callee::ToIntegerChecked : Callee::ToReal;
+                    return checked ? symbols.sum(Type::Option, *target) : *target;
+                }
+            }
             if (owner.kind == Type::Variable) {
                 if (auto method = symbols.contracts.member(owner, call.name.text)) {
                     noTypeArgs();
@@ -789,7 +841,7 @@ struct Checker {
             bool exits = arguments(id, call, 1, [](auto) { return "value"; }, [](auto) { return std::nullopt; });
             auto arg = call.arguments.front().value;
             auto type = fn.expressions[arg].type;
-            if (!exits && type != Type::Int && type != Type::String) throw at(source, fn.syntax.expressions[arg].span, "LYT0001", "print 需要 Int 或 String，实际是 " + typeName(module, type));
+            if (!exits && !numericType(type) && type != Type::String) throw at(source, fn.syntax.expressions[arg].span, "LYT0001", "print 需要数值或 String，实际是 " + typeName(module, type));
             return exits ? Type::Never : Type::Unit;
         } else if (key == "gcCollect") {
             noTypeArgs();
@@ -864,17 +916,22 @@ struct Checker {
         return false;
     }
 
-    Type infer(ExprId, const Unary& unary, auto, bool) {
-        return visit(unary.operand, unary.op == Op::Not ? Type::Bool : Type::Int);
+    Type infer(ExprId, const Unary& unary, std::optional<Type> expected, bool) {
+        if (unary.op == Op::Not) return visit(unary.operand, Type::Bool);
+        auto type = inspect(unary.operand, numericHint(expected));
+        if (type == Type::Never || type.kind == Type::Int || type.kind == Type::Real) return type;
+        if (type.kind == Type::UInt) throw at(source, unary.site, "LYT0006", "无符号整数不能取负");
+        auto hint = numericHint(expected);
+        return fit(unary.operand, type, hint && hint->kind != Type::UInt ? *hint : Type{Type::Int});
     }
 
-    Type infer(ExprId, const Binary& binary, auto, bool) {
+    Type infer(ExprId, const Binary& binary, std::optional<Type> expected, bool) {
         if (binary.op <= Op::RemSet) {
             const auto& place = fn.syntax.expressions[binary.left];
             auto type = visit(binary.left);
             if (type == Type::Never) { visit(binary.right); return type; }
             if (!writable(binary.left)) throw at(source, place.span, "LYT0004", "不能给此位置赋值；需要 var 绑定或可写字段");
-            if (binary.op != Op::Set && type != Type::Int && !(binary.op == Op::AddSet && type == Type::String)) throw mismatch(module, source, place.span, Type::Int, type);
+            if (binary.op != Op::Set && !numericType(type) && !(binary.op == Op::AddSet && type == Type::String)) throw mismatch(module, source, place.span, Type::Int, type);
             return visit(binary.right, type) == Type::Never ? Type::Never : Type::Unit;
         }
         if (binary.op == Op::And || binary.op == Op::Or) {
@@ -891,13 +948,39 @@ struct Checker {
             visit(emptyLeft ? binary.left : binary.right, other);
             return Type::Bool;
         }
-        auto left = visit(binary.left, equality || binary.op == Op::Add ? std::nullopt : std::optional(Type::Int));
-        auto right = visit(binary.right, left == Type::Never ? std::nullopt : std::optional(left));
+        auto hint = binary.op > Op::Ge ? numericHint(expected) : std::nullopt;
+        auto integerLiteral = [&](ExprId id) { return std::holds_alternative<IntegerLiteral>(fn.syntax.expressions[id].node); };
+        auto realLiteral = [&](ExprId id) { return std::get_if<RealLiteral>(&fn.syntax.expressions[id].node); };
+        auto contextual = [&](ExprId id) { auto* real = realLiteral(id); return integerLiteral(id) || (real && !real->width); };
+        Type left, right;
+        if (contextual(binary.left) && (!contextual(binary.right) || (integerLiteral(binary.left) && realLiteral(binary.right)))) {
+            right = inspect(binary.right, hint.value_or(integerLiteral(binary.left) ? Type::Int : Type::Real));
+            left = inspect(binary.left, numericType(right) ? std::optional(right) : hint);
+        } else {
+            left = inspect(binary.left, hint);
+            auto rightHint = numericType(left) && !contextual(binary.right) ? std::nullopt : left == Type::Never ? hint : std::optional(left);
+            right = inspect(binary.right, rightHint);
+        }
         if (left == Type::Never || right == Type::Never) return Type::Never;
+        if (numericType(left) || (numericType(right) && !equality)) {
+            if (!numericType(left)) left = fit(binary.left, left, right);
+            if (!numericType(right)) right = fit(binary.right, right, left);
+            auto common = commonInteger(left, right);
+            if (left.kind == Type::Real && right.kind == Type::Real) common = number(Type::Real, std::max(numberWidth(left), numberWidth(right)));
+            if (!common) {
+                auto error = at(source, binary.site, "LYT0001", numberName(left) + " 与 " + numberName(right) + " 没有共同的无损数值类型");
+                error.hint = "请显式转换其中一个操作数。";
+                throw error;
+            }
+            fit(binary.left, left, *common);
+            fit(binary.right, right, *common);
+            return binary.op <= Op::Ge ? Type{Type::Bool} : *common;
+        }
+        right = fit(binary.right, right, left);
         if (equality && (left.kind == Type::Option || left.kind == Type::Result || left.kind == Type::Closure || left.kind == Type::Variable || (left.kind == Type::Record && !module.aggregates[left.id].syntax.reference))) throw at(source, binary.site, "LYT0006", typeName(module, left) + " 未提供 Eq，不能用 == 或 != 比较");
         if (binary.op == Op::Add && left == Type::String) return Type::String;
-        if (binary.op == Op::Add && left != Type::Int) throw mismatch(module, source, binary.site, Type::Int, left);
-        return binary.op <= Op::Ge ? Type::Bool : Type::Int;
+        if (!equality) throw mismatch(module, source, binary.site, Type::Int, left);
+        return Type::Bool;
     }
 
     Type infer(ExprId id, const Block& block, std::optional<Type> expected, bool discard) {
@@ -1018,7 +1101,11 @@ CheckedModule check(Module module, const std::vector<Source>& sources, bool requ
     Symbols symbols{checked, sources, {}, {}, {}, {}, {}, {}};
     for (auto& decl : module.aggregates) {
         auto id = checked.aggregates.size();
-        for (Type builtin : {Type::Int, Type::Bool, Type::String, Type::Unit, Type::Never, Type::CPtr, Type::Exception}) {
+        const auto& declaration = decl.name.text;
+        auto separator = declaration.rfind("::");
+        auto name = std::string_view(declaration).substr(separator == declaration.npos ? 0 : separator + 2);
+        if (numberType(name)) throw at(sources[decl.file], decl.name.span, "LYN0002", "类型名与内置类型冲突：" + std::string(name));
+        for (Type builtin : {Type::Bool, Type::String, Type::Unit, Type::Never, Type::CPtr, Type::Exception}) {
             if (decl.name.text == typeName(checked, builtin)) throw at(sources[decl.file], decl.name.span, "LYN0002", "类型名与内置类型冲突：" + decl.name.text);
         }
         if (decl.name.text == "print" || decl.name.text == "gcCollect" || !symbols.records.emplace(decl.name.text, id).second) throw at(sources[decl.file], decl.name.span, "LYN0002", "类型名称已声明：" + decl.name.text);

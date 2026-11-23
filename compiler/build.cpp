@@ -65,7 +65,7 @@ void emitExecutable(const llvm::Module& module, const fs::path& output, bool rel
         link.insert(link.end(), {"-lws2_32", "-liphlpapi", "-luserenv", "-lpsapi", "-ladvapi32", "-luser32", "-ldbghelp", "-lole32", "-lshell32"});
     } else {
         for (auto name : {"libgc.a", "libuv.a", "libllhttp.a", "libjansson.a"}) link.push_back(pathText(lib / name));
-        link.insert(link.end(), {"-pthread", "-ldl", "-lrt", "-lsqlite3"});
+        link.insert(link.end(), {"-pthread", "-ldl", "-lrt", "-lsqlite3", "-lm"});
     }
     link.insert(link.end(), {"-o", pathText(executable)});
     runClang(*driver, link, log);

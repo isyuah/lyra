@@ -7,7 +7,7 @@ import sys
 import tempfile
 import unittest
 
-from platform_cli import CLANG, RUNTIME_ARCHIVE, WINDOWS, assert_linkage, executable, running
+from platform_cli import CLANG, RUNTIME_ARCHIVE, WINDOWS, assert_linkage, c_archive, executable, running
 
 
 COMPILER = Path(sys.argv.pop(1)).resolve()
@@ -48,6 +48,29 @@ class PackageTest(unittest.TestCase):
 
 
 class Frontend(PackageTest):
+    def test_numeric_literals_and_conversions_reject_lossy_contexts(self):
+        for declaration, code, fragment in (
+            ('fn value(): Int8 { 128 }', 'LYL0002', 'Int8'),
+            ('fn value(): UInt64 { -1 }', 'LYL0002', 'UInt'),
+            ('fn value(): UInt { 18446744073709551616 }', 'LYL0002', '64'),
+            ('fn value(): Float32 { 3.5e38 }', 'LYL0002', 'Float32'),
+            ('fn value(): Float64 { 1.0e+ }', 'LYL0002', '字面量'),
+            ('fn value(): Float64 { 1.5_f32 }', 'LYL0002', '_'),
+            ('fn value(item: Int): Float { item }', 'LYT0001', 'Float64'),
+            ('fn value(item: Float): Float32 { item }', 'LYT0001', 'Float32'),
+            ('fn value(item: Int16): Int8 { item }', 'LYT0001', 'Int8'),
+            ('fn value(item: Int, real: Float): Float { real + item }', 'LYT0001', '无损'),
+            ('fn value(item: UInt8): UInt8 { -item }', 'LYT0006', '无符号'),
+            ('fn choose<T>(a: T, b: T): T { a }\nfn value(a: Int, b: UInt): Int { choose(a, b) }', 'LYT0001', '类型参数'),
+        ):
+            with self.subTest(declaration=declaration):
+                self.main.write_text(declaration + '\nfn main(): Unit {}', encoding='utf-8')
+                result = self.cli('check', '--diagnostics=json')
+                self.assertNotEqual(result.returncode, 0)
+                error, = json.loads(result.stderr)
+                self.assertEqual(error['code'], code)
+                self.assertIn(fragment, error['message'])
+
     def test_checked_bindings_and_control_flow(self):
         cases = [
             ("fn main(): Unit { val size = 2; size = 3 }", "size = 3", "LYT0004"),
@@ -107,6 +130,106 @@ class Frontend(PackageTest):
 
 
 class Native(PackageTest):
+    def test_fixed_width_integers_floats_and_checked_conversions(self):
+        self.main.write_text('''
+fn flip(flag: Bool): Int8 { if flag { 1 + 2 } else { -128 } }
+fn identity<T>(value: T): T { value }
+fn choose<T>(left: T, right: T): T { right }
+fn main(): Unit {
+    print(flip(false))
+    val small: UInt8 = 0xff
+    val large: UInt64 = 0xffff_ffff_ffff_ffff
+    print(large)
+    print(large % 7)
+    print(match large { 18446744073709551615 => 1, _ => 0 })
+    val signed: Int16 = -1000
+    print(small + signed)
+    print(choose(small, signed))
+    val alias: Int64 = signed
+    print(identity<Int>(alias))
+    print(match large.toIntChecked() { None => 2, _ => 0 })
+    print((-1).toUInt8Checked() ?? 3)
+    print((256).toUInt8Checked() ?? 4)
+    print((255).toUInt8Checked() ?? 0)
+    val a: Float32 = 16_777_217
+    print(a)
+    var value: Float = 1 + 3.5e+0
+    value *= 2
+    value %= 2.5
+    print(value)
+    val widened: Float64 = 3.25f32
+    print(identity(widened))
+    print(large.toFloat())
+    print((-128.0).toInt8Checked() ?? 0)
+    print((127.5).toInt8Checked() ?? 5)
+    print((128.0).toInt8Checked() ?? 6)
+    print((18446744073709551616.0).toUIntChecked() ?? 7)
+    print((9223372036854775808.0).toUIntChecked() ?? 0)
+    val zero: Float = 0
+    val nan = zero / zero
+    if nan != nan && !(nan <= 0) && !(nan >= 0) { print(8) }
+    print(nan.toIntChecked() ?? 9)
+    print(1 + 2.5)
+    print(1.25f32 + 1.25f64)
+}
+''', encoding='utf-8')
+        expected = ('-128\n18446744073709551615\n1\n1\n-745\n-1000\n-1000\n2\n3\n4\n255\n'
+                    '16777216\n1.5\n3.25\n1.8446744073709552e+19\n-128\n5\n6\n7\n9223372036854775808\n8\n9\n3.5\n2.5\n')
+        for flags in ([], ['--release']):
+            with self.subTest(flags=flags):
+                output = executable(self.package / 'numbers')
+                result = self.cli('build', '-o', output, *flags)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                run = subprocess.run([output], capture_output=True, text=True, timeout=5)
+                self.assertEqual((run.returncode, run.stdout, run.stderr), (0, expected, ''))
+
+    def test_small_and_unsigned_arithmetic_traps_in_both_profiles(self):
+        for declaration, operation, fragment in (
+            ('val value: UInt8 = 255', 'value + 1', 'UInt8 overflow'),
+            ('val value: UInt64 = 0', 'value - 1', 'UInt overflow'),
+            ('val value: Int8 = -128', 'value / -1', 'Int8 overflow'),
+            ('val value: Int16 = -32768', '-value', 'Int16 overflow'),
+            ('val value: UInt16 = 2', 'value % 0', 'UInt16 division by zero'),
+        ):
+            self.main.write_text(f'fn main(): Unit {{ {declaration}; print({operation}) }}', encoding='utf-8')
+            for flags in ([], ['--release']):
+                with self.subTest(operation=operation, flags=flags):
+                    output = executable(self.package / 'numbers')
+                    result = self.cli('build', '-o', output, *flags)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    run = subprocess.run([output], capture_output=True, text=True, timeout=5)
+                    self.assertNotEqual(run.returncode, 0)
+                    self.assertIn(fragment, run.stderr)
+                    self.assertIn('main.ly:1:', run.stderr)
+
+    def test_numeric_c_abi(self):
+        source = self.package / 'numbers.c'
+        source.write_text('''
+#include <stdint.h>
+int8_t low(int8_t value) { return value; }
+uint16_t high(uint16_t value) { return value; }
+float half(float value) { return value / 2.0f; }
+double sum(double value, uint64_t offset) { return value + (double)(offset % 5); }
+''', encoding='utf-8')
+        library = c_archive(source, self.package / 'numbers')
+        self.main.write_text('''
+extern fn low(value: Int8): Int8;
+extern fn high(value: UInt16): UInt16;
+extern fn half(value: Float32): Float32;
+extern fn sum(value: Float64, offset: UInt64): Float64;
+fn main(): Unit {
+    print(low(-128))
+    print(high(65535))
+    print(half(3.5))
+    print(sum(2.5, 18446744073709551613))
+}
+''', encoding='utf-8')
+        output = executable(self.package / 'ffi')
+        result = self.cli('build', '--release', '--link', library, '-o', output)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        run = subprocess.run([output], capture_output=True, text=True, timeout=5)
+        self.assertEqual((run.returncode, run.stdout, run.stderr), (0, '-128\n65535\n1.75\n5.5\n', ''))
+
     def test_loop_branches_and_evaluation_order(self):
         self.main.write_text('''
 fn sum(limit: Int): Int {

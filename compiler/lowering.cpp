@@ -1,6 +1,6 @@
 module;
-#include <limits>
 #include <algorithm>
+#include <cmath>
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/Intrinsics.h>
 #include <llvm/IR/Module.h>
@@ -16,6 +16,7 @@ import lyra.foreign;
 import lyra.collections;
 import lyra.closures;
 import lyra.exceptions;
+import lyra.numbers;
 import lyra.platform;
 
 namespace lyra {
@@ -45,7 +46,8 @@ struct Layouts {
 
     llvm::Type* native(Builder& builder, Type type) const {
         switch (type.kind) {
-        case Type::Int: return builder.getInt64Ty();
+        case Type::Int: case Type::UInt: return builder.getIntNTy(numberWidth(type));
+        case Type::Real: return numberWidth(type) == 32 ? builder.getFloatTy() : builder.getDoubleTy();
         case Type::Bool: return builder.getInt1Ty();
         case Type::Unit: case Type::Never: return builder.getInt8Ty();
         case Type::String: case Type::Task: case Type::CPtr: case Type::List: case Type::Exception: case Type::Closure: return builder.getPtrTy();
@@ -211,14 +213,70 @@ struct Emitter {
         return payload ? builder.CreateInsertValue(value, payload, payloadSlot(tag)) : value;
     }
 
+    Value castNumber(Value value, Type from, Type to) {
+        auto* target = layouts.native(builder, to);
+        if (from == to) return value;
+        if (to.kind != Type::Real) return builder.CreateIntCast(value, target, from.kind == Type::Int);
+        if (from.kind == Type::Real) return builder.CreateFPCast(value, target);
+        return from.kind == Type::Int ? builder.CreateSIToFP(value, target) : builder.CreateUIToFP(value, target);
+    }
+
+    Value checkedInteger(Value value, Type from, Type option) {
+        auto to = layouts.program.sumTypes[option.id].success;
+        if (losslessNumber(from, to)) return makeSum(option, SumTag::Some, castNumber(value, from, to));
+        auto* target = layouts.native(builder, to);
+        auto zero = llvm::Constant::getNullValue(target);
+        auto optional = [&](Value present, Value payload) {
+            auto selected = builder.CreateSelect(present, payload, zero);
+            return builder.CreateInsertValue(makeSum(option, SumTag::None, selected), present, 0);
+        };
+        if (integerType(from)) {
+            auto bits = numberWidth(to);
+            auto width = std::max(numberWidth(from), bits) + 1;
+            auto* wideType = builder.getIntNTy(width);
+            auto wide = builder.CreateIntCast(value, wideType, from.kind == Type::Int);
+            auto low = to.kind == Type::Int ? llvm::APInt::getSignedMinValue(bits).sext(width) : llvm::APInt(width, 0);
+            auto high = to.kind == Type::Int ? llvm::APInt::getSignedMaxValue(bits).sext(width) : llvm::APInt::getMaxValue(bits).zext(width);
+            auto fits = builder.CreateAnd(builder.CreateICmpSGE(wide, llvm::ConstantInt::get(wideType, low)),
+                                          builder.CreateICmpSLE(wide, llvm::ConstantInt::get(wideType, high)));
+            return optional(fits, castNumber(value, from, to));
+        }
+        auto limit = std::ldexp(1.0, static_cast<int>(numberWidth(to)) - (to.kind == Type::Int));
+        auto low = llvm::ConstantFP::get(value->getType(), to.kind == Type::Int ? -limit : 0.0);
+        auto high = llvm::ConstantFP::get(value->getType(), limit);
+        auto fits = builder.CreateAnd(builder.CreateFCmpOGE(value, low), builder.CreateFCmpOLT(value, high));
+        auto entry = builder.GetInsertBlock();
+        auto convert = label("numeric.convert"), done = label("numeric.end");
+        builder.CreateCondBr(fits, convert, done);
+        builder.SetInsertPoint(convert);
+        auto converted = to.kind == Type::Int ? builder.CreateFPToSI(value, target) : builder.CreateFPToUI(value, target);
+        auto exact = builder.CreateFCmpOEQ(value, castNumber(converted, to, from));
+        auto result = optional(exact, converted);
+        builder.CreateBr(done);
+        builder.SetInsertPoint(done);
+        auto merged = builder.CreatePHI(layouts.native(builder, option), 2);
+        merged->addIncoming(makeSum(option, SumTag::None), entry);
+        merged->addIncoming(result, convert);
+        return merged;
+    }
+
     Value emit(ExprId id) {
         auto value = std::visit([&](const auto& node) { return emitNode(id, node); }, fn.syntax.expressions[id].node);
         const auto& info = fn.expressions[id];
         if (!live() || !info.sourceType) return value;
-        return info.conversion ? callFunction(*info.conversion, {value}, fn.syntax.expressions[id].span) : makeSum(info.type, SumTag::Some, value);
+        if (info.conversion) return callFunction(*info.conversion, {value}, fn.syntax.expressions[id].span);
+        if (info.type.kind == Type::Option) return makeSum(info.type, SumTag::Some, value);
+        return castNumber(value, *info.sourceType, info.type);
     }
 
-    Value emitNode(ExprId, std::int64_t value) { return builder.getInt64(value); }
+    Value emitNode(ExprId id, IntegerLiteral literal) {
+        auto* type = layouts.native(builder, rawType(id));
+        if (auto value = fn.expressions[id].realLiteral) return llvm::ConstantFP::get(type, *value);
+        return llvm::ConstantInt::get(type, integerBits(literal));
+    }
+    Value emitNode(ExprId id, const RealLiteral&) {
+        return llvm::ConstantFP::get(layouts.native(builder, rawType(id)), *fn.expressions[id].realLiteral);
+    }
     Value emitNode(ExprId, bool value) { return builder.getInt1(value); }
     Value stringConstant(const StringLiteral& string) {
         auto data = llvm::ConstantDataArray::getString(module.getContext(), string.bytes, false);
@@ -328,7 +386,8 @@ struct Emitter {
 
     void emitPattern(const CheckedPattern& pattern, Value subject, Label miss, std::vector<std::pair<std::size_t, Value>>& bindings) {
         if (auto* slot = std::get_if<PatternSlot>(&pattern.node)) bindings.emplace_back(slot->local, subject);
-        else if (auto* number = std::get_if<std::int64_t>(&pattern.node)) matchTest(builder.CreateICmpEQ(subject, builder.getInt64(*number)), miss);
+        else if (auto* number = std::get_if<std::uint64_t>(&pattern.node))
+            matchTest(builder.CreateICmpEQ(subject, llvm::ConstantInt::get(subject->getType(), *number)), miss);
         else if (auto* text = std::get_if<StringLiteral>(&pattern.node)) matchTest(stringEqual(subject, stringConstant(*text)), miss);
         else if (auto* constructor = std::get_if<PatternConstructor>(&pattern.node)) {
             if (auto* tag = std::get_if<SumTag>(constructor)) {
@@ -492,9 +551,18 @@ struct Emitter {
                 return unit();
             case Callee::ListAdd: lists.add(args[0], args[1]); return unit();
             case Callee::Sum: return makeSum(rawType(id), static_cast<SumTag>(info.target), args[0]);
+            case Callee::ToReal: return castNumber(receiver, fn.expressions[*call.receiver].type, rawType(id));
+            case Callee::ToIntegerChecked: return checkedInteger(receiver, fn.expressions[*call.receiver].type, rawType(id));
             case Callee::Print: {
-                bool string = fn.expressions[call.arguments[0].value].type == Type::String;
-                builder.CreateCall(module.getOrInsertFunction(string ? "lyraPrintString" : "lyraPrintInt", builder.getVoidTy(), args[0]->getType()), args);
+                auto type = fn.expressions[call.arguments[0].value].type;
+                const char* symbol;
+                if (type == Type::String) symbol = "lyraPrintString";
+                else if (type.kind == Type::Real) symbol = numberWidth(type) == 32 ? "lyraPrintFloat32" : "lyraPrintFloat64";
+                else {
+                    symbol = type.kind == Type::Int ? "lyraPrintInt" : "lyraPrintUInt";
+                    args[0] = castNumber(args[0], type, Type{type.kind});
+                }
+                builder.CreateCall(module.getOrInsertFunction(symbol, builder.getVoidTy(), args[0]->getType()), args);
                 return unit();
             }
             case Callee::Collect:
@@ -517,7 +585,7 @@ struct Emitter {
         llvm_unreachable("invalid Lyra callee");
     }
 
-    void trapIf(Value condition, Span site, const char* message) {
+    void trapIf(Value condition, Span site, llvm::StringRef message) {
         auto failed = label("arithmetic.error"), next = label("arithmetic.ok");
         builder.CreateCondBr(condition, failed, next);
         builder.SetInsertPoint(failed);
@@ -531,26 +599,45 @@ struct Emitter {
         builder.SetInsertPoint(next);
     }
 
-    Value arithmetic(Op op, Value left, Value right, Span site) {
+    Value arithmetic(Op op, Value left, Value right, Type type, Span site) {
+        if (type.kind == Type::Real) {
+            switch (op) {
+                case Op::Add: return builder.CreateFAdd(left, right);
+                case Op::Sub: return builder.CreateFSub(left, right);
+                case Op::Mul: return builder.CreateFMul(left, right);
+                case Op::Div: return builder.CreateFDiv(left, right);
+                case Op::Rem: return builder.CreateFRem(left, right);
+                default: llvm_unreachable("invalid floating point operation");
+            }
+        }
+        auto* width = llvm::cast<llvm::IntegerType>(left->getType());
+        auto signedType = type.kind == Type::Int;
+        auto name = numberName(type);
         if (op == Op::Div || op == Op::Rem) {
-            trapIf(builder.CreateICmpEQ(right, builder.getInt64(0)), site, "Int division by zero");
-            auto minusOne = builder.CreateICmpEQ(right, builder.getInt64(-1));
-            if (op == Op::Rem) return builder.CreateSRem(left, builder.CreateSelect(minusOne, builder.getInt64(1), right));
-            auto minimum = builder.getInt64(std::numeric_limits<std::int64_t>::min());
-            trapIf(builder.CreateAnd(minusOne, builder.CreateICmpEQ(left, minimum)), site, "Int overflow (/)");
+            trapIf(builder.CreateIsNull(right), site, name + " division by zero");
+            if (!signedType) return op == Op::Div ? builder.CreateUDiv(left, right) : builder.CreateURem(left, right);
+            auto minusOne = builder.CreateICmpEQ(right, llvm::Constant::getAllOnesValue(width));
+            if (op == Op::Rem) return builder.CreateSRem(left, builder.CreateSelect(minusOne, llvm::ConstantInt::get(width, 1), right));
+            auto minimum = llvm::ConstantInt::get(width, llvm::APInt::getSignedMinValue(numberWidth(type)));
+            trapIf(builder.CreateAnd(minusOne, builder.CreateICmpEQ(left, minimum)), site, name + " overflow (/)");
             return builder.CreateSDiv(left, right);
         }
-        auto intrinsic = op == Op::Add ? llvm::Intrinsic::sadd_with_overflow : op == Op::Sub ? llvm::Intrinsic::ssub_with_overflow : llvm::Intrinsic::smul_with_overflow;
-        auto checked = llvm::Intrinsic::getDeclaration(&module, intrinsic, {builder.getInt64Ty()});
+        auto intrinsic = op == Op::Add ? (signedType ? llvm::Intrinsic::sadd_with_overflow : llvm::Intrinsic::uadd_with_overflow)
+                       : op == Op::Sub ? (signedType ? llvm::Intrinsic::ssub_with_overflow : llvm::Intrinsic::usub_with_overflow)
+                                       : (signedType ? llvm::Intrinsic::smul_with_overflow : llvm::Intrinsic::umul_with_overflow);
+        auto checked = llvm::Intrinsic::getDeclaration(&module, intrinsic, {width});
         auto pair = builder.CreateCall(checked, {left, right});
-        trapIf(builder.CreateExtractValue(pair, 1), site, op == Op::Add ? "Int overflow (+)" : op == Op::Sub ? "Int overflow (-)" : "Int overflow (*)");
+        trapIf(builder.CreateExtractValue(pair, 1), site, name + (op == Op::Add ? " overflow (+)" : op == Op::Sub ? " overflow (-)" : " overflow (*)"));
         return builder.CreateExtractValue(pair, 0);
     }
 
     Value emitNode(ExprId, const Unary& unary) {
         auto value = emit(unary.operand);
         if (!live()) return unit();
-        return unary.op == Op::Not ? builder.CreateNot(value) : arithmetic(Op::Sub, builder.getInt64(0), value, unary.site);
+        if (unary.op == Op::Not) return builder.CreateNot(value);
+        auto type = fn.expressions[unary.operand].type;
+        if (type.kind == Type::Real) return builder.CreateFNeg(value);
+        return arithmetic(Op::Sub, llvm::Constant::getNullValue(value->getType()), value, type, unary.site);
     }
 
     Value emitNode(ExprId, const Binary& binary) {
@@ -576,7 +663,7 @@ struct Emitter {
             if (!live()) return unit();
             constexpr Op compound[] = {Op::Add, Op::Sub, Op::Mul, Op::Div, Op::Rem};
             if (op != Op::Set) {
-                right = type == Type::String ? concatenate(left, right) : arithmetic(compound[static_cast<int>(op) - 1], left, right, binary.site);
+                right = type == Type::String ? concatenate(left, right) : arithmetic(compound[static_cast<int>(op) - 1], left, right, type, binary.site);
             }
             if (place.list) {
                 NativeLists lists{builder};
@@ -606,23 +693,36 @@ struct Emitter {
         }
         auto right = emit(binary.right);
         if (!live()) return unit();
-        if (fn.expressions[binary.left].type == Type::Exception) {
+        auto type = fn.expressions[binary.left].type;
+        if (type == Type::Exception) {
             auto same = NativeExceptions{builder}.same(left, right);
             return op == Op::Eq ? same : builder.CreateNot(same);
         }
-        if (fn.expressions[binary.left].type == Type::String) {
+        if (type == Type::String) {
             if (op == Op::Add) return concatenate(left, right);
             auto equal = stringEqual(left, right);
             return op == Op::Eq ? equal : builder.CreateNot(equal);
         }
+        if (type.kind == Type::Real) {
+            switch (op) {
+                case Op::Eq: return builder.CreateFCmpOEQ(left, right);
+                case Op::Ne: return builder.CreateFCmpUNE(left, right);
+                case Op::Lt: return builder.CreateFCmpOLT(left, right);
+                case Op::Le: return builder.CreateFCmpOLE(left, right);
+                case Op::Gt: return builder.CreateFCmpOGT(left, right);
+                case Op::Ge: return builder.CreateFCmpOGE(left, right);
+                default: return arithmetic(op, left, right, type, binary.site);
+            }
+        }
+        auto unsignedType = type.kind == Type::UInt;
         switch (op) {
             case Op::Eq: return builder.CreateICmpEQ(left, right);
             case Op::Ne: return builder.CreateICmpNE(left, right);
-            case Op::Lt: return builder.CreateICmpSLT(left, right);
-            case Op::Le: return builder.CreateICmpSLE(left, right);
-            case Op::Gt: return builder.CreateICmpSGT(left, right);
-            case Op::Ge: return builder.CreateICmpSGE(left, right);
-            default: return arithmetic(op, left, right, binary.site);
+            case Op::Lt: return unsignedType ? builder.CreateICmpULT(left, right) : builder.CreateICmpSLT(left, right);
+            case Op::Le: return unsignedType ? builder.CreateICmpULE(left, right) : builder.CreateICmpSLE(left, right);
+            case Op::Gt: return unsignedType ? builder.CreateICmpUGT(left, right) : builder.CreateICmpSGT(left, right);
+            case Op::Ge: return unsignedType ? builder.CreateICmpUGE(left, right) : builder.CreateICmpSGE(left, right);
+            default: return arithmetic(op, left, right, type, binary.site);
         }
     }
 

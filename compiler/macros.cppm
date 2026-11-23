@@ -14,6 +14,7 @@ module;
 
 export module lyra.macros;
 import lyra.check;
+import lyra.numbers;
 import lyra.platform;
 
 export namespace lyra {
@@ -167,7 +168,7 @@ struct Machine {
         const auto& info = fn.expressions[id];
         const auto& node = fn.syntax.expressions[id].node;
         Value result;
-        if (auto value = std::get_if<std::int64_t>(&node)) result = *value;
+        if (auto value = std::get_if<IntegerLiteral>(&node)) result = static_cast<std::int64_t>(integerBits(*value));
         else if (auto value = std::get_if<bool>(&node)) result = *value;
         else if (auto str = std::get_if<StringLiteral>(&node)) result = str->bytes;
         else if (std::holds_alternative<Identifier>(node)) result = locals[info.target];
@@ -235,7 +236,7 @@ std::string expand(const Source& source, const Expansion& prefix, const MacroPac
     auto scalar = [](Type type) { return type == Type::Int || type == Type::Bool || type == Type::String || type == Type::Unit || type == Type::Never; };
     for (const auto& fn : checked.functions) {
         if (!scalar(fn.result) || !std::ranges::all_of(fn.locals, [&](const auto& local) { return scalar(local.type); }) ||
-            !std::ranges::all_of(fn.expressions, [&](const auto& expr) { return scalar(expr.type); })) {
+            !std::ranges::all_of(fn.expressions, [&](const auto& expr) { return scalar(expr.type) && (!expr.sourceType || scalar(*expr.sourceType)); })) {
             throw at(source, prefix.name.span, "LYM0002", "编译期宏只可计算 Int、Bool、String 和 Unit");
         }
     }

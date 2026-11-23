@@ -28,6 +28,8 @@ struct Member { ExprId receiver; Identifier name; };
 struct ListLiteral { std::vector<ExprId> elements; };
 struct Index { ExprId receiver, offset; Span site; };
 struct StringLiteral { std::string bytes; };
+struct IntegerLiteral { std::uint64_t magnitude{}; bool negative{}; };
+struct RealLiteral { std::string digits; std::optional<unsigned> width; };
 
 enum class Op { Set, AddSet, SubSet, MulSet, DivSet, RemSet, Or, And, Eq, Ne, Lt, Le, Gt, Ge, Add, Sub, Mul, Div, Rem, Not };
 struct Unary { Op op; Span site; ExprId operand; };
@@ -53,7 +55,7 @@ struct Propagate { ExprId operand; Span site; };
 struct RecordPattern { Identifier type; std::vector<Identifier> fields; };
 struct Pattern {
     Span span;
-    std::variant<std::monostate, Identifier, SumTag, RecordPattern, std::int64_t, bool, StringLiteral> node;
+    std::variant<std::monostate, Identifier, SumTag, RecordPattern, IntegerLiteral, bool, StringLiteral> node;
     std::vector<Pattern> parts{};
 };
 struct MatchArm { Pattern pattern; ExprId value; std::optional<ExprId> guard{}; };
@@ -63,7 +65,7 @@ enum class Jump { Break, Continue };
 
 struct Expr {
     Span span;
-    std::variant<std::int64_t, bool, StringLiteral, Identifier, Call, Member, Unary, Binary, Block, Binding, Conditional, While, For, Return, Raise, Attempt, Jump, TaskOp, Blocking, Deferred, EmptyOption, Propagate, Match, ListLiteral, Index, Lambda> node;
+    std::variant<IntegerLiteral, RealLiteral, bool, StringLiteral, Identifier, Call, Member, Unary, Binary, Block, Binding, Conditional, While, For, Return, Raise, Attempt, Jump, TaskOp, Blocking, Deferred, EmptyOption, Propagate, Match, ListLiteral, Index, Lambda> node;
 };
 
 struct Parameter { Identifier name, type; bool variadic{}; std::optional<ExprId> defaultValue{}; std::vector<Attribute> attributes{}; };
