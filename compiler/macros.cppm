@@ -226,7 +226,7 @@ std::string expand(const Source& source, const Expansion& prefix, const MacroPac
     auto builtin = sourceText("<macro-prelude>", prelude, {});
     std::vector<Source> code{std::move(builtin), loadSource(path, {})};
     auto parsed = parse(code);
-    if (!parsed.imports.empty() || !parsed.aggregates.empty() || !parsed.expansions.empty()) throw at(source, prefix.name.span, "LYM0002", "宏实现只能声明同步的纯计算函数");
+    if (!parsed.imports.empty() || !parsed.aggregates.empty() || !parsed.expansions.empty() || !parsed.traits.empty()) throw at(source, prefix.name.span, "LYM0002", "宏实现只能声明同步的纯计算函数");
     for (const auto& fn : parsed.functions) if (fn.isAsync || fn.foreignSymbol || !fn.typeParameters.empty()) throw at(source, prefix.name.span, "LYM0002", "宏不能使用 extern、异步或泛型入口");
     auto checked = check(std::move(parsed), code, false);
     auto scalar = [](Type type) { return type == Type::Int || type == Type::Bool || type == Type::String || type == Type::Unit || type == Type::Never; };
@@ -321,16 +321,16 @@ void expandMacros(Module& syntax, std::vector<Source>& sources, const std::map<s
         auto output = sourceText(source.path.string() + "(" + label + prefix.name.text + ")", std::move(generated), source.moduleId);
         output.origin = source.site(prefix.name.span);
         sources.push_back(std::move(output));
-        auto start = syntax.functions.size(), records = syntax.aggregates.size(), imports = syntax.imports.size();
+        auto start = syntax.functions.size(), records = syntax.aggregates.size(), imports = syntax.imports.size(), traits = syntax.traits.size();
         parseFile(syntax, sources.back(), sources.size() - 1);
-        if (!syntax.expansions.empty() || std::any_of(syntax.functions.begin() + start, syntax.functions.end(), [](const auto& fn) { return fn.isPublic || fn.foreignSymbol; }) ||
+        if (!syntax.expansions.empty() || std::any_of(syntax.traits.begin() + traits, syntax.traits.end(), [](const auto& trait) { return trait.isPublic; }) || std::any_of(syntax.functions.begin() + start, syntax.functions.end(), [](const auto& fn) { return fn.isPublic || fn.foreignSymbol; }) ||
             std::any_of(syntax.aggregates.begin() + records, syntax.aggregates.end(), [](const auto& record) { return record.isPublic; }) ||
             std::any_of(syntax.imports.begin() + imports, syntax.imports.end(), [](const auto& use) { return use.isPublic; })) {
             throw at(sources[prefix.file], prefix.name.span, "LYM0002", "宏不能自行生成公开声明、extern 或新的宏调用");
         }
         if (prefix.decorator) {
             auto& fn = syntax.functions[prefix.target];
-            if (fn.foreignSymbol || syntax.functions.size() != start + 1 || syntax.aggregates.size() != records || syntax.imports.size() != imports) throw at(sources[prefix.file], prefix.name.span, "LYM0002", "入口装饰器需要普通函数体");
+            if (fn.foreignSymbol || syntax.functions.size() != start + 1 || syntax.aggregates.size() != records || syntax.imports.size() != imports || syntax.traits.size() != traits) throw at(sources[prefix.file], prefix.name.span, "LYM0002", "入口装饰器需要普通函数体");
             auto hook = "$decorator" + std::to_string(start);
             syntax.functions[start].name.text = hook;
             auto id = fn.expressions.size();

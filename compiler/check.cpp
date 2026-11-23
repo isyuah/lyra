@@ -17,6 +17,7 @@ module lyra.check;
 import lyra.generics;
 import lyra.foreign;
 import lyra.conversions;
+import lyra.traits;
 import lyra.collections;
 
 namespace lyra {
@@ -78,6 +79,26 @@ struct Symbols {
     std::vector<Callable> callables;
     std::map<GenericInstanceKey, std::size_t> specializations;
     std::vector<DirectConversion> conversions{};
+    StructuralContracts contracts{};
+
+    void requireBounds(const Function& target, std::span<const Type> types, const Source& use, Span site) const {
+        contracts.require(target, types, use, site, [&](Type receiver, const std::string& name) -> std::optional<RequiredMethod> {
+            if (receiver.kind != Type::Record) return {};
+            auto found = methods[receiver.id].find(name);
+            if (found == methods[receiver.id].end()) return {};
+            const auto& candidate = callables[found->second];
+            if (candidate.generic) return {};
+            const auto& actual = module.functions[candidate.target];
+            if (!actual.syntax.isPublic && sources[actual.syntax.file].moduleId != sources[target.file].moduleId) return {};
+            RequiredMethod result{{}, {}, actual.result, actual.syntax.isAsync};
+            for (std::size_t slot = 1; slot < actual.syntax.parameters.size(); ++slot) {
+                if (actual.syntax.parameters[slot].variadic) return {};
+                result.labels.push_back(actual.syntax.parameters[slot].name.text);
+                result.parameters.push_back(actual.locals[slot].type);
+            }
+            return result;
+        }, [&](Type type) { return typeName(module, type); });
+    }
 
     Type unaryType(Type::Kind kind, std::vector<Type>& types, Type result) const {
         auto found = std::find(types.begin(), types.end(), result);
@@ -434,6 +455,7 @@ struct Checker {
             if (item.generic->isAsync) wanted = shape.result.kind == Type::Task ? std::optional(module.taskResults[shape.result.id]) : std::nullopt;
             auto types = inferGenericArguments<Type>(*item.generic, Call{name, {}}, name.span, {}, inputs, wanted, source, [&](Type value) { return typeName(module, value); },
                     [&](Type value, const std::string& key, std::size_t slot) { return symbols.project(value, key, slot); });
+            symbols.requireBounds(*item.generic, types, source, name.span);
             if (variables.empty()) fn.expressions[id].functionRef = symbols.instantiate(found->second, types, source, name.span);
             std::vector<Type> parameters;
             for (const auto& param : item.generic->parameters) {
@@ -647,6 +669,7 @@ struct Checker {
         }
         auto types = inferGenericArguments<Type>(target, call, fn.syntax.expressions[id].span, explicitTypes, actuals, expected, source, [&](Type type) { return typeName(module, type); },
                 [&](Type value, const std::string& name, std::size_t slot) { return symbols.project(value, name, slot); });
+        symbols.requireBounds(target, types, source, call.name.span);
         for (std::size_t index = 0; index < actuals.size(); ++index) {
             const auto& argument = actuals[index];
             auto type = symbols.resolve(target, target.parameters[argument.slot].type, types);
@@ -678,6 +701,13 @@ struct Checker {
         if (call.receiver) {
             auto owner = visit(*call.receiver);
             if (owner == Type::Never) return owner;
+            if (owner.kind == Type::Variable) {
+                if (auto method = symbols.contracts.member(owner, call.name.text)) {
+                    noTypeArgs();
+                    bool exits = arguments(id, call, method->parameters.size(), [&](auto slot) -> std::string_view { return method->labels[slot]; }, [&](auto slot) { return method->parameters[slot]; });
+                    return exits ? Type{Type::Never} : method->asynchronous ? symbols.task(method->result) : method->result;
+                }
+            }
             if (owner.kind == Type::Record) {
                 const auto& fields = symbols.fields[owner.id];
                 if (auto field = fields.find(call.name.text); field != fields.end()) {
@@ -913,6 +943,11 @@ CheckedModule check(Module module, const std::vector<Source>& sources, bool requ
         checked.aggregates.push_back({std::move(decl), {}});
     }
     symbols.fields.resize(checked.aggregates.size());
+    for (const auto& trait : module.traits) {
+        const auto& source = sources[trait.file];
+        if (symbols.records.contains(trait.name.text)) throw at(source, trait.name.span, "LYN0002", "类型名称已声明：" + trait.name.text);
+        symbols.contracts.define(trait, source, [&](const Identifier& type) { return symbols.resolve(source, type); });
+    }
     symbols.methods.resize(checked.aggregates.size());
     for (std::size_t id = 0; id < checked.aggregates.size(); ++id) {
         auto& record = checked.aggregates[id];
@@ -959,6 +994,7 @@ CheckedModule check(Module module, const std::vector<Source>& sources, bool requ
                 variables.emplace_back(Type::Variable, checked.variableNames.size());
                 checked.variableNames.push_back(parameter.text);
             }
+            for (const auto& bound : function.bounds) symbols.contracts.bind(variables[bound.parameter], bound.trait, source);
             symbols.callables.push_back({0, std::move(function), std::move(variables)});
             continue;
         }

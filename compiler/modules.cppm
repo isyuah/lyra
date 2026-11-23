@@ -75,6 +75,7 @@ struct Linker {
     }
 
     void rewrite(Module& syntax) {
+        for (auto& trait : syntax.traits) declare(trait.file, trait.name, trait.isPublic, false);
         for (auto& record : syntax.aggregates) declare(record.file, record.name, record.isPublic, false);
         for (auto& fn : syntax.functions) if (!fn.owner) declare(fn.file, fn.name, fn.isPublic, true);
         std::map<std::size_t, std::map<std::string, const Import*>> generatedImports;
@@ -104,11 +105,16 @@ struct Linker {
             auto generated = generatedScopes.find(file);
             return generated == generatedScopes.end() ? spaces.at(sources[file].moduleId).definitions : generated->second;
         };
-        for (auto& record : syntax.aggregates) {
-            const auto& scope = scopeOf(record.file);
-            for (auto& field : record.fields) field.type.text = mapTypeNames(typeForm(field.type.text), [&](const std::string& name) {
+        auto renameTypeIn = [&](std::size_t file, Identifier& type) {
+            const auto& scope = scopeOf(file);
+            type.text = mapTypeNames(typeForm(type.text), [&](const std::string& name) {
                 auto found = scope.find(name); return found == scope.end() ? name : found->second.name;
             });
+        };
+        for (auto& record : syntax.aggregates) for (auto& field : record.fields) renameTypeIn(record.file, field.type);
+        for (auto& trait : syntax.traits) for (auto& method : trait.methods) {
+            renameTypeIn(trait.file, method.result);
+            for (auto& parameter : method.parameters) renameTypeIn(trait.file, parameter.type);
         }
         for (auto& fn : syntax.functions) {
             const auto& scope = scopeOf(fn.file);
@@ -122,6 +128,7 @@ struct Linker {
                 });
             };
             if (fn.owner) rename(*fn.owner);
+            for (auto& bound : fn.bounds) rename(bound.trait);
             renameType(fn.result);
             for (auto& param : fn.parameters) renameType(param.type);
             auto reference = [&](Identifier& name) {

@@ -48,10 +48,12 @@ lyra pack <目录> [-o <源码包>|--registry <本地目录>]
 - 支持 `Int`、`Bool`、`Unit`、具名形参、按源码顺序求值的命名实参、`val` / `var`、嵌套作用域、赋值和复合赋值、整数四则与余数、比较、短路 `&&` / `||`、`if` / `else`、`while`、`break`、`continue` 和 `return`。整数溢出或除零在 Debug/Release 都带源码位置报错。普通块以末表达式为值，空块或带末尾分号的块取 `Unit`。
 - `String` 支持 UTF-8、拼接和内容相等；`struct` 按值复制，`class` 保留对象身份，可定义字段、主构造和方法。`gcCollect()` 可主动收集。对象由 BDWGC 管理；编译器安装目录带静态 GC 和 libuv 归档，部署应用不需要安装这两个库。见[对象验收程序](tests/fixtures/objects/src/main.ly)。
 - 泛型函数 `fn identity<T>(value: T): T { value }` 可写 `identity(42)` 或 `identity<String>("Ada")`。未调用的泛型也检查函数体，已调用的具体类型组合各生成一份原生实现。
+- `fn draw<T: Render>(item: T)` 可调用 `trait Render` 要求的方法。业务类型有可见、签名匹配的方法即可，不用声明 `implements`。结构检查发生在编译时，见[泛型与接口](rfc/generics-and-interfaces.md)。
 - [函数值与闭包](compiler/closures.md)可以返回、传参或存入集合。`apply(4) { it * 2 }` 把尾块传给末尾的固定函数形参；闭包共享被捕获的绑定，跨 `await`、GC 后仍可调用，`return` 和 `?` 只退出最近的 lambda。
 - [列表和变长参数](compiler/collections.md)支持 `[1, 2]`、按下标读写、`.size`、`.add(value)`、参数默认值、`fn sum(values: Int...)`。`sum(...ids)` 展开元素；函数收到本次调用自己的列表，更改槽位不影响调用方。如果元素是对象引用，引用的仍是同一个对象。
 - `Option<T>`（简写 `T?`）和 `Result<T,E>` 支持嵌套、穷尽 `match` 和 `?` 提前返回。`None`、`Some(None)` 和 `Some(Some(value))` 是不同的值。
 - `for value in values` 遍历列表；`user?.name ?? "unknown"` 只在接收者有值时访问成员，只在结果为空时计算兜底表达式。
+- [std.collections](std/collections/README.md) 提供普通泛型函数 `map`、`filter` 和 `fold`，例如 `map(values) { it * 2 }`。
 - 在源或目标类型的定义模块写 `implicit (user: User): Response { ... }`，即可在需要 `Response` 时直接传入或返回 `User`。不同具体错误之间的 `?` 也用同一种直接转换；不额外声明 trait、不串接转换，两端各有一条可见转换时在使用处报歧义。
 - `async fn` 调用返回冷 `Task<T>`；`await` 在需要时启动，重复等待复用结果，`spawn` 在同一串行域调度。`await blocking { ... }` 把同步工作交给有界线程池，不占住当前域；跨挂起点存活的局部值由 GC 扫描。`async fn main(): Result<Unit,String>` 的 `Err` 打印到 stderr 并以非零状态退出。见[异步实现说明](runtime/managed-tasks.md)。
 - 普通异常写 `throw Exception("reason")`，用 `try { ... } catch e: Exception { ... }` 或 `catch { ... }` 捕获。`defer` 在退出当前块时倒序清理；取消独立于异常。使用 [std.task](std/task/README.md) 给一棵任务树设置 trace 或 deadline，不需要逐层传 `context`。

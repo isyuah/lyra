@@ -42,6 +42,7 @@ target_sources(lyra PRIVATE FILE_SET CXX_MODULES FILES
     compiler/source.cppm compiler/syntax.cppm compiler/check.cppm compiler/lowering.cppm compiler/build.cppm
     compiler/packages.cppm compiler/modules.cppm compiler/generics.cppm compiler/async.cppm compiler/foreign.cppm compiler/sums.cppm compiler/macros.cppm)
 file(GLOB_RECURSE standardSources CONFIGURE_DEPENDS RELATIVE "${CMAKE_CURRENT_SOURCE_DIR}/std" "std/*.ly")
+target_sources(lyra PRIVATE FILE_SET CXX_MODULES FILES compiler/traits.cppm)
 target_sources(lyra PRIVATE FILE_SET CXX_MODULES FILES compiler/collections.cppm compiler/conversions.cppm compiler/exceptions.cppm compiler/closures.cppm)
 foreach(source IN LISTS standardSources)
     configure_file("std/${source}" "share/lyra/std/${source}" COPYONLY)

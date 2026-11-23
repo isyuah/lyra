@@ -143,6 +143,7 @@ Function specializeGeneric(const Function& declaration, const std::vector<std::s
     }
     result.name.text += '>';
     result.typeParameters.clear();
+    result.bounds.clear();
     return result;
 }
 

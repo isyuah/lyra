@@ -56,7 +56,7 @@ public:
         Kind kind;
         if (isLetter(current) || isDigit(current)) {
             while (offset < text.size() && (isLetter(text[offset]) || isDigit(text[offset]))) ++offset;
-            constexpr std::string_view keywords[] = {"fn", "val", "var", "if", "else", "while", "for", "in", "return", "break", "continue", "true", "false", "struct", "class", "pub", "import", "as", "async", "await", "spawn", "extern", "match", "null", "implicit", "defer", "throw", "try", "catch"};
+            constexpr std::string_view keywords[] = {"fn", "val", "var", "if", "else", "while", "for", "in", "return", "break", "continue", "true", "false", "struct", "class", "trait", "pub", "import", "as", "async", "await", "spawn", "extern", "match", "null", "implicit", "defer", "throw", "try", "catch"};
             auto word = text.substr(start, offset - start);
             kind = isDigit(current) ? Kind::Number : std::ranges::find(keywords, word) == std::end(keywords) ? Kind::Name : Kind::Keyword;
         } else if (current == '"') {
@@ -142,6 +142,11 @@ public:
                 module.expansions.push_back({file, std::move(name), std::move(argument), decorator, false, 0});
             }
             bool pub = visibility();
+            if (is("trait")) {
+                if (firstPrefix != module.expansions.size()) throw at(source, module.expansions[firstPrefix].name.span, "LYM0001", "不能修饰 trait 约束声明");
+                module.traits.push_back(trait(pub));
+                continue;
+            }
             for (auto index = firstPrefix; index < module.expansions.size(); ++index) {
                 auto& prefix = module.expansions[index];
                 if (is("import")) throw at(source, prefix.name.span, "LYM0001", "不能修饰 import");
@@ -261,12 +266,36 @@ private:
         return name;
     }
 
-    std::vector<Identifier> typeList(bool declarations = false) {
+    std::vector<Identifier> typeList() {
         require("<");
-        std::vector<Identifier> result{declarations ? identifier() : type()};
-        while (is(",")) { consume(); result.push_back(declarations ? identifier() : type()); }
+        std::vector<Identifier> result{type()};
+        while (is(",")) { consume(); result.push_back(type()); }
         require(">");
         return result;
+    }
+
+    Trait trait(bool pub) {
+        require("trait");
+        Trait declaration{file, identifier(), {}, pub};
+        require("{");
+        while (!is("}")) {
+            bool asynchronous = is("async");
+            if (asynchronous) consume();
+            require("fn");
+            auto name = identifier();
+            require("("); require("self");
+            std::vector<Parameter> parameters;
+            while (is(",")) {
+                consume(); auto parameter = identifier(); require(":");
+                parameters.push_back({std::move(parameter), type()});
+            }
+            require(")"); require(":");
+            declaration.methods.push_back({std::move(name), std::move(parameters), type(), asynchronous});
+            if (is(";")) consume();
+            else if (!is("}") && !token.newlineBefore) throw at(source, token.span, "LYP0001", "约束方法签名之间需要换行或分号");
+        }
+        consume();
+        return declaration;
     }
 
     bool explicitTypes(const Identifier& name) const { return explicitTypesAfter(name.span.end); }
@@ -331,7 +360,18 @@ private:
         auto keyword = require(conversion ? "implicit" : "fn");
         if (conversion && (owner || isAsync || foreign)) throw at(source, keyword.span, "LYV0001", "implicit 必须是顶层同步转换");
         auto name = conversion ? Identifier{"$implicit" + std::to_string(file) + "_" + std::to_string(keyword.span.begin), keyword.span} : identifier();
-        auto typeParameters = is("<") ? typeList(true) : std::vector<Identifier>{};
+        std::vector<Identifier> typeParameters;
+        std::vector<Bound> bounds;
+        if (is("<")) {
+            consume();
+            for (;;) {
+                typeParameters.push_back(identifier());
+                if (is(":")) { consume(); bounds.push_back({typeParameters.size() - 1, identifier()}); }
+                if (!is(",")) break;
+                consume();
+            }
+            require(">");
+        }
         if (foreign && (owner || !typeParameters.empty())) throw at(source, name.span, "LYF0001", "extern 不支持方法或泛型");
         require("(");
         std::vector<Parameter> parameters;
@@ -368,7 +408,7 @@ private:
             return {file, std::move(name), std::move(parameters), std::move(result), {}, 0, {}, pub, {}, false, std::move(symbol)};
         }
         auto body = block();
-        return {file, std::move(name), std::move(parameters), std::move(result), std::exchange(nodes, {}), body, std::move(owner), pub, std::move(typeParameters), isAsync, {}, conversion};
+        return {file, std::move(name), std::move(parameters), std::move(result), std::exchange(nodes, {}), body, std::move(owner), pub, std::move(typeParameters), isAsync, {}, conversion, std::move(bounds)};
     }
 
     ExprId block() {
