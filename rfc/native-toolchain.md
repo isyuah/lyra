@@ -13,6 +13,36 @@
 
 程序包大小与常驻内存分别看待。目标是内置 Runtime/GC 但不用虚拟机、单程序易分发且能够在服务器上多进程运行；目前不设与 Go 对比的硬 MB 上限。建立可执行服务后，再以等价负载与 Go 对照报告多进程总内存、二进制大小、启动时间、吞吐和尾延迟。
 
+### 首个多进程样本
+
+在 WSL 2 的 Ubuntu 22.04.5 x86-64 独立运行根中测量 `90621d5` 对应的 Release 应用：不安装 Lyra、LLVM、GC 或 libuv，另装系统 `libsqlite3-0`。未 `strip` 的 HTTP/SQLite 文件为 **518,824 字节**，JSONL 为 **254,232 字节**。同时启动四个同一 ELF 的服务进程，使用默认阻塞池；每个在同一只读数据库上成功响应一次 `GET /users/7`，保持监听，再从 `/proc/<pid>/smaps_rollup` 取样。
+
+| 指标 | 四进程合计 | 解释 |
+|---|---:|---|
+| PSS | 9,770 KiB | 按实际映射数分摊共享页；单进程 2,417–2,479 KiB。 |
+| RSS | 21,072 KiB | 每个进程都计入其常驻共享页，直接相加会重复计算。 |
+
+复现：用[部署验收脚本](../tests/jammy-smoke.sh)的 `build` 模式生成应用和数据库，把输出放在干净运行环境的 `apps/`，在该目录的上级执行以下 Bash。`stdbuf` 仅让样例通过管道及时宣布端口，测量和复现都使用它。
+
+```bash
+set -eu
+stat -c '%n %s bytes' apps/{http,jsonlines}-release
+scratch=$(mktemp -d); pids=()
+trap 'for pid in "${pids[@]}"; do kill "$pid" 2>/dev/null || :; done; wait || :; rmdir "$scratch"' EXIT
+for instance in 1 2 3 4; do
+    mkfifo "$scratch/port"
+    stdbuf -oL apps/http-release apps/http-fixture.db >"$scratch/port" & pids+=("$!")
+    read -r port <"$scratch/port"; rm "$scratch/port"
+    exec {client}<>"/dev/tcp/127.0.0.1/$port"
+    printf 'GET /users/7 HTTP/1.1\r\nHost: localhost\r\n\r\n' >&"$client"
+    response=$(cat <&"$client"); exec {client}>&-; [[ $response == *'"Ada"'* ]]
+done
+for pid in "${pids[@]}"; do cat "/proc/$pid/smaps_rollup"; done |
+    awk '/^Pss:/ {pss+=$2} /^Rss:/ {rss+=$2} END {print "PSS",pss,"KiB; RSS",rss,"KiB"}'
+```
+
+这是一次极轻负载、暖机后空闲的快照，记录的是应用进程内存，而不是整个 WSL 虚拟机。后续 Go 对照应固定相同的服务、数据库、并发、目标环境和统计方法；这里的数值不作为性能预算。
+
 ### 首个编译器的实现选择
 
 编译器和运行时使用 **C++23、Clang 18、CMake 3.28+ 与 Ninja 1.11+**。源码诊断、语法、类型检查、LLVM lowering 和构建驱动通过 C++ 命名模块暴露接口，CMake `FILE_SET CXX_MODULES` 与 `clang-scan-deps-18` 跟踪依赖。标准库及 LLVM 头在全局模块片段引入；不要求工具链提供 `import std`。`check` 和 `build` 共用前端，前端不调用 Clang。后端用 LLVM 18 的 `IRBuilder` 构造模块，验证后写临时 IR，由 `clang-18` 生成目标文件并链接具有 C ABI 的静态运行时。发布的程序不包含编译器或 LLVM；整数切片只动态依赖系统 libc。
