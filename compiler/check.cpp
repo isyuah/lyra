@@ -102,12 +102,12 @@ Function defaultFunction(const Function& original, std::size_t slot) {
 
 Function constructorSignature(const Aggregate& record) {
     auto result = record.name;
-    result.text += '<';
+    if (!record.typeParameters.empty()) result.text += '<';
     for (std::size_t index = 0; index < record.typeParameters.size(); ++index) {
         if (index) result.text += ',';
         result.text += record.typeParameters[index].text;
     }
-    result.text += '>';
+    if (!record.typeParameters.empty()) result.text += '>';
     std::vector<Parameter> parameters;
     for (const auto& field : record.fields) parameters.push_back({field.name, field.type});
     return {record.file, record.name, std::move(parameters), std::move(result), {}, 0, {}, record.isPublic, record.typeParameters};
@@ -307,6 +307,16 @@ struct Symbols {
         addConcrete(prepare(specializeGeneric(*callables[declaration].generic, key.arguments)));
         specializations.emplace(std::move(key), index);
         return index;
+    }
+
+    void bindFieldDefaults(Type type, std::span<const std::size_t> slots, const Source& source, Span site) {
+        auto& record = module.aggregates[type.id];
+        record.defaultFunctions.resize(record.fields.size());
+        for (auto slot : slots) {
+            if (record.defaultFunctions[slot]) continue;
+            auto helper = functions.at(fieldDefaultName(record.syntax.name.text, record.syntax.fields[slot].name.text));
+            record.defaultFunctions[slot] = record.arguments.empty() ? callables[helper].target : instantiate(helper, record.arguments, source, site);
+        }
     }
 };
 
@@ -876,12 +886,13 @@ struct Checker {
     }
 
     template<class GetType>
-    bool functionArguments(ExprId id, const Call& call, const Function& target, GetType getType, bool deferContextual = false) {
+    bool functionArguments(ExprId id, const Call& call, const Function& target, GetType getType, bool deferContextual = false, std::span<const Field> fields = {}) {
         auto skip = static_cast<std::size_t>(call.receiver.has_value());
         std::vector<ParameterShape> parameters;
         for (auto slot = skip; slot < target.parameters.size(); ++slot) {
             const auto& parameter = target.parameters[slot];
-            parameters.push_back({parameter.name.text, parameter.defaultValue.has_value(), parameter.variadic});
+            auto defaulted = fields.empty() ? parameter.defaultValue.has_value() : fields[slot].defaultValue.has_value();
+            parameters.push_back({parameter.name.text, defaulted, parameter.variadic});
         }
         auto arguments = argumentShapes(call, !parameters.empty() && !parameters.back().variadic && target.parameters.back().type.text.starts_with("$fn<"));
         auto plan = bindArguments(parameters, arguments, source, call.name.span, call.name.text);
@@ -986,7 +997,7 @@ struct Checker {
         return inferred;
     }
 
-    std::pair<std::vector<Type>, bool> bindGeneric(ExprId id, const Call& call, const Function& target, std::optional<Type> expected, std::span<const Type> ownerTypes = {}) {
+    std::pair<std::vector<Type>, bool> bindGeneric(ExprId id, const Call& call, const Function& target, std::optional<Type> expected, std::span<const Type> ownerTypes = {}, std::span<const Field> fields = {}) {
         auto explicitCount = target.typeParameters.size() - ownerTypes.size();
         if (!call.typeArguments.empty() && call.typeArguments.size() != explicitCount) {
             throw at(source, call.name.span, "LYG0001", call.name.text + " 需要 " + std::to_string(explicitCount) + " 个类型实参");
@@ -1011,7 +1022,7 @@ struct Checker {
                         } else resolved = hint(form);
                     }
                     return resolved;
-                }, true);
+                }, true, fields);
         auto& info = fn.expressions[id];
         std::vector<GenericArgument<Type>> actuals;
         for (std::size_t index = 0; index < call.arguments.size(); ++index) {
@@ -1190,19 +1201,24 @@ struct Checker {
                 visible(ctor.file, ctor.isPublic, call.name);
             } else {
                 info.callee = Callee::Constructor;
-                for (const auto& field : decl.fields) visible(decl.file, field.isPublic, call.name);
+                auto signature = constructorSignature(decl);
+                Type type;
+                bool exits;
                 if (!decl.typeParameters.empty()) {
-                    auto init = constructorSignature(decl);
-                    auto [types, exits] = bindGeneric(id, call, init, expected);
-                    auto type = symbols.recordType(record->second, std::move(types), source, call.name.span);
-                    info.target = type.id;
-                    return exits ? Type{Type::Never} : type;
+                    auto bound = bindGeneric(id, call, signature, expected, {}, decl.fields);
+                    type = symbols.recordType(record->second, std::move(bound.first), source, call.name.span);
+                    exits = bound.second;
+                } else {
+                    noTypeArgs();
+                    type = symbols.recordType(record->second, {}, source, call.name.span);
+                    exits = functionArguments(id, call, signature, [&](auto slot, auto, const auto&) { return module.aggregates[type.id].fields[slot]; }, false, decl.fields);
                 }
-                noTypeArgs();
-                auto type = symbols.recordType(record->second, {}, source, call.name.span);
+                for (std::size_t index = 0; index < call.arguments.size(); ++index) {
+                    const auto& field = decl.fields[info.argumentSlots[index]];
+                    visible(decl.file, field.isPublic, call.arguments[index].label.value_or(call.name));
+                }
                 info.target = type.id;
-                const auto& instance = module.aggregates[type.id];
-                bool exits = arguments(id, call, instance.fields.size(), [&](auto slot) -> const auto& { return decl.fields[slot].name.text; }, [&](auto slot) { return instance.fields[slot]; });
+                if (variables.empty() && !info.omittedDefaults.empty()) symbols.bindFieldDefaults(type, info.omittedDefaults, source, call.name.span);
                 return exits ? Type{Type::Never} : type;
             }
         } else {

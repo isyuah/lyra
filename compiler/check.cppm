@@ -38,7 +38,7 @@ struct CheckedFunction {
     std::vector<std::optional<std::size_t>> defaultFunctions{};
     std::vector<std::optional<ExprId>> cleanupOwners{};
 };
-struct CheckedAggregate { Aggregate syntax; std::vector<Type> fields; std::size_t declaration; std::vector<Type> arguments; bool abstract; };
+struct CheckedAggregate { Aggregate syntax; std::vector<Type> fields; std::size_t declaration; std::vector<Type> arguments; bool abstract; std::vector<std::optional<std::size_t>> defaultFunctions{}; };
 struct CheckedEnum { Enumeration syntax; std::vector<std::vector<Type>> payloads; };
 struct SumTypes { Type success, failure; bool operator==(const SumTypes&) const = default; };
 struct FunctionShape { std::vector<Type> parameters; Type result; bool operator==(const FunctionShape&) const = default; };

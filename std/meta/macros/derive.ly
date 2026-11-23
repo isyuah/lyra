@@ -40,41 +40,62 @@ fn jsonKey(index: Int): String {
     key
 }
 
+fn encodeField(name: String, key: String, typeName: String, defaultKind: String): String {
+    val member = "value.`" + name + "`"
+    val encodedKey = if key == name { macroQuote(macroQuote(name) + ":") } else { "quoteJson(" + macroQuote(key) + ") + \":\"" }
+    val prefix = "if output != \"{\" { output += \",\" }; output += " + encodedKey + " + "
+    val inner = optionInner(typeName)
+    if inner == "" || defaultKind == "expression" { return prefix + encodeValue(typeName, member) + "\n" }
+    "match " + member + " { None => {}, Some(item) => { " + prefix + encodeValue(inner, "item") + " } }\n"
+}
+
+fn readPresentField(typeName: String, source: String, path: String): String {
+    val inner = optionInner(typeName)
+    if optionInner(inner) != "" { return "Some(" + readValue(inner, source, path) + ")" }
+    readValue(typeName, source, path)
+}
+
 fn derive(target: String, argument: String): String {
     if argument != "Json" || targetKind() != "struct" { return macroFail("#derive(Json) expects a struct") }
     var encoding = "fn encode" + target + "(value: `" + target + "`): String {\nvar output = \"{\"\n"
     var decoding = ""
+    var defaults = ""
     var known = "false"
     var seenKeys = "\0"
     var args = ""
     var index = 0
     while index < fieldCount() {
         val name = fieldName(index)
-        val typeName = fieldType(index)
-        if !fieldPublic(index) { return macroFail("Cannot construct private field without a default: " + name) }
-        val inner = optionInner(typeName)
-        if optionInner(optionInner(inner)) != "" { return macroFail("JSON cannot distinguish a third optional layer at " + name) }
-        val key = jsonKey(index)
-        if macroContains(seenKeys, "\0" + key + "\0") { return macroFail("Duplicate JSON key " + macroQuote(key) + " at field " + name) }
-        seenKeys += key + "\0"
-        val quoted = macroQuote(key)
-        val member = "value.`" + name + "`"
-        val encodedKey = if key == name { macroQuote(macroQuote(name) + ":") } else { "quoteJson(" + quoted + ") + \":\"" }
-        val prefix = "if output != \"{\" { output += \",\" }; output += " + encodedKey + " + "
-        if inner == "" { encoding += prefix + encodeValue(typeName, member) + "\n" }
-        else { encoding += "match " + member + " { None => {}, Some(item) => { " + prefix + encodeValue(inner, "item") + " } }\n" }
-        val slot = "slot" + name
-        val source = "node" + name
-        val path = if key == name { "path + " + macroQuote("." + name) } else { "path + keyPath(" + quoted + ")" }
-        known += " || key == " + quoted
-        decoding += "val " + source + " = value.field(" + quoted + ")\nval " + slot + ": " + typeName + " = "
-        if inner == "" { decoding += readValue(typeName, source, path) }
-        else {
-            var empty = source + ".missing()"
-            if optionInner(inner) == "" { empty += " || " + source + ".isNull()" }
-            decoding += "if " + empty + " { None } else { Some(" + readValue(inner, source, path) + ") }"
+        val defaultKind = fieldDefaultKind(index)
+        val slot = "slot" + index.toString()
+        if !fieldPublic(index) {
+            if defaultKind == "required" { return macroFail("Cannot construct private field without a default: " + name) }
+            defaults += "val " + slot + " = " + fieldDefaultFunction(index) + "(" + args + ")\n"
+        } else {
+            val typeName = fieldType(index)
+            val inner = optionInner(typeName)
+            val nested = optionInner(inner)
+            if optionInner(nested) != "" { return macroFail("JSON cannot distinguish a third optional layer at " + name) }
+            if nested != "" && defaultKind == "expression" { return macroFail("Nested optional field " + name + " needs a literal None default or a custom JSON mapping") }
+            val key = jsonKey(index)
+            if macroContains(seenKeys, "\0" + key + "\0") { return macroFail("Duplicate JSON key " + macroQuote(key) + " at field " + name) }
+            seenKeys += key + "\0"
+            encoding += encodeField(name, key, typeName, defaultKind)
+            val quoted = macroQuote(key)
+            val source = "node" + index.toString()
+            val path = if key == name { "path + " + macroQuote("." + name) } else { "path + keyPath(" + quoted + ")" }
+            known += " || key == " + quoted
+            decoding += "val " + source + " = value.field(" + quoted + ")\n"
+            var read = readPresentField(typeName, source, path)
+            if defaultKind != "expression" {
+                if inner != "" { read = "if " + source + ".missing() { None } else { " + read + " }" }
+                decoding += "val " + slot + ": " + typeName + " = " + read + "\n"
+            } else {
+                val supplied = "supplied" + index.toString()
+                decoding += "val " + supplied + ": Option<" + typeName + "> = if " + source + ".missing() { None } else { Some(" + read + ") }\n"
+                defaults += "val " + slot + " = " + supplied + " ?? " + fieldDefaultFunction(index) + "(" + args + ")\n"
+            }
         }
-        decoding += "\n"
         if index != 0 { args += ", " }
         args += slot
         index += 1
@@ -83,5 +104,5 @@ fn derive(target: String, argument: String): String {
     val head = "fn read" + target + "Json(value: JsonValue, path: String): Result<`" + target + "`,String> {\nif !value.isObject() { return Err(path + \": expected object\") }\nif value.rejectsUnknownFields { var index = 0; while index < value.size() { val key = value.key(index); if !(" + known + ") { return Err(path + keyPath(key) + \": unknown field\") }; index += 1 } }\n"
     val decoder = "fn decode" + target + "(text: String): Result<`" + target + "`,String> { read" + target + "Json(parseJson(text)?, \"$\") }\n"
     val ignoring = "fn decode" + target + "IgnoringUnknownFields(text: String): Result<`" + target + "`,String> { read" + target + "Json((parseJson(text)?).ignoringUnknownFields(), \"$\") }\n"
-    imports + encoding + "output + \"}\"\n}\n" + head + decoding + "Ok(`" + target + "`(" + args + "))\n}\n" + decoder + ignoring
+    imports + encoding + "output + \"}\"\n}\n" + head + decoding + defaults + "Ok(`" + target + "`(" + args + "))\n}\n" + decoder + ignoring
 }

@@ -76,6 +76,76 @@ fn main(): Unit {
 }
 """, b"9\n2\n1\n7\n")
 
+    def test_field_defaults_use_declaration_scope_and_constructor_order(self):
+        (self.package / 'lyra.json5').write_text('{name:"test/defaults", version:"0.1.0"}')
+        models = self.src / 'models'
+        models.mkdir()
+        (models / 'packet.ly').write_text('''
+fn mark(value: Int): Int { print(value); value }
+pub struct Packet<Item>(pub val item: Item, val base: Int = mark(2)) {
+    pub fn first(): Item { items[0] }
+    pub val items: List<Item> = [item]
+    pub val total: Int = mark(base + 1)
+}
+pub class Counter<Item> {
+    pub val seed: Int = mark(4)
+    pub init(item: Item, seed: Int) { this.item = item; count += seed }
+    pub val item: Item
+    pub var count: Int = seed + 1
+}
+''', encoding='utf-8')
+        self.run_source('''
+import self.models.Packet as Envelope
+import self.models.Counter
+fn mark(value: Int): Int { -1 }
+fn supplied(value: Int): Int { print(value); value }
+fn main(): Unit {
+    val packet = Envelope(total: supplied(9), item: supplied(7))
+    print(packet.total); print(packet.first())
+    val other: Envelope<String> = Envelope("Ada")
+    print(other.first()); print(other.total)
+    val counter = Counter("init", 6)
+    print(counter.count); print(counter.item)
+}
+''', b'9\n7\n2\n9\n7\n2\n3\nAda\n3\n4\n11\ninit\n')
+        self.main.write_text('import self.models.Packet\nfn main(): Unit { Packet(7, base: 99); }')
+        result = subprocess.run([COMPILER, 'check', self.package, '--diagnostics=json'], capture_output=True, timeout=10)
+        self.assertNotEqual(result.returncode, 0)
+        error, = json.loads(result.stderr)
+        self.assertEqual(error['code'], 'LYN0003')
+        self.assertIn('base', error['message'])
+
+    def test_class_defaults_allocate_per_instance_and_propagate_exceptions(self):
+        self.run_source('''
+fn initialItems(): List<Int> { print("new"); [] }
+class Bucket(val items: List<Int> = initialItems(), val count: Int = items.size)
+fn fail(): Int { throw Exception("default failed") }
+class Attempt { val value: Int = fail(); init() { print("body") } }
+fn main(): Unit {
+    val first = Bucket(); first.items.add(8)
+    val second = Bucket(count: 2)
+    val shared = Bucket(items: first.items)
+    print(second.items.size); print(second.count); print(shared.count)
+    print(try { Attempt().value.toString() } catch error: Exception { error.message })
+}
+''', b'new\nnew\n0\n2\n1\ndefault failed\n')
+
+    def test_defaults_are_checked_even_without_construction(self):
+        for declaration, code, message in (
+            ('struct Bad<T>(val wrong: T = 1)', 'LYT0001', 'T'),
+            ('struct Bad(val first: Int = second, val second: Int = 2)', 'LYN0001', 'second'),
+            ('class Bad(val first: Int = this.second, val second: Int = 2)', 'LYT0018', 'this'),
+            ('class Bad { val value: Int = 1; init() { value = 2 } }', 'LYT0017', '只能初始化一次'),
+            ('class Bad { val need: Int; val copy: Int = need; init() { need = 1 } }', 'LYN0001', 'need'),
+        ):
+            with self.subTest(declaration=declaration):
+                self.main.write_text(declaration + '\nfn main(): Unit {}', encoding='utf-8')
+                result = subprocess.run([COMPILER, 'check', self.package, '--diagnostics=json'], capture_output=True, timeout=10)
+                self.assertNotEqual(result.returncode, 0)
+                error, = json.loads(result.stderr)
+                self.assertEqual(error['code'], code)
+                self.assertIn(message, error['message'])
+
     def test_implicit_receiver_respects_shadowing_defaults_and_capture(self):
         self.run_source('''
 fn read(): Int { -1 }

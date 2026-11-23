@@ -34,6 +34,8 @@ constexpr auto prelude = R"(fn fieldCount(): Int { 0 }
 fn fieldName(index: Int): String { "" }
 fn fieldType(index: Int): String { "" }
 fn fieldPublic(index: Int): Bool { false }
+fn fieldDefaultKind(index: Int): String { "" }
+fn fieldDefaultFunction(index: Int): String { "" }
 fn fieldHasAttribute(index: Int, name: String): Bool { false }
 fn fieldAttributeValue(index: Int, name: String): String { "" }
 fn argumentCount(): Int { 0 }
@@ -77,6 +79,7 @@ struct Machine {
     unsigned fuel = 50000, depth = 0;
     std::size_t bytes = 0;
     std::map<std::string, std::string> inputs{};
+    std::map<std::string, std::size_t> defaultReferences{};
 
     [[noreturn]] void error(const std::string& message) const { throw at(use, expansion.name.span, "LYM0002", message); }
     void budget(std::size_t size) {
@@ -122,6 +125,14 @@ struct Machine {
         const auto& field = fields[index];
         if (name == "fieldName") return field.name.text;
         if (name == "fieldType") return field.type.text;
+        if (name == "fieldDefaultKind" || name == "fieldDefaultFunction") {
+            if (kind != "struct") error("字段默认值查询需要 struct 声明宏");
+            if (name == "fieldDefaultKind") return std::string(!field.defaultValue ? "required" : field.defaultValue->emptyOption ? "none" : "expression");
+            if (!field.defaultValue) error("字段没有默认值：" + field.name.text);
+            auto reference = "__lyraFieldDefault" + std::to_string(index);
+            defaultReferences.emplace(reference, field.defaultValue->function);
+            return reference;
+        }
         if (name == "fieldHasAttribute" || name == "fieldAttributeValue") {
             auto found = std::ranges::find_if(field.attributes, [&](const auto& mark) { return mark.name.text == std::get<std::string>(args[1]); });
             if (name == "fieldHasAttribute") return found != field.attributes.end();
@@ -234,7 +245,7 @@ struct Machine {
     }
 };
 
-std::string expand(const Source& source, const Expansion& prefix, const MacroPackage& package, const std::string& target, const std::vector<Field>& fields, const std::string& kind, const std::string& body, std::vector<fs::path>& files, const ExpressionExpansion* expression = nullptr) {
+std::string expand(const Source& source, const Expansion& prefix, const MacroPackage& package, const std::string& target, const std::vector<Field>& fields, const std::string& kind, const std::string& body, std::vector<fs::path>& files, const ExpressionExpansion* expression = nullptr, std::map<std::string, std::size_t>* defaultReferences = nullptr) {
     auto directory = expression ? "expressions" : prefix.decorator ? "decorators" : "macros";
     auto file = prefix.name.text + ".ly";
     auto path = package.root / "src" / (std::string(".") + directory) / file;
@@ -263,7 +274,9 @@ std::string expand(const Source& source, const Expansion& prefix, const MacroPac
         throw at(source, prefix.name.span, "LYM0002", "宏入口应为 fn " + prefix.name.text + "(target: String, argument: String): String");
     }
     Machine machine{checked, source, prefix, fields, kind, body, package, files, expression};
-    return std::get<std::string>(machine.invoke(*it, {target, prefix.argument ? prefix.argument->text : std::string{}}));
+    auto output = std::get<std::string>(machine.invoke(*it, {target, prefix.argument ? prefix.argument->text : std::string{}}));
+    if (defaultReferences) *defaultReferences = std::move(machine.defaultReferences);
+    return output;
 }
 }
 
@@ -341,7 +354,8 @@ void expandMacros(Module& syntax, std::vector<Source>& sources, const std::map<s
             for (const auto& param : fn.parameters) fields.push_back({param.name, param.type, false, true, param.attributes});
             if (!fn.foreignSymbol) { auto span = fn.expressions[fn.body].span; bodyText = source.text.substr(span.begin, span.end - span.begin); }
         }
-        auto generated = expand(source, prefix, packages.at(source.moduleId), name.text, fields, prefix.record ? (syntax.aggregates[prefix.target].reference ? "class" : "struct") : "fn", bodyText, inputs);
+        std::map<std::string, std::size_t> defaultReferences;
+        auto generated = expand(source, prefix, packages.at(source.moduleId), name.text, fields, prefix.record ? (syntax.aggregates[prefix.target].reference ? "class" : "struct") : "fn", bodyText, inputs, nullptr, &defaultReferences);
         auto label = prefix.decorator ? "@" : "#";
         if (prefix.decorator) generated = "fn hook(): Unit {\n" + generated + "\n}";
         auto output = sourceText(fromUtf8(pathText(source.path) + "(" + label + prefix.name.text + ")"), std::move(generated), source.moduleId);
@@ -349,6 +363,14 @@ void expandMacros(Module& syntax, std::vector<Source>& sources, const std::map<s
         sources.push_back(std::move(output));
         auto start = syntax.functions.size(), records = syntax.aggregates.size(), imports = syntax.imports.size(), traits = syntax.traits.size(), enums = syntax.enums.size();
         parseFile(syntax, sources.back(), sources.size() - 1);
+        if (!defaultReferences.empty()) for (auto index = start; index < syntax.functions.size(); ++index) {
+            for (auto& expr : syntax.functions[index].expressions) {
+                auto* reference = std::get_if<Identifier>(&expr.node);
+                if (auto* call = std::get_if<Call>(&expr.node); call && !call->receiver && !call->function && !call->typeOwner) reference = &call->name;
+                if (!reference || sources.back().text[reference->span.begin] == '`') continue;
+                if (auto found = defaultReferences.find(reference->text); found != defaultReferences.end()) reference->text = syntax.functions[found->second].name.text;
+            }
+        }
         if (!syntax.expansions.empty() || std::any_of(syntax.traits.begin() + traits, syntax.traits.end(), [](const auto& trait) { return trait.isPublic; }) || std::any_of(syntax.functions.begin() + start, syntax.functions.end(), [](const auto& fn) { return fn.isPublic || fn.foreignSymbol; }) ||
             std::any_of(syntax.aggregates.begin() + records, syntax.aggregates.end(), [](const auto& record) { return record.isPublic; }) ||
             std::any_of(syntax.enums.begin() + enums, syntax.enums.end(), [](const auto& item) { return item.isPublic; }) ||

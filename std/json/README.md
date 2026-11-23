@@ -21,8 +21,10 @@ fn main(): Unit {
 - `Char` 在 JSON 中是恰含一个 Unicode 标量的字符串：`"🙂"`、`"\ud83d\ude42"`、`"\u0000"` 都能解码；`""`、`"ab"`、数字 `65` 和由 `e` 加组合重音构成的 `"e\u0301"` 会报字段路径错误。解码不做 Unicode 归一化。
 - `decodeUser(text)` 默认拒绝未知键。只有接口明确允许对方添加字段时才调用 `decodeUserIgnoringUnknownFields(text)`：它在整个派生对象树忽略额外键，包括列表里的嵌套对象；重新编码只写已声明字段。已知字段的类型、必填要求不变，重复键（即使藏在忽略的字段内）、无效 JSON 和解析器范围外的整数仍报错。
 - 错误路径使用输入中的键名：普通标识符用点号，其余键用方括号包住 JSON 字符串，如 `$.users[2]["display-name"]: expected String`。`$["user.name"]` 指一个带点的键，而 `$.user.name` 指两层对象。
-- `T?` 字段为 `None` 时省略键；缺键或 `null` 均解为 `None`。`Option<T?>` 区分缺键 `None`、显式 `null` 即 `Some(None)`、非空值 `Some(Some(value))`。更深的可空层没有不丢信息的 JSON 表示，要求手写映射。
-- 当前派生范围为可通过公开字段构造的 `struct`。私有必填字段、`class` 身份图及自定义字段默认值没有自动映射。编码和解码都是普通 Lyra 函数，不需要运行时反射。
+- 对每个 `struct`，解码器先读取公开字段，再按声明顺序求缺键字段的构造默认值。默认表达式可引用前面已确定的字段，各执行一次。显式 `null` 只由字段类型解释，例如必填 `Int` 收到 `null` 会报字段路径错误。
+- 若声明 `pub val name: String? = "guest"`，`{}` 解为 `"guest"`，`{"name":null}` 解为 `None`。编码这个 `None` 会写 `null`。单层可空字段没有默认值，或默认值直接写 `None` / `null` 时，编码 `None` 会省略键。其他默认表达式一律按可能产生非空值处理，编码不执行该表达式。
+- `Option<T?>` 在没有默认值或默认值直接写 `None` / `null` 时区分三种状态：缺键得到 `None`，显式 `null` 得到 `Some(None)`，非空值得到 `Some(Some(value))`。这种字段若使用其他默认表达式，或字段有第三层可空类型，须手写映射。
+- 私有字段必须有显式默认值。解码时由默认值初始化，编码时省略，类型可以没有 JSON 编解码实现。输入中的私有字段名按未知键处理。自动派生面向非泛型 `struct`，`class` 身份图需手写映射。
 - 非固定 schema 可 `import std.json.parseJson`：它返回 `Result<JsonValue,String>`。用 `isObject()`、`isArray()`、`size()`、`key(index)`、`field(name)`、`item(index)` 检查结构，用 `readString(path)`、`readChar(path)`、`readBool(path)` 或 `read` 加数值类型名（如 `readUInt16(path)`、`readFloat32(path)`）读取标量。`missing()` 和 `isNull()` 可分别检查缺键和显式空值。
 - 手写 `read类型名Json(value: JsonValue, path: String)` 时，可把 `value.field(name)`、`value.item(index)` 直接交给其他解码器，它们继承当前视图的策略。若手动遍历未知键，按 `value.rejectsUnknownFields` 决定是否报错。`value.ignoringUnknownFields()` 与原视图共用解析结果，不修改原视图。
 

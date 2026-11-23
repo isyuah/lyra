@@ -480,12 +480,46 @@ private:
         return result;
     }
 
-    Field field(bool pub, std::vector<Attribute> marks) {
+    void field(Module& module, Aggregate& record, bool pub, std::vector<Attribute> marks, bool inParens) {
         if (!is("var") && !is("val")) throw at(source, token.span, "LYP0001", "字段声明需要 val 或 var");
         bool writable = text(consume()) == "var";
         auto name = identifier();
         require(":");
-        return {std::move(name), type(), writable, pub, std::move(marks)};
+        Field member{std::move(name), type(), writable, pub, std::move(marks)};
+        if (is("=")) {
+            consume();
+            auto body = expression(inParens);
+            member.defaultValue = FieldDefault{module.functions.size(), std::holds_alternative<EmptyOption>(nodes[body].node)};
+            Identifier helper{fieldDefaultName(record.name.text, member.name.text), member.name.span};
+            module.functions.push_back({file, std::move(helper), {}, member.type, std::exchange(nodes, {}), body, {}, false, record.typeParameters});
+        }
+        record.fields.push_back(std::move(member));
+    }
+
+    void bindFieldDefaults(Module& module, const Aggregate& record, Function* init) {
+        std::vector<Parameter> earlier;
+        std::vector<Statement> assignments;
+        for (const auto& member : record.fields) {
+            if (member.defaultValue) {
+                auto& helper = module.functions[member.defaultValue->function];
+                helper.parameters = earlier;
+                if (init) {
+                    auto site = member.name.span;
+                    auto append = [&](auto node) { init->expressions.push_back({site, std::move(node)}); return init->expressions.size() - 1; };
+                    auto receiver = append(This{});
+                    Call call{helper.name, {}, {}, record.typeParameters};
+                    for (const auto& parameter : earlier) call.arguments.push_back({{}, append(Member{receiver, parameter.name})});
+                    auto field = append(Member{receiver, member.name});
+                    auto value = append(std::move(call));
+                    assignments.push_back({append(Binary{Op::Set, site, field, value}), site});
+                }
+            }
+            if (!init || member.defaultValue) earlier.push_back({member.name, member.type});
+        }
+        if (!assignments.empty()) {
+            auto& statements = std::get<Block>(init->expressions[init->body].node).statements;
+            statements.insert(statements.begin(), assignments.begin(), assignments.end());
+        }
     }
 
     void aggregate(Module& module, bool pub) {
@@ -498,11 +532,12 @@ private:
             require(">");
         }
         bool primary = is("(");
+        std::optional<std::size_t> initializer;
         if (primary) {
             consume();
             while (!is(")")) {
                 auto marks = attributes();
-                decl.fields.push_back(field(visibility(), std::move(marks)));
+                field(module, decl, visibility(), std::move(marks), true);
                 if (!is(",")) break;
                 consume();
             }
@@ -510,27 +545,27 @@ private:
         }
         if (!primary || is("{")) {
             require("{");
-            bool initialized = false;
             while (!is("}")) {
                 auto marks = attributes();
                 bool publicMember = visibility();
                 if (is("init")) {
-                    if (!reference || primary || initialized)
+                    if (!reference || primary || initializer)
                         throw at(source, token.span, "LYP0001", "仅没有主构造参数列表的 class 可以声明一个 init 构造函数");
                     if (!marks.empty()) throw at(source, marks.front().name.span, "LYM0003", "此处的标记只适用于字段和形参");
-                    initialized = true;
+                    initializer = module.functions.size();
                     module.functions.push_back(function(decl.name, publicMember, decl.typeParameters, true));
                 } else if (is("fn") || is("async") || is("extern") || is("static")) {
                     if (!marks.empty()) throw at(source, marks.front().name.span, "LYM0003", "此处的标记只适用于字段和形参");
                     bool staticMember = is("static");
                     if (staticMember) consume();
                     module.functions.push_back(function(decl.name, publicMember, decl.typeParameters, false, staticMember));
-                } else decl.fields.push_back(field(publicMember, std::move(marks)));
+                } else field(module, decl, publicMember, std::move(marks), false);
                 if (is(";")) consume();
                 else if (!is("}") && !token.newlineBefore) throw at(source, token.span, "LYP0001", "成员之间需要换行或分号");
             }
             consume();
         }
+        bindFieldDefaults(module, decl, initializer ? &module.functions[*initializer] : nullptr);
         module.aggregates.push_back(std::move(decl));
     }
 

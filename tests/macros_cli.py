@@ -113,6 +113,46 @@ fn main(): Unit {
                            '{"user":' + user + ',"note":"text"}', '$.user.naem: unknown field',
                            '$.user.name: expected String', '$.user: expected object', '11'])
 
+    def test_json_defaults_share_constructor_values_and_keep_explicit_null(self):
+        self.native(r'''class Memo(val text: String)
+fn intText(value: Int): String { print("default name"); "guest" }
+fn remember(name: String?): Memo { val text = name ?? "anonymous"; print("memo " + text); Memo(text) }
+#derive(Json)
+struct User(pub val name: String? = intText(0), val memo: Memo = remember(name),
+            [jsonName("display-name")] pub val label: String = memo.text, pub val note: String? = null)
+fn show(text: String): String { match decodeUser(text) { Ok(user) => encodeUser(user), Err(error) => error } }
+fn main(): Unit {
+    print(encodeUser(User()))
+    print(show("{}"))
+    print(show(r#"{"name":null}"#))
+    print(show(r#"{"name":"Ada","display-name":"A","note":"hello"}"#))
+    print(show(r#"{"display-name":false}"#))
+    print(show(r#"{"display-name":null}"#))
+    print(show(r#"{"memo":"fake"}"#))
+    print(match decodeUserIgnoringUnknownFields(r#"{"name":"Bo","memo":"fake"}"#) {
+        Ok(user) => user.memo.text, Err(error) => error,
+    })
+}''', ['default name', 'memo guest', '{"name":"guest","display-name":"guest"}',
+       'default name', 'memo guest', '{"name":"guest","display-name":"guest"}',
+       'memo anonymous', '{"name":null,"display-name":"anonymous"}',
+       'memo Ada', '{"name":"Ada","display-name":"A","note":"hello"}',
+       '$["display-name"]: expected String', '$["display-name"]: expected String',
+       '$.memo: unknown field', 'memo Bo', 'Bo'])
+
+    def test_json_nested_optional_with_literal_none_keeps_three_states(self):
+        self.native(r'''#derive(Json)
+struct Change(pub val note: Option<String?> = None)
+fn show(text: String): String { match decodeChange(text) { Ok(change) => encodeChange(change), Err(error) => error } }
+fn main(): Unit {
+    print(show("{}")); print(show(r#"{"note":null}"#)); print(show(r#"{"note":"Ada"}"#))
+}''', ['{}', '{"note":null}', '{"note":"Ada"}'])
+        main = self.src / 'main.ly'
+        for field, reason in (('pub val note: Option<String?> = Some(None)', 'custom JSON mapping'),
+                              ('val note: String?', 'private field without a default')):
+            with self.subTest(field=field):
+                main.write_text('#derive(Json)\nstruct Bad(' + field + ')\nfn main(): Unit {}')
+                self.diagnostic('LYM0002', reason)
+
     def test_derive_is_opt_in_for_every_type(self):
         main = self.src / 'main.ly'
         main.write_text('struct Item(pub val id: Int)\nfn main(): Unit { print(encodeItem(Item(7))) }')

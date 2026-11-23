@@ -621,7 +621,9 @@ struct Emitter {
             if (!live()) return unit();
         }
         auto* target = info.callee == Callee::Function ? &layouts.program.functions[info.target] : nullptr;
-        std::vector<Value> args(target ? target->syntax.parameters.size() : call.arguments.size() + skip);
+        auto count = target ? target->syntax.parameters.size() : call.arguments.size() + skip;
+        if (info.callee == Callee::Constructor) count = layouts.program.aggregates[info.target].fields.size();
+        std::vector<Value> args(count);
         if (receiver) args[0] = receiver;
         bool variadic = target && !target->syntax.parameters.empty() && target->syntax.parameters.back().variadic;
         NativeLists lists{builder};
@@ -636,7 +638,8 @@ struct Emitter {
             } else args[slot] = value;
         }
         for (auto slot : info.omittedDefaults) {
-            args[slot] = callFunction(*target->defaultFunctions[slot], llvm::ArrayRef<Value>(args).take_front(slot), call.name.span);
+            const auto& defaults = target ? target->defaultFunctions : layouts.program.aggregates[info.target].defaultFunctions;
+            args[slot] = callFunction(*defaults[slot], llvm::ArrayRef<Value>(args).take_front(slot), call.name.span);
         }
         switch (info.callee) {
             case Callee::Indirect: llvm_unreachable("indirect call already emitted");
