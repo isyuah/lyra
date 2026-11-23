@@ -28,6 +28,10 @@ struct Member { ExprId receiver; Identifier name; };
 struct ListLiteral { std::vector<ExprId> elements; };
 struct Index { ExprId receiver, offset; Span site; };
 struct StringLiteral { std::string bytes; };
+struct BytesLiteral { std::string bytes; };
+struct CharLiteral { std::uint32_t point; };
+struct DisplayValue { ExprId value; };
+struct TextTemplate { std::vector<ExprId> parts; };
 struct IntegerLiteral { std::uint64_t magnitude{}; bool negative{}; };
 struct RealLiteral { std::string digits; std::optional<unsigned> width; };
 
@@ -60,7 +64,7 @@ struct PatternName {
 };
 struct Pattern {
     Span span;
-    std::variant<std::monostate, PatternName, SumTag, IntegerLiteral, bool, StringLiteral> node;
+    std::variant<std::monostate, PatternName, SumTag, IntegerLiteral, bool, StringLiteral, CharLiteral> node;
     std::vector<Pattern> parts{};
 };
 struct MatchArm { Pattern pattern; ExprId value; std::optional<ExprId> guard{}; };
@@ -70,7 +74,7 @@ enum class Jump { Break, Continue };
 
 struct Expr {
     Span span;
-    std::variant<IntegerLiteral, RealLiteral, bool, StringLiteral, Identifier, Call, Member, Unary, Binary, Block, Binding, Conditional, While, For, Return, Raise, Attempt, Jump, TaskOp, Blocking, Deferred, EmptyOption, Propagate, Match, ListLiteral, Index, Lambda> node;
+    std::variant<IntegerLiteral, RealLiteral, bool, StringLiteral, BytesLiteral, CharLiteral, DisplayValue, TextTemplate, Identifier, Call, Member, Unary, Binary, Block, Binding, Conditional, While, For, Return, Raise, Attempt, Jump, TaskOp, Blocking, Deferred, EmptyOption, Propagate, Match, ListLiteral, Index, Lambda> node;
 };
 
 struct Parameter { Identifier name, type; bool variadic{}; std::optional<ExprId> defaultValue{}; std::vector<Attribute> attributes{}; };

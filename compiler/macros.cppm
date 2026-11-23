@@ -162,6 +162,12 @@ struct Machine {
         error("宏中整数溢出或除零");
     }
 
+    std::string display(Value value) {
+        if (auto integer = std::get_if<std::int64_t>(&value)) return std::to_string(*integer);
+        if (auto boolean = std::get_if<bool>(&value)) return *boolean ? "true" : "false";
+        return std::get<std::string>(std::move(value));
+    }
+
     Value eval(const CheckedFunction& fn, ExprId id, std::vector<Value>& locals) {
         if (!fuel--) error("宏展开超过执行步数预算");
         auto sub = [&](ExprId child) { return eval(fn, child, locals); };
@@ -171,6 +177,15 @@ struct Machine {
         if (auto value = std::get_if<IntegerLiteral>(&node)) result = static_cast<std::int64_t>(integerBits(*value));
         else if (auto value = std::get_if<bool>(&node)) result = *value;
         else if (auto str = std::get_if<StringLiteral>(&node)) result = str->bytes;
+        else if (auto item = std::get_if<DisplayValue>(&node)) result = display(sub(item->value));
+        else if (auto text = std::get_if<TextTemplate>(&node)) {
+            std::string combined;
+            for (auto part : text->parts) {
+                combined += std::get<std::string>(sub(part));
+                budget(combined.size());
+            }
+            result = std::move(combined);
+        }
         else if (std::holds_alternative<Identifier>(node)) result = locals[info.target];
         else if (auto binding = std::get_if<Binding>(&node)) locals[info.target] = sub(binding->value);
         else if (auto block = std::get_if<Block>(&node)) {
@@ -204,12 +219,15 @@ struct Machine {
                 else result = math(op, left, sub(binary->right));
             }
         } else if (auto call = std::get_if<Call>(&node)) {
-            if (info.callee != Callee::Function || call->receiver) error("编译期不能调用运行时函数：" + call->name.text);
-            const auto& callee = program.functions[info.target];
-            if (call->arguments.size() != callee.syntax.parameters.size()) error("编译期宏调用需要显式传入每个形参");
-            std::vector<Value> args(call->arguments.size());
-            for (std::size_t index = 0; index < args.size(); ++index) args[info.argumentSlots[index]] = sub(call->arguments[index].value);
-            result = invoke(callee, args);
+            if (info.callee == Callee::ToString) result = display(sub(*call->receiver));
+            else {
+                if (info.callee != Callee::Function || call->receiver) error("编译期不能调用运行时函数：" + call->name.text);
+                const auto& callee = program.functions[info.target];
+                if (call->arguments.size() != callee.syntax.parameters.size()) error("编译期宏调用需要显式传入每个形参");
+                std::vector<Value> args(call->arguments.size());
+                for (std::size_t index = 0; index < args.size(); ++index) args[info.argumentSlots[index]] = sub(call->arguments[index].value);
+                result = invoke(callee, args);
+            }
         } else error("此表达式不属于受限的编译期 Lyra 子集");
         if (auto str = std::get_if<std::string>(&result)) budget(str->size());
         return result;

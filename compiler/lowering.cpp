@@ -58,8 +58,9 @@ struct Layouts {
         case Type::Int: case Type::UInt: return builder.getIntNTy(numberWidth(type));
         case Type::Real: return numberWidth(type) == 32 ? builder.getFloatTy() : builder.getDoubleTy();
         case Type::Bool: return builder.getInt1Ty();
+        case Type::Char: return builder.getInt32Ty();
         case Type::Unit: case Type::Never: return builder.getInt8Ty();
-        case Type::String: case Type::Task: case Type::CPtr: case Type::List: case Type::Exception: case Type::Closure: return builder.getPtrTy();
+        case Type::String: case Type::Bytes: case Type::Task: case Type::CPtr: case Type::List: case Type::Exception: case Type::Closure: return builder.getPtrTy();
         case Type::Variable: llvm_unreachable("abstract type reached LLVM lowering");
         case Type::Record: return reference(type) ? static_cast<llvm::Type*>(builder.getPtrTy()) : objects[type.id];
         case Type::Enum: return llvm::StructType::get(builder.getContext(), {builder.getInt32Ty(), builder.getPtrTy()});
@@ -300,14 +301,58 @@ struct Emitter {
         return llvm::ConstantFP::get(layouts.native(builder, rawType(id)), *fn.expressions[id].realLiteral);
     }
     Value emitNode(ExprId, bool value) { return builder.getInt1(value); }
-    Value stringConstant(const StringLiteral& string) {
-        auto data = llvm::ConstantDataArray::getString(module.getContext(), string.bytes, false);
-        auto constant = llvm::ConstantStruct::getAnon({builder.getInt64(string.bytes.size()), data});
+    Value emitNode(ExprId, CharLiteral value) { return builder.getInt32(value.point); }
+    Value stringConstant(llvm::StringRef bytes) {
+        auto data = llvm::ConstantDataArray::getString(module.getContext(), bytes, false);
+        auto constant = llvm::ConstantStruct::getAnon({builder.getInt64(bytes.size()), data});
         auto global = new llvm::GlobalVariable(module, constant->getType(), true, llvm::GlobalValue::PrivateLinkage, constant, "str");
         global->setUnnamedAddr(llvm::GlobalValue::UnnamedAddr::Global);
         return global;
     }
-    Value emitNode(ExprId, const StringLiteral& string) { return stringConstant(string); }
+    Value emitNode(ExprId, const StringLiteral& string) { return stringConstant(string.bytes); }
+    Value emitNode(ExprId, const BytesLiteral& literal) { return stringConstant(literal.bytes); }
+
+    Value displayScalar(Value value, Type type) {
+        const char* symbol;
+        switch (type.kind) {
+            case Type::String: return value;
+            case Type::Bool: return builder.CreateSelect(value, stringConstant("true"), stringConstant("false"));
+            case Type::Char: symbol = "lyraCharText"; break;
+            case Type::Int: case Type::UInt:
+                symbol = type.kind == Type::Int ? "lyraIntText" : "lyraUIntText";
+                value = castNumber(value, type, Type{type.kind});
+                break;
+            case Type::Real: symbol = numberWidth(type) == 32 ? "lyraFloat32Text" : "lyraFloat64Text"; break;
+            default: llvm_unreachable("value requires a Display method");
+        }
+        return builder.CreateCall(module.getOrInsertFunction(symbol, builder.getPtrTy(), value->getType()), {value});
+    }
+
+    Value emitNode(ExprId id, const DisplayValue& display) {
+        auto value = emit(display.value);
+        if (!live()) return unit();
+        auto type = fn.expressions[display.value].type;
+        if (type.kind == Type::Record) return callFunction(fn.expressions[id].target, {value}, fn.syntax.expressions[display.value].span);
+        return displayScalar(value, type);
+    }
+
+    Value emitNode(ExprId, const TextTemplate& text) {
+        if (text.parts.size() == 1) return emit(text.parts.front());
+        auto pointer = builder.getPtrTy();
+        auto array = llvm::ArrayType::get(pointer, text.parts.size());
+        Builder entry(&native->getEntryBlock(), native->getEntryBlock().getFirstInsertionPt());
+        auto parts = entry.CreateAlloca(array, nullptr, "text.parts");
+        for (std::size_t index = 0; index < text.parts.size(); ++index) {
+            auto value = emit(text.parts[index]);
+            if (!live()) return unit();
+            builder.CreateStore(value, builder.CreateInBoundsGEP(array, parts, {builder.getInt64(0), builder.getInt64(index)}));
+        }
+        auto join = module.getOrInsertFunction("lyraStringJoin", pointer, builder.getInt64Ty(), pointer);
+        auto result = builder.CreateCall(join, {builder.getInt64(text.parts.size()), parts});
+        builder.CreateStore(llvm::Constant::getNullValue(array), parts);
+        return result;
+    }
+
     Value emitNode(ExprId id, const Identifier&) {
         const auto& info = fn.expressions[id];
         if (info.functionRef) {
@@ -370,11 +415,17 @@ struct Emitter {
     }
 
     Value emitNode(ExprId id, const Index& index) {
-        auto list = emit(index.receiver);
+        auto receiver = emit(index.receiver);
         if (!live()) return unit();
         auto offset = emit(index.offset);
         if (!live()) return unit();
-        return builder.CreateLoad(layouts.native(builder, rawType(id)), NativeLists{builder}.get(list, offset, source, index.site));
+        auto* result = layouts.native(builder, rawType(id));
+        auto owner = fn.expressions[index.receiver].type;
+        if (owner.kind == Type::List) return builder.CreateLoad(result, NativeLists{builder}.get(receiver, offset, source, index.site));
+        auto site = source.origin ? *source.origin : source.site(index.site);
+        auto pointer = builder.getPtrTy(); auto integer = builder.getInt64Ty();
+        auto access = module.getOrInsertFunction(owner == Type::String ? "lyraStringIndex" : "lyraBytesIndex", result, pointer, integer, pointer, integer, integer);
+        return builder.CreateCall(access, {receiver, offset, builder.CreateGlobalStringPtr(site.file), builder.getInt64(site.start.line), builder.getInt64(site.start.column)});
     }
 
     Value emitNode(ExprId id, const Propagate& propagation) {
@@ -410,7 +461,7 @@ struct Emitter {
         if (auto* slot = std::get_if<PatternSlot>(&pattern.node)) bindings.emplace_back(slot->local, subject);
         else if (auto* number = std::get_if<std::uint64_t>(&pattern.node))
             matchTest(builder.CreateICmpEQ(subject, llvm::ConstantInt::get(subject->getType(), *number)), miss);
-        else if (auto* text = std::get_if<StringLiteral>(&pattern.node)) matchTest(stringEqual(subject, stringConstant(*text)), miss);
+        else if (auto* text = std::get_if<StringLiteral>(&pattern.node)) matchTest(stringEqual(subject, stringConstant(text->bytes)), miss);
         else if (auto* constructor = std::get_if<PatternConstructor>(&pattern.node)) {
             if (auto* tag = std::get_if<SumTag>(constructor)) {
                 auto success = builder.CreateExtractValue(subject, 0);
@@ -498,6 +549,11 @@ struct Emitter {
         if (!live()) return unit();
         auto owner = fn.expressions[member.receiver].type;
         if (owner.kind == Type::List) return NativeLists{builder}.size(object);
+        if (owner == Type::Char) return object;
+        if (owner == Type::String || owner == Type::Bytes) {
+            auto symbol = owner == Type::String && member.name.text == "size" ? "lyraStringScalarCount" : "lyraStringLength";
+            return builder.CreateCall(module.getOrInsertFunction(symbol, builder.getInt64Ty(), builder.getPtrTy()), {object});
+        }
         if (owner == Type::Exception) return NativeExceptions{builder}.message(object);
         auto slot = static_cast<unsigned>(fn.expressions[id].target);
         if (!layouts.reference(owner)) return builder.CreateExtractValue(object, slot);
@@ -587,10 +643,23 @@ struct Emitter {
             case Callee::Variant: return makeVariant(id, args);
             case Callee::ToReal: return castNumber(receiver, fn.expressions[*call.receiver].type, rawType(id));
             case Callee::ToIntegerChecked: return checkedInteger(receiver, fn.expressions[*call.receiver].type, rawType(id));
+            case Callee::ToString: return displayScalar(receiver, fn.expressions[*call.receiver].type);
+            case Callee::ToBytes: return receiver;
+            case Callee::DecodeUtf8: {
+                auto pointer = builder.getPtrTy();
+                auto check = module.getOrInsertFunction("lyraBytesUtf8", builder.getInt8Ty(), pointer);
+                auto valid = builder.CreateIsNotNull(builder.CreateCall(check, {receiver}));
+                auto option = layouts.native(builder, rawType(id));
+                auto payload = builder.CreateSelect(valid, receiver, llvm::ConstantPointerNull::get(pointer));
+                return builder.CreateInsertValue(builder.CreateInsertValue(llvm::Constant::getNullValue(option), valid, 0), payload, 1);
+            }
             case Callee::Print: {
                 auto type = fn.expressions[call.arguments[0].value].type;
                 const char* symbol;
-                if (type == Type::String) symbol = "lyraPrintString";
+                if (type == Type::String || type == Type::Char || type == Type::Bool) {
+                    symbol = "lyraPrintString";
+                    args[0] = displayScalar(args[0], type);
+                }
                 else if (type.kind == Type::Real) symbol = numberWidth(type) == 32 ? "lyraPrintFloat32" : "lyraPrintFloat64";
                 else {
                     symbol = type.kind == Type::Int ? "lyraPrintInt" : "lyraPrintUInt";
@@ -732,7 +801,7 @@ struct Emitter {
             auto same = NativeExceptions{builder}.same(left, right);
             return op == Op::Eq ? same : builder.CreateNot(same);
         }
-        if (type == Type::String) {
+        if (type == Type::String || type == Type::Bytes) {
             if (op == Op::Add) return concatenate(left, right);
             auto equal = stringEqual(left, right);
             return op == Op::Eq ? equal : builder.CreateNot(equal);
@@ -809,8 +878,8 @@ struct Emitter {
         return unit();
     }
 
-    template<class Element>
-    Value countedLoop(const For& loop, std::size_t slot, Value first, Value last, bool inclusive, Element element) {
+    template<class Element, class Advance>
+    Value countedLoop(const For& loop, std::size_t slot, Value first, Value last, bool inclusive, Element element, Advance advance) {
         auto entry = builder.GetInsertBlock();
         auto test = label("for.test"), body = label("for.body"), step = label("for.step"), done = label("for.end");
         builder.CreateBr(test);
@@ -819,7 +888,8 @@ struct Emitter {
         index->addIncoming(first, entry);
         builder.CreateCondBr(inclusive ? builder.CreateICmpSLE(index, last) : builder.CreateICmpSLT(index, last), body, done);
         builder.SetInsertPoint(body);
-        initialize(slot, element(index));
+        auto current = element(index);
+        initialize(slot, current);
         loopBody(loop.body, step, done);
         builder.SetInsertPoint(step);
         if (inclusive) {
@@ -827,10 +897,15 @@ struct Emitter {
             builder.CreateCondBr(builder.CreateICmpEQ(index, last), done, increment);
             builder.SetInsertPoint(increment);
         }
-        index->addIncoming(builder.CreateAdd(index, builder.getInt64(1)), builder.GetInsertBlock());
+        index->addIncoming(advance(index, current), builder.GetInsertBlock());
         builder.CreateBr(test);
         builder.SetInsertPoint(done);
         return unit();
+    }
+
+    template<class Element>
+    Value countedLoop(const For& loop, std::size_t slot, Value first, Value last, bool inclusive, Element element) {
+        return countedLoop(loop, slot, first, last, inclusive, element, [&](Value index, Value) { return builder.CreateAdd(index, builder.getInt64(1)); });
     }
 
     Value emitNode(ExprId id, const For& loop) {
@@ -855,6 +930,20 @@ struct Emitter {
             loopBody(loop.body, test, done);
             builder.SetInsertPoint(done);
             return unit();
+        }
+        auto owner = fn.expressions[loop.input].type;
+        if (owner == Type::String || owner == Type::Bytes) {
+            auto pointer = builder.getPtrTy(); auto integer = builder.getInt64Ty();
+            auto size = builder.CreateCall(module.getOrInsertFunction("lyraStringLength", integer, pointer), {input});
+            auto element = layouts.native(builder, fn.locals[slot].type);
+            auto get = module.getOrInsertFunction(owner == Type::String ? "lyraStringAtByte" : "lyraBytesAtByte", element, pointer, integer);
+            return countedLoop(loop, slot, builder.getInt64(0), size, false, [&](Value index) {
+                return builder.CreateCall(get, {input, index});
+            }, [&](Value index, Value value) {
+                if (owner == Type::Bytes) return builder.CreateAdd(index, builder.getInt64(1));
+                auto width = builder.CreateCall(module.getOrInsertFunction("lyraCharWidth", element, element), {value});
+                return builder.CreateAdd(index, builder.CreateZExt(width, integer));
+            });
         }
         NativeLists lists{builder};
         auto type = layouts.native(builder, fn.locals[slot].type);

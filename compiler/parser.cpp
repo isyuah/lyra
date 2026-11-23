@@ -2,6 +2,7 @@ module;
 #include <charconv>
 #include <algorithm>
 #include <cstdint>
+#include <lyra/utf8.hpp>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -14,12 +15,14 @@ module lyra.syntax;
 namespace lyra {
 namespace {
 
-enum class Kind { Name, Keyword, Escaped, Number, String, Symbol, End };
+enum class Kind { Name, Keyword, Escaped, Number, String, Bytes, Char, TextHead, TextMiddle, TextTail, Symbol, End };
 
 struct Token {
     Kind kind;
     Span span;
     bool newlineBefore;
+    Span content{};
+    bool raw{};
 };
 
 bool isLetter(char value) {
@@ -28,6 +31,58 @@ bool isLetter(char value) {
 
 bool isDigit(char value) { return value >= '0' && value <= '9'; }
 bool basedInteger(std::string_view value) { return value.starts_with("0x") || value.starts_with("0o") || value.starts_with("0b"); }
+
+std::uint32_t hexEscape(const Source& source, Span digits, std::size_t maximum) {
+    auto word = std::string_view(source.text).substr(digits.begin, digits.end - digits.begin);
+    std::uint32_t value{};
+    auto [end, error] = std::from_chars(word.data(), word.data() + word.size(), value, 16);
+    if (word.empty() || word.size() > maximum || error != std::errc{} || end != word.data() + word.size())
+        throw at(source, digits, "LYL0003", "无效的十六进制转义");
+    return value;
+}
+
+std::string decodeLiteral(const Source& source, Token token) {
+    auto bytes = std::string_view(source.text).substr(token.content.begin, token.content.end - token.content.begin);
+    if (token.raw) return std::string(bytes);
+    std::string result;
+    for (std::size_t index = token.content.begin; index < token.content.end; ++index) {
+        auto byte = source.text[index];
+        if (byte == '\\') {
+            auto start = index;
+            if (++index == token.content.end) throw at(source, {start, index}, "LYL0003", "不完整的字面量转义");
+            byte = source.text[index];
+            switch (byte) {
+                case 'n': byte = '\n'; break;
+                case 'r': byte = '\r'; break;
+                case 't': byte = '\t'; break;
+                case '0': byte = '\0'; break;
+                case '\\': case '"': case '\'': case '$': break;
+                case 'x': {
+                    if (token.kind != Kind::Bytes || token.content.end - index < 3) throw at(source, {start, index + 1}, "LYL0003", "\\xHH 只用于字节串且需要两个十六进制数字");
+                    byte = static_cast<char>(hexEscape(source, {index + 1, index + 3}, 2));
+                    index += 2;
+                    break;
+                }
+                case 'u': {
+                    if (token.kind == Kind::Bytes || index + 1 == token.content.end || source.text[index + 1] != '{')
+                        throw at(source, {start, index + 1}, "LYL0003", "Unicode 转义需要 \\u{十六进制标量}");
+                    auto close = bytes.find('}', index + 2 - token.content.begin);
+                    if (close == bytes.npos) throw at(source, {start, token.content.end}, "LYL0003", "Unicode 转义缺少 }");
+                    close += token.content.begin;
+                    auto point = hexEscape(source, {index + 2, close}, 6);
+                    if (!utf8::scalar(point)) throw at(source, {start, close + 1}, "LYL0003", "转义不是有效的 Unicode 标量");
+                    char encoded[4];
+                    result.append(encoded, utf8::encode(point, encoded));
+                    index = close;
+                    continue;
+                }
+                default: throw at(source, {start, index + 1}, "LYL0003", "未知的字面量转义");
+            }
+        }
+        result.push_back(byte);
+    }
+    return result;
+}
 
 class Lexer {
 public:
@@ -51,7 +106,33 @@ public:
             } else break;
         }
         auto start = offset;
-        if (offset == text.size()) return {Kind::End, {start, start}, newline};
+        if (offset == text.size()) {
+            if (!interpolations.empty()) throw at(source, {interpolations.back().opening, start}, "LYL0003", "字符串插值缺少结束的 }");
+            return {Kind::End, {start, start}, newline};
+        }
+        if (!interpolations.empty()) {
+            if (text[offset] == '{') ++interpolations.back().braces;
+            if (text[offset] == '}') {
+                if (!interpolations.back().braces) return quoted(start, offset + 1, '"', Kind::String, newline, true);
+                --interpolations.back().braces;
+            }
+        }
+        if (text[offset] == '"' || text[offset] == '\'') return quoted(start, start + 1, text[offset], text[offset] == '"' ? Kind::String : Kind::Char, newline);
+        if (text.substr(offset).starts_with("b\"")) return quoted(start, start + 2, '"', Kind::Bytes, newline);
+        bool bytes = text.substr(offset).starts_with("br");
+        if (bytes || text[offset] == 'r') {
+            auto open = offset + (bytes ? 2 : 1);
+            auto delimiters = open;
+            while (open < text.size() && text[open] == '#') ++open;
+            if (open < text.size() && text[open] == '"') {
+                auto close = text.substr(delimiters, open - delimiters);
+                auto end = text.find('"', open + 1);
+                while (end != text.npos && !text.substr(end + 1).starts_with(close)) end = text.find('"', end + 1);
+                if (end == text.npos) throw at(source, {start, open + 1}, "LYL0003", "原始字面量缺少结束分隔符");
+                offset = end + 1 + close.size();
+                return {bytes ? Kind::Bytes : Kind::String, {start, offset}, newline, {open + 1, end}, true};
+            }
+        }
         char current = text[offset++];
         Kind kind;
         if (isDigit(current)) {
@@ -72,18 +153,6 @@ public:
             constexpr std::string_view keywords[] = {"fn", "val", "var", "if", "else", "while", "for", "in", "return", "break", "continue", "true", "false", "struct", "class", "enum", "trait", "pub", "import", "as", "async", "await", "spawn", "extern", "match", "null", "implicit", "defer", "throw", "try", "catch"};
             auto word = text.substr(start, offset - start);
             kind = std::ranges::find(keywords, word) == std::end(keywords) ? Kind::Name : Kind::Keyword;
-        } else if (current == '"') {
-            kind = Kind::String;
-            while (offset < text.size() && text[offset] != '"') {
-                if (text[offset] == '\r' || text[offset] == '\n') throw at(source, {start, offset}, "LYL0003", "字符串缺少结束引号");
-                if (text[offset] == '$' && text.substr(offset, 2) == "${") throw at(source, {offset, offset + 2}, "LYL0003", "此版本尚不支持字符串插值");
-                if (text[offset++] == '\\') {
-                    if (offset == text.size() || std::string_view("\\\"$nrt0").find(text[offset]) == text.npos) throw at(source, {offset - 1, offset}, "LYL0003", "未知的字符串转义");
-                    ++offset;
-                }
-            }
-            if (offset == text.size()) throw at(source, {start, offset}, "LYL0003", "字符串缺少结束引号");
-            ++offset;
         } else if (current == '`') {
             if (offset == text.size() || !isLetter(text[offset])) throw at(source, {start, offset}, "LYL0001", "反引号内需要标识符");
             while (offset < text.size() && (isLetter(text[offset]) || isDigit(text[offset]))) ++offset;
@@ -107,6 +176,31 @@ private:
     const Source& source;
     std::string_view text;
     std::size_t offset = 0;
+    struct Interpolation { std::size_t opening; unsigned braces; };
+    std::vector<Interpolation> interpolations{};
+
+    Token quoted(std::size_t start, std::size_t content, char quote, Kind kind, bool newline, bool resumed = false) {
+        offset = content;
+        while (offset < text.size()) {
+            auto byte = text[offset];
+            if (byte == quote) {
+                if (resumed) { interpolations.pop_back(); kind = Kind::TextTail; }
+                auto end = offset++;
+                return {kind, {start, offset}, newline, {content, end}};
+            }
+            if (byte == '\r' || byte == '\n') break;
+            if (kind == Kind::String && text.substr(offset, 2) == "${") {
+                auto open = offset;
+                offset += 2;
+                if (resumed) interpolations.back().opening = open;
+                else interpolations.push_back({open, 0});
+                return {resumed ? Kind::TextMiddle : Kind::TextHead, {start, offset}, newline, {content, open}};
+            }
+            if (byte == '\\' && offset + 1 < text.size() && text[offset + 1] != '\r' && text[offset + 1] != '\n') ++offset;
+            ++offset;
+        }
+        throw at(source, {start, offset}, "LYL0003", "字面量缺少结束引号");
+    }
 };
 
 IntegerLiteral integer(const Source& source, Span digits, bool negative) {
@@ -234,17 +328,29 @@ private:
     }
     Identifier stringLiteral() {
         auto item = consume();
-        auto literal = text(item);
-        std::string result;
-        for (std::size_t offset = 1; offset + 1 < literal.size(); ++offset) {
-            auto byte = literal[offset];
-            if (byte == '\\') {
-                byte = literal[++offset];
-                switch (byte) { case 'n': byte = '\n'; break; case 'r': byte = '\r'; break; case 't': byte = '\t'; break; case '0': byte = '\0'; break; }
-            }
-            result.push_back(byte);
+        return {decodeLiteral(source, item), item.span};
+    }
+
+    CharLiteral character(Token item) const {
+        auto bytes = decodeLiteral(source, item);
+        if (bytes.empty() || bytes.size() != utf8::sequenceWidth(static_cast<unsigned char>(bytes.front())))
+            throw at(source, item.span, "LYL0003", "字符字面量必须恰好包含一个 Unicode 标量");
+        return {utf8::decode(bytes.data(), static_cast<unsigned>(bytes.size()))};
+    }
+
+    ExprId textTemplate() {
+        auto segment = consume();
+        auto begin = segment.span.begin;
+        TextTemplate result;
+        for (;;) {
+            if (segment.content.begin != segment.content.end) result.parts.push_back(add(segment.content, StringLiteral{decodeLiteral(source, segment)}));
+            if (segment.kind == Kind::TextTail) break;
+            auto value = expression(true);
+            result.parts.push_back(add(nodes[value].span, DisplayValue{value}));
+            if (token.kind != Kind::TextMiddle && token.kind != Kind::TextTail) throw at(source, token.span, "LYP0001", "插值表达式后需要 }");
+            segment = consume();
         }
-        return {std::move(result), item.span};
+        return add({begin, segment.span.end}, std::move(result));
     }
     Identifier metadataValue() { return token.kind == Kind::String ? stringLiteral() : identifier(); }
     std::vector<Attribute> attributes() {
@@ -624,6 +730,7 @@ private:
             auto literal = stringLiteral();
             return {literal.span, StringLiteral{std::move(literal.text)}};
         }
+        if (token.kind == Kind::Char) { auto item = consume(); return {item.span, character(item)}; }
         if (is("true") || is("false")) return {site, text(consume()) == "true"};
         if (is("null")) { consume(); return {site, SumTag::None}; }
         bool escaped = token.kind == Kind::Escaped;
@@ -733,7 +840,12 @@ private:
                 bool followsName = false;
                 while (!delimiters.empty() || (!is(",") && !is(")"))) {
                     if (token.kind == Kind::End) throw at(source, open, "LYP0001", "表达式宏缺少结束括号");
-                    if (is("<") && ((!delimiters.empty() && delimiters.back() == '>') || (followsName && explicitTypesAfter(end)))) delimiters.push_back('>');
+                    if (token.kind == Kind::TextHead) delimiters.push_back('"');
+                    else if (token.kind == Kind::TextMiddle || token.kind == Kind::TextTail) {
+                        if (delimiters.empty() || delimiters.back() != '"') throw at(source, token.span, "LYP0001", "宏实参的插值内分隔符不匹配");
+                        if (token.kind == Kind::TextTail) delimiters.pop_back();
+                    }
+                    else if (is("<") && ((!delimiters.empty() && delimiters.back() == '>') || (followsName && explicitTypesAfter(end)))) delimiters.push_back('>');
                     else if (is(">") && !delimiters.empty() && delimiters.back() == '>') delimiters.pop_back();
                     else if (is("(") || is("[") || is("{")) delimiters.push_back(is("(") ? ')' : is("[") ? ']' : '}');
                     else if (is(")") || is("]") || is("}")) {
@@ -774,6 +886,9 @@ private:
             auto literal = stringLiteral();
             return add(literal.span, StringLiteral{std::move(literal.text)});
         }
+        if (token.kind == Kind::Char) { auto item = consume(); return add(item.span, character(item)); }
+        if (token.kind == Kind::Bytes) { auto item = consume(); return add(item.span, BytesLiteral{decodeLiteral(source, item)}); }
+        if (token.kind == Kind::TextHead) return textTemplate();
         if (token.kind == Kind::Number || (is("-") && next.kind == Kind::Number)) {
             bool negative = is("-");
             if (negative) consume();

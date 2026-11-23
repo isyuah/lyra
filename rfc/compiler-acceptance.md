@@ -22,7 +22,7 @@ H 由作者委托设计。顺序是先证明**写错能指出原因、写对能�
 | 范围 | 可重复验证的行为 |
 |---|---|
 | M0–M1：工具链、诊断与核心 | `cmake --preset dev` 使用 Clang 18、C++23 命名模块和 Ninja。[前端与原生用例](../tests/compiler_cli.py)覆盖分号返回 `Unit`、副作用顺序、溢出和失败时不覆盖产物。 |
-| M2：数据与 GC | [对象测试](../tests/objects_cli.py)检查值复制、引用身份和 UTF-8 字符串。[原生任务测试](../tests/runtime_tasks.cpp)让 GC 在任务挂起期间运行；恢复后能读到同一对象。 |
+| M2：数据与 GC | [对象测试](../tests/objects_cli.py)检查值复制和引用身份；[文本测试](../tests/text_cli.py)检查 Unicode、无损字节转换和跨 `await` 的插值。[原生任务测试](../tests/runtime_tasks.cpp)让 GC 在任务挂起期间运行；恢复后能读到同一对象。 |
 | M3：类型、集合与调用 | [泛型](../tests/generics_cli.py)、[集合](../tests/collections_cli.py)、[和类型](../tests/sums_cli.py)、[隐式转换](../tests/conversions_cli.py)以及[可空与遍历](../tests/sugar_cli.py)分别核对推断、默认值、展开、空值层数、提前返回和转换歧义。 |
 | M4：模块、包与工具分发 | [安装验收](../tests/installed_cli.py)搬迁完整工具链、发布库、锁定并拉取源码，移走注册中心和生产者源码，在仓库外用离线缓存原生编译并执行。 |
 | M5：异步、异常与收尾 | [词法清理](../tests/defer_cli.py)、[异常](../tests/exceptions_cli.py)和[Context](../tests/context_cli.py)区分完成值、普通异常和取消，检查阻塞池、任务树及 `await` 的源位置。 |
@@ -31,7 +31,7 @@ H 由作者委托设计。顺序是先证明**写错能指出原因、写对能�
 
 运行 `ctest --preset dev --output-on-failure` 执行这些套件；`release` preset 另测优化版编译器。最低部署目标由[Jammy 两阶段验收](../tests/jammy-smoke.sh)分别验证只有 libc 的应用和额外依赖系统 SQLite 的应用；量测条件和结果见[原生工具链](native-toolchain.md)。
 
-**仍属设计、不能当作现有 API：** `dyn` 动态接口值、泛型结构体和类、完整的数值类型和重载排序、用户自定义异常子类及过滤捕获、运行时字段反射和 TOML 派生。编辑器集成、`fmt` 和 `doc` 另行交付。[设计服务](../examples/user-service/README.md)保留最终写法；目前编译运行的是[原生服务](../examples/http-sqlite/README.md)。
+**仍属设计、不能当作现有 API：** `dyn` 动态接口值、泛型结构体和类、用户函数重载排序、用户自定义异常子类及过滤捕获、运行时字段反射和 TOML 派生。编辑器集成、`fmt` 和 `doc` 另行交付。[设计服务](../examples/user-service/README.md)保留最终写法；目前编译运行的是[原生服务](../examples/http-sqlite/README.md)。
 
 ## 后续扩展仍要守住的三个验收点
 

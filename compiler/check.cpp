@@ -29,6 +29,10 @@ using Names = std::unordered_map<std::string, std::size_t>;
 
 const std::string& linkedName(const Identifier& name) { return name.linked.empty() ? name.text : name.linked; }
 
+constexpr Type scalarTypes[] = {Type::Bool, Type::String, Type::Char, Type::Bytes, Type::Unit, Type::CPtr, Type::Exception};
+
+bool builtInDisplay(Type type) { return numericType(type) || type == Type::Bool || type == Type::String || type == Type::Char; }
+
 std::string typeName(const CheckedModule& module, Type type, bool canonical = false) {
     auto name = [&](Type nested) { return typeName(module, nested, canonical); };
     switch (type.kind) {
@@ -37,6 +41,8 @@ std::string typeName(const CheckedModule& module, Type type, bool canonical = fa
         case Type::Unit: return "Unit";
         case Type::Never: return "Never";
         case Type::String: return "String";
+        case Type::Char: return "Char";
+        case Type::Bytes: return "Bytes";
         case Type::Exception: return "Exception";
         case Type::CPtr: return "CPtr";
         case Type::Record: return module.aggregates[type.id].syntax.name.text;
@@ -157,7 +163,7 @@ struct Symbols {
         if (form.arguments.empty()) {
             if (signature) if (auto parameter = genericParameter(*signature, form.name)) return lookup(*parameter);
             if (auto type = numberType(form.name)) return type;
-            for (Type type : {Type::Bool, Type::String, Type::Unit, Type::CPtr, Type::Exception}) if (form.name == typeName(module, type)) return type;
+            for (Type type : scalarTypes) if (form.name == typeName(module, type)) return type;
             if (auto found = records.find(form.name); found != records.end()) return Type{Type::Record, found->second};
             if (auto found = enums.find(form.name); found != enums.end()) return Type{Type::Enum, found->second};
         } else {
@@ -324,6 +330,39 @@ struct Checker {
     }
     Type infer(ExprId, bool, auto, bool) { return Type::Bool; }
     Type infer(ExprId, const StringLiteral&, auto, bool) { return Type::String; }
+    Type infer(ExprId, const BytesLiteral&, auto, bool) { return Type::Bytes; }
+    Type infer(ExprId, CharLiteral, auto, bool) { return Type::Char; }
+
+    Type infer(ExprId id, const DisplayValue& display, auto, bool) {
+        auto type = visit(display.value);
+        if (type == Type::Never) return type;
+        if (builtInDisplay(type)) return Type::String;
+        if (type.kind == Type::Variable) {
+            if (const auto* method = symbols.contracts.member(type, "toString"); method && method->parameters.empty() && !method->asynchronous && method->result == Type::String) return Type::String;
+        } else if (type.kind == Type::Record) {
+            const auto& methods = symbols.methods[type.id];
+            if (auto found = methods.find("toString"); found != methods.end()) {
+                const auto& method = symbols.callables[found->second];
+                if (!method.generic) {
+                    const auto& target = module.functions[method.target];
+                    const auto& syntax = target.syntax;
+                    if ((syntax.isPublic || symbols.sources[syntax.file].moduleId == source.moduleId) && syntax.parameters.size() == 1 && !syntax.isAsync && target.result == Type::String) {
+                        fn.expressions[id].target = method.target;
+                        return Type::String;
+                    }
+                }
+            }
+        }
+        auto error = at(source, fn.syntax.expressions[display.value].span, "LYT0016", typeName(module, type) + " 未满足 Display，无法用于字符串插值");
+        error.hint = "提供可见的同步方法 fn toString(self): String，或在插值中显式转换。";
+        throw error;
+    }
+
+    Type infer(ExprId, const TextTemplate& text, auto, bool) {
+        bool exits = false;
+        for (auto part : text.parts) exits |= visit(part, Type::String) == Type::Never;
+        return exits ? Type::Never : Type::String;
+    }
 
     Type infer(ExprId, const Raise& raise, auto, bool) {
         if (raise.value) visit(*raise.value, Type::Exception);
@@ -365,11 +404,13 @@ struct Checker {
     }
 
     Type infer(ExprId, const Index& index, auto, bool) {
-        auto list = visit(index.receiver);
+        auto owner = visit(index.receiver);
         auto offset = visit(index.offset, Type::Int);
-        if (list == Type::Never || offset == Type::Never) return Type::Never;
-        if (list.kind != Type::List) throw at(source, index.site, "LYT0014", "下标需要 List，实际是 " + typeName(module, list));
-        return module.listElements[list.id];
+        if (owner == Type::Never || offset == Type::Never) return Type::Never;
+        if (owner == Type::String) return Type::Char;
+        if (owner == Type::Bytes) return number(Type::UInt, 8);
+        if (owner.kind != Type::List) throw at(source, index.site, "LYT0014", "下标需要 List、String 或 Bytes，实际是 " + typeName(module, owner));
+        return module.listElements[owner.id];
     }
 
     Type infer(ExprId id, const EmptyOption&, std::optional<Type> expected, bool) {
@@ -491,6 +532,10 @@ struct Checker {
             if (!integerType(subject)) throw at(source, pattern.span, "LYT0011", "整数字面量不能匹配 " + typeName(module, subject));
             checkIntegerLiteral(pattern.span, subject, *literal);
             return {integerBits(*literal)};
+        }
+        if (auto* literal = std::get_if<CharLiteral>(&node)) {
+            if (subject != Type::Char) throw at(source, pattern.span, "LYT0011", "字符字面量不能匹配 " + typeName(module, subject));
+            return {static_cast<std::uint64_t>(literal->point)};
         }
         auto literal = std::holds_alternative<bool>(node) ? Type::Bool : Type::String;
         if (subject != literal)
@@ -757,6 +802,9 @@ struct Checker {
         auto owner = visit(member.receiver);
         if (owner == Type::Never) return owner;
         if (owner.kind == Type::List && member.name.text == "size") return Type::Int;
+        if (owner == Type::String && (member.name.text == "size" || member.name.text == "byteSize")) return Type::Int;
+        if (owner == Type::Bytes && member.name.text == "size") return Type::Int;
+        if (owner == Type::Char && member.name.text == "codePoint") return number(Type::UInt, 32);
         if (owner == Type::Exception && member.name.text == "message") return Type::String;
         auto field = memberIndex(owner, member.name, symbols.fields);
         fn.expressions[id].target = field;
@@ -859,6 +907,14 @@ struct Checker {
             }
             auto owner = visit(*call.receiver);
             if (owner == Type::Never) return owner;
+            if ((call.name.text == "toString" && (builtInDisplay(owner) || owner == Type::Bytes)) || (call.name.text == "toBytes" && owner == Type::String)) {
+                noTypeArgs();
+                if (!call.arguments.empty()) throw at(source, call.name.span, "LYT0002", call.name.text + " 不接收实参");
+                if (call.name.text == "toBytes") { info.callee = Callee::ToBytes; return Type::Bytes; }
+                if (owner == Type::Bytes) { info.callee = Callee::DecodeUtf8; return symbols.sum(Type::Option, Type::String); }
+                info.callee = Callee::ToString;
+                return Type::String;
+            }
             if (numericType(owner) && call.name.text.starts_with("to")) {
                 auto name = std::string_view(call.name.text).substr(2);
                 bool checked = name.ends_with("Checked");
@@ -927,7 +983,7 @@ struct Checker {
             bool exits = arguments(id, call, 1, [](auto) { return "value"; }, [](auto) { return std::nullopt; });
             auto arg = call.arguments.front().value;
             auto type = fn.expressions[arg].type;
-            if (!exits && !numericType(type) && type != Type::String) throw at(source, fn.syntax.expressions[arg].span, "LYT0001", "print 需要数值或 String，实际是 " + typeName(module, type));
+            if (!exits && !builtInDisplay(type)) throw at(source, fn.syntax.expressions[arg].span, "LYT0001", "print 需要数值、Bool、Char 或 String，实际是 " + typeName(module, type));
             return exits ? Type::Never : Type::Unit;
         } else if (key == "gcCollect") {
             noTypeArgs();
@@ -991,7 +1047,7 @@ struct Checker {
 
     bool writable(ExprId id) const {
         const auto& expr = fn.syntax.expressions[id];
-        if (std::holds_alternative<Index>(expr.node)) return true;
+        if (auto index = std::get_if<Index>(&expr.node)) return fn.expressions[index->receiver].type.kind == Type::List;
         if (std::holds_alternative<Identifier>(expr.node)) return !fn.expressions[id].callableType && fn.locals[fn.expressions[id].target].writable;
         if (auto member = std::get_if<Member>(&expr.node)) {
             auto type = fn.expressions[member->receiver].type;
@@ -1149,6 +1205,10 @@ struct Checker {
             element = Type::Int;
         } else if (input.kind == Type::List) {
             element = module.listElements[input.id];
+        } else if (input == Type::String) {
+            element = Type::Char;
+        } else if (input == Type::Bytes) {
+            element = number(Type::UInt, 8);
         } else if (!exits) {
             auto site = fn.syntax.expressions[loop.input].span;
             auto iterator = iterationMethod(input, "iterator", site);
@@ -1190,9 +1250,10 @@ CheckedModule check(Module module, const std::vector<Source>& sources, bool requ
         auto separator = declaration.rfind("::");
         auto name = std::string_view(declaration).substr(separator == declaration.npos ? 0 : separator + 2);
         if (numberType(name)) throw at(sources[decl.file], decl.name.span, "LYN0002", "类型名与内置类型冲突：" + std::string(name));
-        for (Type builtin : {Type::Bool, Type::String, Type::Unit, Type::Never, Type::CPtr, Type::Exception}) {
+        for (Type builtin : scalarTypes) {
             if (name == typeName(checked, builtin)) throw at(sources[decl.file], decl.name.span, "LYN0002", "类型名与内置类型冲突：" + std::string(name));
         }
+        if (name == "Never") throw at(sources[decl.file], decl.name.span, "LYN0002", "类型名与内置类型冲突：Never");
         if (decl.name.text == "print" || decl.name.text == "gcCollect" || !names.emplace(declaration, index).second) throw at(sources[decl.file], decl.name.span, "LYN0002", "类型名称已声明：" + decl.name.text);
     };
     for (auto& decl : module.aggregates) {

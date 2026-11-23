@@ -92,6 +92,12 @@ implicit (user: User): Response { Response.json(user) }
 
 后缀 `?` 同时支持 `Result` 和 `Option`；由静态类型决定是传播 `Err`，还是从返回兼容 Optional 的函数提前返回 `None`，两者不隐式互转。嵌套类型可用 `Option<Option<T>>` 明确表达。
 
+## 文本与字节
+
+`String` 是不可变 UTF-8 文本，`Char` 是 Unicode 标量（不等同于用户感知的字素），`Bytes` 是不可变的原始字节。`String.size` 和 `text[index]` 按标量计数，`String.byteSize` 和 `Bytes.size` 按字节计数，`bytes[index]` 得到 `UInt8`。下标从零开始，越界在 `[` 处报错。`Char.codePoint` 为 `UInt32`；可用 `character.toString()` 得到文本。
+
+`text.toBytes()` 保留所有 UTF-8 字节。`bytes.toString()` 完整检查 UTF-8，成功返回 `Some(text)`，非法序列返回 `None`，不做替换或丢弃。`==` 分别比较文本内容、字节内容或字符码点，不进行 Unicode 归一化。`for` 线性遍历文本或字节；文本按标量索引可能从头扫描，不适合用索引逐个遍历长文本。原生字节缓冲区接口另单独设计。
+
 ## 封闭枚举与匹配
 
 ```text
