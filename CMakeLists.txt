@@ -36,7 +36,7 @@ endif()
 add_library(lyraRuntime STATIC runtime/core.cpp runtime/strings.cpp runtime/managed.cpp runtime/tasks.cpp
     runtime/io.cpp runtime/io_args.cpp runtime/sqlite.cpp runtime/sqlite_api.cpp runtime/json.cpp)
 include(cmake/LyraHttp.cmake)
-target_sources(lyraRuntime PRIVATE runtime/lists.cpp runtime/exceptions.cpp runtime/context.cpp runtime/net.cpp)
+target_sources(lyraRuntime PRIVATE runtime/lists.cpp runtime/errors.cpp runtime/exceptions.cpp runtime/context.cpp runtime/net.cpp)
 lyra_enable_http(lyraRuntime)
 target_compile_options(lyraRuntime PRIVATE -fno-exceptions -fno-rtti)
 target_include_directories(lyraRuntime PUBLIC runtime PRIVATE include)

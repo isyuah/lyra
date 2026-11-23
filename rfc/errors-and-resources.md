@@ -18,6 +18,8 @@ fn startServer(): Result<Server, Error> {
 
 标准库提供共同的 `Error` 接口。各具体错误可以保留自己的类型；当返回目标使用 `Error` 时，`?` 自动将具体错误包装到共同接口中，并保留原错误及原因链。这样跨多层调用不需每层使用第三方 `anyhow` 容器或手写 `mapErr`。若 API 必须在静态类型上限制错误集合，仍可以使用具体错误类型或错误枚举。
 
+共同 `Error` 是业务错误值，不是 `Exception`。`String` 或提供可见同步实例方法 `fn message(): String` 的类型可提升为 `Error`。`Error(value, cause: prior)` 可显式包装并指定原因；`cause` 可省略。只读属性 `message: String`、`original: Any`、`cause: Error?` 和 `suppressed: List<Error>` 分别提供展示文本、原始具体值、前因及附加失败。可用 `original as? DbError` 安全检查具体类型。`withSuppressed(error)` 返回附加失败后的新值；读取 `suppressed` 得到列表快照。`async main` 可返回 `Result<Unit,Error>`，未处理的 `Err` 打印原因及附加失败并以非零状态退出，不经过普通 catch。
+
 `?` 作用于 `Result` 时，成功取值；失败时可原样传播、提升到标准 `Error`，或在两个具体错误类型之间使用普通 `implicit`。`?` 也可在返回兼容 Optional 的函数中传播 `None`，不隐式互转 `None` 和 `Err`。
 
 普通异常的根类型是 `Exception`。可以按类型捕获并加过滤条件，`catch { ... }` 兜底捕获普通异常，不吞掉取消。catch 中单独写 `throw` 会原样重抛当前异常，保留最初抛出的位置。首版 `throws` 只作文档提示，不改变函数类型，也不强制调用者捕获。`Result::Err` 不会因为携带相同的错误类型就自动抛出。未处理异常到达入口时，运行时输出原因、源位置和异步调用链，并以非零状态退出。稳定错误类型或 kind 是契约，自然语言文案不是。
@@ -45,6 +47,8 @@ fn load(id: Int): Result<User, ServiceError> { Ok(readUser(id)?) }
 **查找规则与 [RFC-0003](0003-types.md) 相同。** 只查源、目标类型的定义模块；声明在本模块可用，跨模块只看 `pub`，不需要单独导入转换。只有 `DbError → StorageError → ServiceError` 两段时，在 `?` 处报缺少直接转换；两端各有一条可见的同向转换时，在 `?` 处报歧义并指向两处声明。不按导入顺序选取。
 
 `load` 遇到 `Ok(user)` 时不执行转换；遇到 `Err(dbError)` 时执行一次，提前返回 `Err(serviceError)`。传播后仍能检查原始 `DbError`、`cause` 和已有的 `suppressed`；若新错误未携带源错误，传播记录须保留两者的关联。普通异常和取消不走这条转换路径。
+
+`result.failureInfo()` 在 `Err` 时返回共同错误，在 `Ok` 时返回 `None`；不改变原有 `match result` 的具体载荷类型。具体类型间转换只调用 `implicit`，不为记录历史而调用用户的格式化方法。转换前的具体载荷以原类型保存在下一层 `cause`，历史条目同样可用 `original` 检查。
 
 只有 `reportService(ServiceError)` 一个候选时，`reportService(dbError)` 也使用同一声明。若同一种错误在注册时应映射为冲突、在读取时应映射为服务故障，就不声明通用转换，在各自调用点用 `mapErr` 或 `match` 显式选择。
 
@@ -80,6 +84,5 @@ alias.readAll()   // 已关闭错误；不会拿旧句柄去读
 
 ## 仍开放
 
-- `Error` 接口的具体继承、错误原因链 API、类型检查与展示接口。
 - `throws` 文档标记及其展示方式。
 - 可失败分配 API 的最小范围，以及多个清理失败的完整诊断数据结构。

@@ -99,13 +99,13 @@ struct Layouts {
         case Type::Bool: return builder.getInt1Ty();
         case Type::Char: return builder.getInt32Ty();
         case Type::Unit: case Type::Never: return builder.getInt8Ty();
-        case Type::String: case Type::Bytes: case Type::Task: case Type::CPtr: case Type::List: case Type::Exception: case Type::Closure: return builder.getPtrTy();
+        case Type::String: case Type::Bytes: case Type::Task: case Type::CPtr: case Type::List: case Type::Exception: case Type::Closure: case Type::Error: return builder.getPtrTy();
         case Type::Variable: llvm_unreachable("abstract type reached LLVM lowering");
         case Type::Any: case Type::Dyn: return llvm::StructType::get(builder.getContext(), {builder.getPtrTy(), builder.getPtrTy()});
         case Type::Record: return reference(type) ? static_cast<llvm::Type*>(builder.getPtrTy()) : objects[type.id];
         case Type::Enum: return llvm::StructType::get(builder.getContext(), {builder.getInt32Ty(), builder.getPtrTy()});
         case Type::Option: return llvm::StructType::get(builder.getContext(), {builder.getInt1Ty(), native(builder, program.sumTypes[type.id].success)});
-        case Type::Result: return llvm::StructType::get(builder.getContext(), {builder.getInt1Ty(), native(builder, program.sumTypes[type.id].success), native(builder, program.sumTypes[type.id].failure)});
+        case Type::Result: return llvm::StructType::get(builder.getContext(), {builder.getInt1Ty(), native(builder, program.sumTypes[type.id].success), native(builder, program.sumTypes[type.id].failure), builder.getPtrTy()});
         }
         llvm_unreachable("invalid Lyra type");
     }
@@ -261,9 +261,10 @@ struct Emitter {
 
     Type rawType(ExprId id) const { const auto& info = fn.expressions[id]; return info.sourceType.value_or(info.type); }
 
-    Value makeSum(Type type, SumTag tag, Value payload = nullptr) {
+    Value makeSum(Type type, SumTag tag, Value payload = nullptr, Value previousError = nullptr) {
         Value value = llvm::Constant::getNullValue(layouts.native(builder, type));
         value = builder.CreateInsertValue(value, builder.getInt1(successTag(tag)), 0);
+        if (previousError) value = builder.CreateInsertValue(value, previousError, 3);
         return payload ? builder.CreateInsertValue(value, payload, payloadSlot(tag)) : value;
     }
 
@@ -333,11 +334,30 @@ struct Emitter {
         if (info.conversion) return callFunction(*info.conversion, {value}, fn.syntax.expressions[id].span);
         if (info.type.kind == Type::Option) return makeSum(info.type, SumTag::Some, value);
         if (info.type == Type::Exception && info.sourceType->kind == Type::Exception) return value;
-        if (info.type == Type::Any) {
-            auto boxed = builder.CreateInsertValue(llvm::PoisonValue::get(layouts.native(builder, info.type)), layouts.typeToken(builder, *info.sourceType), 0);
-            return builder.CreateInsertValue(boxed, NativeLists{builder}.box(value), 1);
-        }
+        if (info.type == Type::Any) return boxAny(value, *info.sourceType);
+        if (info.type == Type::Error) return wrapError(value, *info.sourceType, info.errorPromotion, nullPointer(), fn.syntax.expressions[id].span);
         return castNumber(value, *info.sourceType, info.type);
+    }
+
+    Value nullPointer() { return llvm::ConstantPointerNull::get(builder.getPtrTy()); }
+
+    Value boxAny(Value value, Type type) {
+        if (type == Type::Any) return value;
+        auto boxed = builder.CreateInsertValue(llvm::PoisonValue::get(layouts.native(builder, Type::Any)), layouts.typeToken(builder, type), 0);
+        return builder.CreateInsertValue(boxed, NativeLists{builder}.box(value), 1);
+    }
+
+    Value errorCall(llvm::StringRef name, llvm::ArrayRef<Value> arguments) {
+        auto pointer = builder.getPtrTy();
+        auto signature = llvm::FunctionType::get(pointer, std::vector<llvm::Type*>(arguments.size(), pointer), false);
+        return builder.CreateCall(module.getOrInsertFunction(name, signature), arguments);
+    }
+
+    Value wrapError(Value value, Type type, const ErrorDisplay& display, Value cause, Span site) {
+        if (type == Type::Error) return value;
+        auto message = display.method ? callFunction(*display.method, {value}, site) : type == Type::String ? value : stringConstant(display.fallback);
+        auto original = boxAny(value, type);
+        return errorCall("lyraErrorCreate", {builder.CreateExtractValue(original, 0), builder.CreateExtractValue(original, 1), message, cause});
     }
 
     Value emitNode(ExprId id, IntegerLiteral literal) {
@@ -486,12 +506,23 @@ struct Emitter {
         builder.CreateCondBr(builder.CreateExtractValue(value, 0), success, failure);
         builder.SetInsertPoint(failure);
         auto target = completionType();
-        Value result = nullptr;
+        Value result = nullptr, previous = nullptr;
         if (target.kind == Type::Result) {
-            result = builder.CreateExtractValue(value, payloadSlot(SumTag::Err));
-            if (auto conversion = fn.expressions[id].errorConversion) result = callFunction(*conversion, {result}, propagation.site);
+            const auto& info = fn.expressions[id];
+            auto from = layouts.program.sumTypes[fn.expressions[propagation.operand].type.id].failure;
+            auto to = layouts.program.sumTypes[target.id].failure;
+            auto failureValue = builder.CreateExtractValue(value, payloadSlot(SumTag::Err));
+            previous = builder.CreateExtractValue(value, 3);
+            result = failureValue;
+            if (info.errorConversion) {
+                result = callFunction(*info.errorConversion, {failureValue}, propagation.site);
+                previous = wrapError(failureValue, from, info.errorDisplay, previous, propagation.site);
+            } else if (from != to) {
+                result = wrapError(failureValue, from, info.errorDisplay, previous, propagation.site);
+                previous = nullptr;
+            }
         }
-        leave(makeSum(target, target.kind == Type::Option ? SumTag::None : SumTag::Err, result));
+        leave(makeSum(target, target.kind == Type::Option ? SumTag::None : SumTag::Err, result, previous));
         builder.SetInsertPoint(success);
         return builder.CreateExtractValue(value, 1);
     }
@@ -608,6 +639,21 @@ struct Emitter {
             return builder.CreateCall(module.getOrInsertFunction(symbol, builder.getInt64Ty(), builder.getPtrTy()), {object});
         }
         if (owner.kind == Type::Exception) return NativeExceptions{builder}.message(object);
+        if (owner.kind == Type::Error) {
+            switch (static_cast<ErrorMember>(fn.expressions[id].target)) {
+                case ErrorMember::Message: return errorCall("lyraErrorMessage", {object});
+                case ErrorMember::Original: {
+                    auto value = builder.CreateInsertValue(llvm::PoisonValue::get(layouts.native(builder, Type::Any)), errorCall("lyraErrorType", {object}), 0);
+                    return builder.CreateInsertValue(value, errorCall("lyraErrorValue", {object}), 1);
+                }
+                case ErrorMember::Cause: {
+                    auto cause = errorCall("lyraErrorCause", {object});
+                    return builder.CreateInsertValue(makeSum(rawType(id), SumTag::Some, cause), builder.CreateIsNotNull(cause), 0);
+                }
+                case ErrorMember::Suppressed: return errorCall("lyraErrorSuppressed", {object});
+            }
+            llvm_unreachable("invalid Error member");
+        }
         auto slot = static_cast<unsigned>(fn.expressions[id].target);
         if (!layouts.reference(owner)) return builder.CreateExtractValue(object, slot);
         auto field = builder.CreateStructGEP(layouts.objects[owner.id], object, slot);
@@ -696,6 +742,28 @@ struct Emitter {
         }
         switch (info.callee) {
             case Callee::Indirect: llvm_unreachable("indirect call already emitted");
+            case Callee::BusinessError: {
+                auto argument = call.arguments[std::ranges::find(info.argumentSlots, 0) - info.argumentSlots.begin()].value;
+                auto cause = args.size() == 2 ? builder.CreateExtractValue(args[1], 1) : nullPointer();
+                return wrapError(args[0], fn.expressions[argument].type, info.errorDisplay, cause, call.name.span);
+            }
+            case Callee::ErrorSuppress: return errorCall("lyraErrorSuppress", args);
+            case Callee::FailureInfo: {
+                auto missing = builder.GetInsertBlock(), failure = label("result.error"), done = label("result.end");
+                builder.CreateCondBr(builder.CreateExtractValue(receiver, 0), done, failure);
+                builder.SetInsertPoint(failure);
+                auto owner = fn.expressions[*call.receiver].type;
+                auto error = wrapError(builder.CreateExtractValue(receiver, 2), layouts.program.sumTypes[owner.id].failure,
+                    info.errorDisplay, builder.CreateExtractValue(receiver, 3), call.name.span);
+                auto some = makeSum(rawType(id), SumTag::Some, error);
+                failure = builder.GetInsertBlock();
+                builder.CreateBr(done);
+                builder.SetInsertPoint(done);
+                auto* result = builder.CreatePHI(some->getType(), 2);
+                result->addIncoming(llvm::Constant::getNullValue(some->getType()), missing);
+                result->addIncoming(some, failure);
+                return result;
+            }
             case Callee::Dynamic: {
                 auto* pointer = builder.getPtrTy();
                 auto table = builder.CreateExtractValue(receiver, 1);
@@ -1187,7 +1255,9 @@ std::unique_ptr<llvm::Module> lower(const CheckedModule& program, const std::vec
     const auto& root = program.functions[entry];
     if (root.syntax.isAsync) {
         auto result = NativeExceptions{builder}.created(builder.CreateCall(functions[entry]), sources[root.syntax.file], root.syntax.name.span);
-        builder.CreateRet(asyncEntry(builder, result, root.result.kind == Type::Result ? layouts.native(builder, root.result) : nullptr));
+        auto returnsResult = root.result.kind == Type::Result;
+        builder.CreateRet(asyncEntry(builder, result, returnsResult ? layouts.native(builder, root.result) : nullptr,
+            returnsResult && program.sumTypes[root.result.id].failure == Type::Error));
     } else {
         auto slot = NativeExceptions{builder}.slot();
         builder.CreateCall(functions[entry], {slot});

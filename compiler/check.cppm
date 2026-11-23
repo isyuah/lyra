@@ -12,14 +12,14 @@ export import lyra.syntax;
 
 export namespace lyra {
 struct Type {
-    enum Kind { Unit, Int, UInt, Real, Bool, String, Char, Bytes, Never, Record, Enum, Variable, Task, CPtr, Option, Result, List, Exception, Closure, Any, Dyn };
+    enum Kind { Unit, Int, UInt, Real, Bool, String, Char, Bytes, Never, Record, Enum, Variable, Task, CPtr, Option, Result, List, Exception, Closure, Any, Dyn, Error };
     Kind kind;
     std::size_t id{};
     constexpr Type(Kind kind = Unit, std::size_t id = 0) : kind(kind), id(id) {}
     auto operator<=>(const Type&) const = default;
 };
 struct Local { Type type; bool writable; std::optional<ExprId> worker{}; bool captured{}; std::optional<Span> declaration{}; };
-enum class Callee { Function, Constructor, Variant, Print, Collect, Sum, ListAdd, TaskCancel, Exception, Indirect, ToReal, ToIntegerChecked, ToString, ToBytes, DecodeUtf8, Dynamic };
+enum class Callee { Function, Constructor, Variant, Print, Collect, Sum, ListAdd, TaskCancel, Exception, Indirect, ToReal, ToIntegerChecked, ToString, ToBytes, DecodeUtf8, Dynamic, BusinessError, ErrorSuppress, FailureInfo };
 struct PatternSlot { std::size_t local; };
 struct PatternProduct { bool operator==(const PatternProduct&) const = default; };
 struct VariantTag { std::size_t owner; unsigned index; bool operator==(const VariantTag&) const = default; };
@@ -30,7 +30,9 @@ struct CheckedPattern {
 };
 struct IteratorPlan { std::size_t open, next; };
 struct CheckedCatch { Type type; std::optional<std::size_t> local; };
-struct CheckedExpr { Type type; std::size_t target{}; std::vector<std::size_t> argumentSlots{}; Callee callee{}; std::optional<Type> sourceType{}; std::vector<std::size_t> captures{}; std::vector<std::size_t> omittedDefaults{}; std::optional<std::size_t> conversion{}, errorConversion{}, functionRef{}; std::optional<Type> callableType{}; std::optional<IteratorPlan> iterator{}; std::vector<CheckedPattern> patterns{}; std::optional<double> realLiteral{}; bool narrowed{}; std::optional<std::string> boundTrait{}; std::optional<Type> testedType{}; bool boxedSpread{}; std::vector<std::size_t> interfaceMethods{}; bool interfaceAsync{}; std::vector<CheckedCatch> catches{}; };
+struct ErrorDisplay { std::optional<std::size_t> method; std::string fallback; };
+enum class ErrorMember { Message, Original, Cause, Suppressed };
+struct CheckedExpr { Type type; std::size_t target{}; std::vector<std::size_t> argumentSlots{}; Callee callee{}; std::optional<Type> sourceType{}; std::vector<std::size_t> captures{}; std::vector<std::size_t> omittedDefaults{}; std::optional<std::size_t> conversion{}, errorConversion{}, functionRef{}; std::optional<Type> callableType{}; std::optional<IteratorPlan> iterator{}; std::vector<CheckedPattern> patterns{}; std::optional<double> realLiteral{}; bool narrowed{}; std::optional<std::string> boundTrait{}; std::optional<Type> testedType{}; bool boxedSpread{}; std::vector<std::size_t> interfaceMethods{}; bool interfaceAsync{}; std::vector<CheckedCatch> catches{}; ErrorDisplay errorDisplay{}, errorPromotion{}; };
 struct CheckedFunction {
     Function syntax;
     Type result;

@@ -79,6 +79,54 @@ fn main(): Unit {
     try { propagating(); } catch error: Exception { print(error.message) }
 }''', ['default', 'conversion', 'conversion'])
 
+    def test_result_error_preserves_concrete_causes_through_conversion(self):
+        self.executable('''struct LookupFailed(val code: Int) {
+    fn message(): String { "lookup " + code.toString() }
+}
+struct ServiceFailure(val code: Int) {
+    fn message(): String { "service " + code.toString() }
+}
+implicit (failure: LookupFailed): ServiceFailure { print("convert"); ServiceFailure(failure.code) }
+fn query(fail: Bool): Result<Int,LookupFailed> { if fail { Err(LookupFailed(7)) } else { Ok(12) } }
+fn convert(fail: Bool): Result<Int,ServiceFailure> { Ok(query(fail)?) }
+fn lift(): Result<Int,Error> { Ok(convert(true)?) }
+fn forward(): Result<Int,Error> { Ok(lift()?) }
+fn main(): Unit {
+    match convert(false) { Ok(value) => print(value), Err(_) => print("unexpected") }
+    val result = forward()
+    gcCollect()
+    match result.failureInfo() {
+        Some(error) => {
+            print(error.message)
+            print(error.original is ServiceFailure)
+            match error.cause {
+                Some(previous) => match previous.original as? LookupFailed {
+                    Some(database) => print(database.code), None => print("lost database error"),
+                },
+                None => print("lost cause"),
+            }
+        },
+        None => print("unexpected success"),
+    }
+    val ok: Result<Int,LookupFailed> = Ok(1)
+    print(ok.failureInfo() == None)
+}''', ['12', 'convert', 'service 7', 'true', '7', 'true'])
+
+    def test_common_error_wait_and_root_report_do_not_throw(self):
+        self.executable('''async fn read(): Result<Int,Error> {
+    val original = Error("missing table", cause: Error("database"))
+    val failed = original.withSuppressed(Error("finalize")).withSuppressed(Error("close"))
+    val copy = failed.suppressed
+    copy[0] = Error("changed")
+    print(original.suppressed.size)
+    print(failed.suppressed[0].message)
+    Err(failed)
+}
+async fn main(): Result<Unit,Error> {
+    try { val value = (await read())?; print(value) } catch { print("unexpected catch") }
+    Ok({})
+}''', ['0', 'finalize'], ['Error: missing table', 'caused by: database', 'suppressed: finalize', 'suppressed: close'])
+
     def test_return_cleanup_can_be_caught_before_enclosing_scope_exits(self):
         self.executable('''fn choose(): Int {
     defer print("outer")

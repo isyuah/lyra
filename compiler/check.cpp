@@ -67,7 +67,7 @@ using Overloads = std::unordered_map<std::string, std::vector<std::size_t>>;
 
 const std::string& linkedName(const Identifier& name) { return name.linked.empty() ? name.text : name.linked; }
 
-constexpr Type scalarTypes[] = {Type::Bool, Type::String, Type::Char, Type::Bytes, Type::Unit, Type::CPtr, Type::Exception, Type::Any};
+constexpr Type scalarTypes[] = {Type::Bool, Type::String, Type::Char, Type::Bytes, Type::Unit, Type::CPtr, Type::Exception, Type::Any, Type::Error};
 
 bool builtInDisplay(Type type) { return numericType(type) || type == Type::Bool || type == Type::String || type == Type::Char; }
 
@@ -89,6 +89,7 @@ std::string typeName(const CheckedModule& module, Type type, bool canonical = fa
         }
         case Type::CPtr: return "CPtr";
         case Type::Any: return "Any";
+        case Type::Error: return "Error";
         case Type::Dyn: {
             const auto& full = module.traits[type.id].name.text;
             if (canonical) return "$dyn:" + full;
@@ -819,12 +820,31 @@ struct Checker {
         return fn.expressions[id].type = std::visit([&](const auto& node) { return infer(id, node, hint, discard); }, expr.node);
     }
 
+    ErrorDisplay displayError(Type type, Span site, bool requireMessage, bool useMethod = true) {
+        if (type == Type::String || type == Type::Error) return {};
+        auto hasMessage = [](const RequiredMethod& shape) {
+            return shape.parameters.empty() && !shape.asynchronous && shape.result == Type::String;
+        };
+        if (useMethod) {
+            if (const auto* method = symbols.contracts.member(type, "message"); method && hasMessage(*method)) return {};
+            if (auto selected = symbols.shapedMethod(type, "message", source, hasMessage)) {
+                if (!materializing()) return {};
+                const auto& item = symbols.callables[selected->first];
+                return {item.generic ? symbols.instantiate(selected->first, module.aggregates[type.id].arguments, source, site) : item.target, {}};
+            }
+        }
+        auto name = typeName(module, type);
+        if (requireMessage) throw at(source, site, "LYE0003", name + " 不能提升为 Error：需要可见的同步实例方法 fn message(): String");
+        return {{}, std::move(name)};
+    }
+
     Type fit(ExprId id, Type type, std::optional<Type> expected) {
         auto& info = fn.expressions[id];
         if (expected && type != *expected && type != Type::Never) {
             auto site = fn.syntax.expressions[id].span;
             auto exceptionUpcast = type.kind == Type::Exception && *expected == Type::Exception;
-            if (*expected != Type::Any && !exceptionUpcast && !losslessNumber(type, *expected) && (expected->kind != Type::Option || module.sumTypes[expected->id].success != type)) {
+            if (*expected == Type::Error) info.errorPromotion = displayError(type, site, true);
+            else if (*expected != Type::Any && !exceptionUpcast && !losslessNumber(type, *expected) && (expected->kind != Type::Option || module.sumTypes[expected->id].success != type)) {
                 info.conversion = directConversion(symbols.conversions, module, symbols.sources, type, *expected, source, site, !probing);
                 if (!info.conversion) throw mismatch(module, source, site, *expected, type);
             }
@@ -1034,9 +1054,21 @@ struct Checker {
         auto operand = inspectOption(propagation.operand, hint);
         if (operand == Type::Never) return operand;
         if (operand.kind != Type::Option && operand.kind != Type::Result) throw at(source, propagation.site, "LYT0013", "? 需要 Option 或 Result，实际是 " + typeName(module, operand));
-        if (operand.kind == Type::Result && target->kind == Type::Result && module.sumTypes[target->id].failure != module.sumTypes[operand.id].failure) {
-            fn.expressions[id].errorConversion = directConversion(symbols.conversions, module, symbols.sources, module.sumTypes[operand.id].failure, module.sumTypes[target->id].failure, source, propagation.site, !probing);
-            if (fn.expressions[id].errorConversion) return module.sumTypes[operand.id].success;
+        if (operand.kind == Type::Result && target->kind == Type::Result) {
+            const auto& from = module.sumTypes[operand.id];
+            auto to = module.sumTypes[target->id].failure;
+            if (from.failure == to) return from.success;
+            auto& info = fn.expressions[id];
+            auto input = from.failure, success = from.success;
+            if (to == Type::Error) {
+                info.errorDisplay = displayError(input, propagation.site, true);
+                return success;
+            }
+            info.errorConversion = directConversion(symbols.conversions, module, symbols.sources, input, to, source, propagation.site, !probing);
+            if (info.errorConversion) {
+                info.errorDisplay = displayError(input, propagation.site, false, false);
+                return success;
+            }
         }
         if (target->kind != operand.kind || (operand.kind == Type::Result && module.sumTypes[target->id].failure != module.sumTypes[operand.id].failure)) {
             throw at(source, propagation.site, "LYT0013", "? 无法将 " + typeName(module, operand) + " 的失败传播到 " + typeName(module, *target));
@@ -1493,6 +1525,13 @@ struct Checker {
         if (owner == Type::Bytes && member.name.text == "size") return Type::Int;
         if (owner == Type::Char && member.name.text == "codePoint") return number(Type::UInt, 32);
         if (owner.kind == Type::Exception && member.name.text == "message") return Type::String;
+        if (owner == Type::Error) {
+            auto slot = [&](ErrorMember field, Type type) { fn.expressions[id].target = static_cast<std::size_t>(field); return type; };
+            if (member.name.text == "message") return slot(ErrorMember::Message, Type::String);
+            if (member.name.text == "original") return slot(ErrorMember::Original, Type::Any);
+            if (member.name.text == "cause") return slot(ErrorMember::Cause, symbols.sum(Type::Option, Type::Error));
+            if (member.name.text == "suppressed") return slot(ErrorMember::Suppressed, symbols.list(Type::Error));
+        }
         auto field = memberIndex(owner, member.name, symbols.fields);
         fn.expressions[id].target = field;
         const auto& record = module.aggregates[owner.id];
@@ -1605,7 +1644,7 @@ struct Checker {
         const auto& info = fn.expressions[id];
         if (info.conversion) return {MatchKind::User};
         if (info.boxedSpread || (info.sourceType && info.type == Type::Any)) return {MatchKind::Box};
-        if (info.sourceType && info.type == Type::Exception) return {MatchKind::Upcast};
+        if (info.sourceType && (info.type == Type::Exception || info.type == Type::Error)) return {MatchKind::Upcast};
         if (info.sourceType) return info.type.kind == Type::Option ? ArgumentMatch{MatchKind::Nullable} : ArgumentMatch{MatchKind::Number, info.type};
         const auto& node = fn.syntax.expressions[id].node;
         if (std::holds_alternative<IntegerLiteral>(node) && info.type != Type::Int) return {MatchKind::Literal, info.type};
@@ -1728,6 +1767,18 @@ struct Checker {
             auto owner = visit(*call.receiver);
             if (owner == Type::Never) return owner;
             bool privateMember = false, staticMember = false;
+            if (owner.kind == Type::Result && call.name.text == "failureInfo") {
+                noTypeArgs();
+                if (!call.arguments.empty()) throw at(source, call.name.span, "LYT0002", "failureInfo 不接收实参");
+                info.callee = Callee::FailureInfo;
+                info.errorDisplay = displayError(module.sumTypes[owner.id].failure, call.name.span, false);
+                return symbols.sum(Type::Option, Type::Error);
+            }
+            if (owner == Type::Error && call.name.text == "withSuppressed") {
+                noTypeArgs();
+                info.callee = Callee::ErrorSuppress;
+                return arguments(id, call, 1, [](auto) { return "error"; }, [](auto) { return Type{Type::Error}; }) ? Type::Never : Type::Error;
+            }
             if ((call.name.text == "toString" && (builtInDisplay(owner) || owner == Type::Bytes)) || (call.name.text == "toBytes" && owner == Type::String)) {
                 noTypeArgs();
                 if (!call.arguments.empty()) throw at(source, call.name.span, "LYT0002", call.name.text + " 不接收实参");
@@ -1822,6 +1873,17 @@ struct Checker {
             info.argumentSlots.push_back(0);
             if (value == Type::Never) return value;
             return expected ? *expected : symbols.sum(kind, value);
+        } else if (key == "Error") {
+            noTypeArgs();
+            if (call.arguments.empty() || call.arguments.size() > 2) throw at(source, call.name.span, "LYT0002", "Error 需要 value 及可选的 cause 实参");
+            info.callee = Callee::BusinessError;
+            auto cause = symbols.sum(Type::Option, Type::Error);
+            if (arguments(id, call, call.arguments.size(), [](auto slot) { return slot ? "cause" : "value"; }, [&](auto slot) -> std::optional<Type> { return slot ? std::optional(cause) : std::nullopt; })) return Type::Never;
+            auto value = call.arguments[std::ranges::find(info.argumentSlots, 0) - info.argumentSlots.begin()].value;
+            auto type = fn.expressions[value].type;
+            if (type == Type::Error) throw at(source, fn.syntax.expressions[value].span, "LYE0003", "已有 Error 值无需再次包装");
+            info.errorDisplay = displayError(type, fn.syntax.expressions[value].span, true);
+            return Type::Error;
         } else if (key == "Exception") {
             noTypeArgs();
             info.callee = Callee::Exception;
@@ -2003,7 +2065,7 @@ struct Checker {
             return Type::Bool;
         }
         right = fit(binary.right, right, left);
-        if (equality && (left.kind == Type::Option || left.kind == Type::Result || left.kind == Type::Enum || left.kind == Type::Closure || left.kind == Type::Any || left.kind == Type::Dyn || left.kind == Type::Variable || (left.kind == Type::Record && !module.aggregates[left.id].syntax.reference))) throw at(source, binary.site, "LYT0006", typeName(module, left) + " 未提供 Eq，不能用 == 或 != 比较");
+        if (equality && (left.kind == Type::Option || left.kind == Type::Result || left.kind == Type::Enum || left.kind == Type::Closure || left.kind == Type::Any || left.kind == Type::Dyn || left.kind == Type::Error || left.kind == Type::Variable || (left.kind == Type::Record && !module.aggregates[left.id].syntax.reference))) throw at(source, binary.site, "LYT0006", typeName(module, left) + " 未提供 Eq，不能用 == 或 != 比较");
         if (binary.op == Op::Add && left == Type::String) return Type::String;
         if (!equality) throw mismatch(module, source, binary.site, Type::Int, left);
         return Type::Bool;
@@ -2349,7 +2411,8 @@ CheckedModule check(Module module, const std::vector<Source>& sources, bool requ
             if (!syntax.parameters.empty()) throw at(source, syntax.name.span, "LYT0002", "main 不能接收形参");
             if (syntax.isAsync && concrete.result != Type::Unit) {
                 auto expected = symbols.sum(Type::Result, Type::Unit, Type::String);
-                if (concrete.result != expected) throw mismatch(checked, source, syntax.result.span, expected, concrete.result);
+                if (concrete.result != expected && concrete.result != symbols.sum(Type::Result, Type::Unit, Type::Error))
+                    throw at(source, syntax.result.span, "LYT0001", "async main 必须返回 Unit、Result<Unit,String> 或 Result<Unit,Error>");
             } else if (concrete.result != Type::Unit) throw mismatch(checked, source, syntax.result.span, Type::Unit, concrete.result);
             checked.entry = checked.functions.size();
         }

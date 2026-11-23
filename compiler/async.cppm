@@ -67,7 +67,7 @@ export void asyncFailure(llvm::IRBuilder<>& builder, llvm::Value* error) {
     marker(builder, "lyra.fail", builder.getVoidTy(), {error});
 }
 
-export llvm::Value* asyncEntry(llvm::IRBuilder<>& builder, llvm::Value* coldRoot, llvm::Type* resultType) {
+export llvm::Value* asyncEntry(llvm::IRBuilder<>& builder, llvm::Value* coldRoot, llvm::Type* resultType, bool commonError) {
     auto* status = builder.CreateCall(runtime(builder, "lyraTaskRunRoot", builder.getInt32Ty(), {builder.getPtrTy()}), {coldRoot});
     if (!resultType) return status;
     auto* start = builder.GetInsertBlock();
@@ -81,7 +81,7 @@ export llvm::Value* asyncEntry(llvm::IRBuilder<>& builder, llvm::Value* coldRoot
     auto* result = builder.CreateLoad(resultType, box);
     builder.CreateCondBr(builder.CreateExtractValue(result, 0), done, error);
     builder.SetInsertPoint(error);
-    auto* failed = builder.CreateCall(runtime(builder, "lyraReportStringError", builder.getInt32Ty(), {builder.getPtrTy()}), {builder.CreateExtractValue(result, 2)});
+    auto* failed = builder.CreateCall(runtime(builder, commonError ? "lyraErrorReport" : "lyraReportStringError", builder.getInt32Ty(), {builder.getPtrTy()}), {builder.CreateExtractValue(result, 2)});
     builder.CreateBr(done);
     builder.SetInsertPoint(done);
     auto* exit = builder.CreatePHI(builder.getInt32Ty(), 3);
