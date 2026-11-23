@@ -29,6 +29,7 @@ namespace lyra {
 namespace {
 
 using Names = std::unordered_map<std::string, std::size_t>;
+using Overloads = std::unordered_map<std::string, std::vector<std::size_t>>;
 
 const std::string& linkedName(const Identifier& name) { return name.linked.empty() ? name.text : name.linked; }
 
@@ -182,8 +183,9 @@ struct Symbols {
     CheckedModule& module;
     const std::vector<Source>& sources;
     Names records;
-    std::unordered_map<std::string, std::vector<std::size_t>> functions;
-    std::vector<Names> fields, methods;
+    Overloads functions;
+    std::vector<Names> fields;
+    std::vector<Overloads> methods;
     std::vector<Callable> callables;
     std::map<GenericInstanceKey, std::size_t> specializations;
     std::vector<DirectConversion> conversions{};
@@ -193,7 +195,7 @@ struct Symbols {
     std::vector<Enumeration> enumDeclarations{};
     std::vector<Aggregate> recordDeclarations{};
     std::vector<std::optional<std::size_t>> initializers{};
-    std::vector<Names> staticMethods{};
+    std::vector<Overloads> staticMethods{};
     mutable std::map<std::pair<std::size_t, std::vector<Type>>, Type> recordInstances{};
     mutable std::map<std::pair<std::size_t, std::vector<Type>>, Type> enumInstances{};
     mutable unsigned expandingNominal{};
@@ -230,13 +232,22 @@ struct Symbols {
         return site.file + ':' + std::to_string(site.start.line) + ':' + std::to_string(site.start.column);
     }
 
-    std::vector<std::size_t> visibleFunctions(const Source& use, const Identifier& name) const {
+    std::vector<std::size_t> visibleCandidates(std::span<const std::size_t> indexes, const Source& use, bool exportedOnly = false) const {
         std::vector<std::size_t> result;
-        if (auto found = functions.find(linkedName(name)); found != functions.end()) for (auto index : found->second) {
+        for (auto index : indexes) {
             const auto& syntax = declaration(callables[index]);
-            if (syntax.isPublic || (!name.exportedOnly && sources[syntax.file].moduleId == use.moduleId)) result.push_back(index);
+            if (syntax.isPublic || (!exportedOnly && sources[syntax.file].moduleId == use.moduleId)) result.push_back(index);
         }
         return result;
+    }
+
+    std::vector<std::size_t> visibleFunctions(const Source& use, const Identifier& name) const {
+        auto found = functions.find(linkedName(name));
+        return found == functions.end() ? std::vector<std::size_t>{} : visibleCandidates(found->second, use, name.exportedOnly);
+    }
+
+    std::size_t enclosingParameters(const Function& syntax) const {
+        return syntax.owner ? recordDeclarations[records.at(syntax.owner->text)].typeParameters.size() : 0;
     }
 
     std::string signature(std::size_t index, const std::string& spelling) const {
@@ -248,17 +259,19 @@ struct Symbols {
             });
         };
         std::string text = spelling;
-        if (!syntax.typeParameters.empty()) {
+        auto owning = enclosingParameters(syntax);
+        if (syntax.typeParameters.size() > owning) {
             text += '<';
-            for (const auto& parameter : syntax.typeParameters) {
-                if (&parameter != &syntax.typeParameters.front()) text += ", ";
-                text += parameter.text;
+            for (auto slot = owning; slot < syntax.typeParameters.size(); ++slot) {
+                if (slot != owning) text += ", ";
+                text += syntax.typeParameters[slot].text;
             }
             text += '>';
         }
         text += '(';
-        for (const auto& parameter : syntax.parameters) {
-            if (&parameter != &syntax.parameters.front()) text += ", ";
+        for (auto slot = static_cast<std::size_t>(syntax.hasReceiver); slot < syntax.parameters.size(); ++slot) {
+            const auto& parameter = syntax.parameters[slot];
+            if (slot != syntax.hasReceiver) text += ", ";
             text += format(parameter.type);
             if (parameter.variadic) text += "...";
         }
@@ -280,12 +293,24 @@ struct Symbols {
         return result;
     }
 
+    std::optional<std::pair<std::size_t, RequiredMethod>> shapedMethod(Type receiver, const std::string& name, const Source& use, const auto& accept) {
+        if (receiver.kind != Type::Record) return {};
+        const auto& members = methods[module.aggregates[receiver.id].declaration];
+        auto found = members.find(name);
+        if (found == members.end()) return {};
+        for (auto index : found->second) {
+            auto shape = methodShape(receiver, callables[index], use);
+            if (shape && accept(*shape)) return std::pair(index, std::move(*shape));
+        }
+        return {};
+    }
+
     void requireBounds(const Function& target, std::span<const Type> types, const Source& use, Span site) {
-        contracts.require(target, types, use, site, [&](Type receiver, const std::string& name) -> std::optional<RequiredMethod> {
-            if (receiver.kind != Type::Record) return {};
-            const auto& members = methods[module.aggregates[receiver.id].declaration];
-            auto found = members.find(name);
-            return found == members.end() ? std::nullopt : methodShape(receiver, callables[found->second], sources[target.file]);
+        contracts.require(target, types, use, site, [&](Type receiver, const std::string& name, const RequiredMethod& expected) -> std::optional<RequiredMethod> {
+            const auto& definition = sources[target.file];
+            auto result = shapedMethod(receiver, name, definition, [&](const auto& shape) { return shape == expected; });
+            if (!result) result = shapedMethod(receiver, name, definition, [](const auto&) { return true; });
+            return result ? std::optional(std::move(result->second)) : std::nullopt;
         }, [&](Type type) { return typeName(module, type); });
     }
 
@@ -733,14 +758,13 @@ struct Checker {
             if (const auto* method = symbols.contracts.member(type, "toString"); method && method->parameters.empty() && !method->asynchronous && method->result == Type::String) return Type::String;
         } else if (type.kind == Type::Record) {
             const auto& record = module.aggregates[type.id];
-            const auto& methods = symbols.methods[record.declaration];
-            if (auto found = methods.find("toString"); found != methods.end()) {
-                const auto& method = symbols.callables[found->second];
+            if (auto found = symbols.shapedMethod(type, "toString", source, [](const auto& shape) {
+                return shape.parameters.empty() && !shape.asynchronous && shape.result == Type::String;
+            })) {
+                const auto& method = symbols.callables[found->first];
                 const auto& syntax = symbols.declaration(method);
-                if (auto shape = symbols.methodShape(type, method, source); shape && shape->parameters.empty() && !shape->asynchronous && shape->result == Type::String) {
-                    if (materializing()) fn.expressions[id].target = method.generic ? symbols.instantiate(found->second, record.arguments, source, syntax.name.span) : method.target;
-                    return Type::String;
-                }
+                if (materializing()) fn.expressions[id].target = method.generic ? symbols.instantiate(found->first, record.arguments, source, syntax.name.span) : method.target;
+                return Type::String;
             }
         }
         auto error = at(source, fn.syntax.expressions[display.value].span, "LYT0016", typeName(module, type) + " 未满足 Display，无法用于字符串插值");
@@ -1396,7 +1420,8 @@ struct Checker {
         return {MatchKind::Exact};
     }
 
-    std::size_t selectOverload(ExprId id, const Call& call, std::optional<Type> expected, std::span<const std::size_t> candidates) {
+    std::size_t selectOverload(ExprId id, const Call& call, std::optional<Type> expected, std::span<const std::size_t> candidates, std::span<const Type> ownerTypes = {}) {
+        if (candidates.size() == 1) return candidates.front();
         auto site = fn.syntax.expressions[id].span;
         std::vector<OverloadMatch> matches;
         std::vector<std::pair<std::size_t, std::string>> rejected;
@@ -1409,8 +1434,8 @@ struct Checker {
             Checker checker{trial, source, module, symbols, scopes, variables, loops, workers, catchOwners, lambdaHints, receiverSlot, implicitReceivers, true, inferredReturn ? &returnHint : nullptr, present};
             try {
                 const auto& trialCall = std::get<Call>(trial.syntax.expressions[id].node);
-                checker.declaredCall(index, id, trialCall, expected, {}, true);
-                OverloadMatch match{index, {}, item.generic.has_value(), !syntax.parameters.empty() && syntax.parameters.back().variadic,
+                checker.declaredCall(index, id, trialCall, expected, ownerTypes, true);
+                OverloadMatch match{index, {}, syntax.typeParameters.size() > symbols.enclosingParameters(syntax), !syntax.parameters.empty() && syntax.parameters.back().variadic,
                     trial.expressions[id].omittedDefaults.size()};
                 for (const auto& argument : trialCall.arguments) match.arguments.push_back(checker.argumentMatch(argument.value));
                 matches.push_back(std::move(match));
@@ -1469,9 +1494,6 @@ struct Checker {
                     throw at(source, call.name.span, "LYT0018", "实例成员需要对象接收者：" + call.name.text);
                 throw at(source, call.name.span, "LYN0001", "找不到静态方法：" + call.name.text);
             }
-            declaration = member->second;
-            const auto& method = symbols.declaration(symbols.callables[declaration]);
-            visible(method.file, method.isPublic, call.name);
             if (!qualifier.arguments.empty()) {
                 std::vector<Type> arguments;
                 for (const auto& type : qualifier.arguments) arguments.push_back(symbols.resolve(fn.syntax, type, variables));
@@ -1480,6 +1502,9 @@ struct Checker {
             } else if (!call.typeArguments.empty() && !symbols.recordDeclarations[owner].typeParameters.empty()) {
                 throw at(source, call.name.span, "LYG0001", "显式指定静态方法的类型实参时，先指定所属类型的类型实参，例如 Box<Int>.make<String>(...)");
             }
+            auto candidates = symbols.visibleCandidates(member->second, source);
+            if (candidates.empty()) throw at(source, call.name.span, "LYN0003", "此成员是模块私有的：" + call.name.text);
+            declaration = selectOverload(id, call, expected, candidates, ownerTypes);
         } else if (call.receiver) {
             if (const auto* item = enumNamespace(*call.receiver)) return variant(id, TypeQualifier{*item}, call, expected);
             auto owner = visit(*call.receiver);
@@ -1506,12 +1531,19 @@ struct Checker {
             if (owner.kind == Type::Variable) {
                 if (auto method = symbols.contracts.member(owner, call.name.text)) {
                     noTypeArgs();
+                    info.boundTrait = *symbols.contracts.constraint(owner);
                     bool exits = arguments(id, call, method->parameters.size(), [&](auto slot) -> std::string_view { return method->labels[slot]; }, [&](auto slot) { return method->parameters[slot]; });
                     return exits ? Type{Type::Never} : method->asynchronous ? symbols.task(method->result) : method->result;
                 }
             }
             if (owner.kind == Type::Record) {
                 const auto& decl = module.aggregates[owner.id];
+                ownerTypes = decl.arguments;
+                if (call.boundTrait) {
+                    const auto& required = *symbols.contracts.member(*call.boundTrait, call.name.text);
+                    auto chosen = symbols.shapedMethod(owner, call.name.text, source, [&](const auto& shape) { return shape == required; });
+                    return declaredCall(chosen.value().first, id, call, expected, ownerTypes);
+                }
                 const auto& fields = symbols.fields[decl.declaration];
                 if (auto field = fields.find(call.name.text); field != fields.end()) {
                     visible(decl.syntax.file, decl.syntax.fields[field->second].isPublic, call.name);
@@ -1519,9 +1551,14 @@ struct Checker {
                     info.target = field->second;
                     return invoke(decl.fields[info.target]);
                 }
+                const auto& methods = symbols.methods[decl.declaration];
+                if (auto member = methods.find(call.name.text); member != methods.end()) {
+                    auto candidates = symbols.visibleCandidates(member->second, source);
+                    if (candidates.empty()) throw at(source, call.name.span, "LYN0003", "此成员是模块私有的：" + call.name.text);
+                    return declaredCall(selectOverload(id, call, expected, candidates, ownerTypes), id, call, expected, ownerTypes);
+                }
                 if (symbols.staticMethods[decl.declaration].contains(call.name.text))
                     throw at(source, call.name.span, "LYT0018", "静态方法必须通过类型名调用：" + call.name.text);
-                ownerTypes = decl.arguments;
             }
             if (owner.kind == Type::Task && call.name.text == "cancel") {
                 if (!workers.empty() || !fn.syntax.isAsync) throw at(source, call.name.span, "LYT0008", "Task.cancel() 只能在 async 函数中调用，不能在同步 lambda、blocking 或 defer 中调用");
@@ -1535,10 +1572,7 @@ struct Checker {
                 info.callee = Callee::ListAdd;
                 return arguments(id, call, 1, [](auto) { return "value"; }, [&](auto) { return module.listElements[owner.id]; }) ? Type::Never : Type::Unit;
             }
-            declaration = memberIndex(owner, call.name, symbols.methods);
-            const auto& item = symbols.callables[declaration];
-            const auto& method = item.generic ? *item.generic : module.functions[item.target].syntax;
-            visible(method.file, method.isPublic, call.name);
+            throw at(source, call.name.span, "LYN0001", typeName(module, owner) + " 没有成员：" + call.name.text);
         } else if (auto tag = sumTag(key); tag && *tag != SumTag::None) {
             noTypeArgs();
             if (call.arguments.size() != 1 || call.arguments[0].label || call.arguments[0].spread) throw at(source, call.name.span, "LYT0002", call.name.text + " 需要一个位置实参");
@@ -1604,7 +1638,7 @@ struct Checker {
         } else {
             auto candidates = symbols.visibleFunctions(source, call.name);
             if (candidates.empty()) throw at(source, call.name.span, "LYN0001", "找不到函数：" + call.name.text);
-            declaration = candidates.size() == 1 ? candidates.front() : selectOverload(id, call, expected, candidates);
+            declaration = selectOverload(id, call, expected, candidates);
         }
         return declaredCall(declaration, id, call, expected, ownerTypes);
     }
@@ -1807,16 +1841,12 @@ struct Checker {
                 return {method->result, {}};
         } else if (owner.kind == Type::Record) {
             const auto& record = module.aggregates[owner.id];
-            const auto& methods = symbols.methods[record.declaration];
-            if (auto found = methods.find(name); found != methods.end()) {
-                const auto& entry = symbols.callables[found->second];
-                const auto& target = symbols.declaration(entry);
-                visible(target.file, target.isPublic, {name, site});
-                if (auto shape = symbols.methodShape(owner, entry, source); shape && shape->parameters.empty() && !shape->asynchronous) {
-                    std::optional<std::size_t> function;
-                    if (materializing()) function = entry.generic ? symbols.instantiate(found->second, record.arguments, source, site) : entry.target;
-                    return {shape->result, function};
-                }
+            auto selected = symbols.shapedMethod(owner, name, source, [](const auto& shape) { return shape.parameters.empty() && !shape.asynchronous; });
+            if (selected) {
+                const auto& entry = symbols.callables[selected->first];
+                std::optional<std::size_t> function;
+                if (materializing()) function = entry.generic ? symbols.instantiate(selected->first, record.arguments, source, site) : entry.target;
+                return {selected->second.result, function};
             }
         }
         auto expected = name == "iterator" ? "可见的同步 iterator()，或使用 List、整数区间" : "可见的同步 next(): Option<T>";
@@ -1954,30 +1984,33 @@ CheckedModule check(Module module, const std::vector<Source>& sources, bool requ
         }
         symbols.enumType(id, typeVariables(syntax), source, syntax.name.span);
     }
+    auto addOverload = [&](std::vector<std::size_t>& candidates, const Function& function, const Source& source) {
+        auto signature = overloadKey(function);
+        for (auto index : candidates) {
+            const auto& prior = symbols.declaration(symbols.callables[index]);
+            if (overloadKey(prior) == signature) throw at(source, function.name.span, "LYN0002", "函数重载的形参类型重复：" + symbols.declarationSite(prior));
+        }
+        candidates.push_back(symbols.callables.size());
+    };
     for (auto& function : module.functions) {
         const auto& source = sources[function.file];
         auto owner = function.owner ? std::optional(symbols.records.at(function.owner->text)) : std::nullopt;
-        if (function.initializer) symbols.initializers[*owner] = symbols.callables.size();
+        if (function.initializer) {
+            if (symbols.initializers[*owner]) throw at(source, function.name.span, "LYN0002", "class 只允许一个 init");
+            symbols.initializers[*owner] = symbols.callables.size();
+        }
         else if (owner) {
             auto& names = function.hasReceiver ? symbols.methods[*owner] : symbols.staticMethods[*owner];
-            bool collision = symbols.fields[*owner].contains(function.name.text) ||
-                (function.hasReceiver ? symbols.staticMethods[*owner] : symbols.methods[*owner]).contains(function.name.text);
-            if (collision || !names.emplace(function.name.text, symbols.callables.size()).second)
+            if (function.hasReceiver && symbols.fields[*owner].contains(function.name.text))
                 throw at(source, function.name.span, "LYN0002", "函数名已声明：" + function.name.text);
+            addOverload(names[function.name.text], function, source);
         } else {
             const auto& name = function.name.text;
             if (symbols.records.contains(name) || symbols.enums.contains(name) || name == "print" || name == "gcCollect")
                 throw at(source, function.name.span, "LYN0002", "函数名已声明：" + name);
             auto& candidates = symbols.functions[name];
-            if (!candidates.empty()) {
-                if (name == "main" || name.ends_with("::main")) throw at(source, function.name.span, "LYN0002", "main 不能重载");
-                auto signature = overloadKey(function);
-                for (auto index : candidates) {
-                    const auto& prior = symbols.declaration(symbols.callables[index]);
-                    if (overloadKey(prior) == signature) throw at(source, function.name.span, "LYN0002", "函数重载的形参类型重复：" + symbols.declarationSite(prior));
-                }
-            }
-            candidates.push_back(symbols.callables.size());
+            if (!candidates.empty() && (name == "main" || name.ends_with("::main"))) throw at(source, function.name.span, "LYN0002", "main 不能重载");
+            addOverload(candidates, function, source);
         }
         if (!function.typeParameters.empty()) {
             if (!owner && requireEntry && function.name.text == "main") throw at(source, function.name.span, "LYG0001", "main 不能声明类型形参");
@@ -2013,16 +2046,24 @@ CheckedModule check(Module module, const std::vector<Source>& sources, bool requ
         const auto& annotation = symbols.resultAnnotation(callable, sources[syntax.file], syntax.name.span);
         if (!callable.generic) checked.functions[callable.target].result = symbols.resolve(syntax, annotation, {});
     }
-    for (const auto& callable : symbols.callables) if (callable.generic) {
+    for (auto& callable : symbols.callables) if (callable.generic) {
+        auto rememberContracts = [&](const CheckedFunction& fn) {
+            for (ExprId id = 0; id < callable.generic->expressions.size(); ++id) {
+                if (const auto& bound = fn.expressions[id].boundTrait)
+                    std::get<Call>(callable.generic->expressions[id].node).boundTrait = bound;
+            }
+        };
         for (std::size_t slot = 0; slot < callable.generic->parameters.size(); ++slot) if (callable.generic->parameters[slot].defaultValue) {
             auto helper = symbols.prepare(defaultFunction(*callable.generic, slot), callable.variables);
             Checker{helper, sources[helper.syntax.file], checked, symbols, {}, callable.variables}.run();
+            rememberContracts(helper);
             rememberReferences(helper);
         }
         auto syntax = *callable.generic;
         syntax.result = symbols.resultAnnotation(callable, sources[syntax.file], syntax.name.span);
         auto body = symbols.prepare(std::move(syntax), callable.variables);
         Checker{body, sources[body.syntax.file], checked, symbols, {}, callable.variables}.run();
+        rememberContracts(body);
         rememberReferences(body);
     }
     for (std::size_t index = 0; index < checked.functions.size(); ++index) {

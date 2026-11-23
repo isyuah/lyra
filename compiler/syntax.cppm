@@ -25,6 +25,7 @@ struct Call {
     std::vector<Identifier> typeArguments{};
     std::optional<ExprId> function{};
     std::optional<TypeQualifier> typeOwner{};
+    std::optional<std::string> boundTrait{};
 };
 struct Member { ExprId receiver; Identifier name; };
 struct QualifiedMember { TypeQualifier owner; Identifier name; };

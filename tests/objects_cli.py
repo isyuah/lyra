@@ -196,6 +196,34 @@ fn main(): Unit {
                 self.assertEqual(diagnostic['code'], code)
                 self.assertIn(message, diagnostic['message'])
 
+    def test_overloaded_methods_keep_receiver_and_structural_dispatch(self):
+        self.run_source('''
+trait Renderer { fn render(text: String): String }
+struct Label(val value: String)
+implicit (label: Label): String { "converted " + label.value }
+class Tool<Item>(val item: Item) {
+    fn read(value: Item): String { "item" }
+    fn read<Other>(value: Other): String { "generic" }
+    static fn read(value: String): String { value }
+    static fn read(value: Item, extra: Int = 7): Int { extra }
+    fn render(text: Label): String { "exact " + text.value }
+    fn render(text: String): String { text }
+    fn test(value: Item): String { read(value) }
+}
+fn render<T: Renderer>(tool: T): String { tool.render(Label("through constraint")) }
+fn receiver(): Tool<Int> { print("receiver"); Tool(42) }
+fn main(): Unit {
+    print(receiver().read(8))
+    val tool = Tool(0)
+    print(tool.test(1))
+    print(tool.read(true))
+    print(Tool<Int>.read("static"))
+    print(Tool<Int>.read(9))
+    print(tool.render(Label("direct")))
+    print(render(tool))
+}
+''', b'receiver\nitem\nitem\ngeneric\nstatic\n7\nexact direct\nconverted through constraint\n')
+
     def test_static_rejections(self):
         types = "struct Point(var x: Int)\nclass Box(val point: Point, var value: Int)\n"
         for body, code in (("val p = Point(1); p.x = 2", "LYT0004"),

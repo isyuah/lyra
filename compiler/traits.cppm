@@ -24,7 +24,7 @@ struct RequiredMethod {
 class StructuralContracts {
     using Shape = std::map<std::string, RequiredMethod>;
     std::map<std::string, Shape> traits;
-    std::map<std::size_t, const Shape*> variables;
+    std::map<std::size_t, std::string> variables;
 
     static std::string describe(const std::string& name, const RequiredMethod& method, const auto& typeName) {
         std::string text = method.asynchronous ? "async fn " : "fn ";
@@ -55,14 +55,23 @@ public:
     void bind(Type variable, const Identifier& bound, const Source& source) {
         auto trait = traits.find(bound.text);
         if (trait == traits.end()) throw at(source, bound.span, "LYG0005", "找不到结构约束 trait：" + bound.text);
-        variables.emplace(variable.id, &trait->second);
+        variables.emplace(variable.id, trait->first);
+    }
+
+    const std::string* constraint(Type variable) const {
+        auto found = variables.find(variable.id);
+        return found == variables.end() ? nullptr : &found->second;
+    }
+
+    const RequiredMethod* member(const std::string& trait, const std::string& name) const {
+        const auto& shape = traits.at(trait);
+        auto found = shape.find(name);
+        return found == shape.end() ? nullptr : &found->second;
     }
 
     const RequiredMethod* member(Type variable, const std::string& name) const {
-        auto bound = variables.find(variable.id);
-        if (bound == variables.end()) return nullptr;
-        auto found = bound->second->find(name);
-        return found == bound->second->end() ? nullptr : &found->second;
+        auto bound = constraint(variable);
+        return bound ? member(*bound, name) : nullptr;
     }
 
     void require(const Function& target, std::span<const Type> arguments, const Source& use, Span site, const auto& concrete, const auto& typeName) const {
@@ -72,7 +81,7 @@ public:
                 std::optional<RequiredMethod> found;
                 if (actual.kind == Type::Variable) {
                     if (auto method = member(actual, name)) found = *method;
-                } else found = concrete(actual, name);
+                } else found = concrete(actual, name, expected);
                 if (found && *found == expected) continue;
                 auto reason = found ? "，实际为 " + describe(name, *found, typeName) : "，缺少可见方法 " + name;
                 throw at(use, site, "LYG0005", typeName(actual) + " 不满足 " + bound.trait.text + "：需要 " + describe(name, expected, typeName) + reason);
