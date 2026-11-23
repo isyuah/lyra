@@ -14,7 +14,7 @@
 |---|---|
 | 创建与启动 | `lyraTaskCreate(step, frame)` 只记录入口和已求值的帧，不执行用户代码。首次 `lyraTaskStart(domain, task)` 入队并建强根，至终态才撤销。后来再次启动不重跑、不改域。 |
 | 推进域 | `lyraDomainRun(domain)` 在该域驱动 libuv，串行调用就绪的 `step(task, frame)`，返回本次执行的步数。没有就绪任务/活动 libuv 工作时返回；手动门闩未放行的任务可以仍挂起。只在回调外泵循环，域中没有存活任务时再 `lyraDomainDestroy`。 |
-| 等待 | 正在运行的 `step` 调用 `lyraTaskAwait(self, target)`。冷目标在等待者域启动；活跃目标保持原域。返回 `0` 时先前保存好恢复点的回调须立即返回；被唤醒时重新检查取消/结果。返回 `1` 时按 `lyraTaskState(target)` 分别处理完成、失败、取消，再用 `lyraTaskOutcome` 读载荷。等待者总是入**自身**域的队列。 |
+| 等待 | 正在运行的 `step` 调用 `lyraTaskAwait(self, target)`。冷目标在等待者域启动；活跃目标保持原域。返回 `0` 时保存过恢复点的回调须立即返回；返回 `1` 时按 `lyraTaskState(target)` 分支，成功只读 `lyraTaskOutcome`，失败读 `lyraTaskException`。等待者总是入**自身**域的队列。 |
 | 手动门闩 | 设置恢复点后调用 `lyraTaskSuspend(self)` 并返回；域线程可用 `lyraTaskWake(task)` 解除本次门闩。真实外部事件应在清理时撤销旧回调，不把上一轮的通知复用到下一次挂起。 |
 | 完成 | `lyraTaskComplete(self, value)`、`lyraTaskFail(self, error)` 等已登记子任务完成后，逆序执行剩余清理，再发布终态并唤醒等待者。`Unit` 可用空指针；其他载荷应存在可追踪的受管理存储中，不能传短命的栈地址。句柄存活时，多次等到同一终态；需要按值复制的结果由调用端读取。 |
 | 取消 | `lyraTaskRequestCancel(task)` 设置请求，唤醒可取消的挂起点。回调在恢复入口用 `lyraTaskCancelRequested` 检查；`lyraTaskFinishCancelled` 与其余退出路径共用任务清理。取消一个等待者会撤销它自己的订阅，不替它取消别人已启动的任务。 |
@@ -34,6 +34,14 @@ LLVM 后端给每个异步函数生成一个用于创建冷 Task 的普通函数
 `defer expr` 或 `defer { ... }` 在执行到该语句时登记回调，退出词法块时后进先出。回调捕获绑定，`defer print(number)` 打印清理时的 `number`；块的返回值则在执行清理前求值。正常块尾、`return`、`?`、`break` 和 `continue` 均按退出范围清理。`defer` 内不能 `await`、`spawn` 或请求取消；同步的阻塞 Worker 也可以在自己的线程上登记清理。
 
 异步函数退出时尚未运行的清理保存在堆帧，等本任务所有子任务（含不可中断的 C 工作）安全结束后执行，再把终态交给等待者。`task.cancel()` 只能直接写在 `async fn` 中；重复请求不重复清理，不会连带取消兄弟。对冷 Task 请求取消后再启动，不会进入函数体，也就不会运行体内未登记的清理。语言层用[源码用例](../tests/defer_cli.py)验证逆序、绑定更新、跨挂起 GC、工作线程中 SQLite 句柄释放与重复等待。
+
+### 普通异常如何跨过 `await`？
+
+生成的状态机使用 `lyraTaskAwaitValue`：挂起时返回调度循环，成功时读取结果盒，普通异常时从独立的错误槽进入当前 `catch`。被等待者取消时则直接收尾，不经过普通 `catch`。`lyraTaskFail` 接受 `LyraException`，原生错误需显式适配；不把 C 指针当异常，不让 C++ 异常或 `longjmp` 越过 Worker 回调。Worker 通过异常输出参数交回失败，`defer` 回调直接返回异常或空指针。
+
+每次调用清理前先弹栈。正常退出时第一个清理失败成为主异常；已有异常或取消时保留原主因，后续清理仍运行，所有附加原因按实际执行顺序保留。任务缓存不可变的失败记录，附带抛出及创建位置；每个等待者只给自己的异常视图附加 `await` 位置。未处理的普通异常到达根时打印原因链并非零退出。[源码用例](../tests/exceptions_cli.py)覆盖跨挂起重抛、Worker、`?` 和取消收尾。
+
+[多域原生测试](../tests/runtime_task_errors.cpp)用明确放行的失败任务区分三种情况：直接等待冷任务、在失败发布前等待自己 `spawn` 的孩子、从另一组或发布后才观察它。只有前两种可在本地捕获后让所属组正常结束。单独取消孩子不会取消兄弟；因无人观察的异常而取消的兄弟，其清理失败附在组的原失败之后。
 
 ### 在 Worker 执行同步代码
 
@@ -65,15 +73,15 @@ async fn main(): Unit {
 
 **任务上下文：**[std.task](../std/task/README.md) 用普通泛型函数提供隐式 trace 和 deadline。冷 Task 创建时没有快照，首次启动时从所有者继承；重复等待不重设。阻塞请求在提交时保留不可变快照，Worker 仅在调用期间可读，不能登记超时或 socket watch。每个更严格的作用域在所属事件循环安装单调时钟定时器；继承同一期限的子任务由上层传播取消，无需另建定时器。只有已经激活的所有者承担收尾责任。[源码用例](../tests/context_cli.py)用单 Worker 和 FIFO 固定等待顺序；[原生用例](../tests/runtime_context.cpp)验证任务局部的 GC 保活、提前结束时撤掉定时器及已挂起任务到期后被唤醒。
 
-**当前边界：**多个串行域由同一主线程驱动，原生测试验证跨域等待与恢复归属。显式 CPU 并行域、普通异常的抛出、异步原因链与清理异常仍需各自的端到端验收。
+**当前边界：**多个串行域由同一主线程驱动，原生测试验证跨域等待与恢复归属。显式 CPU 并行域仍需端到端验收。
 
 ## 独立验证（Linux）
 
-以下两个原生测试需要 Ubuntu `libgc-dev`、`libuv1-dev`、Clang 18。运行时各源码分别生成归档成员；纯整数程序不引用 `managed`/`tasks` 符号，即使链接命令列出带 `--as-needed` 的两库，ELF 也无需它们。用 GC/Task 的程序可显式动态链接两库，或在目标构建环境中静态打入相应归档再检查 `DT_NEEDED`。
+以下原生测试需要 Ubuntu `libgc-dev`、`libuv1-dev`、Clang 18。它们使用系统提供的 GC/libuv；发布程序则由编译驱动静态打入所需的运行时归档，可用 `readelf -d` 检查目标产物的 `DT_NEEDED`。
 
 ```sh
 out=$(mktemp -d)
-clang-18 -std=c++23 -O2 -I runtime runtime/managed.cpp tests/runtime_managed.cpp $(pkg-config --cflags --libs bdw-gc) -o "$out/managed"
+clang++-18 -std=c++23 -O2 -I runtime runtime/managed.cpp runtime/exceptions.cpp runtime/strings.cpp tests/runtime_managed.cpp $(pkg-config --cflags --libs bdw-gc) -o "$out/managed"
 clang++-18 -std=c++23 -O2 -I runtime runtime/managed.cpp runtime/tasks.cpp runtime/strings.cpp runtime/context.cpp runtime/exceptions.cpp tests/runtime_tasks.cpp $(pkg-config --cflags --libs bdw-gc libuv) -o "$out/tasks"
 "$out/managed" && "$out/tasks" && UV_THREADPOOL_SIZE=1 "$out/tasks"
 readelf -d "$out/tasks" | grep NEEDED

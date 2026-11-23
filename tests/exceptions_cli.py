@@ -1,0 +1,178 @@
+import json
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import unittest
+
+
+COMPILER = Path(sys.argv.pop(1)).resolve()
+
+
+class Exceptions(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.package = Path(directory.name)
+        (self.package / 'src').mkdir()
+        (self.package / 'lyra.json5').write_text('{name:"example/errors", version:"1.0.0"}')
+        self.source = self.package / 'src/main.ly'
+
+    def executable(self, source, stdout, errors=()):
+        self.source.write_text(source, encoding='utf-8')
+        for mode in ([], ['--release']):
+            with self.subTest(mode=mode):
+                app = self.package / 'app'
+                build = subprocess.run([COMPILER, 'build', self.package, *mode, '-o', app], capture_output=True, text=True, timeout=30)
+                self.assertEqual(build.returncode, 0, build.stderr)
+                result = subprocess.run([app], capture_output=True, text=True, timeout=15)
+                self.assertEqual(result.stdout.splitlines(), stdout)
+                self.assertEqual(result.returncode != 0, bool(errors), result.stderr)
+                if not errors:
+                    self.assertEqual(result.stderr, '')
+                cursor = 0
+                for text in errors:
+                    found = result.stderr.find(text, cursor)
+                    self.assertNotEqual(found, -1, result.stderr)
+                    cursor = found + len(text)
+
+    def test_nested_calls_catch_expression_rethrow_and_result(self):
+        self.executable('''fn leaf(): Int { throw Exception("boom") }
+fn relay<T>(value: T): Int { leaf() }
+fn catchAndRethrow(): Int { try { relay(8) } catch { gcCollect(); throw } }
+fn returned(): Result<Int,String> { Err("normal value") }
+fn main(): Unit {
+    val value = try { catchAndRethrow() } catch error: Exception { print(error.message); 42 }
+    print(value)
+    val result = try { returned() } catch { Ok(9) }
+    print(match result { Err(text) => text, Ok(_) => "wrong" })
+    print(try { 73 } catch { 4 })
+    val original = Exception(message: "same text")
+    try { throw original } catch error: Exception {
+        if error == original && error != Exception("same text") { print("same exception") }
+    }
+}''', ['boom', '42', 'normal value', '73', 'same exception'])
+
+    def test_unhandled_rethrow_reports_original_location_and_call_chain(self):
+        self.executable('''fn original(): Unit {
+    throw Exception("original error")
+}
+fn again(): Unit { try { original() } catch { throw } }
+fn main(): Unit { again(); print(99) }
+''', [], ['Exception: original error', 'throw at ', 'main.ly:2:5', 'call at ', 'main.ly:4:', 'call at ', 'main.ly:5:'])
+
+    def test_exception_during_default_or_implicit_stops_call(self):
+        self.executable('''struct Bad()
+struct Good()
+implicit (value: Bad): Good { throw Exception("conversion") }
+fn mark(): Int { print("extra"); 1 }
+fn missing(): Int { throw Exception("default") }
+fn call(a: Int = missing(), b: Int = mark()): Unit { print("body") }
+fn take(g: Good): Unit { print("taken") }
+fn failing(): Result<Int,Bad> { Err(Bad()) }
+fn propagating(): Result<Int,Good> { Ok(failing()?) }
+fn main(): Unit {
+    try { call() } catch error: Exception { print(error.message) }
+    try { take(Bad()) } catch error: Exception { print(error.message) }
+    try { propagating(); } catch error: Exception { print(error.message) }
+}''', ['default', 'conversion', 'conversion'])
+
+    def test_return_cleanup_can_be_caught_before_enclosing_scope_exits(self):
+        self.executable('''fn choose(): Int {
+    defer print("outer")
+    try {
+        defer print("inner")
+        defer { throw Exception("cleanup") }
+        return 1
+    } catch problem: Exception { print(problem.message) }
+    print("after catch")
+    2
+}
+fn main(): Unit { print(choose()) }
+''', ['inner', 'cleanup', 'after catch', 'outer', '2'])
+
+    def test_cleanup_preserves_original_and_all_additional_causes(self):
+        self.executable('''fn cleanup(message: String): Unit { print(message); throw Exception(message) }
+fn main(): Unit {
+    defer cleanup("first registered")
+    defer cleanup("last registered")
+    throw Exception("primary")
+}''', ['last registered', 'first registered'], ['Exception: primary', 'main.ly:5:5', 'suppressed Exception: last registered', 'suppressed Exception: first registered'])
+
+    def test_await_handles_failure_without_recancelling_the_group(self):
+        self.executable('''async fn bad(): Int { print("once"); throw Exception("child") }
+async fn nested(): Int { await bad() }
+async fn later(): Unit { print("sibling") }
+async fn main(): Unit {
+    val child = nested()
+    try { await child; } catch problem: Exception { print(problem.message) }
+    try { await child; } catch problem: Exception { print(problem.message) }
+    await later()
+    val worker: Task<Int> = blocking { defer print("worker cleanup"); throw Exception("worker") }
+    try { await worker; } catch problem: Exception { print(problem.message) }
+}''', ['once', 'child', 'child', 'sibling', 'worker cleanup', 'worker'])
+
+    def test_unobserved_spawn_and_await_sites_reach_entry(self):
+        self.executable('''async fn bad(): Unit { throw Exception("child") }
+async fn group(): Unit { await bad() }
+async fn main(): Unit { spawn group(); }
+''', [], ['Exception: child', 'throw at ', 'main.ly:1:', 'main.ly:2:', 'await at ', 'main.ly:2:', 'main.ly:3:'])
+
+    def test_rethrow_after_suspension_preserves_the_observed_exception(self):
+        self.executable('''async fn checkpoint(): Unit { gcCollect() }
+async fn original(): Int { throw Exception("from child") }
+async fn relay(): Int {
+    try { await original() } catch error: Exception {
+        await checkpoint()
+        print(error.message)
+        throw
+    }
+}
+async fn main(): Unit { print(await relay()) }
+''', ['from child'], ['Exception: from child', 'main.ly:2:', 'await at ', 'main.ly:4:', 'await at ', 'main.ly:10:'])
+
+    def test_cancel_skips_catch_and_retains_cleanup_failure(self):
+        self.executable('''async fn leaf(): Unit { print("too late") }
+async fn victim(): Unit {
+    defer { print("cleanup"); throw Exception("failure during cancellation") }
+    try { await leaf() } catch { print("caught cancellation in child") }
+}
+async fn cancel(child: Task<Unit>): Unit { child.cancel() }
+async fn main(): Unit {
+    val child = spawn victim()
+    spawn cancel(child)
+    try { await child } catch { print("caught cancellation in parent") }
+}
+''', ['cleanup'], ['cancelled', 'failure during cancellation', 'main.ly:3:'])
+
+    def test_result_early_return_runs_cleanups_and_is_replaced_by_first_failure(self):
+        self.executable('''fn read(): Result<Int,String> { Err("value") }
+fn fail(message: String): Unit { print(message); throw Exception(message) }
+fn call(): Result<Int,String> {
+    defer fail("older cleanup")
+    defer fail("newer cleanup")
+    Ok(read()?)
+}
+fn main(): Unit { call(); }
+''', ['newer cleanup', 'older cleanup'], ['Exception: newer cleanup', 'main.ly:2:', 'suppressed Exception: older cleanup'])
+
+    def test_diagnostics_reject_illegal_rethrow_and_types(self):
+        cases = (
+            ('fn main(): Unit { throw }', 'LYE0001', 'throw'),
+            ('fn main(): Unit { throw 5 }', 'LYT0001', '5'),
+            ('fn main(): Unit { try {} catch problem: Int {} }', 'LYE0002', 'Int'),
+            ('fn main(): Unit { try {} catch problem: Exception if true {} }', 'LYE0002', 'if'),
+            ('fn main(): Unit { try {} catch problem: Exception {}; print(problem.message) }', 'LYN0001', 'problem.message'),
+            ('fn main(): Unit { try {} catch { defer { throw } } }', 'LYE0001', 'throw'),
+        )
+        for source, code, token in cases:
+            with self.subTest(source=source):
+                self.source.write_text(source, encoding='utf-8')
+                result = subprocess.run([COMPILER, 'check', self.package, '--diagnostics=json'], capture_output=True, text=True, timeout=10)
+                self.assertNotEqual(result.returncode, 0)
+                item, = json.loads(result.stderr)
+                self.assertEqual((item['code'], item['range']['start']['offset']), (code, source.index(token)), item)
+
+
+if __name__ == '__main__':
+    unittest.main()

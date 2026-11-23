@@ -56,7 +56,7 @@ public:
         Kind kind;
         if (isLetter(current) || isDigit(current)) {
             while (offset < text.size() && (isLetter(text[offset]) || isDigit(text[offset]))) ++offset;
-            constexpr std::string_view keywords[] = {"fn", "val", "var", "if", "else", "while", "return", "break", "continue", "true", "false", "struct", "class", "pub", "import", "as", "async", "await", "spawn", "extern", "match", "null", "implicit", "defer"};
+            constexpr std::string_view keywords[] = {"fn", "val", "var", "if", "else", "while", "return", "break", "continue", "true", "false", "struct", "class", "pub", "import", "as", "async", "await", "spawn", "extern", "match", "null", "implicit", "defer", "throw", "try", "catch"};
             auto word = text.substr(start, offset - start);
             kind = isDigit(current) ? Kind::Number : std::ranges::find(keywords, word) == std::end(keywords) ? Kind::Name : Kind::Keyword;
         } else if (current == '"') {
@@ -495,6 +495,27 @@ private:
             return add(item.span, text(item) == "true");
         }
         if (is("null") || is("None")) return add(consume().span, EmptyOption{});
+        if (is("throw")) {
+            auto site = consume().span;
+            if (token.newlineBefore || is(";") || is("}") || is(")") || is(",")) return add(site, Raise{site, {}});
+            auto value = expression(inParens, 1, trailingBlock);
+            return add({start, nodes[value].span.end}, Raise{site, value});
+        }
+        if (is("try")) {
+            consume();
+            auto body = block();
+            require("catch");
+            std::optional<CatchBinding> binding;
+            if (!is("{")) {
+                auto name = identifier();
+                require(":");
+                binding = CatchBinding{std::move(name), type()};
+            }
+            if (is("if")) throw at(source, token.span, "LYE0002", "当前尚不支持 catch 过滤条件");
+            auto handler = block();
+            if (is("catch")) throw at(source, token.span, "LYE0002", "Exception 兜底捕获之后不能再写 catch 分支");
+            return add({start, nodes[handler].span.end}, Attempt{body, handler, std::move(binding)});
+        }
         if (is("match")) {
             consume();
             Match match{expression(false, 1, false), {}};

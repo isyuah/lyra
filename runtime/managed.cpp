@@ -68,12 +68,13 @@ void lyraCleanupPush(LyraCleanup **stack, LyraCleanupCall call, void *environmen
     *stack = ::new (lyraGcAlloc(sizeof(LyraCleanup))) LyraCleanup{call, environment, *stack};
 }
 
-void lyraCleanupUntil(LyraCleanup **stack, const LyraCleanup *mark) {
+const LyraException *lyraCleanupUntil(LyraCleanup **stack, const LyraCleanup *mark, const LyraException *primary) {
     while (*stack != mark) {
         auto *top = *stack;
         *stack = top->next;
-        top->call(top->environment);
+        if (auto *failure = top->call(top->environment)) primary = lyraExceptionSuppress(primary, failure);
     }
+    return primary;
 }
 
 int lyraGcEnterWorker() {

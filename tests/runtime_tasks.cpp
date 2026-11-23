@@ -1,4 +1,5 @@
 #include "managed.h"
+#include "strings.h"
 #include "tasks.h"
 
 #include <pthread.h>
@@ -34,7 +35,7 @@ void produce(LyraTask *self, void *storage) {
         frame->captured->count = 173;
         lyraTaskSuspend(self);
     } else if (frame->shouldFail) {
-        lyraTaskFail(self, frame->captured);
+        lyraTaskFail(self, lyraExceptionCreate(lyraStringFromBytes("producer", 8)));
     } else {
         lyraTaskComplete(self, frame->captured);
     }
@@ -61,7 +62,7 @@ void observe(LyraTask *self, void *storage) {
     }
     if (!lyraTaskAwait(self, frame->target)) return;
     if (lyraTaskState(frame->target) == LYRA_TASK_FAILED) {
-        lyraTaskFail(self, lyraTaskOutcome(frame->target));
+        lyraTaskFail(self, lyraTaskException(frame->target));
         return;
     }
     check(lyraTaskState(frame->target) == LYRA_TASK_COMPLETED, "unexpected observed outcome");
@@ -197,7 +198,7 @@ struct DisconnectCase {
     bool observed{}, closed{};
 };
 
-void *queuedClosure(void *storage) {
+void *queuedClosure(void *storage, const LyraException **) {
     auto *test = static_cast<DisconnectCase *>(storage);
     check(!lyraTaskWatchDisconnect(test->sockets[0]), "worker shared the caller's current task");
     close(test->sockets[1]);
@@ -227,11 +228,12 @@ void observeDisconnect(LyraTask *self, void *storage) {
 void watchedHandler(LyraTask *self, void *storage) {
     auto *test = static_cast<DisconnectCase *>(storage);
     if (!test->blocked) {
-        lyraCleanupPush(&test->cleanups, [](void *environment) {
+        lyraCleanupPush(&test->cleanups, [](void *environment) -> const LyraException * {
             auto *closing = static_cast<DisconnectCase *>(environment);
             check(closing->gate.returned && closing->observed && !closing->closed, "defer closed a resource before opaque native work ended");
             close(closing->sockets[0]);
             closing->closed = true;
+            return nullptr;
         }, test);
         check(lyraTaskWatchDisconnect(test->sockets[0]), "owner could not watch a socket");
         test->blocked = lyraTaskBlocking(queuedClosure, test);
@@ -246,7 +248,7 @@ void watchedHandler(LyraTask *self, void *storage) {
 struct GroupCase {
     LyraTask *early;
     unsigned order;
-    Counter causes[2];
+    const LyraException *causes[2];
     LyraCleanup *cleanups;
     unsigned cleaned;
 };
@@ -255,21 +257,22 @@ void firstFailure(LyraTask *self, void *storage) {
     auto *test = static_cast<GroupCase *>(storage);
     if (!lyraTaskCancelRequested(self)) { lyraTaskSuspend(self); return; }
     check(++test->order == 2, "unexpected failure order");
-    lyraTaskFail(self, &test->causes[0]);
+    lyraTaskFail(self, test->causes[0]);
 }
 
 void secondFailure(LyraTask *self, void *storage) {
     auto *test = static_cast<GroupCase *>(storage);
     check(++test->order == 1, "second child did not fail first");
-    lyraTaskFail(self, &test->causes[1]);
+    lyraTaskFail(self, test->causes[1]);
 }
 
 void failGroup(LyraTask *self, void *storage) {
     auto *test = static_cast<GroupCase *>(storage);
-    lyraCleanupPush(&test->cleanups, [](void *environment) {
+    lyraCleanupPush(&test->cleanups, [](void *environment) -> const LyraException * {
         auto *closing = static_cast<GroupCase *>(environment);
         check(closing->order == 2, "failure cleanup did not wait for the other child");
         ++closing->cleaned;
+        return nullptr;
     }, test);
     test->early = lyraTaskSpawn(self, lyraTaskCreate(firstFailure, test));
     lyraTaskSpawn(self, lyraTaskCreate(secondFailure, test));
@@ -324,7 +327,7 @@ int main() {
     lyraDomainRun(origin);
     lyraTaskWake(failure);
     lyraDomainRun(origin);
-    check(lyraTaskState(failedWaiter) == LYRA_TASK_FAILED && lyraTaskOutcome(failedWaiter) == lyraTaskOutcome(failure), "await lost the failure identity");
+    check(lyraTaskState(failedWaiter) == LYRA_TASK_FAILED && lyraTaskException(failedWaiter) == lyraTaskException(failure), "await lost the failure identity");
 
     unsigned counter = 0;
     auto *sibling = lyraTaskCreate(increment, &counter);
@@ -373,12 +376,14 @@ int main() {
     pthread_mutex_destroy(&disconnected.gate.lock);
 
     GroupCase group{};
+    group.causes[0] = lyraExceptionCreate(lyraStringFromBytes("first", 5));
+    group.causes[1] = lyraExceptionCreate(lyraStringFromBytes("second", 6));
     auto *parent = lyraTaskCreate(failGroup, &group);
     lyraTaskKeepCleanups(parent, &group.cleanups);
     lyraTaskStart(origin, parent);
     lyraDomainRun(origin);
     check(lyraTaskState(parent) == LYRA_TASK_FAILED && lyraTaskFailureCount(parent) == 2 && group.cleaned == 1, "unobserved failure or group cleanup was lost");
-    check(lyraTaskFailureAt(parent, 0) == &group.causes[0] && lyraTaskFailureAt(parent, 1) == &group.causes[1],
+    check(lyraTaskFailureAt(parent, 0) == group.causes[0] && lyraTaskFailureAt(parent, 1) == group.causes[1],
           "failures were reported by completion instead of registration");
     lyraDomainDestroy(other);
     lyraDomainDestroy(origin);

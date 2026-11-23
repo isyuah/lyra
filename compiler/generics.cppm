@@ -129,6 +129,7 @@ Function specializeGeneric(const Function& declaration, const std::vector<std::s
     for (auto& parameter : result.parameters) substitute(parameter.type);
     for (auto& expression : result.expressions) {
         if (auto binding = std::get_if<Binding>(&expression.node); binding && binding->annotation) substitute(*binding->annotation);
+        if (auto attempt = std::get_if<Attempt>(&expression.node); attempt && attempt->binding) substitute(attempt->binding->type);
         if (auto call = std::get_if<Call>(&expression.node)) for (auto& type : call->typeArguments) substitute(type);
     }
     result.name.text += '<';

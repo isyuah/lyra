@@ -14,6 +14,7 @@ import lyra.check;
 import lyra.async;
 import lyra.foreign;
 import lyra.collections;
+import lyra.exceptions;
 
 namespace lyra {
 namespace {
@@ -45,7 +46,7 @@ struct Layouts {
         case Type::Int: return builder.getInt64Ty();
         case Type::Bool: return builder.getInt1Ty();
         case Type::Unit: case Type::Never: return builder.getInt8Ty();
-        case Type::String: case Type::Task: case Type::CPtr: case Type::List: return builder.getPtrTy();
+        case Type::String: case Type::Task: case Type::CPtr: case Type::List: case Type::Exception: return builder.getPtrTy();
         case Type::Variable: llvm_unreachable("abstract type reached LLVM lowering");
         case Type::Record: return reference(type) ? static_cast<llvm::Type*>(builder.getPtrTy()) : objects[type.id];
         case Type::Option: return llvm::StructType::get(builder.getContext(), {builder.getInt1Ty(), native(builder, program.sumTypes[type.id].success)});
@@ -64,10 +65,14 @@ struct Emitter {
     const Layouts& layouts;
     Builder builder{module.getContext()};
     std::vector<Value> locals{};
-    struct Loop { Label test, done; Value cleanups; };
+    struct Loop { Label test, done; Value cleanups; std::size_t handlers; };
     std::vector<Loop> loops{};
     std::optional<ExprId> worker{};
     llvm::AllocaInst* cleanupHead{};
+    llvm::AllocaInst* errorSlot{};
+    struct Handler { Label landing; Value mark; };
+    std::vector<Handler> handlers{};
+    std::vector<Value> caught{};
 
     Label label(const char* name) { return llvm::BasicBlock::Create(module.getContext(), name, native); }
     bool live() const { return builder.GetInsertBlock() != nullptr; }
@@ -86,10 +91,57 @@ struct Emitter {
         return deferred() ? Type{Type::Unit} : layouts.program.taskResults[rawType(*worker).id];
     }
     Value cleanupMark() { return cleanupHead ? builder.CreateLoad(builder.getPtrTy(), cleanupHead) : nullptr; }
-    void unwind(Value mark = nullptr) { if (cleanupHead) cleanupUntil(builder, cleanupHead, mark); }
+    bool asyncBody() const { return !worker && fn.syntax.isAsync; }
+
+    void propagate(Value error, std::size_t depth) {
+        if (depth) {
+            const auto& handler = handlers[depth - 1];
+            if (cleanupHead) error = cleanupUntil(builder, cleanupHead, handler.mark, error);
+            builder.CreateStore(error, errorSlot);
+            builder.CreateBr(handler.landing);
+        } else if (asyncBody()) {
+            asyncFailure(builder, error);
+            builder.CreateUnreachable();
+        } else {
+            if (cleanupHead) error = cleanupUntil(builder, cleanupHead, nullptr, error);
+            builder.CreateStore(error, native->getArg(native->arg_size() - 1));
+            builder.CreateRet(llvm::Constant::getNullValue(native->getReturnType()));
+        }
+        end();
+    }
+
+    void guard(Value error, std::size_t depth, Span site = {}, const char* role = nullptr) {
+        auto failed = label("exception"), normal = label("no.exception");
+        builder.CreateCondBr(builder.CreateIsNotNull(error), failed, normal);
+        builder.SetInsertPoint(failed);
+        if (role) error = NativeExceptions{builder}.locate(error, source, site, role);
+        propagate(error, depth);
+        builder.SetInsertPoint(normal);
+    }
+
+    void unwind(Value mark, std::size_t depth) {
+        if (cleanupHead) guard(cleanupUntil(builder, cleanupHead, mark), depth);
+    }
+
+    void exitHandlers(std::size_t remain) {
+        for (auto depth = handlers.size(); depth > remain; --depth) unwind(handlers[depth - 1].mark, depth);
+    }
+
     void leave(Value value) {
-        if (worker || !fn.syntax.isAsync) unwind();
+        exitHandlers(0);
+        if (!asyncBody()) unwind(nullptr, 0);
         builder.CreateRet(value);
+    }
+
+    Value callFunction(std::size_t target, llvm::ArrayRef<Value> args, Span site) {
+        const auto& syntax = layouts.program.functions[target].syntax;
+        if (syntax.foreignSymbol) return builder.CreateCall(functions[target], args);
+        if (syntax.isAsync) return NativeExceptions{builder}.created(builder.CreateCall(functions[target], args), source, site);
+        std::vector<Value> nativeArgs(args.begin(), args.end());
+        nativeArgs.push_back(errorSlot);
+        auto result = builder.CreateCall(functions[target], nativeArgs);
+        guard(builder.CreateLoad(builder.getPtrTy(), errorSlot), handlers.size(), site, "call");
+        return result;
     }
 
     Value cell(std::size_t slot) {
@@ -107,6 +159,7 @@ struct Emitter {
     void run(std::optional<ExprId> workerId = {}) {
         worker = workerId;
         builder.SetInsertPoint(label("entry"));
+        errorSlot = NativeExceptions{builder}.slot();
         if (std::ranges::find(fn.cleanupOwners, worker) != fn.cleanupOwners.end()) cleanupHead = cleanupStack(builder);
         locals.resize(fn.locals.size());
         for (std::size_t slot = 0; slot < fn.locals.size(); ++slot) {
@@ -114,6 +167,7 @@ struct Emitter {
             if (local.worker == worker) locals[slot] = builder.CreateAlloca(local.captured ? builder.getPtrTy() : layouts.native(builder, local.type));
         }
         for (auto& arg : native->args()) {
+            if (!asyncBody() && arg.getArgNo() + 1 == native->arg_size()) break;
             if (worker) {
                 auto slot = fn.expressions[*worker].captures[arg.getArgNo()];
                 locals[slot] = builder.CreateAlloca(builder.getPtrTy());
@@ -136,7 +190,7 @@ struct Emitter {
         auto value = std::visit([&](const auto& node) { return emitNode(id, node); }, fn.syntax.expressions[id].node);
         const auto& info = fn.expressions[id];
         if (!live() || !info.sourceType) return value;
-        return info.conversion ? builder.CreateCall(functions[*info.conversion], {value}) : makeSum(info.type, SumTag::Some, value);
+        return info.conversion ? callFunction(*info.conversion, {value}, fn.syntax.expressions[id].span) : makeSum(info.type, SumTag::Some, value);
     }
 
     Value emitNode(ExprId, std::int64_t value) { return builder.getInt64(value); }
@@ -158,7 +212,10 @@ struct Emitter {
     Value emitNode(ExprId id, const TaskOp& op) {
         auto task = emit(op.operand);
         if (!live()) return unit();
-        return op.spawn ? asyncSpawn(builder, task) : asyncAwait(builder, layouts.native(builder, rawType(id)), task);
+        if (op.spawn) return asyncSpawn(builder, task);
+        auto result = asyncAwait(builder, layouts.native(builder, rawType(id)), task, errorSlot);
+        guard(builder.CreateLoad(builder.getPtrTy(), errorSlot), handlers.size(), op.site, "await");
+        return result;
     }
 
     std::pair<BlockingCode, std::vector<Value>> closure(ExprId id, Type result, llvm::StringRef suffix) {
@@ -172,7 +229,7 @@ struct Emitter {
 
     Value emitNode(ExprId id, const Blocking&) {
         auto [code, cells] = closure(id, layouts.program.taskResults[rawType(id).id], ".worker");
-        return blockingTask(builder, code, cells);
+        return NativeExceptions{builder}.created(blockingTask(builder, code, cells), source, fn.syntax.expressions[id].span);
     }
 
     Value emitNode(ExprId id, const Deferred&) {
@@ -212,7 +269,7 @@ struct Emitter {
         Value result = nullptr;
         if (target.kind == Type::Result) {
             result = builder.CreateExtractValue(value, payloadSlot(SumTag::Err));
-            if (auto conversion = fn.expressions[id].errorConversion) result = builder.CreateCall(functions[*conversion], {result});
+            if (auto conversion = fn.expressions[id].errorConversion) result = callFunction(*conversion, {result}, propagation.site);
         }
         leave(makeSum(target, target.kind == Type::Option ? SumTag::None : SumTag::Err, result));
         builder.SetInsertPoint(success);
@@ -282,6 +339,7 @@ struct Emitter {
         if (!live()) return unit();
         auto owner = fn.expressions[member.receiver].type;
         if (owner.kind == Type::List) return NativeLists{builder}.size(object);
+        if (owner == Type::Exception) return NativeExceptions{builder}.message(object);
         auto slot = static_cast<unsigned>(fn.expressions[id].target);
         if (!layouts.reference(owner)) return builder.CreateExtractValue(object, slot);
         auto field = builder.CreateStructGEP(layouts.objects[owner.id], object, slot);
@@ -303,7 +361,7 @@ struct Emitter {
             if (!live()) break;
             if (statement.semicolon) tail = unit();
         }
-        if (live() && mark) unwind(mark);
+        if (live() && mark) unwind(mark, handlers.size());
         return rawType(id) == Type::Unit ? unit() : tail;
     }
 
@@ -331,10 +389,10 @@ struct Emitter {
             } else args[slot] = value;
         }
         for (auto slot : info.omittedDefaults) {
-            auto helper = functions[*target->defaultFunctions[slot]];
-            args[slot] = builder.CreateCall(helper, llvm::ArrayRef<Value>(args).take_front(slot));
+            args[slot] = callFunction(*target->defaultFunctions[slot], llvm::ArrayRef<Value>(args).take_front(slot), call.name.span);
         }
         switch (info.callee) {
+            case Callee::Exception: return NativeExceptions{builder}.create(args.front());
             case Callee::TaskCancel:
                 builder.CreateCall(module.getOrInsertFunction("lyraTaskRequestCancel", builder.getVoidTy(), builder.getPtrTy()), args);
                 return unit();
@@ -360,7 +418,7 @@ struct Emitter {
                 for (unsigned slot = 0; slot < args.size(); ++slot) value = builder.CreateInsertValue(value, args[slot], slot);
                 return value;
             }
-            case Callee::Function: return builder.CreateCall(functions[info.target], args);
+            case Callee::Function: return callFunction(info.target, args, call.name.span);
         }
         llvm_unreachable("invalid Lyra callee");
     }
@@ -454,6 +512,10 @@ struct Emitter {
         }
         auto right = emit(binary.right);
         if (!live()) return unit();
+        if (fn.expressions[binary.left].type == Type::Exception) {
+            auto same = NativeExceptions{builder}.same(left, right);
+            return op == Op::Eq ? same : builder.CreateNot(same);
+        }
         if (fn.expressions[binary.left].type == Type::String) {
             if (op == Op::Add) return concatenate(left, right);
             auto pointer = builder.getPtrTy();
@@ -508,7 +570,7 @@ struct Emitter {
         auto body = label("while.body"), done = label("while.end");
         builder.CreateCondBr(condition, body, done);
         builder.SetInsertPoint(body);
-        loops.push_back({test, done, cleanupMark()});
+        loops.push_back({test, done, cleanupMark(), handlers.size()});
         emit(loop.body);
         loops.pop_back();
         if (live()) builder.CreateBr(test);
@@ -523,9 +585,42 @@ struct Emitter {
         return unit();
     }
 
+    Value emitNode(ExprId, const Raise& raise) {
+        auto error = raise.value ? emit(*raise.value) : caught.back();
+        if (live()) propagate(raise.value ? NativeExceptions{builder}.locate(error, source, raise.site) : error, handlers.size());
+        return unit();
+    }
+
+    Value emitNode(ExprId id, const Attempt& attempt) {
+        auto landing = label("catch"), done = label("try.end");
+        handlers.push_back({landing, cleanupMark()});
+        auto value = emit(attempt.body);
+        handlers.pop_back();
+        auto normal = builder.GetInsertBlock();
+        if (normal) builder.CreateBr(done);
+        builder.SetInsertPoint(landing);
+        auto error = builder.CreateLoad(builder.getPtrTy(), errorSlot);
+        builder.CreateStore(NativeExceptions{builder}.none(), errorSlot);
+        if (attempt.binding) initialize(fn.expressions[id].target, error);
+        caught.push_back(error);
+        auto fallback = emit(attempt.handler);
+        caught.pop_back();
+        auto handled = builder.GetInsertBlock();
+        if (handled) builder.CreateBr(done);
+        if (!normal && !handled) { done->eraseFromParent(); end(); return unit(); }
+        builder.SetInsertPoint(done);
+        auto type = rawType(id);
+        if (type == Type::Unit) return unit();
+        auto result = builder.CreatePHI(layouts.native(builder, type), 2);
+        if (normal) result->addIncoming(value, normal);
+        if (handled) result->addIncoming(fallback, handled);
+        return result;
+    }
+
     Value emitNode(ExprId, Jump jump) {
-        auto [test, done, mark] = loops.back();
-        unwind(mark);
+        auto [test, done, mark, depth] = loops.back();
+        exitHandlers(depth);
+        unwind(mark, depth);
         builder.CreateBr(jump == Jump::Break ? done : test);
         end();
         return unit();
@@ -543,6 +638,7 @@ std::unique_ptr<llvm::Module> lower(const CheckedModule& program, const std::vec
     for (const auto& fn : program.functions) {
         std::vector<llvm::Type*> params;
         for (std::size_t index = 0; index < fn.syntax.parameters.size(); ++index) params.push_back(layouts.native(builder, fn.locals[index].type));
+        if (!fn.syntax.isAsync && !fn.syntax.foreignSymbol) params.push_back(builder.getPtrTy());
         auto signature = llvm::FunctionType::get(fn.syntax.isAsync ? builder.getPtrTy() : layouts.native(builder, fn.result), params, false);
         functions.push_back(llvm::Function::Create(signature, llvm::Function::InternalLinkage, "lyra.fn." + fn.syntax.name.text, *module));
     }
@@ -565,10 +661,22 @@ std::unique_ptr<llvm::Module> lower(const CheckedModule& program, const std::vec
     builder.SetInsertPoint(llvm::BasicBlock::Create(context, "entry", main));
     if (commandLine) builder.CreateCall(module->getOrInsertFunction("lyraIoSetArgs", builder.getVoidTy(), builder.getInt32Ty(), builder.getPtrTy()), {main->getArg(0), main->getArg(1)});
     auto entry = program.entry.value();
-    auto result = builder.CreateCall(functions[entry]);
     const auto& root = program.functions[entry];
-    if (root.syntax.isAsync) builder.CreateRet(asyncEntry(builder, result, root.result.kind == Type::Result ? layouts.native(builder, root.result) : nullptr));
-    else builder.CreateRet(builder.getInt32(0));
+    if (root.syntax.isAsync) {
+        auto result = NativeExceptions{builder}.created(builder.CreateCall(functions[entry]), sources[root.syntax.file], root.syntax.name.span);
+        builder.CreateRet(asyncEntry(builder, result, root.result.kind == Type::Result ? layouts.native(builder, root.result) : nullptr));
+    } else {
+        auto slot = NativeExceptions{builder}.slot();
+        builder.CreateCall(functions[entry], {slot});
+        auto error = builder.CreateLoad(builder.getPtrTy(), slot);
+        auto failed = llvm::BasicBlock::Create(context, "failed", main), success = llvm::BasicBlock::Create(context, "success", main);
+        builder.CreateCondBr(builder.CreateIsNotNull(error), failed, success);
+        builder.SetInsertPoint(failed);
+        NativeExceptions{builder}.report(error);
+        builder.CreateRet(builder.getInt32(1));
+        builder.SetInsertPoint(success);
+        builder.CreateRet(builder.getInt32(0));
+    }
     std::string reason;
     llvm::raw_string_ostream log(reason);
     if (llvm::verifyModule(*module, &log)) throw Diagnostic{"LYB0001", "编译器生成的 LLVM 模块无效：" + reason};

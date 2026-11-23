@@ -2,6 +2,7 @@
 #define LYRA_RUNTIME_MANAGED_H
 
 #include <stddef.h>
+#include "exceptions.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -9,7 +10,7 @@ extern "C" {
 
 typedef struct LyraGcRoot LyraGcRoot;
 typedef struct LyraCleanup LyraCleanup;
-typedef void (*LyraCleanupCall)(void *environment);
+typedef const LyraException *(*LyraCleanupCall)(void *environment);
 
 void *lyraGcAlloc(size_t bytes);
 void *lyraGcAllocAtomic(size_t bytes);
@@ -18,7 +19,7 @@ LyraGcRoot *lyraGcRootCreate(void *value);
 void *lyraGcRootGet(const LyraGcRoot *root);
 void lyraGcRootDrop(LyraGcRoot *root);
 void lyraCleanupPush(LyraCleanup **stack, LyraCleanupCall call, void *environment);
-void lyraCleanupUntil(LyraCleanup **stack, const LyraCleanup *mark);
+const LyraException *lyraCleanupUntil(LyraCleanup **stack, const LyraCleanup *mark, const LyraException *primary);
 int lyraGcEnterWorker(void);
 void lyraGcLeaveWorker(int registration);
 

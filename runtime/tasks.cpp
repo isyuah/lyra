@@ -24,7 +24,7 @@ struct DisconnectWatch;
 struct DeadlineWatch;
 struct Failure {
     size_t ordinal;
-    void *cause;
+    const LyraException *cause;
     Failure *next;
 };
 
@@ -32,6 +32,10 @@ struct LyraTask {
     LyraTaskStep step;
     void *frame;
     void *outcome;
+    const LyraException *error;
+    const char *createdFile;
+    uint64_t createdLine, createdColumn;
+    bool reportToGroup;
     LyraDomain *domain;
     LyraGcRoot *activeRoot;
     LyraCleanup **cleanups;
@@ -41,7 +45,7 @@ struct LyraTask {
     LyraTask *waitingOn;
     LyraTask *owner, *firstChild, *lastChild, *previousChild, *nextChild;
     size_t ordinal, nextOrdinal;
-    Failure *failures;
+    Failure *failures, *cancelledCleanups;
     DisconnectWatch *watches;
     const LyraContext *context;
     DeadlineWatch *deadlineWatch;
@@ -150,9 +154,10 @@ void detachWaiter(LyraTask *waiter) {
     waiter->nextWaiter = nullptr;
 }
 
-void startChild(LyraTask *owner, LyraTask *child) {
+void startChild(LyraTask *owner, LyraTask *child, bool reportToGroup) {
     if (child->state != LYRA_TASK_COLD) return;
     child->owner = owner;
+    child->reportToGroup = reportToGroup;
     child->ordinal = owner->nextOrdinal++;
     child->previousChild = owner->lastChild;
     if (owner->lastChild) owner->lastChild->nextChild = child;
@@ -162,8 +167,8 @@ void startChild(LyraTask *owner, LyraTask *child) {
     lyraTaskStart(owner->domain, child);
 }
 
-void addFailure(LyraTask *task, size_t ordinal, void *cause) {
-    auto **slot = &task->failures;
+void addFailure(Failure *&head, size_t ordinal, const LyraException *cause) {
+    auto **slot = &head;
     while (*slot && (*slot)->ordinal <= ordinal) slot = &(*slot)->next;
     *slot = ::new (lyraGcAlloc(sizeof(Failure))) Failure{ordinal, cause, *slot};
 }
@@ -211,22 +216,24 @@ void finish(LyraTask *task, LyraTaskState state, void *outcome) {
     }
     for (;;) {
         auto terminal = task->pendingState;
-        if (terminal == LYRA_TASK_FAILED) {
-            bool included = false;
-            for (auto *cause = task->failures; cause; cause = cause->next) included |= cause->cause == task->outcome;
-            if (!included) addFailure(task, 0, task->outcome);
-        }
-        if (task->failures && terminal != LYRA_TASK_CANCELLED) {
-            terminal = LYRA_TASK_FAILED;
-            task->outcome = task->failures->cause;
-        }
+        if (task->error) addFailure(task->failures, 0, task->error);
+        const LyraException *primary = nullptr;
+        for (auto *cause = task->failures; cause; cause = cause->next) primary = lyraExceptionSuppress(primary, cause->cause);
+        for (auto *cause = task->cancelledCleanups; cause; cause = cause->next) primary = lyraExceptionSuppress(primary, cause->cause);
         if (task->cleanups) {
             auto *previous = currentTask;
             currentTask = task;
-            lyraCleanupUntil(task->cleanups, nullptr);
+            auto *cleaned = lyraCleanupUntil(task->cleanups, nullptr, primary);
+            if (!primary && cleaned) addFailure(task->failures, 0, cleaned);
+            primary = cleaned;
             currentTask = previous;
             task->cleanups = nullptr;
         }
+        if (primary) {
+            if (terminal != LYRA_TASK_CANCELLED) terminal = LYRA_TASK_FAILED;
+            task->error = task->createdFile ? lyraExceptionFrame(primary, "created", task->createdFile, task->createdLine, task->createdColumn) : primary;
+        }
+        if (terminal != LYRA_TASK_COMPLETED) task->outcome = nullptr;
         task->state = terminal;
         task->frame = nullptr;
         task->step = nullptr;
@@ -249,9 +256,11 @@ void finish(LyraTask *task, LyraTaskState state, void *outcome) {
             if (task->nextChild) task->nextChild->previousChild = task->previousChild;
             else parent->lastChild = task->previousChild;
             task->owner = task->nextChild = task->previousChild = nullptr;
-            if (task->state == LYRA_TASK_FAILED) {
-                for (auto *cause = task->failures; cause; cause = cause->next) addFailure(parent, task->ordinal + 1, cause->cause);
+            if (task->state == LYRA_TASK_FAILED && task->reportToGroup) {
+                addFailure(parent->failures, task->ordinal + 1, task->error);
                 for (auto *sibling = parent->firstChild; sibling; sibling = sibling->nextChild) lyraTaskRequestCancel(sibling);
+            } else if (task->error && (parent->cancelRequested || parent->failures || (parent->joining && parent->pendingState == LYRA_TASK_FAILED))) {
+                addFailure(parent->cancelledCleanups, task->ordinal + 1, task->error);
             }
         }
         auto *root = task->activeRoot;
@@ -267,17 +276,19 @@ void finish(LyraTask *task, LyraTaskState state, void *outcome) {
 struct BlockingClosure {
     LyraBlockingBody body;
     void *environment, *result;
+    const LyraException *error;
     bool submitted;
 };
 
 void runClosure(void *storage) {
     auto *closure = static_cast<BlockingClosure *>(storage);
-    closure->result = closure->body(closure->environment);
+    closure->result = closure->body(closure->environment, &closure->error);
 }
 
 void blockingStep(LyraTask *self, void *storage) {
     auto *closure = static_cast<BlockingClosure *>(storage);
-    if (lyraTaskCancelRequested(self)) lyraTaskFinishCancelled(self);
+    if (lyraTaskCancelRequested(self)) { self->error = closure->error; lyraTaskFinishCancelled(self); }
+    else if (closure->error) lyraTaskFail(self, closure->error);
     else if (closure->submitted) lyraTaskComplete(self, closure->result);
     else { closure->submitted = true; lyraTaskBlock(self, runClosure, closure); }
 }
@@ -336,8 +347,14 @@ void lyraTaskKeepCleanups(LyraTask *task, LyraCleanup **stack) {
     task->cleanups = stack;
 }
 
+void lyraTaskCreatedAt(LyraTask *task, const char *file, uint64_t line, uint64_t column) {
+    task->createdFile = file;
+    task->createdLine = line;
+    task->createdColumn = column;
+}
+
 LyraTask *lyraTaskBlocking(LyraBlockingBody body, void *environment) {
-    auto *closure = ::new (lyraGcAlloc(sizeof(BlockingClosure))) BlockingClosure{body, environment, nullptr, false};
+    auto *closure = ::new (lyraGcAlloc(sizeof(BlockingClosure))) BlockingClosure{body, environment, nullptr, nullptr, false};
     return lyraTaskCreate(blockingStep, closure);
 }
 
@@ -380,7 +397,7 @@ void lyraTaskStart(LyraDomain *domain, LyraTask *task) {
 }
 
 LyraTask *lyraTaskSpawn(LyraTask *parent, LyraTask *target) {
-    startChild(parent, target);
+    startChild(parent, target, true);
     return target;
 }
 
@@ -390,7 +407,8 @@ int lyraTaskRunRoot(LyraTask *task) {
     lyraDomainRun(domain);
     require(domain->live == 0, "no runnable work can complete the root task group");
     int status = task->state == LYRA_TASK_COMPLETED ? EXIT_SUCCESS : EXIT_FAILURE;
-    if (status != EXIT_SUCCESS) fputs("Lyra runtime: async entry or child failed or was cancelled\n", stderr);
+    if (task->state == LYRA_TASK_CANCELLED) fputs("Lyra runtime: async entry was cancelled\n", stderr);
+    if (task->error) lyraExceptionReport(task->error);
     lyraDomainDestroy(domain);
     return status;
 }
@@ -402,7 +420,8 @@ int lyraTaskAwait(LyraTask *waiter, LyraTask *target) {
         return 0;
     }
     if (isTerminal(target)) return 1;
-    startChild(waiter, target);
+    startChild(waiter, target, false);
+    if (target->owner == waiter) target->reportToGroup = false;
     waiter->nextWaiter = target->firstWaiter;
     target->firstWaiter = waiter;
     waiter->waitingOn = target;
@@ -410,18 +429,20 @@ int lyraTaskAwait(LyraTask *waiter, LyraTask *target) {
     return 0;
 }
 
-int lyraTaskAwaitValue(LyraTask *waiter, LyraTask *target) {
-    if (!lyraTaskAwait(waiter, target)) return 0;
-    if (target->state == LYRA_TASK_FAILED) {
-        lyraTaskFail(waiter, target->outcome);
-        return 0;
-    }
+LyraAwaitStatus lyraTaskAwaitValue(LyraTask *waiter, LyraTask *target) {
+    if (!lyraTaskAwait(waiter, target)) return LYRA_AWAIT_PENDING;
+    if (target->state == LYRA_TASK_FAILED) return LYRA_AWAIT_EXCEPTION;
     if (target->state == LYRA_TASK_CANCELLED) {
+        if (waiter->failures && !waiter->cancelRequested) {
+            finish(waiter, LYRA_TASK_FAILED, nullptr);
+            return LYRA_AWAIT_PENDING;
+        }
+        waiter->error = target->error;
         lyraTaskRequestCancel(waiter);
         lyraTaskFinishCancelled(waiter);
-        return 0;
+        return LYRA_AWAIT_PENDING;
     }
-    return 1;
+    return LYRA_AWAIT_VALUE;
 }
 
 void lyraTaskSuspend(LyraTask *task) {
@@ -458,8 +479,9 @@ void lyraTaskComplete(LyraTask *task, void *value) {
     else finish(task, LYRA_TASK_COMPLETED, value);
 }
 
-void lyraTaskFail(LyraTask *task, void *error) {
-    finish(task, LYRA_TASK_FAILED, error);
+void lyraTaskFail(LyraTask *task, const LyraException *error) {
+    task->error = error;
+    finish(task, LYRA_TASK_FAILED, nullptr);
 }
 
 void lyraTaskRequestCancel(LyraTask *task) {
@@ -495,8 +517,13 @@ LyraTaskState lyraTaskState(const LyraTask *task) {
 }
 
 void *lyraTaskOutcome(const LyraTask *task) {
-    require(isTerminal(task), "task does not have an outcome yet");
+    require(task->state == LYRA_TASK_COMPLETED, "task has no successful outcome");
     return task->outcome;
+}
+
+const LyraException *lyraTaskException(const LyraTask *task) {
+    require(isTerminal(task), "task has not finished cleanup");
+    return task->error;
 }
 
 size_t lyraTaskFailureCount(const LyraTask *task) {
@@ -506,7 +533,7 @@ size_t lyraTaskFailureCount(const LyraTask *task) {
     return count;
 }
 
-void *lyraTaskFailureAt(const LyraTask *task, size_t index) {
+const LyraException *lyraTaskFailureAt(const LyraTask *task, size_t index) {
     require(isTerminal(task), "task has not finished cleanup");
     auto *entry = task->failures;
     while (entry && index--) entry = entry->next;

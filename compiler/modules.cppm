@@ -133,6 +133,7 @@ struct Linker {
                     for (auto& type : call->typeArguments) renameType(type);
                 }
                 if (auto* binding = std::get_if<Binding>(&expr.node); binding && binding->annotation) renameType(*binding->annotation);
+                if (auto* attempt = std::get_if<Attempt>(&expr.node); attempt && attempt->binding) renameType(attempt->binding->type);
             }
         }
     }

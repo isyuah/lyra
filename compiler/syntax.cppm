@@ -36,6 +36,9 @@ struct Binding { Identifier name; bool writable; std::optional<Identifier> annot
 struct Conditional { ExprId condition, yes; std::optional<ExprId> no; };
 struct While { ExprId condition, body; };
 struct Return { std::optional<ExprId> value; };
+struct Raise { Span site; std::optional<ExprId> value; };
+struct CatchBinding { Identifier name, type; };
+struct Attempt { ExprId body, handler; std::optional<CatchBinding> binding; };
 struct TaskOp { bool spawn; Span site; ExprId operand; };
 struct Blocking { ExprId body; };
 struct Deferred { ExprId body; };
@@ -47,7 +50,7 @@ enum class Jump { Break, Continue };
 
 struct Expr {
     Span span;
-    std::variant<std::int64_t, bool, StringLiteral, Identifier, Call, Member, Unary, Binary, Block, Binding, Conditional, While, Return, Jump, TaskOp, Blocking, Deferred, EmptyOption, Propagate, Match, ListLiteral, Index> node;
+    std::variant<std::int64_t, bool, StringLiteral, Identifier, Call, Member, Unary, Binary, Block, Binding, Conditional, While, Return, Raise, Attempt, Jump, TaskOp, Blocking, Deferred, EmptyOption, Propagate, Match, ListLiteral, Index> node;
 };
 
 struct Parameter { Identifier name, type; bool variadic{}; std::optional<ExprId> defaultValue{}; };

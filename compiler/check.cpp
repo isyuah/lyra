@@ -32,6 +32,7 @@ std::string typeName(const CheckedModule& module, Type type) {
         case Type::Unit: return "Unit";
         case Type::Never: return "Never";
         case Type::String: return "String";
+        case Type::Exception: return "Exception";
         case Type::CPtr: return "CPtr";
         case Type::Record: return module.aggregates[type.id].syntax.name.text;
         case Type::Variable: return module.variableNames[type.id];
@@ -103,7 +104,7 @@ struct Symbols {
         if (form.arguments.size() == 2 && form.name == "Result") return sum(Type::Result, child(0), child(1));
         if (form.arguments.empty()) {
             if (signature) if (auto parameter = genericParameter(*signature, form.name)) return types[*parameter];
-            for (Type type : {Type::Int, Type::Bool, Type::String, Type::Unit, Type::CPtr}) if (form.name == typeName(module, type)) return type;
+            for (Type type : {Type::Int, Type::Bool, Type::String, Type::Unit, Type::CPtr, Type::Exception}) if (form.name == typeName(module, type)) return type;
             if (auto found = records.find(form.name); found != records.end()) return {Type::Record, found->second};
         }
         throw at(source, span, "LYT0003", "找不到类型或类型实参数量不符：" + form.name);
@@ -166,6 +167,7 @@ struct Checker {
     unsigned loops = 0;
     struct WorkerScope { ExprId id; std::size_t firstLocal; std::optional<Type> result; };
     std::vector<WorkerScope> workers{};
+    std::vector<std::optional<ExprId>> catchOwners{};
 
     std::optional<ExprId> currentWorker() const { return workers.empty() ? std::nullopt : std::optional(workers.back().id); }
     std::optional<Type> returnType() const { return workers.empty() ? std::optional(fn.result) : workers.back().result; }
@@ -208,6 +210,30 @@ struct Checker {
     Type infer(ExprId, std::int64_t, auto, bool) { return Type::Int; }
     Type infer(ExprId, bool, auto, bool) { return Type::Bool; }
     Type infer(ExprId, const StringLiteral&, auto, bool) { return Type::String; }
+
+    Type infer(ExprId, const Raise& raise, auto, bool) {
+        if (raise.value) visit(*raise.value, Type::Exception);
+        else if (catchOwners.empty() || catchOwners.back() != currentWorker()) throw at(source, raise.site, "LYE0001", "单独的 throw 只可在当前执行体的 catch 中重抛");
+        return Type::Never;
+    }
+
+    Type infer(ExprId id, const Attempt& attempt, std::optional<Type> expected, bool discard) {
+        auto normal = visit(attempt.body, discard ? std::nullopt : expected, discard);
+        scopes.emplace_back();
+        if (const auto& binding = attempt.binding) {
+            if (symbols.resolve(fn.syntax, binding->type, variables) != Type::Exception) throw at(source, binding->type.span, "LYE0002", "当前仅支持捕获普通异常根类型 Exception");
+            auto slot = fn.locals.size();
+            declare(binding->name, slot);
+            fn.locals.push_back({Type::Exception, false, currentWorker()});
+            fn.expressions[id].target = slot;
+        }
+        catchOwners.push_back(currentWorker());
+        auto recovered = visit(attempt.handler, discard ? std::nullopt : normal != Type::Never ? std::optional(normal) : expected, discard);
+        catchOwners.pop_back();
+        scopes.pop_back();
+        if (normal == Type::Never && recovered == Type::Never) return Type::Never;
+        return discard ? Type{Type::Unit} : normal == Type::Never ? recovered : normal;
+    }
 
     Type infer(ExprId id, const ListLiteral& literal, std::optional<Type> expected, bool) {
         if (expected && expected->kind == Type::Option) expected = module.sumTypes[expected->id].success;
@@ -256,8 +282,17 @@ struct Checker {
     }
 
     Type infer(ExprId id, const Match& match, std::optional<Type> expected, bool discard) {
+        bool defaults = match.optional == OptionalForm::Default;
+        if (defaults && std::holds_alternative<EmptyOption>(fn.syntax.expressions[match.subject].node)) {
+            auto fallback = visit(match.arms.back().value, discard ? std::nullopt : expected, discard);
+            auto element = fallback == Type::Never ? expected.value_or(Type::Unit) : fallback;
+            visit(match.subject, symbols.sum(Type::Option, element));
+            return discard ? Type{Type::Unit} : fallback;
+        }
         auto subject = visit(match.subject);
         if (subject == Type::Never) return subject;
+        if (match.optional != OptionalForm::None && subject.kind != Type::Option)
+            throw at(source, match.operation, "LYT0010", "可空运算符需要 Option，实际是 " + typeName(module, subject));
         if (subject.kind != Type::Option && subject.kind != Type::Result) throw at(source, fn.syntax.expressions[match.subject].span, "LYT0011", "match 需要 Option 或 Result，实际是 " + typeName(module, subject));
         std::vector<const SumPattern*> patterns;
         std::optional<Type> result;
@@ -275,8 +310,14 @@ struct Checker {
                 fn.locals.push_back({payload, false, currentWorker()});
             }
             fn.expressions[id].argumentSlots.push_back(slot);
-            auto value = visit(arm.value, discard ? std::nullopt : result ? result : expected, discard);
-            if (value != Type::Never && !result) result = discard ? Type::Unit : value;
+            Type value;
+            if (match.optional == OptionalForm::Access && &arm == &match.arms.front()) {
+                value = visit(arm.value);
+                if (value != Type::Never && value.kind != Type::Option) value = fit(arm.value, value, symbols.sum(Type::Option, value));
+            } else if (match.optional == OptionalForm::Access) {
+                value = visit(arm.value, result ? result : expected);
+            } else value = visit(arm.value, discard ? std::nullopt : result ? result : expected, discard);
+            if (value != Type::Never && !result) result = discard && match.optional != OptionalForm::Access ? Type::Unit : value;
             scopes.pop_back();
             patterns.push_back(&arm.pattern);
         }
@@ -287,7 +328,7 @@ struct Checker {
             return std::array{SumCase<Type>{SumTag::Ok, fields.success}, SumCase<Type>{SumTag::Err, fields.failure}};
         };
         if (auto missing = missingPattern(subject, patterns, cases)) throw at(source, fn.syntax.expressions[id].span, "LYT0012", "match 未穷尽，缺少分支：" + *missing);
-        return result.value_or(Type::Never);
+        return discard && match.optional == OptionalForm::Access ? Type{Type::Unit} : result.value_or(Type::Never);
     }
 
     Type infer(ExprId id, const Identifier& name, auto, bool) {
@@ -392,6 +433,7 @@ struct Checker {
         auto owner = visit(member.receiver);
         if (owner == Type::Never) return owner;
         if (owner.kind == Type::List && member.name.text == "size") return Type::Int;
+        if (owner == Type::Exception && member.name.text == "message") return Type::String;
         auto field = memberIndex(owner, member.name, symbols.fields);
         fn.expressions[id].target = field;
         const auto& record = module.aggregates[owner.id];
@@ -472,6 +514,10 @@ struct Checker {
             info.argumentSlots.push_back(0);
             if (value == Type::Never) return value;
             return expected ? *expected : symbols.sum(kind, value);
+        } else if (call.name.text == "Exception") {
+            noTypeArgs();
+            info.callee = Callee::Exception;
+            return arguments(id, call, 1, [](auto) { return "message"; }, [](auto) { return Type{Type::String}; }) ? Type::Never : Type::Exception;
         } else if (call.name.text == "print") {
             noTypeArgs();
             info.callee = Callee::Print;
@@ -656,7 +702,7 @@ CheckedModule check(Module module, const std::vector<Source>& sources, bool requ
     Symbols symbols{checked, sources, {}, {}, {}, {}, {}, {}};
     for (auto& decl : module.aggregates) {
         auto id = checked.aggregates.size();
-        for (Type builtin : {Type::Int, Type::Bool, Type::String, Type::Unit, Type::Never, Type::CPtr}) {
+        for (Type builtin : {Type::Int, Type::Bool, Type::String, Type::Unit, Type::Never, Type::CPtr, Type::Exception}) {
             if (decl.name.text == typeName(checked, builtin)) throw at(sources[decl.file], decl.name.span, "LYN0002", "类型名与内置类型冲突：" + decl.name.text);
         }
         if (decl.name.text == "print" || decl.name.text == "gcCollect" || !symbols.records.emplace(decl.name.text, id).second) throw at(sources[decl.file], decl.name.span, "LYN0002", "类型名称已声明：" + decl.name.text);
