@@ -44,6 +44,23 @@ fn main(): Unit {
 }
 ''', b"A\nB\n24\nX\nL\n19\nL\nR\n12\n")
 
+    def test_standard_higher_order_collection_pipeline(self):
+        (self.package / 'lyra.json5').write_text('{name:"test/collections",version:"0.1.0"}')
+        self.native('''import std.collections.map
+import std.collections.filter
+import std.collections.fold
+fn main(): Unit {
+    var visits = 0
+    val input = [1, 2, 3, 4]
+    val selected = filter(input) { visits += 1; it > 2 }
+    val doubled = map(selected) { it * 2 }
+    input[2] = 100
+    print(fold(doubled, 0, (total: Int, value: Int) => { total + value }))
+    val empty: List<String> = []
+    print(fold(empty, "zero", (total: String, value: String) => { total + value }))
+    print(visits)
+}''', b'14\nzero\n4\n')
+
     def test_async_defaults_run_before_the_cold_task_starts(self):
         self.native('''
 fn mark(value: Int): Int { print(value); value }
