@@ -364,7 +364,8 @@ struct Emitter {
             const auto& shape = layouts.program.signatures[rawType(id).id];
             return NativeClosures{builder}.named(functions[*info.functionRef], signature(shape), shape.parameters.size(), syntax.isAsync, syntax.foreignSymbol.has_value());
         }
-        return read(info.target);
+        auto value = read(info.target);
+        return info.narrowed ? builder.CreateExtractValue(value, 1) : value;
     }
 
     Value emitNode(ExprId id, This) { return read(fn.expressions[id].target); }
@@ -599,7 +600,10 @@ struct Emitter {
                     auto address = builder.CreateStructGEP(layouts.objects[owner.id], object, info.target);
                     closure = layouts.workers ? sharedRead(builder, builder.getPtrTy(), address) : builder.CreateLoad(builder.getPtrTy(), address);
                 } else closure = builder.CreateExtractValue(object, info.target);
-            } else closure = read(info.target);
+            } else {
+                closure = read(info.target);
+                if (info.narrowed) closure = builder.CreateExtractValue(closure, 1);
+            }
             if (!live()) return unit();
             std::vector<Value> args;
             for (const auto& arg : call.arguments) {

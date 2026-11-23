@@ -95,7 +95,7 @@ std::vector<Type> inferGenericArguments(const Function& declaration, const Call&
         if (argument.type == Type::Never) continue;
         unify(unify, typeForm(declaration.parameters[argument.slot].type.text), argument.type, argument.span, false, true);
     }
-    if (expected && *expected != Type::Never) unify(unify, typeForm(declaration.result.text), *expected, site, true, false);
+    if (expected && *expected != Type::Never && !declaration.result.text.empty()) unify(unify, typeForm(declaration.result.text), *expected, site, true, false);
     std::vector<Type> types;
     for (std::size_t index = 0; index < bound.size(); ++index) {
         if (!bound[index]) {
@@ -114,10 +114,9 @@ struct GenericInstanceKey {
     auto operator<=>(const GenericInstanceKey&) const = default;
 };
 
-Function specializeGeneric(const Function& declaration, const std::vector<std::string>& types) {
-    auto result = declaration;
+Function specializeGeneric(Function result, const std::vector<std::string>& types) {
     auto substitute = [&](Identifier& type) {
-        type.text = mapTypeNames(typeForm(type.text), [&](const std::string& name) { auto index = genericParameter(declaration, name); return index ? types[*index] : name; });
+        type.text = mapTypeNames(typeForm(type.text), [&](const std::string& name) { auto index = genericParameter(result, name); return index ? types[*index] : name; });
     };
     substitute(result.result);
     for (auto& parameter : result.parameters) substitute(parameter.type);

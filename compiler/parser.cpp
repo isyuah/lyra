@@ -632,8 +632,11 @@ private:
         }
         require(")");
         if (conversion && (!typeParameters.empty() || parameters.size() != 1 || parameters.front().defaultValue || parameters.front().variadic)) throw at(source, keyword.span, "LYV0001", "implicit 需要一个无默认值的普通形参");
-        if (!initializer) require(":");
-        auto result = initializer ? std::move(ownerType) : type();
+        auto result = Identifier{"", token.span};
+        if (initializer) result = std::move(ownerType);
+        else if (is(":")) { consume(); result = type(); }
+        else if (pub || foreign || conversion || (!owner && name.text == "main"))
+            throw at(source, token.span, "LYP0001", "此声明需要用 : 标注返回类型");
         if (foreign) {
             require(";");
             auto symbol = name;

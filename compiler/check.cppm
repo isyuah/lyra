@@ -29,7 +29,7 @@ struct CheckedPattern {
     std::vector<CheckedPattern> parts{};
 };
 struct IteratorPlan { std::size_t open, next; };
-struct CheckedExpr { Type type; std::size_t target{}; std::vector<std::size_t> argumentSlots{}; Callee callee{}; std::optional<Type> sourceType{}; std::vector<std::size_t> captures{}; std::vector<std::size_t> omittedDefaults{}; std::optional<std::size_t> conversion{}, errorConversion{}, functionRef{}; std::optional<Type> callableType{}; std::optional<IteratorPlan> iterator{}; std::vector<CheckedPattern> patterns{}; std::optional<double> realLiteral{}; };
+struct CheckedExpr { Type type; std::size_t target{}; std::vector<std::size_t> argumentSlots{}; Callee callee{}; std::optional<Type> sourceType{}; std::vector<std::size_t> captures{}; std::vector<std::size_t> omittedDefaults{}; std::optional<std::size_t> conversion{}, errorConversion{}, functionRef{}; std::optional<Type> callableType{}; std::optional<IteratorPlan> iterator{}; std::vector<CheckedPattern> patterns{}; std::optional<double> realLiteral{}; bool narrowed{}; };
 struct CheckedFunction {
     Function syntax;
     Type result;
@@ -38,6 +38,7 @@ struct CheckedFunction {
     std::vector<std::optional<std::size_t>> defaultFunctions{};
     std::vector<std::optional<ExprId>> cleanupOwners{};
     std::vector<NameReference> references{};
+    std::vector<SourceAnchor> calls{};
 };
 struct CheckedAggregate { Aggregate syntax; std::vector<Type> fields; std::size_t declaration; std::vector<Type> arguments; bool abstract; std::vector<std::optional<std::size_t>> defaultFunctions{}; };
 struct CheckedEnum { Enumeration syntax; std::vector<std::vector<Type>> payloads; };
