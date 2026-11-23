@@ -15,3 +15,24 @@ fn main(): Unit {
 ```
 
 程序打印 `14`。尾部块只绑定在固定的最后一个函数形参；`it` 表示这个块的单个参数。也可以按位置传入已有的具名函数。
+
+## 字典与集合
+
+```lyra
+import std.collections.stringMap
+import std.collections.intSet
+
+fn main(): Unit {
+    val scores = stringMap<Int>()
+    scores.put("Ada", 42)
+    print(scores.get("Ada") ?? 0)
+
+    val seen = intSet()
+    print(seen.add(7))
+    print(seen.add(7))
+}
+```
+
+- `stringMap<Value>()`、`intMap<Value>()` 返回 `HashMap<Key,Value>`。`get`、`put`、`remove` 分别返回可空的当前值或旧值；`None` 表示没有此键。若值本身是可空类型，`Some(None)` 表示键存在、值为空。`contains` 和 `size()` 不用取出值。
+- `stringSet()`、`intSet()` 返回 `HashSet<Item>`；`add` 和 `remove` 只在集合发生改变时返回 `true`。Map/Set 都以引用共享；`entries()`、`values()` 返回独立列表快照，不承诺顺序。快照不会深拷贝 Class 对象。
+- 自定义键用 `hashMap<Key,Value>(hash, equal)` 或 `hashSet<Item>(hash, equal)`。相等的键须哈希一致；键存入后不能改变其哈希或相等所依赖的状态。回调需确定且不能在执行中反过来修改当前集合，不同执行域共同写入时应由调用方同步。

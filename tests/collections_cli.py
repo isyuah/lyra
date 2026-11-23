@@ -24,7 +24,7 @@ class Collections(unittest.TestCase):
         self.main.write_text(source, encoding="utf-8")
         for flags in ([], ["--release"]):
             with self.subTest(flags=flags):
-                app = executable(self.package / "program")
+                app = executable(self.package / ("release" if flags else "debug"))
                 build = subprocess.run([COMPILER, "build", self.package, *flags, "-o", app], capture_output=True, timeout=30)
                 self.assertEqual(build.returncode, 0, build.stderr.decode())
                 run = subprocess.run([app], capture_output=True, timeout=10)
@@ -69,6 +69,41 @@ fn mark(value: Int): Int { print(value); value }
 async fn work(value: Int = mark(3)): Int { print(4); value }
 async fn main(): Unit { val cold = work(); print(5); print(await cold); print(await cold) }
 ''', b"3\n5\n4\n3\n3\n")
+
+    def test_hash_collections_grow_remove_and_preserve_optional_values(self):
+        (self.package / 'lyra.json5').write_text('{name:"test/hash-collections",version:"0.1.0"}')
+        self.native(r'''
+import std.collections.hashMap
+import std.collections.intSet
+import std.collections.stringMap
+
+fn main(): Unit {
+    val map = hashMap<Int,String>((key) => { -1 }, (left, right) => { left == right })
+    for key in 0..<20 { map.put(key, "item ${key}"); }
+    val alias = map
+    print(map.size())
+    print(alias.remove(12) ?? "missing")
+    print(map.contains(12))
+    print(alias.put(7, "updated") ?? "missing")
+    val snapshot = map.entries()
+    print(snapshot.size)
+    print(map.get(7) ?? "missing")
+    map.remove(7)
+    print(snapshot.size)
+
+    val optional = stringMap<String?>()
+    optional.put("key\0é", None)
+    gcCollect()
+    print(match optional.get("key\0é") { Some(None) => "present null", Some(Some(_)) => "wrong", None => "missing" })
+    print(optional.get("other") == None)
+
+    val set = intSet()
+    print(set.add(-9223372036854775808))
+    print(set.add(-9223372036854775808))
+    print(set.remove(-9223372036854775808))
+    print(set.size())
+}
+''', b"20\nitem 12\nfalse\nitem 7\n19\nupdated\n19\npresent null\ntrue\ntrue\nfalse\ntrue\n0\n")
 
     def test_generic_and_method_defaults_use_declaration_scope(self):
         self.native('''
