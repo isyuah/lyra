@@ -4,6 +4,7 @@ module;
 #include <filesystem>
 #include <limits>
 #include <map>
+#include <memory>
 #include <optional>
 #include <string>
 #include <utility>
@@ -17,6 +18,7 @@ export namespace lyra {
 using MacroFiles = std::map<std::string, std::map<std::string, std::filesystem::path>>;
 struct MacroPackage { std::filesystem::path root; MacroFiles inputs; };
 void expandMacros(Module& syntax, std::vector<Source>& sources, const std::map<std::string, MacroPackage>& packages, std::vector<std::filesystem::path>& inputs);
+void parsePackageFile(Module& syntax, Source& source, std::size_t file, const MacroPackage& package, std::vector<std::filesystem::path>& inputs);
 }
 
 namespace lyra {
@@ -31,6 +33,9 @@ fn fieldType(index: Int): String { "" }
 fn fieldPublic(index: Int): Bool { false }
 fn fieldHasAttribute(index: Int, name: String): Bool { false }
 fn fieldAttributeValue(index: Int, name: String): String { "" }
+fn argumentCount(): Int { 0 }
+fn argumentCode(index: Int): String { "" }
+fn argumentString(index: Int): String { "" }
 fn targetKind(): String { "" }
 fn targetBody(): String { "" }
 fn optionInner(typeName: String): String { "" }
@@ -64,6 +69,7 @@ struct Machine {
     const std::string& body;
     const MacroPackage& package;
     std::vector<fs::path>& files;
+    const ExpressionExpansion* expression;
     unsigned fuel = 50000, depth = 0;
     std::size_t bytes = 0;
     std::map<std::string, std::string> inputs{};
@@ -96,6 +102,16 @@ struct Machine {
         if (name == "macroFail") error(std::get<std::string>(args.front()));
         if (name == "macroQuote") return quote(std::get<std::string>(args.front()));
         if (name == "macroInput") return input(std::get<std::string>(args.front()));
+        if (name == "argumentCount" || name == "argumentCode" || name == "argumentString") {
+            if (!expression) error("此查询仅适用于表达式宏");
+            if (name == "argumentCount") return static_cast<std::int64_t>(expression->arguments.size());
+            auto index = std::get<std::int64_t>(args.front());
+            if (index < 0 || static_cast<std::size_t>(index) >= expression->arguments.size()) error("表达式宏实参下标越界");
+            if (name == "argumentCode") return "__lyraMacroArg" + std::to_string(index);
+            const auto& arg = expression->arguments[index];
+            if (!arg.literal) throw at(use, arg.span, "LYM0002", "此宏实参需要字符串字面量");
+            return *arg.literal;
+        }
         auto index = std::get<std::int64_t>(args.front());
         if (index < 0 || static_cast<std::size_t>(index) >= fields.size()) error("宏读取的字段或形参下标越界");
         const auto& field = fields[index];
@@ -195,15 +211,15 @@ struct Machine {
     }
 };
 
-std::string expand(const Source& source, const Expansion& prefix, const MacroPackage& package, const std::string& target, const std::vector<Field>& fields, const std::string& kind, const std::string& body, std::vector<fs::path>& files) {
-    auto directory = prefix.decorator ? "decorators" : "macros";
+std::string expand(const Source& source, const Expansion& prefix, const MacroPackage& package, const std::string& target, const std::vector<Field>& fields, const std::string& kind, const std::string& body, std::vector<fs::path>& files, const ExpressionExpansion* expression = nullptr) {
+    auto directory = expression ? "expressions" : prefix.decorator ? "decorators" : "macros";
     auto file = prefix.name.text + ".ly";
     auto path = package.root / "src" / (std::string(".") + directory) / file;
     if (fs::is_regular_file(path)) {
         auto relative = fs::weakly_canonical(path).lexically_relative(fs::canonical(package.root));
         if (relative.empty() || *relative.begin() == "..") throw at(source, prefix.name.span, "LYM0002", "宏实现必须位于声明包内");
     } else path = fs::canonical("/proc/self/exe").parent_path().parent_path() / "share/lyra/std/meta" / directory / file;
-    if (!fs::is_regular_file(path)) throw at(source, prefix.name.span, "LYM0001", "找不到" + std::string(prefix.decorator ? "装饰器 @" : "声明宏 #") + prefix.name.text);
+    if (!fs::is_regular_file(path)) throw at(source, prefix.name.span, "LYM0001", "找不到" + std::string(expression ? "表达式宏 #" : prefix.decorator ? "装饰器 @" : "声明宏 #") + prefix.name.text);
     if (fs::file_size(path) > byteLimit) throw at(source, prefix.name.span, "LYM0002", "宏实现超过大小限制");
     files.push_back(path);
     auto builtin = sourceText("<macro-prelude>", prelude, {});
@@ -223,9 +239,63 @@ std::string expand(const Source& source, const Expansion& prefix, const MacroPac
     if (it == checked.functions.end() || it->result != Type::String || it->syntax.parameters.size() != 2 || it->locals[0].type != Type::String || it->locals[1].type != Type::String) {
         throw at(source, prefix.name.span, "LYM0002", "宏入口应为 fn " + prefix.name.text + "(target: String, argument: String): String");
     }
-    Machine machine{checked, source, prefix, fields, kind, body, package, files};
+    Machine machine{checked, source, prefix, fields, kind, body, package, files, expression};
     return std::get<std::string>(machine.invoke(*it, {target, prefix.argument ? prefix.argument->text : std::string{}}));
 }
+}
+
+void parsePackageFile(Module& syntax, Source& source, std::size_t file, const MacroPackage& package, std::vector<fs::path>& inputs) {
+    const auto limit = source.text.size() + 4 * byteLimit;
+    for (unsigned depth = 0; source.text.contains('#'); ++depth) {
+        Module scratch;
+        std::vector<ExpressionExpansion> calls;
+        parseFile(scratch, source, file, &calls);
+        if (calls.empty()) break;
+        if (depth == 32) throw at(source, calls.front().name.span, "LYM0002", "表达式宏嵌套超过 32 层");
+        std::string text;
+        std::vector<SourcePiece> pieces;
+        std::size_t read = 0;
+        const auto original = std::string_view(source.text);
+        for (const auto& call : calls) {
+            auto site = call.name.span;
+            auto append = [&](std::string_view bytes, Span input, bool copied, std::size_t hygiene) {
+                if (bytes.empty()) return;
+                if (bytes.size() > limit - text.size()) throw at(source, site, "LYM0002", "展开后源码超过字节预算");
+                pieces.push_back({{text.size(), text.size() + bytes.size()}, input, copied, hygiene});
+                text += bytes;
+            };
+            auto copy = [&](Span span) { append(original.substr(span.begin, span.end - span.begin), span, true, 0); };
+            copy({read, call.span.begin});
+            auto argument = call.argumentsSpan;
+            Expansion prefix{file, call.name, Identifier{std::string(original.substr(argument.begin, argument.end - argument.begin)), argument}, false, false, 0};
+            auto output = sourceText(source.path.string() + "(#" + call.name.text + ")", expand(source, prefix, package, "", {}, "expression", "", inputs, &call), source.moduleId);
+            output.origin = source.site(site);
+            auto splices = macroSplices(output, call.arguments.size());
+            auto mark = output.origin->start.offset + 1;
+            append("(", site, false, mark);
+            std::size_t cursor = 0;
+            auto generated = std::string_view(output.text);
+            for (auto splice : splices) {
+                append(generated.substr(cursor, splice.span.begin - cursor), site, false, mark);
+                auto input = call.arguments[splice.argument].span;
+                append("(", input, false, 0); copy(input); append(")", input, false, 0);
+                cursor = splice.span.end;
+            }
+            append(generated.substr(cursor), site, false, mark);
+            append("\n)", site, false, mark);
+            read = call.span.end;
+        }
+        if (limit - text.size() < original.size() - read) throw at(source, calls.back().name.span, "LYM0002", "展开后源码超过字节预算");
+        if (read < original.size()) {
+            pieces.push_back({{text.size(), text.size() + original.size() - read}, {read, original.size()}, true, 0});
+            text += original.substr(read);
+        }
+        auto next = sourceText(source.path, std::move(text), source.moduleId);
+        next.previous = std::make_shared<Source>(std::move(source));
+        next.pieces = std::move(pieces);
+        source = std::move(next);
+    }
+    parseFile(syntax, source, file);
 }
 
 void expandMacros(Module& syntax, std::vector<Source>& sources, const std::map<std::string, MacroPackage>& packages, std::vector<fs::path>& inputs) {

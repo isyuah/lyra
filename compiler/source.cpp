@@ -15,7 +15,9 @@ namespace lyra {
 
 namespace fs = std::filesystem;
 
-Position Source::position(std::size_t offset) const {
+static Position rawPosition(const Source& source, std::size_t offset) {
+    const auto& text = source.text;
+    const auto& lineStarts = source.lineStarts;
     auto next = std::upper_bound(lineStarts.begin(), lineStarts.end(), offset);
     auto start = *std::prev(next);
     std::size_t column = 1;
@@ -25,16 +27,50 @@ Position Source::position(std::size_t offset) const {
     return {offset, static_cast<std::size_t>(next - lineStarts.begin()), column};
 }
 
+static Site rawSite(const Source& source, Span span) {
+    auto start = rawPosition(source, span.begin);
+    auto lineStart = source.lineStarts[start.line - 1];
+    auto lineEnd = source.text.find_first_of("\r\n", lineStart);
+    return {source.path.string(), start, rawPosition(source, span.end), source.text.substr(lineStart, lineEnd - lineStart), lineStart};
+}
+
+static const SourcePiece& pieceAt(const Source& source, std::size_t offset) {
+    return *std::prev(std::ranges::upper_bound(source.pieces, offset, {}, [](const auto& piece) { return piece.output.begin; }));
+}
+
+static Span beforeExpansion(const Source& source, Span span) {
+    const auto& first = pieceAt(source, span.begin);
+    const auto& last = span.end == span.begin ? first : pieceAt(source, span.end - 1);
+    auto begin = first.copied ? first.input.begin + span.begin - first.output.begin : first.input.begin;
+    auto end = last.copied ? last.input.begin + span.end - last.output.begin : last.input.end;
+    return {std::min(begin, end), std::max(begin, end)};
+}
+
 Site Source::site(Span span) const {
-    auto start = position(span.begin);
-    auto lineStart = lineStarts[start.line - 1];
-    auto lineEnd = text.find_first_of("\r\n", lineStart);
-    return {path.string(), start, position(span.end), text.substr(lineStart, lineEnd - lineStart), lineStart};
+    return previous ? previous->site(beforeExpansion(*this, span)) : rawSite(*this, span);
+}
+
+Position Source::position(std::size_t offset) const {
+    return previous ? site({offset, offset}).start : rawPosition(*this, offset);
+}
+
+std::size_t Source::hygieneAt(Span span) const {
+    if (!previous) return 0;
+    const auto& piece = pieceAt(*this, span.begin);
+    return piece.copied ? previous->hygieneAt(beforeExpansion(*this, span)) : piece.hygiene;
+}
+
+std::optional<Site> Source::generatedSite(Span span) const {
+    if (!previous) return {};
+    const auto& piece = pieceAt(*this, span.begin);
+    if (piece.copied) return previous->generatedSite(beforeExpansion(*this, span));
+    return piece.hygiene ? std::optional(rawSite(*this, span)) : std::nullopt;
 }
 
 Diagnostic at(const Source& source, Span span, std::string code, std::string message) {
     Diagnostic error{std::move(code), std::move(message), source.site(span)};
     if (source.origin) { error.generated = std::move(error.site); error.site = source.origin; }
+    else error.generated = source.generatedSite(span);
     return error;
 }
 

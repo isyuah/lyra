@@ -15,4 +15,16 @@ fn banner(target: String, argument: String): String {
 - `#post("/teams/{id}")` 可以读到路由字面量，以及形参上的 `[path]`、`[query("tag")]`。`fieldHasAttribute(i, "query")` 检查标记是否存在，`fieldAttributeValue(i, "query")` 得到 `tag`；无参数标记返回空字符串，读取不存在的标记报错。字段也可在 `pub val` 前写标记。标记自身不进行取参；宏生成的适配器和手写调用一样走原函数和装饰器，无需运行时反射。
 - 求值器支持普通同步函数、标量、局部绑定、分支、循环和字符串拼接。每次展开限 50,000 步、64 层函数调用、1 MiB 单次文本和 32 MiB 累计文本预算。不能用 `extern`、系统 I/O、环境变量、网络或子进程。输出重新解析和检查；宏不能自行发布 API、声明 `extern` 或递归生成新的声明宏。生成代码的私有导入不会占用手写代码的名称。
 - 本包入口装饰器放在 `src/.decorators`；返回的语句在调用时进入原函数体。多个装饰器按源码从上到下进入。标准 `@trace` 装饰冷 Task 时，构造 Task 不会打印；首次真正运行时打印，重复等待不重复打印。
-- 目前接口以限定范围的源码文本和声明查询为主。完整 AST 构造、任意签名不变的前后包装和表达式宏的最终契约见[宏 RFC](../../rfc/metaprogramming-data.md)。
+- 表达式位置的 `#name(...)` 只查找 `src/.expressions/name.ly`，与同名声明宏、装饰器分开。入口仍为 `fn name(target: String, argument: String): String`，`target` 为空，`argument` 是实参原文。`argumentCount()` 取实参数量，`argumentString(i)` 读取已解码的字符串字面量，`argumentCode(i)` 返回可安全插入生成表达式的语法槽。每个槽在出现的位置求值；没有出现的槽不会运行。生成的局部绑定与调用处隔离，普通函数和方法仍由类型检查器解析。
+
+例如在 `src/.expressions/query.ly` 中写下面的函数，并给 `query` 授予 `statement` 输入。`#query("SELECT ?1", userId)` 展开后会由普通类型检查验证 `userId` 能否传给项目定义的 `bindId`。错误指回原实参；刷新快照是独立的显式操作。
+
+```lyra
+fn query(target: String, argument: String): String {
+    if argumentCount() != 2 { return macroFail("expected SQL and a parameter") }
+    if argumentString(0) != macroInput("statement") { return macroFail("refresh query snapshot") }
+    "bindId(" + argumentCode(1) + ")"
+}
+```
+
+表达式宏只能生成一个表达式，可用块引入临时变量；不能从生成文本再启动宏。调用者可在实参里显式嵌套宏，最多 32 层。宏 API 以调用语法和声明查询为主。完整 AST 构造与通用装饰器的边界见[宏 RFC](../../rfc/metaprogramming-data.md)。

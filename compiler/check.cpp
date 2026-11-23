@@ -172,8 +172,13 @@ struct Checker {
     std::optional<ExprId> currentWorker() const { return workers.empty() ? std::nullopt : std::optional(workers.back().id); }
     std::optional<Type> returnType() const { return workers.empty() ? std::optional(fn.result) : workers.back().result; }
 
+    std::string localKey(const Identifier& name) const {
+        auto mark = source.hygieneAt(name.span);
+        return mark ? "$macro" + std::to_string(mark) + ":" + name.text : name.text;
+    }
+
     void declare(const Identifier& name, std::size_t slot) {
-        if (!scopes.back().emplace(name.text, slot).second) throw at(source, name.span, "LYN0002", "名称已在此作用域声明：" + name.text);
+        if (!scopes.back().emplace(localKey(name), slot).second) throw at(source, name.span, "LYN0002", "名称已在此作用域声明：" + name.text);
     }
 
     void run() {
@@ -346,7 +351,7 @@ struct Checker {
 
     Type infer(ExprId id, const Identifier& name, auto, bool) {
         for (auto scope = scopes.rbegin(); scope != scopes.rend(); ++scope) {
-            if (auto found = scope->find(name.text); found != scope->end()) {
+            if (auto found = scope->find(localKey(name)); found != scope->end()) {
                 auto slot = found->second;
                 for (const auto& worker : workers) if (slot < worker.firstLocal) {
                     fn.locals[slot].captured = true;

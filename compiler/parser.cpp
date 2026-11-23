@@ -129,7 +129,7 @@ constexpr Infix infix[] = {
 
 class Parser {
 public:
-    Parser(const Source& source, std::size_t file) : source(source), file(file), lexer(source), token(lexer.next()), next(lexer.next()) {}
+    Parser(const Source& source, std::size_t file, std::vector<ExpressionExpansion>* expressions = nullptr) : source(source), file(file), lexer(source), token(lexer.next()), next(lexer.next()), macros(expressions) {}
 
     void appendTo(Module& module) {
         while (token.kind != Kind::End) {
@@ -167,6 +167,7 @@ private:
     std::size_t file;
     Lexer lexer;
     Token token, next;
+    std::vector<ExpressionExpansion>* macros;
     std::vector<Expr> nodes;
 
     Token consume() {
@@ -531,8 +532,45 @@ private:
         return add({begin, close.end}, std::move(node));
     }
 
+    ExprId macroExpression() {
+        auto begin = require("#").span.begin;
+        auto name = identifier();
+        if (!macros) throw at(source, name.span, "LYM0001", "此处不能调用表达式宏 #" + name.text);
+        auto open = require("(").span;
+        ExpressionExpansion expansion{std::move(name), {begin, begin}, {open.end, open.end}, {}};
+        while (!is(")")) {
+            auto start = token.span.begin;
+            std::size_t end = start;
+            std::optional<std::string> literal;
+            if (token.kind == Kind::String && (text(next) == ")" || text(next) == ",")) {
+                auto string = stringLiteral(); end = string.span.end; literal = std::move(string.text);
+            } else {
+                std::vector<char> delimiters;
+                while (!delimiters.empty() || (!is(",") && !is(")"))) {
+                    if (token.kind == Kind::End) throw at(source, open, "LYP0001", "表达式宏缺少结束括号");
+                    if (is("(") || is("[") || is("{")) delimiters.push_back(is("(") ? ')' : is("[") ? ']' : '}');
+                    else if (is(")") || is("]") || is("}")) {
+                        if (delimiters.empty() || delimiters.back() != text(token).front()) throw at(source, token.span, "LYP0001", "宏实参括号不匹配");
+                        delimiters.pop_back();
+                    }
+                    end = consume().span.end;
+                }
+                if (start == end) throw at(source, token.span, "LYP0001", "表达式宏缺少实参");
+            }
+            expansion.arguments.push_back({{start, end}, std::move(literal)});
+            if (!is(",")) break;
+            consume();
+        }
+        auto close = require(")").span;
+        expansion.argumentsSpan.end = close.begin;
+        expansion.span.end = close.end;
+        macros->push_back(std::move(expansion));
+        return add({begin, close.end}, std::int64_t{0});
+    }
+
     ExprId atom(bool inParens, bool trailingBlock) {
         auto start = token.span.begin;
+        if (is("#")) return macroExpression();
         if (is("[")) {
             consume();
             ListLiteral literal;
@@ -642,8 +680,32 @@ Module parse(const std::vector<Source>& sources) {
     return functions;
 }
 
-void parseFile(Module& module, const Source& source, std::size_t file) {
-    Parser(source, file).appendTo(module);
+void parseFile(Module& module, const Source& source, std::size_t file, std::vector<ExpressionExpansion>* expressions) {
+    Parser(source, file, expressions).appendTo(module);
+}
+
+std::vector<MacroSplice> macroSplices(const Source& generated, std::size_t count) {
+    std::vector<MacroSplice> result;
+    Lexer lexer(generated);
+    constexpr std::string_view prefix = "__lyraMacroArg";
+    std::vector<char> delimiters;
+    for (auto token = lexer.next(); token.kind != Kind::End; token = lexer.next()) {
+        auto word = std::string_view(generated.text).substr(token.span.begin, token.span.end - token.span.begin);
+        if (word == "#") throw at(generated, token.span, "LYM0002", "宏不能递归生成新的宏调用");
+        if (word == "(" || word == "[" || word == "{") delimiters.push_back(word == "(" ? ')' : word == "[" ? ']' : '}');
+        if (word == ")" || word == "]" || word == "}") {
+            if (delimiters.empty() || delimiters.back() != word.front()) throw at(generated, token.span, "LYM0002", "表达式宏输出括号不匹配");
+            delimiters.pop_back();
+        }
+        if (token.kind != Kind::Name || !word.starts_with(prefix)) continue;
+        word.remove_prefix(prefix.size());
+        std::size_t index;
+        auto [stopped, error] = std::from_chars(word.data(), word.data() + word.size(), index);
+        if (error != std::errc{} || stopped != word.data() + word.size() || index >= count) throw at(generated, token.span, "LYM0002", "无效的宏实参插槽");
+        result.push_back({token.span, index});
+    }
+    if (!delimiters.empty()) throw at(generated, {0, generated.text.size()}, "LYM0002", "表达式宏输出括号未闭合");
+    return result;
 }
 
 }

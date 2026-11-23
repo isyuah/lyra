@@ -75,8 +75,12 @@ struct Field { Identifier name, type; bool writable; bool isPublic{}; std::vecto
 struct Aggregate { std::size_t file; Identifier name; bool reference; std::vector<Field> fields; bool isPublic{}; };
 struct Import { std::size_t file; bool isPublic; std::vector<Identifier> path; Identifier alias; };
 struct Expansion { std::size_t file; Identifier name; std::optional<Identifier> argument; bool decorator; bool record; std::size_t target; };
+struct MacroArgument { Span span; std::optional<std::string> literal; };
+struct ExpressionExpansion { Identifier name; Span span, argumentsSpan; std::vector<MacroArgument> arguments; };
+struct MacroSplice { Span span; std::size_t argument; };
 struct Module { std::vector<Function> functions; std::vector<Aggregate> aggregates; std::vector<Import> imports; std::vector<Expansion> expansions; };
 Module parse(const std::vector<Source>& sources);
-void parseFile(Module& module, const Source& source, std::size_t file);
+void parseFile(Module& module, const Source& source, std::size_t file, std::vector<ExpressionExpansion>* expressions = nullptr);
+std::vector<MacroSplice> macroSplices(const Source& generated, std::size_t count);
 
 }

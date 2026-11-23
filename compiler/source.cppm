@@ -1,6 +1,7 @@
 module;
 #include <cstddef>
 #include <filesystem>
+#include <memory>
 #include <optional>
 #include <string>
 #include <utility>
@@ -26,15 +27,21 @@ struct Site {
     std::size_t lineStartOffset;
 };
 
+struct SourcePiece { Span output, input; bool copied; std::size_t hygiene; };
+
 struct Source {
     std::filesystem::path path;
     std::string text;
     std::vector<std::size_t> lineStarts;
     std::string moduleId{};
     std::optional<Site> origin{};
+    std::shared_ptr<const Source> previous{};
+    std::vector<SourcePiece> pieces{};
 
     Position position(std::size_t offset) const;
     Site site(Span span) const;
+    std::size_t hygieneAt(Span span) const;
+    std::optional<Site> generatedSite(Span span) const;
 };
 
 struct Diagnostic {

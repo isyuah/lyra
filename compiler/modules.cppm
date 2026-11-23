@@ -180,9 +180,12 @@ Compilation loadProgram(const PackageGraph& graph, const std::string& entry, con
         spaces.emplace(root, Space{packages.at(entry)});
         program.sources.push_back(loadSource(*testFile, root));
     }
-    program.syntax = parse(program.sources);
     std::map<std::string, MacroPackage> macroPackages;
     for (const auto& [module, space] : spaces) macroPackages.emplace(module, MacroPackage{space.package->root, space.package->macroInputs});
+    for (std::size_t file = 0; file < program.sources.size(); ++file) {
+        auto& source = program.sources[file];
+        parsePackageFile(program.syntax, source, file, macroPackages.at(source.moduleId), program.macroInputs);
+    }
     expandMacros(program.syntax, program.sources, macroPackages, program.macroInputs);
     std::map<std::string, ResolvedPackage> bundled;
     auto standard = fs::canonical("/proc/self/exe").parent_path().parent_path() / "share" / "lyra" / "std";

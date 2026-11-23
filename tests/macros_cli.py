@@ -149,6 +149,57 @@ fn main(): Unit { print(route()); print(adapt(Request(7))); print(show(8, "direc
         (self.src / 'main.ly').write_text('fn work([path][path] id: Int): Int { id }\nfn main(): Unit {}')
         self.diagnostic('LYM0003', 'path')
 
+    def test_expression_splices_preserve_scope_short_circuit_and_source_ranges(self):
+        directory = self.src / '.expressions'
+        directory.mkdir()
+        expression = directory / 'make.ly'
+        expression.write_text('''fn make(target: String, raw: String): String {
+    if argumentCount() != 2 { return macroFail("expected two expressions") }
+    "{ val temp = 10; if " + argumentCode(0) + " { temp + " + argumentCode(1) + " } else { 0 } }"
+}''')
+        self.native('''fn add(left: Int, right: Int): Int { print("add"); left + right }
+fn main(): Unit {
+    val temp = 2
+    print(2 * #make(true, add(temp, 1)))
+    print(#make(false, add(temp, 9)))
+    print(#make(true, #make(true, temp)))
+}''', ['add', '26', '0', '22'])
+        main = self.src / 'main.ly'
+        main.write_text('fn main(): Unit {\n    print(#make(true, false))\n}')
+        error = self.diagnostic('LYT0001')
+        self.assertEqual((error['range']['start']['line'], error['range']['start']['column']), (2, 23))
+        expression.write_text('fn make(target: String, raw: String): String { "temp" }')
+        main.write_text('fn main(): Unit { val temp = 7; print(#make()) }')
+        error = self.diagnostic('LYN0001', 'temp')
+        self.assertEqual(error['range']['start']['column'], main.read_text().index('#make') + 2)
+        self.assertIn('temp', error['generated']['source'])
+
+    def test_expression_macro_uses_only_declared_snapshot_and_one_expression(self):
+        directory = self.src / '.expressions'
+        directory.mkdir()
+        impl = directory / 'query.ly'
+        impl.write_text('''fn query(target: String, raw: String): String {
+    if argumentString(0) != macroInput("statement") { return macroFail("refresh query snapshot") }
+    "bindId(" + argumentCode(1) + ")"
+}''')
+        self.manifest(macroInputs={'query': {'statement': 'inputs/query.sql'}})
+        (self.pkg / 'inputs').mkdir()
+        (self.pkg / 'inputs/query.sql').write_text('SELECT ?1')
+        code = 'fn bindId(id: Int): Int { id }\nfn main(): Unit { print(#query("SELECT ?1", 7)) }'
+        self.native(code, ['7'])
+        self.assertNotEqual(self.cli('build', self.pkg, '-o', impl).returncode, 0)
+        main = self.src / 'main.ly'
+        main.write_text(code.replace('SELECT ?1', 'SELECT ?2'))
+        self.diagnostic('LYM0002', 'snapshot')
+        main.write_text(code.replace('"SELECT ?1"', '7'))
+        self.diagnostic('LYM0002', '字面量')
+        main.write_text(code)
+        for generated in ('1); pub fn escaped(): Int { 9 }', '#query(7)'):
+            impl.write_text('fn query(target: String, raw: String): String { ' + json.dumps(generated) + ' }')
+            self.diagnostic('LYM0002')
+        main.write_text('fn main(): Unit { print(#derive(Json)) }')
+        self.diagnostic('LYM0001', '表达式宏')
+
 
 if __name__ == '__main__':
     unittest.main()
