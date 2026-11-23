@@ -130,6 +130,91 @@ async fn main(): Unit {
 }
 ''', "9\n3\n")
 
+    def test_task_group_joins_lexically_and_keeps_errors_inside_scope(self):
+        self.run_source('''
+exception ChildFailed
+async fn child(): Unit { print("child") }
+async fn broken(): Unit { throw ChildFailed("group failure") }
+fn missing(): Int? { None }
+async fn main(): Unit {
+    val result = taskGroup {
+        defer print("cleanup")
+        spawn child()
+        print("body")
+        return 7
+    }
+    print(result)
+    val optional: Int? = taskGroup { missing()? + 1 }
+    print(optional == None)
+    try { taskGroup { spawn broken(); }; } catch reason: ChildFailed { print(reason.message) }
+    print("outside")
+}
+''', 'body\nchild\ncleanup\n7\ntrue\ngroup failure\noutside\n')
+
+    def test_parallel_domain_rendezvous_and_locked_gc_references(self):
+        (self.package / "lyra.json5").write_text("{name:'test/domains',version:'1.0.0'}")
+        self.run_source('''
+import std.sync.AtomicInt
+import std.sync.Mutex
+import std.sync.withLock
+
+class Counter(var value: Int)
+async fn delimited(value: Int): Int { gcCollect(); value }
+async fn main(): Unit {
+    val gate = AtomicInt()
+    val lock = Mutex()
+    val counter = Counter(0)
+    val items: List<Int> = []
+    var captured = 0
+    try { withLock(lock) { throw Exception("unlock") }; } catch { print("caught") }
+    val first = parallel {
+        gate.fetchAdd(1)
+        while gate.load() < 2 {}
+        val value = await delimited(11)
+        withLock(lock) { captured += value; counter.value += 1; items.add(value) }
+        value
+    }
+    val second = parallel {
+        gate.fetchAdd(1)
+        while gate.load() < 2 {}
+        val value = await delimited(31)
+        withLock(lock) { captured += value; counter.value += 1; items.add(value) }
+        value
+    }
+    print((await first) + (await second))
+    print(captured)
+    print(counter.value)
+    print(items[0] + items[1])
+    print(gate.compareExchange(2, 4))
+    print(gate.load())
+}
+''', 'caught\n42\n42\n2\n42\ntrue\n4\n')
+
+    def test_typed_task_local_keeps_unset_and_stored_none_distinct(self):
+        self.run_source('''
+async fn inspect(key: TaskLocal<String?>): String {
+    await blocking {
+        gcCollect()
+        match key.get() { None => "unset", Some(None) => "empty", Some(Some(value)) => value }
+    }
+}
+async fn nested(cold: Task<String>): String {
+    val work = parallel { await cold }
+    await work
+}
+async fn main(): Unit {
+    val key = TaskLocal<String?>()
+    val distinct: TaskLocal<String?> = TaskLocal()
+    val cold = inspect(key)
+    print(key.get() == None)
+    print(await withLocal(key, "request 🤝", nested(cold)))
+    print(await withLocal(key, None, inspect(key)))
+    print(await withLocal(distinct, "other", inspect(key)))
+    print(await cold)
+    print(key.get() == None)
+}
+''', 'true\nrequest 🤝\nempty\nunset\nrequest 🤝\ntrue\n')
+
     def test_business_error_main_drains_children_and_reports_the_message(self):
         for outcome, status, message in (("Ok({})", 0, b""), ('Err("数据\\0错误")', 1, "数据\0错误\n".encode())):
             self.main.write_text('async fn child(): Unit { print(1) }\n'

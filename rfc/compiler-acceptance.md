@@ -27,13 +27,13 @@ H 由作者委托设计。顺序是先证明**写错能指出原因、写对能�
 | M3：泛型对象与公开 API | [对象](../tests/objects_cli.py)核对实例/静态方法重载和结构约束分派；[模块](../tests/modules_cli.py)核对跨包泛型枚举、扩展组导入和优先级，以及嵌套签名的私有类型检查。 |
 | 日常类型推断 | [返回推断与可空收窄](../tests/inference_cli.py)检查私有函数、泛型方法、递归需标注、短路和提前返回，以及跨 `await` 读取同一局部快照。 |
 | M4：模块、包与工具分发 | [安装验收](../tests/installed_cli.py)搬迁完整工具链、发布库、锁定并拉取源码，移走注册中心和生产者源码，在仓库外用离线缓存原生编译并执行。 |
-| M5：异步、异常与收尾 | [词法清理](../tests/defer_cli.py)、[异常](../tests/exceptions_cli.py)和[Context](../tests/context_cli.py)区分完成值、普通异常和取消，检查阻塞池、任务树及 `await` 的源位置。 |
+| M5：异步、异常与收尾 | [词法清理](../tests/defer_cli.py)、[异常](../tests/exceptions_cli.py)和[Context](../tests/context_cli.py)区分业务错误、普通异常和取消。[异步源码用例](../tests/async_cli.py)核对组的清理顺序、跨域门闩与类型化任务局部值；[原生任务用例](../tests/runtime_tasks.cpp)检查等待者回到自身域、跨线程 GC 和取消时的 C 工作收尾。 |
 | M6：C ABI 与服务 | [HTTP/SQLite](../tests/http_cli.py)使用真实 TCP 和系统 SQLite。另一个连接断开时，数据库工作安全收尾，释放 statement 和连接；服务仍接受后续请求。 |
 | M7：宏与独立应用 | [宏](../tests/macros_cli.py)检查显式派生、嵌套字段/数组错误路径、标记、入口装饰器、表达式拼接和受控文件输入。[JSONL CLI](../tests/jsonlines_cli.py)检查正确输入、坏行、流错误以及工具链外的双包部署。 |
 
 运行 `ctest --preset dev --output-on-failure` 执行这些套件；`release` preset 另测优化版编译器。最低部署目标由[Jammy 两阶段验收](../tests/jammy-smoke.sh)分别验证只有 libc 的应用和额外依赖系统 SQLite 的应用；量测条件和结果见[原生工具链](native-toolchain.md)。
 
-**仍属设计、不能当作现有 API：** 共同业务 `Error`、运行时字段反射和 TOML 派生。编辑器集成、`fmt` 和 `doc` 另行交付。[设计服务](../examples/user-service/README.md)保留最终写法；目前编译运行的是[原生服务](../examples/http-sqlite/README.md)。
+**仍属设计、不能当作现有 API：** 运行时字段反射和 TOML 派生。编辑器集成、`fmt` 和 `doc` 另行交付。[设计服务](../examples/user-service/README.md)保留最终写法；目前编译运行的是[原生服务](../examples/http-sqlite/README.md)。
 
 ## 后续扩展仍要守住的三个验收点
 

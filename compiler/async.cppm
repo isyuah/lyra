@@ -59,8 +59,8 @@ export llvm::Value* asyncAwait(llvm::IRBuilder<>& builder, llvm::Type* result, l
     return marker(builder, "lyra.await", result, {task, errorSlot});
 }
 
-export llvm::Value* asyncSpawn(llvm::IRBuilder<>& builder, llvm::Value* task) {
-    return marker(builder, "lyra.spawn", builder.getPtrTy(), {task});
+export llvm::Value* asyncSpawn(llvm::IRBuilder<>& builder, llvm::Value* task, bool parallel = false) {
+    return marker(builder, parallel ? "lyra.parallel" : "lyra.spawn", builder.getPtrTy(), {task});
 }
 
 export void asyncFailure(llvm::IRBuilder<>& builder, llvm::Value* error) {
@@ -204,7 +204,7 @@ export void lowerAsync(llvm::Function& factory, llvm::Function& body, llvm::Allo
             if (callee && callee->hasFnAttribute("lyra.suspension")) {
                 auto name = callee->getFnAttribute("lyra.suspension").getValueAsString();
                 if (name == "lyra.await") waits.push_back(call);
-                else if (name == "lyra.spawn") spawns.push_back(call);
+                else if (name == "lyra.spawn" || name == "lyra.parallel") spawns.push_back(call);
                 else failures.push_back(call);
             }
         } else if (auto* phi = llvm::dyn_cast<llvm::PHINode>(&instruction)) phis.push_back(phi);
@@ -316,7 +316,9 @@ export void lowerAsync(llvm::Function& factory, llvm::Function& body, llvm::Allo
     }
     for (auto* spawn : spawns) {
         builder.SetInsertPoint(spawn);
-        spawn->replaceAllUsesWith(builder.CreateCall(runtime(builder, "lyraTaskSpawn", pointer, {pointer, pointer}), {task, spawn->getArgOperand(0)}));
+        auto parallel = spawn->getCalledFunction()->getFnAttribute("lyra.suspension").getValueAsString() == "lyra.parallel";
+        auto start = runtime(builder, parallel ? "lyraTaskParallel" : "lyraTaskSpawn", pointer, {pointer, pointer});
+        spawn->replaceAllUsesWith(builder.CreateCall(start, {task, spawn->getArgOperand(0)}));
         eraseMarker(spawn);
     }
     for (auto* failure : failures) {

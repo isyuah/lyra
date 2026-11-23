@@ -43,6 +43,7 @@ std::optional<Type> hiddenType(const CheckedModule& module, Type type) {
         }
         case Type::List: return hiddenType(module, module.listElements[type.id]);
         case Type::Task: return hiddenType(module, module.taskResults[type.id]);
+        case Type::TaskLocal: return hiddenType(module, module.taskLocalValues[type.id]);
         case Type::Option: return hiddenType(module, module.sumTypes[type.id].success);
         case Type::Result: {
             const auto& sum = module.sumTypes[type.id];
@@ -77,7 +78,7 @@ std::string typeName(const CheckedModule& module, Type type, bool canonical = fa
         case Type::Bool: return "Bool";
         case Type::Int: case Type::UInt: case Type::Real: return numberName(type);
         case Type::Unit: return "Unit";
-        case Type::Never: return "Never";
+        case Type::Never: return canonical ? "$never" : "Never";
         case Type::String: return "String";
         case Type::Char: return "Char";
         case Type::Bytes: return "Bytes";
@@ -111,6 +112,7 @@ std::string typeName(const CheckedModule& module, Type type, bool canonical = fa
         }
         case Type::Variable: return module.variableNames[type.id];
         case Type::Task: return "Task<" + name(module.taskResults[type.id]) + ">";
+        case Type::TaskLocal: return "TaskLocal<" + name(module.taskLocalValues[type.id]) + ">";
         case Type::List: return "List<" + name(module.listElements[type.id]) + ">";
         case Type::Option: return "Option<" + name(module.sumTypes[type.id].success) + ">";
         case Type::Result: return "Result<" + name(module.sumTypes[type.id].success) + "," + name(module.sumTypes[type.id].failure) + ">";
@@ -261,7 +263,8 @@ struct Symbols {
     struct TypeTrial {
         Symbols& symbols;
         std::size_t aggregates = symbols.module.aggregates.size(), enums = symbols.module.enums.size(), tasks = symbols.module.taskResults.size(),
-            sums = symbols.module.sumTypes.size(), lists = symbols.module.listElements.size(), signatures = symbols.module.signatures.size();
+            sums = symbols.module.sumTypes.size(), lists = symbols.module.listElements.size(), signatures = symbols.module.signatures.size(),
+            taskLocals = symbols.module.taskLocalValues.size();
         unsigned expanding = symbols.expandingNominal;
         std::size_t nominal = symbols.nominalChecks.size(), nextNominal = symbols.nextNominalCheck;
 
@@ -278,6 +281,7 @@ struct Symbols {
             symbols.nominalChecks.resize(nominal);
             symbols.nextNominalCheck = nextNominal;
             symbols.module.taskResults.resize(tasks);
+            symbols.module.taskLocalValues.resize(taskLocals);
             symbols.module.sumTypes.resize(sums);
             symbols.module.listElements.resize(lists);
             symbols.module.signatures.resize(signatures);
@@ -410,6 +414,7 @@ struct Symbols {
     }
 
     Type task(Type result) const { return unaryType(Type::Task, module.taskResults, result); }
+    Type taskLocal(Type value) const { return unaryType(Type::TaskLocal, module.taskLocalValues, value); }
     Type list(Type element) const { return unaryType(Type::List, module.listElements, element); }
 
     Type closure(std::vector<Type> parameters, Type result) const {
@@ -443,6 +448,7 @@ struct Symbols {
             if (slot == shape.parameters.size()) return shape.result;
         }
         if (name == "Task" && value.kind == Type::Task && slot == 0) return module.taskResults[value.id];
+        if (name == "TaskLocal" && value.kind == Type::TaskLocal && slot == 0) return module.taskLocalValues[value.id];
         if (name == "List" && value.kind == Type::List && slot == 0) return module.listElements[value.id];
         if (name == "Option" && value.kind == Type::Option && slot == 0) return module.sumTypes[value.id].success;
         if (name == "Result" && value.kind == Type::Result && slot < 2) return slot ? module.sumTypes[value.id].failure : module.sumTypes[value.id].success;
@@ -479,6 +485,7 @@ struct Symbols {
             case Type::Record: return module.aggregates[type.id].abstract;
             case Type::Enum: return module.enums[type.id].abstract;
             case Type::Task: return abstract(module.taskResults[type.id]);
+            case Type::TaskLocal: return abstract(module.taskLocalValues[type.id]);
             case Type::List: return abstract(module.listElements[type.id]);
             case Type::Option: return abstract(module.sumTypes[type.id].success);
             case Type::Result: return abstract(module.sumTypes[type.id].success) || abstract(module.sumTypes[type.id].failure);
@@ -545,6 +552,7 @@ struct Symbols {
             auto found = std::ranges::find(parameters, form.name, &Identifier::text);
             if (found != parameters.end()) return lookup(static_cast<std::size_t>(found - parameters.begin()));
             if (auto type = numberType(form.name)) return type;
+            if (form.name == "$never") return Type::Never;
             if (form.name.starts_with("$dyn:")) {
                 auto trait = traitNames.find(form.name.substr(5));
                 if (trait == traitNames.end()) throw at(source, span, "LYG0005", "找不到动态接口 trait：" + form.name.substr(5));
@@ -565,6 +573,7 @@ struct Symbols {
             return closure(std::move(arguments), result);
         }
         if (arguments.size() == 1 && form.name == "Task") return task(arguments[0]);
+        if (arguments.size() == 1 && form.name == "TaskLocal") return taskLocal(arguments[0]);
         if (arguments.size() == 1 && form.name == "List") return list(arguments[0]);
         if (arguments.size() == 1 && form.name == "Option") return sum(Type::Option, arguments[0]);
         if (arguments.size() == 2 && form.name == "Result") return sum(Type::Result, arguments[0], arguments[1]);
@@ -659,6 +668,7 @@ struct Checker {
     bool materializing() const { return variables.empty() && !probing && !inferredReturn; }
 
     std::optional<ExprId> currentWorker() const { return workers.empty() ? std::nullopt : std::optional(workers.back().id); }
+    bool inAsync() const { return workers.empty() ? fn.syntax.isAsync : std::holds_alternative<AsyncBlock>(fn.syntax.expressions[workers.back().id].node); }
     std::optional<Type> returnType() const {
         if (!workers.empty()) return workers.back().result;
         return inferredReturn ? *inferredReturn : std::optional(fn.result);
@@ -1047,8 +1057,10 @@ struct Checker {
         auto target = returnType();
         if (!target) {
             if (workers.empty()) throw at(source, propagation.site, "LYT0013", "请给函数标注 Option 或 Result 的返回类型以使用 ?");
-            bool lambda = std::holds_alternative<Lambda>(fn.syntax.expressions[workers.back().id].node);
-            throw at(source, propagation.site, "LYT0013", lambda ? "请给 lambda 标注 Option 或 Result 的返回类型以使用 ?" : "请给 blocking 块明确的 Task<Option<T>> 或 Task<Result<T,E>> 目标类型以使用 ?");
+            const auto& node = fn.syntax.expressions[workers.back().id].node;
+            if (std::holds_alternative<Lambda>(node)) throw at(source, propagation.site, "LYT0013", "请给 lambda 标注 Option 或 Result 的返回类型以使用 ?");
+            auto group = std::get_if<AsyncBlock>(&node);
+            throw at(source, propagation.site, "LYT0013", group && group->kind == AsyncBlock::Group ? "请给 taskGroup 块明确的 Option 或 Result 目标类型以使用 ?" : "请给任务块明确的 Task<Option<T>> 或 Task<Result<T,E>> 目标类型以使用 ?");
         }
         if (expected && (target->kind == Type::Option || target->kind == Type::Result)) hint = symbols.sum(target->kind, *expected, module.sumTypes[target->id].failure);
         auto operand = inspectOption(propagation.operand, hint);
@@ -1843,11 +1855,17 @@ struct Checker {
                 staticMember = symbols.staticMethods[decl.declaration].contains(call.name.text);
             }
             if (owner.kind == Type::Task && call.name.text == "cancel") {
-                if (!workers.empty() || !fn.syntax.isAsync) throw at(source, call.name.span, "LYT0008", "Task.cancel() 只能在 async 函数中调用，不能在同步 lambda、blocking 或 defer 中调用");
+                if (!inAsync()) throw at(source, call.name.span, "LYT0008", "Task.cancel() 只能在异步执行体中调用，不能在同步 lambda、blocking 或 defer 中调用");
                 noTypeArgs();
                 if (!call.arguments.empty()) throw at(source, call.name.span, "LYT0002", "Task.cancel() 不接收实参");
                 info.callee = Callee::TaskCancel;
                 return Type::Unit;
+            }
+            if (owner.kind == Type::TaskLocal && call.name.text == "get") {
+                noTypeArgs();
+                if (!call.arguments.empty()) throw at(source, call.name.span, "LYT0002", "TaskLocal.get 不接收实参");
+                info.callee = Callee::LocalGet;
+                return symbols.sum(Type::Option, module.taskLocalValues[owner.id]);
             }
             if (owner.kind == Type::List && call.name.text == "add") {
                 noTypeArgs();
@@ -1873,6 +1891,28 @@ struct Checker {
             info.argumentSlots.push_back(0);
             if (value == Type::Never) return value;
             return expected ? *expected : symbols.sum(kind, value);
+        } else if (key == "TaskLocal") {
+            if (!call.arguments.empty()) throw at(source, call.name.span, "LYT0002", "TaskLocal 不接收值实参");
+            info.callee = Callee::LocalKey;
+            if (call.typeArguments.size() == 1) return symbols.taskLocal(symbols.resolve(fn.syntax, call.typeArguments.front(), variables));
+            if (call.typeArguments.empty()) {
+                if (expected && expected->kind == Type::Option) expected = module.sumTypes[expected->id].success;
+                if (expected && expected->kind == Type::TaskLocal) return *expected;
+            }
+            throw at(source, call.name.span, "LYG0001", "TaskLocal 需要一个类型实参或明确的 TaskLocal<T> 目标类型");
+        } else if (key == "withLocal") {
+            noTypeArgs();
+            if (call.arguments.size() != 3 || std::ranges::any_of(call.arguments, [](const Argument& item) { return item.label || item.spread || item.trailing; }))
+                throw at(source, call.name.span, "LYT0002", "withLocal 写作 withLocal(key, value, task)");
+            auto key = visit(call.arguments[0].value);
+            if (key == Type::Never) return key;
+            if (key.kind != Type::TaskLocal) throw at(source, fn.syntax.expressions[call.arguments[0].value].span, "LYT0008", "withLocal 的第一个实参需要 TaskLocal<T>");
+            auto value = visit(call.arguments[1].value, module.taskLocalValues[key.id]);
+            auto task = visit(call.arguments[2].value, expected && expected->kind == Type::Task ? expected : std::nullopt);
+            if (task != Type::Never && task.kind != Type::Task) throw at(source, fn.syntax.expressions[call.arguments[2].value].span, "LYT0008", "withLocal 的第三个实参需要冷 Task 或已启动的 Task");
+            info.callee = Callee::WithLocal;
+            info.argumentSlots = {0, 1, 2};
+            return value == Type::Never ? value : task;
         } else if (key == "Error") {
             noTypeArgs();
             if (call.arguments.empty() || call.arguments.size() > 2) throw at(source, call.name.span, "LYT0002", "Error 需要 value 及可选的 cause 实参");
@@ -1946,25 +1986,36 @@ struct Checker {
     }
 
     Type infer(ExprId, const TaskOp& op, std::optional<Type> expected, bool) {
-        if (!workers.empty() || !fn.syntax.isAsync) throw at(source, op.site, "LYT0008", "await 和 spawn 只能在 async 函数中使用，不能用于同步 lambda、blocking 或 defer");
+        if (!inAsync()) throw at(source, op.site, "LYT0008", "await 和 spawn 只能在异步执行体中使用，不能用于同步 lambda、blocking 或 defer");
         auto operand = inspect(op.operand, op.spawn || !expected ? expected : std::optional(symbols.task(*expected)));
         if (operand.kind == Type::Never) return operand;
         if (operand.kind != Type::Task) throw at(source, fn.syntax.expressions[op.operand].span, "LYT0008", "此处需要 Task，实际是 " + typeName(module, operand));
         return op.spawn ? operand : module.taskResults[operand.id];
     }
 
-    Type infer(ExprId id, const Blocking& worker, std::optional<Type> expected, bool) {
-        auto hint = expected && expected->kind == Type::Task ? std::optional(module.taskResults[expected->id]) : std::nullopt;
+    Type taskBlock(ExprId id, ExprId bodyId, std::optional<Type> hint) {
         workers.push_back({id, fn.locals.size(), hint});
         unsigned previous = std::exchange(loops, 0);
         auto entry = present;
-        auto body = visit(worker.body, hint);
+        auto body = visit(bodyId, hint);
         auto result = workers.back().result.value_or(body);
-        fit(worker.body, body, result);
+        fit(bodyId, body, result);
         workers.pop_back();
         present = std::move(entry);
         loops = previous;
-        return symbols.task(result);
+        return result;
+    }
+
+    Type infer(ExprId id, const Blocking& worker, std::optional<Type> expected, bool) {
+        auto hint = expected && expected->kind == Type::Task ? std::optional(module.taskResults[expected->id]) : std::nullopt;
+        return symbols.task(taskBlock(id, worker.body, hint));
+    }
+
+    Type infer(ExprId id, const AsyncBlock& block, std::optional<Type> expected, bool discard) {
+        if (!inAsync()) throw at(source, block.site, "LYT0008", "taskGroup 和 parallel 只能在异步执行体中使用");
+        if (block.kind == AsyncBlock::Group) return taskBlock(id, block.body, discard ? std::nullopt : expected);
+        auto hint = expected && expected->kind == Type::Task ? std::optional(module.taskResults[expected->id]) : std::nullopt;
+        return symbols.task(taskBlock(id, block.body, hint));
     }
 
     Type infer(ExprId id, const Deferred& cleanup, auto, bool) {
@@ -2246,7 +2297,7 @@ CheckedModule check(Module module, const std::vector<Source>& sources, bool requ
         for (Type builtin : scalarTypes) {
             if (name == typeName(checked, builtin)) throw at(sources[decl.file], decl.name.span, "LYN0002", "类型名与内置类型冲突：" + std::string(name));
         }
-        if (name == "Never") throw at(sources[decl.file], decl.name.span, "LYN0002", "类型名与内置类型冲突：Never");
+        if (name == "Never" || name == "TaskLocal") throw at(sources[decl.file], decl.name.span, "LYN0002", "类型名与内置类型冲突：" + std::string(name));
         if (decl.name.text == "print" || decl.name.text == "gcCollect" || !names.emplace(declaration, index).second) throw at(sources[decl.file], decl.name.span, "LYN0002", "类型名称已声明：" + decl.name.text);
     };
     for (auto& decl : module.aggregates) {

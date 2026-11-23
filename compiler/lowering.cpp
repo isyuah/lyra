@@ -38,7 +38,10 @@ struct Layouts {
     bool workers{};
 
     Layouts(const CheckedModule& program, Builder& builder) : program(program) {
-        for (const auto& fn : program.functions) workers |= std::ranges::any_of(fn.syntax.expressions, [](const Expr& expr) { return std::holds_alternative<Blocking>(expr.node); });
+        for (const auto& fn : program.functions) workers |= std::ranges::any_of(fn.syntax.expressions, [](const Expr& expr) {
+            const auto* block = std::get_if<AsyncBlock>(&expr.node);
+            return std::holds_alternative<Blocking>(expr.node) || (block && block->kind == AsyncBlock::Parallel);
+        });
         for (const auto& record : program.aggregates) objects.push_back(record.abstract ? nullptr : llvm::StructType::create(builder.getContext(), "lyra.type." + record.syntax.name.text));
         for (std::size_t id = 0; id < objects.size(); ++id) {
             if (program.aggregates[id].abstract) continue;
@@ -99,7 +102,7 @@ struct Layouts {
         case Type::Bool: return builder.getInt1Ty();
         case Type::Char: return builder.getInt32Ty();
         case Type::Unit: case Type::Never: return builder.getInt8Ty();
-        case Type::String: case Type::Bytes: case Type::Task: case Type::CPtr: case Type::List: case Type::Exception: case Type::Closure: case Type::Error: return builder.getPtrTy();
+        case Type::String: case Type::Bytes: case Type::Task: case Type::CPtr: case Type::List: case Type::Exception: case Type::Closure: case Type::Error: case Type::TaskLocal: return builder.getPtrTy();
         case Type::Variable: llvm_unreachable("abstract type reached LLVM lowering");
         case Type::Any: case Type::Dyn: return llvm::StructType::get(builder.getContext(), {builder.getPtrTy(), builder.getPtrTy()});
         case Type::Record: return reference(type) ? static_cast<llvm::Type*>(builder.getPtrTy()) : objects[type.id];
@@ -136,20 +139,23 @@ struct Emitter {
 
     bool deferred() const { return worker && std::holds_alternative<Deferred>(fn.syntax.expressions[*worker].node); }
     bool lambda() const { return worker && std::holds_alternative<Lambda>(fn.syntax.expressions[*worker].node); }
+    const AsyncBlock* asyncBlock() const { return worker ? std::get_if<AsyncBlock>(&fn.syntax.expressions[*worker].node) : nullptr; }
     ExprId bodyId() const {
         if (!worker) return fn.syntax.body;
         const auto& node = fn.syntax.expressions[*worker].node;
         if (auto cleanup = std::get_if<Deferred>(&node)) return cleanup->body;
         if (auto literal = std::get_if<Lambda>(&node)) return literal->body;
+        if (auto block = asyncBlock()) return block->body;
         return std::get<Blocking>(node).body;
     }
     Type completionType() const {
         if (!worker) return fn.result;
         if (lambda()) return layouts.program.signatures[rawType(*worker).id].result;
+        if (auto block = asyncBlock(); block && block->kind == AsyncBlock::Group) return rawType(*worker);
         return deferred() ? Type{Type::Unit} : layouts.program.taskResults[rawType(*worker).id];
     }
     Value cleanupMark() { return cleanupHead ? builder.CreateLoad(builder.getPtrTy(), cleanupHead) : nullptr; }
-    bool asyncBody() const { return !worker && fn.syntax.isAsync; }
+    bool asyncBody() const { return worker ? asyncBlock() != nullptr : fn.syntax.isAsync; }
 
     void propagate(Value error, std::size_t depth) {
         if (depth) {
@@ -347,7 +353,7 @@ struct Emitter {
         return builder.CreateInsertValue(boxed, NativeLists{builder}.box(value), 1);
     }
 
-    Value errorCall(llvm::StringRef name, llvm::ArrayRef<Value> arguments) {
+    Value pointerCall(llvm::StringRef name, llvm::ArrayRef<Value> arguments) {
         auto pointer = builder.getPtrTy();
         auto signature = llvm::FunctionType::get(pointer, std::vector<llvm::Type*>(arguments.size(), pointer), false);
         return builder.CreateCall(module.getOrInsertFunction(name, signature), arguments);
@@ -357,7 +363,7 @@ struct Emitter {
         if (type == Type::Error) return value;
         auto message = display.method ? callFunction(*display.method, {value}, site) : type == Type::String ? value : stringConstant(display.fallback);
         auto original = boxAny(value, type);
-        return errorCall("lyraErrorCreate", {builder.CreateExtractValue(original, 0), builder.CreateExtractValue(original, 1), message, cause});
+        return pointerCall("lyraErrorCreate", {builder.CreateExtractValue(original, 0), builder.CreateExtractValue(original, 1), message, cause});
     }
 
     Value emitNode(ExprId id, IntegerLiteral literal) {
@@ -447,8 +453,12 @@ struct Emitter {
         auto task = emit(op.operand);
         if (!live()) return unit();
         if (op.spawn) return asyncSpawn(builder, task);
+        return awaitValue(id, task, op.site);
+    }
+
+    Value awaitValue(ExprId id, Value task, Span site) {
         auto result = asyncAwait(builder, layouts.native(builder, rawType(id)), task, errorSlot);
-        guard(builder.CreateLoad(builder.getPtrTy(), errorSlot), handlers.size(), op.site, "await");
+        guard(builder.CreateLoad(builder.getPtrTy(), errorSlot), handlers.size(), site, "await");
         return result;
     }
 
@@ -464,6 +474,24 @@ struct Emitter {
     Value emitNode(ExprId id, const Blocking&) {
         auto [code, cells] = closure(id, layouts.program.taskResults[rawType(id).id], ".worker");
         return NativeExceptions{builder}.created(blockingTask(builder, code, cells), source, fn.syntax.expressions[id].span);
+    }
+
+    Value emitNode(ExprId id, const AsyncBlock& block) {
+        const auto& captures = fn.expressions[id].captures;
+        auto parallel = block.kind == AsyncBlock::Parallel;
+        auto type = rawType(id);
+        if (parallel) type = layouts.program.taskResults[type.id];
+        auto* pointer = builder.getPtrTy();
+        auto signature = llvm::FunctionType::get(pointer, std::vector<llvm::Type*>(captures.size(), pointer), false);
+        auto* factory = llvm::Function::Create(signature, llvm::Function::InternalLinkage, native->getName() + (parallel ? ".parallel" : ".group"), module);
+        auto* body = lyra::asyncBody(*factory, layouts.native(builder, type));
+        Emitter child{fn, source, module, body, functions, layouts};
+        child.run(id);
+        lowerAsync(*factory, *body, child.cleanupHead);
+        std::vector<Value> cells;
+        for (auto slot : captures) cells.push_back(cell(slot));
+        auto task = NativeExceptions{builder}.created(builder.CreateCall(factory, cells), source, block.site);
+        return parallel ? asyncSpawn(builder, task, true) : awaitValue(id, task, block.site);
     }
 
     Value emitNode(ExprId id, const Deferred&) {
@@ -641,16 +669,16 @@ struct Emitter {
         if (owner.kind == Type::Exception) return NativeExceptions{builder}.message(object);
         if (owner.kind == Type::Error) {
             switch (static_cast<ErrorMember>(fn.expressions[id].target)) {
-                case ErrorMember::Message: return errorCall("lyraErrorMessage", {object});
+                case ErrorMember::Message: return pointerCall("lyraErrorMessage", {object});
                 case ErrorMember::Original: {
-                    auto value = builder.CreateInsertValue(llvm::PoisonValue::get(layouts.native(builder, Type::Any)), errorCall("lyraErrorType", {object}), 0);
-                    return builder.CreateInsertValue(value, errorCall("lyraErrorValue", {object}), 1);
+                    auto value = builder.CreateInsertValue(llvm::PoisonValue::get(layouts.native(builder, Type::Any)), pointerCall("lyraErrorType", {object}), 0);
+                    return builder.CreateInsertValue(value, pointerCall("lyraErrorValue", {object}), 1);
                 }
                 case ErrorMember::Cause: {
-                    auto cause = errorCall("lyraErrorCause", {object});
+                    auto cause = pointerCall("lyraErrorCause", {object});
                     return builder.CreateInsertValue(makeSum(rawType(id), SumTag::Some, cause), builder.CreateIsNotNull(cause), 0);
                 }
-                case ErrorMember::Suppressed: return errorCall("lyraErrorSuppressed", {object});
+                case ErrorMember::Suppressed: return pointerCall("lyraErrorSuppressed", {object});
             }
             llvm_unreachable("invalid Error member");
         }
@@ -742,12 +770,30 @@ struct Emitter {
         }
         switch (info.callee) {
             case Callee::Indirect: llvm_unreachable("indirect call already emitted");
+            case Callee::LocalKey: return asyncCell(builder, builder.getInt8Ty());
+            case Callee::WithLocal: return NativeExceptions{builder}.created(pointerCall("lyraTaskWithLocal", {args[0], NativeLists{builder}.box(args[1]), args[2]}), source, call.name.span);
+            case Callee::LocalGet: {
+                auto context = pointerCall("lyraContextCurrent", {});
+                auto box = pointerCall("lyraContextLocal", {context, receiver});
+                auto option = rawType(id);
+                auto payload = layouts.native(builder, layouts.program.sumTypes[option.id].success);
+                auto missing = builder.GetInsertBlock(), found = label("local.found"), done = label("local.end");
+                builder.CreateCondBr(builder.CreateIsNotNull(box), found, done);
+                builder.SetInsertPoint(found);
+                auto some = makeSum(option, SumTag::Some, builder.CreateLoad(payload, box));
+                builder.CreateBr(done);
+                builder.SetInsertPoint(done);
+                auto* result = builder.CreatePHI(some->getType(), 2);
+                result->addIncoming(llvm::Constant::getNullValue(some->getType()), missing);
+                result->addIncoming(some, found);
+                return result;
+            }
             case Callee::BusinessError: {
                 auto argument = call.arguments[std::ranges::find(info.argumentSlots, 0) - info.argumentSlots.begin()].value;
                 auto cause = args.size() == 2 ? builder.CreateExtractValue(args[1], 1) : nullPointer();
                 return wrapError(args[0], fn.expressions[argument].type, info.errorDisplay, cause, call.name.span);
             }
-            case Callee::ErrorSuppress: return errorCall("lyraErrorSuppress", args);
+            case Callee::ErrorSuppress: return pointerCall("lyraErrorSuppress", args);
             case Callee::FailureInfo: {
                 auto missing = builder.GetInsertBlock(), failure = label("result.error"), done = label("result.end");
                 builder.CreateCondBr(builder.CreateExtractValue(receiver, 0), done, failure);

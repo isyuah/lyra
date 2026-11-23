@@ -1103,6 +1103,12 @@ private:
             auto body = block();
             return add({start, nodes[body].span.end}, Blocking{body});
         }
+        if (trailingBlock && (is("taskGroup") || is("parallel")) && text(next) == "{" && !next.newlineBefore) {
+            auto kind = is("parallel") ? AsyncBlock::Parallel : AsyncBlock::Group;
+            auto site = consume().span;
+            auto body = block();
+            return add({start, nodes[body].span.end}, AsyncBlock{kind, body, site});
+        }
         if (is("{")) return block();
         if (token.kind == Kind::Name || token.kind == Kind::Escaped) {
             auto name = identifier();

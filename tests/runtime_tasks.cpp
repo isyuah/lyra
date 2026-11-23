@@ -1,3 +1,4 @@
+#include "context.h"
 #include "managed.h"
 #include "net.h"
 #include "strings.h"
@@ -7,6 +8,7 @@
 #include <mutex>
 #include <stdio.h>
 #include <stdlib.h>
+#include <thread>
 
 namespace {
 
@@ -281,6 +283,219 @@ void failGroup(LyraTask *self, void *storage) {
     check(lyraTaskState(self) == LYRA_TASK_SUSPENDED, "group completed before children finished");
 }
 
+struct ParallelCase;
+
+struct ParallelPeer {
+    ParallelCase *test;
+    unsigned index;
+};
+
+struct ParallelCase {
+    std::mutex mutex;
+    std::condition_variable changed;
+    std::thread::id caller, peers[2];
+    ParallelPeer frames[2];
+    LyraTask *children[2]{};
+    unsigned arrived{}, sameDomainSteps{}, initialLocal{}, laterLocal{};
+    bool mayComplete{}, resumed{};
+};
+
+void rendezvous(LyraTask *self, void *storage) {
+    auto *peer = static_cast<ParallelPeer *>(storage);
+    auto& test = *peer->test;
+    auto *answer = static_cast<Counter *>(lyraGcAlloc(sizeof(Counter)));
+    answer->count = 90 + peer->index;
+    check(lyraContextLocal(lyraContextCurrent(), &test) == &test.initialLocal, "parallel task did not capture its activation context");
+    {
+        std::unique_lock lock(test.mutex);
+        test.peers[peer->index] = std::this_thread::get_id();
+        ++test.arrived;
+        test.changed.notify_all();
+        test.changed.wait(lock, [&] { return test.mayComplete; });
+    }
+    lyraTaskComplete(self, answer);
+}
+
+void openRendezvous(LyraTask *self, void *storage) {
+    auto& test = *static_cast<ParallelCase *>(storage);
+    check(std::this_thread::get_id() == test.caller, "spawn left its caller's domain");
+    ++test.sameDomainSteps;
+    {
+        std::lock_guard lock(test.mutex);
+        test.mayComplete = true;
+        test.changed.notify_all();
+    }
+    lyraTaskComplete(self, nullptr);
+}
+
+void parallelRendezvous(LyraTask *self, void *storage) {
+    auto& test = *static_cast<ParallelCase *>(storage);
+    if (!test.children[0]) {
+        test.caller = std::this_thread::get_id();
+        check(lyraContextEnter(lyraContextWithLocal(lyraContextCurrent(), &test, &test.initialLocal)), "cannot install activation context");
+        for (unsigned index = 0; index < 2; ++index) {
+            test.frames[index] = {&test, index};
+            test.children[index] = lyraTaskParallel(self, lyraTaskCreate(rendezvous, &test.frames[index]));
+        }
+        check(lyraContextEnter(lyraContextWithLocal(lyraContextCurrent(), &test, &test.laterLocal)), "cannot replace parent context");
+        lyraTaskSpawn(self, lyraTaskCreate(openRendezvous, &test));
+        {
+            std::unique_lock lock(test.mutex);
+            test.changed.wait(lock, [&] { return test.arrived == 2; });
+            check(test.peers[0] != test.peers[1] && test.peers[0] != test.caller && test.peers[1] != test.caller,
+                  "parallel domains did not reach the same gate on distinct OS threads");
+        }
+        check(!test.sameDomainSteps, "spawn ran during an unsuspended step in its own domain");
+        collectUnderPressure();
+        check(lyraTaskAwaitValue(self, test.children[0]) == LYRA_AWAIT_PENDING, "cross-domain await did not park on a closed gate");
+        return;
+    }
+    check(std::this_thread::get_id() == test.caller && test.sameDomainSteps == 1, "parallel completion resumed outside the waiter's domain");
+    check(lyraContextLocal(lyraContextCurrent(), &test) == &test.laterLocal, "cross-domain resume changed the waiter's context");
+    for (unsigned index = 0; index < 2; ++index) {
+        auto *target = test.children[index];
+        if (lyraTaskAwaitValue(self, target) == LYRA_AWAIT_PENDING) return;
+        check(lyraTaskState(target) == LYRA_TASK_COMPLETED && static_cast<Counter *>(lyraTaskOutcome(target))->count == 90 + index,
+              "parallel result was lost during collection or transfer");
+    }
+    test.resumed = true;
+    lyraTaskComplete(self, nullptr);
+}
+
+struct NestedDomain {
+    std::thread::id caller;
+    unsigned depth;
+    LyraTask *child;
+};
+
+void nestedDomain(LyraTask *self, void *storage) {
+    auto& frame = *static_cast<NestedDomain *>(storage);
+    auto thread = std::this_thread::get_id();
+    check(thread != frame.caller, "nested parallel reentered its immediate caller's executor");
+    if (frame.depth) {
+        if (!frame.child) {
+            auto *child = static_cast<NestedDomain *>(lyraGcAlloc(sizeof(NestedDomain)));
+            *child = {thread, frame.depth - 1, nullptr};
+            frame.child = lyraTaskParallel(self, lyraTaskCreate(nestedDomain, child));
+        }
+        if (lyraTaskAwaitValue(self, frame.child) == LYRA_AWAIT_PENDING) return;
+        check(lyraTaskState(frame.child) == LYRA_TASK_COMPLETED, "nested domain failed while sharing the worker pool");
+    }
+    lyraTaskComplete(self, nullptr);
+}
+
+struct ParallelNative {
+    NativeGate gate;
+    BlockingFrame work{&gate, false};
+    LyraTask *owner{}, *child{};
+    LyraCleanup *cleanups{};
+    std::thread::id caller;
+    bool cleaned{};
+};
+
+void joinNative(LyraTask *self, void *storage) {
+    auto& test = *static_cast<ParallelNative *>(storage);
+    test.caller = std::this_thread::get_id();
+    lyraCleanupPush(&test.cleanups, [](void *storage) -> const LyraException * {
+        auto& test = *static_cast<ParallelNative *>(storage);
+        check(std::this_thread::get_id() == test.caller, "joining cleanup ran on the child's domain");
+        check(test.gate.returned && test.gate.closed, "parent closed before a parallel native handle was safe");
+        test.cleaned = true;
+        return nullptr;
+    }, &test);
+    test.child = lyraTaskParallel(self, lyraTaskCreate(callThenClose, &test.work));
+    {
+        std::unique_lock lock(test.gate.mutex);
+        test.gate.changed.wait(lock, [&] { return test.gate.entered; });
+        lyraTaskRequestCancel(self);
+        check(lyraTaskCancelRequested(test.child), "cancellation did not reach the parallel native task");
+    }
+    lyraTaskFinishCancelled(self);
+}
+
+void releaseNative(LyraTask *self, void *storage) {
+    auto& test = *static_cast<ParallelNative *>(storage);
+    {
+        std::lock_guard lock(test.gate.mutex);
+        check(lyraTaskState(test.owner) == LYRA_TASK_SUSPENDED && lyraTaskState(test.child) == LYRA_TASK_SUSPENDED && !test.cleaned,
+              "cancellation published before a cross-domain native operation returned");
+        test.gate.mayReturn = true;
+        test.gate.changed.notify_all();
+    }
+    lyraTaskComplete(self, nullptr);
+}
+
+struct ParallelFailure {
+    std::mutex mutex;
+    std::condition_variable changed;
+    const LyraException *causes[2];
+    bool parked{};
+};
+
+void waitForFailure(LyraTask *self, void *storage) {
+    auto& test = *static_cast<ParallelFailure *>(storage);
+    if (lyraTaskCancelRequested(self)) {
+        lyraTaskFail(self, test.causes[0]);
+        return;
+    }
+    std::lock_guard lock(test.mutex);
+    lyraTaskSuspend(self);
+    test.parked = true;
+    test.changed.notify_all();
+}
+
+void publishFailure(LyraTask *self, void *storage) {
+    auto& test = *static_cast<ParallelFailure *>(storage);
+    {
+        std::unique_lock lock(test.mutex);
+        test.changed.wait(lock, [&] { return test.parked; });
+    }
+    lyraTaskFail(self, test.causes[1]);
+}
+
+void parallelFailureGroup(LyraTask *self, void *storage) {
+    lyraTaskParallel(self, lyraTaskCreate(waitForFailure, storage));
+    lyraTaskParallel(self, lyraTaskCreate(publishFailure, storage));
+    lyraTaskComplete(self, nullptr);
+}
+
+void checkParallel(LyraDomain *origin) {
+    ParallelCase rendezvous{};
+    auto *parent = lyraTaskCreate(parallelRendezvous, &rendezvous);
+    lyraTaskStart(origin, parent);
+    lyraDomainRun(origin);
+    check(rendezvous.resumed && lyraTaskState(parent) == LYRA_TASK_COMPLETED, "parallel rendezvous did not finish");
+
+    auto *deep = lyraTaskCreate([](LyraTask *self, void *) {
+        auto *frame = static_cast<NestedDomain *>(lyraGcAlloc(sizeof(NestedDomain)));
+        *frame = {std::this_thread::get_id(), 8, nullptr};
+        lyraTaskParallel(self, lyraTaskCreate(nestedDomain, frame));
+        lyraTaskComplete(self, nullptr);
+    }, nullptr);
+    lyraTaskStart(origin, deep);
+    lyraDomainRun(origin);
+    check(lyraTaskState(deep) == LYRA_TASK_COMPLETED, "nested awaits consumed all available workers");
+
+    ParallelNative native;
+    native.owner = lyraTaskCreate(joinNative, &native);
+    lyraTaskKeepCleanups(native.owner, &native.cleanups);
+    lyraTaskStart(origin, native.owner);
+    lyraTaskStart(origin, lyraTaskCreate(releaseNative, &native));
+    lyraDomainRun(origin);
+    check(native.cleaned && lyraTaskState(native.owner) == LYRA_TASK_CANCELLED && lyraTaskState(native.child) == LYRA_TASK_CANCELLED,
+          "parallel native cancellation did not complete cleanup");
+
+    ParallelFailure failure{};
+    failure.causes[0] = lyraExceptionCreate(lyraStringFromBytes("first", 5));
+    failure.causes[1] = lyraExceptionCreate(lyraStringFromBytes("second", 6));
+    auto *failed = lyraTaskCreate(parallelFailureGroup, &failure);
+    lyraTaskStart(origin, failed);
+    lyraDomainRun(origin);
+    check(lyraTaskState(failed) == LYRA_TASK_FAILED && lyraTaskFailureCount(failed) == 2, "parallel group lost a child failure");
+    check(lyraTaskFailureAt(failed, 0) == failure.causes[0] && lyraTaskFailureAt(failed, 1) == failure.causes[1],
+          "parallel failures were reported in completion order");
+}
+
 }
 
 int main() {
@@ -382,6 +597,7 @@ int main() {
     check(lyraTaskState(parent) == LYRA_TASK_FAILED && lyraTaskFailureCount(parent) == 2 && group.cleaned == 1, "unobserved failure or group cleanup was lost");
     check(lyraTaskFailureAt(parent, 0) == group.causes[0] && lyraTaskFailureAt(parent, 1) == group.causes[1],
           "failures were reported by completion instead of registration");
+    checkParallel(origin);
     lyraDomainDestroy(other);
     lyraDomainDestroy(origin);
 }
