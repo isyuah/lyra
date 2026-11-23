@@ -4,6 +4,7 @@ import std.http.Response
 import std.io.arg
 import std.io.assert
 import std.io.writeError
+import std.sqlite.Connection
 import std.sqlite.DbStatus
 import std.sqlite.Statement
 import std.sqlite.openReadOnly
@@ -16,9 +17,19 @@ implicit (user: User): Response { Response(200, "application/json", encodeUser(u
 fn text(code: Int, body: String): Response { Response(code, "text/plain", body) }
 fn cause(status: DbStatus): String { status.operation() + ": " + status.message() }
 
-fn readUser(query: Statement, id: Int): Result<User?,String> {
+fn prepareUserById(db: Connection, sql: String, id: Int): Result<Statement,String> {
+    val query = db.prepare(sql)
+    if !query.status().ok() { return Err(cause(query.status())) }
     val bound = query.bindInt(1, id)
-    if !bound.ok() { return Err(cause(bound)) }
+    if !bound.ok() {
+        val reason = cause(bound)
+        query.close()
+        return Err(reason)
+    }
+    Ok(query)
+}
+
+fn readUser(query: Statement, id: Int): Result<User?,String> {
     val cursor = query.next()
     if cursor.done() { return Ok(None) }
     if !cursor.row() { return Err(cause(cursor)) }
@@ -30,11 +41,9 @@ fn readUser(query: Statement, id: Int): Result<User?,String> {
 fn lookup(path: String, id: Int): Result<User?,String> {
     val db = openReadOnly(path)
     if !db.status().ok() { return Err(cause(db.status())) }
-    val query = db.prepare("SELECT name FROM users WHERE id=?1")
-    if !query.status().ok() {
-        val reason = cause(query.status())
-        db.close()
-        return Err(reason)
+    val query = match #userQuery(db, "SELECT name FROM users WHERE id=?1", id) {
+        Ok(cursor) => cursor,
+        Err(reason) => { db.close(); return Err(reason) },
     }
     val result = readUser(query, id)
     val cursorClosed = query.close()

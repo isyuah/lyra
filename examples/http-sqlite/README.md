@@ -11,6 +11,12 @@ lyra build examples/http-sqlite -o "$work/users-app"
 
 第一行是本地端口。在另一个终端运行 `curl -i http://127.0.0.1:<端口>/users/7`，应得到 `200 application/json` 和 `{"id":7,"name":"Ada"}`。不存在的记录返回 `404`，非法路径参数返回 `400`，不支持的方法返回 `405`；数据库故障在标准错误记录操作和原因，客户端得到 `500`。按 Ctrl+C 结束前台服务。部署机只需要 Linux 系统库和 SQLite，不需要 Lyra、LLVM 或 `sqlite3` 命令。
 
+## SQL 的准备、构建和执行
+
+`#userQuery(db, "SELECT name FROM users WHERE id=?1", id)` 是本包用 Lyra 写的[表达式宏](src/.expressions/userQuery.ly)。工具链只读清单授予它的 `inputs/schema.sql`、`inputs/userById.snapshot`。校验通过后，生成对 `prepareUserById` 的普通调用：数据库连接和 `id: Int` 由编译器检查，执行时用 SQLite 的 `bindInt`，不拼接用户输入。
+
+改动查询时，同时更新宏调用处字面量和 `tools/userById.sql`；改动 schema 时更新 `inputs/schema.sql`。显式运行 `python3 examples/http-sqlite/tools/prepareQuery.py`：用空的内存库装载 schema、编译 SQL 并核对参数和结果列；成功才更新快照。CI 可加 `--check` 只比对、不写入。普通 `lyra check/build` 不执行这个脚本，也不读取服务要使用的数据库。这是固定查询、显式 `Int → String` 契约的示例，不尝试从任意 SQL 表达式推断 Lyra 类型。
+
 ## 一个请求的生命期
 
 1. `main` 用 `await blocking { server.accept(...) }` 接收请求，在自己的 `requestGroup` 中启动 handler。示例一次处理一条请求，让单线程阻塞池也能取得进展。

@@ -91,6 +91,28 @@ class HTTP(unittest.TestCase):
                 needed = {line.split("[")[1].split("]")[0] for line in dynamic.splitlines() if "(NEEDED)" in line}
                 self.assertEqual(needed, {"libc.so.6", "libsqlite3.so.0"})
 
+    def test_query_snapshot_is_checked_without_running_a_prepare_step(self):
+        package = self.root / 'service'
+        shutil.copytree(SERVICE, package, ignore=shutil.ignore_patterns('build', 'lyra.lock'))
+        prepare = [sys.executable, package / 'tools/prepareQuery.py']
+        subprocess.run([*prepare, '--check'], check=True, capture_output=True)
+        schema = package / 'inputs/schema.sql'
+        schema.write_text(schema.read_text() + 'CREATE TABLE events(id INTEGER PRIMARY KEY);\n')
+        def check():
+            return subprocess.run([COMPILER, 'check', package, '--diagnostics=json'], capture_output=True, timeout=20)
+        mismatch = check()
+        self.assertNotEqual(mismatch.returncode, 0)
+        self.assertEqual(json.loads(mismatch.stderr)[0]['code'], 'LYM0002')
+        subprocess.run(prepare, check=True, capture_output=True)
+        self.assertEqual(check().returncode, 0)
+        saved = (package / 'inputs/userById.snapshot').read_bytes()
+        (package / 'tools/userById.sql').write_text('SELECT typo FROM users WHERE id=?1')
+        failed = subprocess.run(prepare, capture_output=True)
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertIn(b'typo', failed.stderr)
+        self.assertEqual((package / 'inputs/userById.snapshot').read_bytes(), saved)
+        self.assertEqual(check().returncode, 0)
+
     def test_disconnect_and_framing(self):
         package = self.root / "listener"
         (package / "src").mkdir(parents=True)

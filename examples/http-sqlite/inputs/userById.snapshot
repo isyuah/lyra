@@ -1,0 +1,5 @@
+lyra-sqlite-example/1
+parameter: Int; column: name String
+SELECT name FROM users WHERE id=?1
+-- schema --
+CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT NOT NULL);
