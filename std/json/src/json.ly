@@ -7,6 +7,7 @@ extern fn lyraJsonKey(value: CPtr, index: Int): String;
 extern fn lyraJsonIndex(value: CPtr, index: Int): CPtr;
 extern fn lyraJsonField(value: CPtr, key: String): CPtr;
 extern fn lyraJsonQuote(text: String): String;
+extern fn lyraJsonSimpleKey(key: String): Bool;
 extern fn lyraJsonIntText(value: Int): String;
 
 pub struct JsonValue(val handle: CPtr) {
@@ -34,5 +35,6 @@ pub fn parseJson(text: String): Result<JsonValue,String> {
     if lyraJsonKind(value) == 8 { Err(lyraJsonText(value)) } else { Ok(JsonValue(value)) }
 }
 pub fn quoteJson(text: String): String { lyraJsonQuote(text) }
+pub fn keyPath(key: String): String { if lyraJsonSimpleKey(key) { "." + key } else { "[" + quoteJson(key) + "]" } }
 pub fn intText(value: Int): String { lyraJsonIntText(value) }
 pub fn boolText(value: Bool): String { if value { "true" } else { "false" } }

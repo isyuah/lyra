@@ -25,11 +25,19 @@ fn readValue(typeName: String, source: String, path: String): String {
     "read" + typeName + "Json(" + source + ", " + path + ")?"
 }
 
+fn jsonKey(index: Int): String {
+    if !fieldHasAttribute(index, "jsonName") { return fieldName(index) }
+    val key = fieldAttributeValue(index, "jsonName")
+    if key == "" || macroContains(key, "\0") { return macroFail("jsonName on " + fieldName(index) + " requires a non-empty key without NUL") }
+    key
+}
+
 fn derive(target: String, argument: String): String {
     if argument != "Json" || targetKind() != "struct" { return macroFail("#derive(Json) expects a struct") }
     var encoding = "fn encode" + target + "(value: `" + target + "`): String {\nvar output = \"{\"\n"
     var decoding = ""
     var known = "false"
+    var seenKeys = "\0"
     var args = ""
     var index = 0
     while index < fieldCount() {
@@ -38,14 +46,18 @@ fn derive(target: String, argument: String): String {
         if !fieldPublic(index) { return macroFail("Cannot construct private field without a default: " + name) }
         val inner = optionInner(typeName)
         if optionInner(optionInner(inner)) != "" { return macroFail("JSON cannot distinguish a third optional layer at " + name) }
-        val quoted = macroQuote(name)
+        val key = jsonKey(index)
+        if macroContains(seenKeys, "\0" + key + "\0") { return macroFail("Duplicate JSON key " + macroQuote(key) + " at field " + name) }
+        seenKeys += key + "\0"
+        val quoted = macroQuote(key)
         val member = "value.`" + name + "`"
-        val prefix = "if output != \"{\" { output += \",\" }; output += " + macroQuote(macroQuote(name) + ":") + " + "
+        val encodedKey = if key == name { macroQuote(macroQuote(name) + ":") } else { "quoteJson(" + quoted + ") + \":\"" }
+        val prefix = "if output != \"{\" { output += \",\" }; output += " + encodedKey + " + "
         if inner == "" { encoding += prefix + encodeValue(typeName, member) + "\n" }
         else { encoding += "match " + member + " { None => {}, Some(item) => { " + prefix + encodeValue(inner, "item") + " } }\n" }
         val slot = "slot" + name
         val source = "node" + name
-        val path = "path + " + macroQuote("." + name)
+        val path = if key == name { "path + " + macroQuote("." + name) } else { "path + keyPath(" + quoted + ")" }
         known += " || key == " + quoted
         decoding += "val " + source + " = value.field(" + quoted + ")\nval " + slot + ": " + typeName + " = "
         if inner == "" { decoding += readValue(typeName, source, path) }
@@ -59,8 +71,8 @@ fn derive(target: String, argument: String): String {
         args += slot
         index += 1
     }
-    val imports = "import std.json.JsonValue\nimport std.json.parseJson\nimport std.json.intText\nimport std.json.quoteJson\nimport std.json.boolText\n"
-    val head = "fn read" + target + "Json(value: JsonValue, path: String): Result<`" + target + "`,String> {\nif !value.isObject() { return Err(path + \": expected object\") }\nvar index = 0\nwhile index < value.size() { val key = value.key(index); if !(" + known + ") { return Err(path + \".\" + key + \": unknown field\") }; index += 1 }\n"
+    val imports = "import std.json.JsonValue\nimport std.json.parseJson\nimport std.json.intText\nimport std.json.quoteJson\nimport std.json.boolText\nimport std.json.keyPath\n"
+    val head = "fn read" + target + "Json(value: JsonValue, path: String): Result<`" + target + "`,String> {\nif !value.isObject() { return Err(path + \": expected object\") }\nvar index = 0\nwhile index < value.size() { val key = value.key(index); if !(" + known + ") { return Err(path + keyPath(key) + \": unknown field\") }; index += 1 }\n"
     val decoder = "fn decode" + target + "(text: String): Result<`" + target + "`,String> { read" + target + "Json(parseJson(text)?, \"$\") }\n"
     imports + encoding + "output + \"}\"\n}\n" + head + decoding + "Ok(`" + target + "`(" + args + "))\n}\n" + decoder
 }

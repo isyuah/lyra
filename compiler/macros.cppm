@@ -43,6 +43,7 @@ fn targetBody(): String { "" }
 fn optionInner(typeName: String): String { "" }
 fn listElement(typeName: String): String { "" }
 fn macroQuote(text: String): String { "" }
+fn macroContains(text: String, fragment: String): Bool { false }
 fn macroInput(key: String): String { "" }
 fn macroFail(message: String): String { "" }
 )";
@@ -103,6 +104,7 @@ struct Machine {
         }
         if (name == "macroFail") error(std::get<std::string>(args.front()));
         if (name == "macroQuote") return quote(std::get<std::string>(args.front()));
+        if (name == "macroContains") return std::get<std::string>(args[0]).find(std::get<std::string>(args[1])) != std::string::npos;
         if (name == "macroInput") return input(std::get<std::string>(args.front()));
         if (name == "argumentCount" || name == "argumentCode" || name == "argumentString") {
             if (!expression) error("此查询仅适用于表达式宏");

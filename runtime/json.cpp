@@ -85,6 +85,16 @@ const Node* lyraJsonField(const Node* value, const void* key) {
     return nullptr;
 }
 
+std::uint8_t lyraJsonSimpleKey(const void* key) {
+    const auto* bytes = lyraStringBytes(key);
+    const auto size = lyraStringLength(key);
+    for (std::size_t index = 0; index < size; ++index) {
+        auto byte = bytes[index];
+        if (!(byte == '_' || (byte >= 'a' && byte <= 'z') || (byte >= 'A' && byte <= 'Z') || (index && byte >= '0' && byte <= '9'))) return false;
+    }
+    return size != 0;
+}
+
 const void* lyraJsonQuote(const void* text) {
     auto* json = json_stringn_nocheck(lyraStringBytes(text), lyraStringLength(text));
     if (!json) std::abort();

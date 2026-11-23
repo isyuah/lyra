@@ -132,6 +132,59 @@ fn main(): Unit {
     print(show("{\"rows\":[[1,true]]}"))
 }''', ['{"rows":[[1,null],[],[2]],"labels":["a","b"]}', '{"rows":[]}', '$.rows[0][1]: expected Int'])
 
+    def test_json_name_roundtrips_nested_lists_and_keeps_wire_paths(self):
+        self.native(r'''#derive(Json)
+struct Person([jsonName("display-name")] pub val name: String, [jsonName("nick.name")] pub val nick: Option<String?>)
+#derive(Json)
+struct Group([jsonName("$people")] pub val members: List<Person>)
+fn show(input: String): String { match decodeGroup(input) { Ok(group) => encodeGroup(group), Err(reason) => reason } }
+fn main(): Unit {
+    print(show(encodeGroup(Group([Person("Ada", None), Person("Bo", Some(None)), Person("Cy", Some(Some("C")))]))))
+    print(show("{\"$people\":[{\"display-name\":\"Ada\"},{\"display-name\":false}]}"))
+    print(show("{\"$people\":[{\"name\":\"Ada\"}]}"))
+    print(show("{\"$people\":[{\"odd.key\":5}]}"))
+    print(show("{\"$people\":[{\"display-name\":\"Ada\",\"nick.name\":false}]}"))
+    print(show("{\"$people\":[{}]}"))
+    print(show("{\"members\":[]}"))
+}''', ['{"$people":[{"display-name":"Ada"},{"display-name":"Bo","nick.name":null},{"display-name":"Cy","nick.name":"C"}]}',
+       '$["$people"][1]["display-name"]: expected String', '$["$people"][0].name: unknown field',
+       '$["$people"][0]["odd.key"]: unknown field', '$["$people"][0]["nick.name"]: expected String',
+       '$["$people"][0]["display-name"]: expected String', '$.members: unknown field'])
+
+    def test_json_keys_use_json_escaping_for_output_and_paths(self):
+        key = '${rate}\\"\n品'
+        wire = json.dumps(key, ensure_ascii=False)
+        self.native(r'''#derive(Json)
+struct Odd([jsonName("\${rate}\\\"\n品")] pub val value: Int)
+fn show(input: String): String { match decodeOdd(input) { Ok(item) => encodeOdd(item), Err(reason) => reason } }
+fn main(): Unit {
+    print(show(encodeOdd(Odd(4))))
+    print(show("{}"))
+    print(show("{\"bad\\\"key\":0}"))
+    print(show("{\"\":0}"))
+}''', ['{' + wire + ':4}', '$[' + wire + ']: expected Int', '$["bad\\"key"]: unknown field', '$[""]: unknown field'])
+
+    def test_json_name_rejects_ambiguous_or_unrepresentable_keys(self):
+        main = self.src / 'main.ly'
+        for fields, fragment in (
+            ('pub val id: Int, [jsonName("id")] pub val code: Int', 'Duplicate JSON key "id"'),
+            ('[jsonName("id")] pub val code: Int, pub val id: Int', 'Duplicate JSON key "id"'),
+            ('[jsonName("same")] pub val one: Int, [jsonName("same")] pub val two: Int', 'Duplicate JSON key "same"'),
+            ('[jsonName] pub val field: Int', 'non-empty key'),
+            ('[jsonName("")] pub val field: Int', 'non-empty key'),
+            (r'[jsonName("before\0after")] pub val field: Int', 'without NUL'),
+        ):
+            with self.subTest(fields=fields):
+                main.write_text('#derive(Json)\nstruct Bad(' + fields + ')\nfn main(): Unit {}', encoding='utf-8')
+                error = self.diagnostic('LYM0002', fragment)
+                self.assertEqual((Path(error['file']), error['range']['start']['line']), (main, 1))
+
+    def test_macro_contains_matches_exact_substrings(self):
+        self.macro('if macroContains("ab\\0cd", "\\0c") && macroContains("abc", "") && !macroContains("Case", "case") && !macroContains("\u00e9", "e\u0301") { "" } else { macroFail("substring comparison lost data") }')
+        (self.src / 'main.ly').write_text('#make\nfn main(): Unit {}', encoding='utf-8')
+        result = self.cli('check', self.pkg)
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+
     def test_attributes_generate_a_typed_adapter_without_changing_direct_calls(self):
         (self.src / '.macros/post.ly').write_text('''fn post(target: String, route: String): String {
     if !fieldHasAttribute(0, "path") || fieldType(0) != "Int" { return macroFail("expected Int path") }

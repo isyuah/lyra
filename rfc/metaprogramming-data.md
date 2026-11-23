@@ -78,6 +78,8 @@ val row = await query.fetchOptional(db)?
 
 TOML 同样显式写 `#derive(Toml)`；已有实现直接使用，多项可合写为 `#derive(Json, Toml)`。两种格式只自动映射公开字段；未知输入键默认报错，诊断包含字段路径，接口可显式改为忽略。编码普通可空字段的 `None` 默认省略键；若省略会在解码时得到非空默认值，JSON 写 `null`，TOML 需显式表示或报错。
 
+JSON 派生支持 `[jsonName("display-name")]`：编码和解码使用该键，源码中的字段名不变。别名不可为空或含 NUL；同一结构体有两个字段映射到同一键时编译报错。错误路径使用 JSON 键，而非源码中的字段名；非标识符键用方括号和 JSON 字符串表示，例如 `$.users[2]["display-name"]`。
+
 缺少必填字段时报错，有默认值的字段缺失时取默认值，无默认值的普通可空字段缺失时取 `None`。对无显式默认值、类型为 `Option<Option<String>>` 的 **JSON 对象字段**，`{}`、`{"name":null}`、`{"name":"Ada"}` 分别映射到 `None`、`Some(None)`、`Some(Some("Ada"))`；JSON 顶层或数组元素没有“缺失键”。TOML 没有 `null`，目标格式无法区分的状态须指定自定义表示或报错，不能静默合并。
 
 首个往返验收例（`META-005`）取只有公开 `id: Int32` 和 `name: String` 字段的 Struct，值为 `7` 和 `"Ada"`。JSON 用 `#derive(Json)` 生成实现：编码结果是对象 `{"id":7,"name":"Ada"}`，解码后两项字段值保持。TOML 按自身格式做相同的字段往返；不检查键顺序、空白或输出字节是否相同。Class 身份图和循环引用不在该验收范围内。
