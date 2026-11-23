@@ -15,7 +15,8 @@ namespace fs = std::filesystem;
 using namespace lyra;
 
 namespace {
-constexpr auto usage = "lyra new <目录> [--name <包名>] [--lib]\n"
+constexpr auto usage = "lyra --help | --version\n"
+                       "lyra new <目录> [--name <包名>] [--lib]\n"
                        "lyra check|build|run|test <包目录> [--locked] [--offline] [--diagnostics=json]\n"
                        "lyra build <包目录> [-o <产物>] [--release] [--link <C库>] | run <包目录> [--release] [--link <C库>] [-- <程序实参>...]\n"
                        "lyra lock|fetch <目录> [--locked] [--offline] | lock <目录> --update\n"
@@ -123,6 +124,7 @@ int main(int argc, char** argv) {
     if (forwards) { arguments.assign(separator + 1, args.end()); args.erase(separator, args.end()); }
     bool json = std::erase(args, "--diagnostics=json") > 0;
     try {
+        if (args.size() == 1 && args[0] == "--version" && !forwards) { std::cout << "lyra " LYRA_TOOLCHAIN_VERSION "\n"; return 0; }
         if (args.size() == 1 && args[0] == "--help") { std::cout << usage << '\n'; return 0; }
         if (args.empty()) throw Diagnostic{"LYC0001", usage};
         int code;

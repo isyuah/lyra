@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.28)
-project(Lyra LANGUAGES C CXX)
+project(Lyra VERSION 0.1.0 LANGUAGES C CXX)
 
 if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" OR NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
     message(FATAL_ERROR "This compiler slice targets x86-64 Linux. On Windows configure it inside WSL.")
@@ -37,6 +37,7 @@ target_link_libraries(lyraRuntime PUBLIC SQLite::SQLite3 INTERFACE "${gcArchive}
 set_target_properties(lyraRuntime PROPERTIES ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib")
 
 add_executable(lyra compiler/main.cpp compiler/source.cpp compiler/parser.cpp compiler/check.cpp compiler/lowering.cpp compiler/build.cpp)
+set_source_files_properties(compiler/main.cpp PROPERTIES COMPILE_DEFINITIONS "LYRA_TOOLCHAIN_VERSION=\"${PROJECT_VERSION}-alpha.1\"")
 target_sources(lyra PRIVATE FILE_SET CXX_MODULES FILES
     compiler/source.cppm compiler/syntax.cppm compiler/check.cppm compiler/lowering.cppm compiler/build.cppm
     compiler/packages.cppm compiler/modules.cppm compiler/generics.cppm compiler/async.cppm compiler/foreign.cppm compiler/sums.cppm compiler/macros.cppm)

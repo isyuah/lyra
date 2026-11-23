@@ -34,6 +34,7 @@ printf '%s\n' '{"station":"东区","delta":7}' '{"station":"西区","delta":-2}'
 ## 命令与语言子集
 
 ```text
+lyra --version
 lyra new <目录> [--name <包名>] [--lib]
 lyra check|build|run|test <包目录> [--locked] [--offline] [--diagnostics=json]
 lyra build <包目录> [-o <产物>] [--release]
