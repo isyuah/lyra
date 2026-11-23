@@ -74,24 +74,26 @@ class Generics(unittest.TestCase):
         (self.package / 'lyra.json5').write_text('{name:"demo",version:"0.1.0"}')
         library = self.package / 'src/drawing'
         library.mkdir()
-        (library / 'draw.ly').write_text('''pub trait Render { fn render(self, prefix: String): String }
+        (library / 'draw.ly').write_text('''pub trait Render { fn render(prefix: String): String }
 pub fn draw<T: Render>(value: T): String { value.render(prefix: ">") }
 pub fn relay<T: Render>(value: T): String { draw(value) }''')
         self.program('''import self.drawing.relay
             import self.drawing.Render as Printable
-            struct Tag(val text: String) { pub fn render(self, prefix: String): String { prefix + self.text } }
-            class Flag { pub fn render(self, prefix: String): String { prefix + "flag" } }
+            struct Tag(val text: String) { pub fn render(prefix: String): String { prefix + text } }
+            class Flag { pub fn render(prefix: String): String { prefix + "flag" } }
             fn localRender<T: Printable>(value: T): String { value.render("/") }
             fn main(): Unit { print(relay(Tag("Ada"))); print(relay<Flag>(Flag())); print(localRender(Flag())) }
         ''')
         self.run_native('>Ada\n>flag\n/flag\n')
-        self.program(self.source.read_text().replace('pub fn render(self, prefix:', 'fn render(self, prefix:', 1))
+        self.program(self.source.read_text().replace('pub fn render(prefix:', 'fn render(prefix:', 1))
         self.rejects('LYG0005', 'render', 'relay')
 
     def test_constraints_check_signatures_unused_bodies_and_type_arguments(self):
-        header = 'trait Render { fn render(self): String }\nfn draw<T: Render>(value: T): String { value.render() }\n'
-        self.program(header + 'struct Wrong { fn render(self): Int { 7 } }\nfn main(): Unit { print(draw(Wrong())) }')
+        header = 'trait Render { fn render(): String }\nfn draw<T: Render>(value: T): String { value.render() }\n'
+        self.program(header + 'struct Wrong { fn render(): Int { 7 } }\nfn main(): Unit { print(draw(Wrong())) }')
         self.rejects('LYG0005', 'Int', 'draw')
+        self.program(header + 'struct Wrong { static fn render(): String { "wrong" } }\nfn main(): Unit { print(draw(Wrong())) }')
+        self.rejects('LYG0005', 'render', 'draw')
         self.program(header + 'fn unused<U>(value: U): String { draw(value) }\nfn main(): Unit {}')
         self.rejects('LYG0005', 'render', 'draw')
         self.program(header + 'fn unused<U: Render>(value: U): Int { value.render() }\nfn main(): Unit {}')
@@ -102,8 +104,8 @@ pub fn relay<T: Render>(value: T): String { draw(value) }''')
         self.rejects('LYG0005', 'render', 'draw')
 
     def test_async_structural_method_preserves_cold_task(self):
-        self.program('''trait Fetch { async fn read(self): Int }
-            struct Store { async fn read(self): Int { print("started"); 7 } }
+        self.program('''trait Fetch { async fn read(): Int }
+            struct Store { async fn read(): Int { print("started"); 7 } }
             async fn fetch<T: Fetch>(store: T): Int { await store.read() }
             async fn main(): Unit { val task = fetch(Store()); print("cold"); print(await task) }''')
         self.run_native('cold\nstarted\n7\n')
@@ -186,13 +188,13 @@ pub fn relay<T: Render>(value: T): String { draw(value) }''')
 
     def test_generic_methods_use_receiver_types_and_infer_tail_lambdas(self):
         self.program('''
-            trait Read { fn read(self): String }
+            trait Read { fn read(): String }
             class Cell<Item>(val item: Item, var next: Cell<Item>?) {
-                fn read(self): Item { self.item }
-                fn map<Other>(self, transform: (Item) -> Other): Cell<Other> { Cell<Other>(transform(self.item), None) }
-                async fn getNext(self): Item? {
+                fn read(): Item { item }
+                fn map<Other>(transform: (Item) -> Other): Cell<Other> { Cell<Other>(transform(item), None) }
+                async fn getNext(): Item? {
                     await blocking { gcCollect() }
-                    match self.next { None => None, Some(node) => Some(node.item) }
+                    match next { None => None, Some(node) => Some(node.item) }
                 }
             }
             fn read<Reader: Read>(value: Reader): String { value.read() }
@@ -215,7 +217,7 @@ pub fn relay<T: Render>(value: T): String { draw(value) }''')
             ('struct Bad<Item>(val next: Bad<Item>?)', 'LYT0007', 'Bad'),
             ('class Bad<Item>(val next: Bad<List<Item>>?)', 'LYG0004', 'Bad'),
             ('struct Box<Item>(val item: Item)\nfn accept(item: Box): Unit {}', 'LYG0001', 'Box'),
-            ('class Box<Item>(val item: Item) { fn bad(self): String { self.item } }', 'LYT0001', 'Item'),
+            ('class Box<Item>(val item: Item) { fn bad(): String { item } }', 'LYT0001', 'Item'),
             ('struct Box<Item>(val item: Item)\nfn accept(value: Box<Int>): Unit {}\nfn wrong(): Unit { accept(Box("str")) }', 'LYT0001', 'Box<Int>'),
         ):
             with self.subTest(source=source):

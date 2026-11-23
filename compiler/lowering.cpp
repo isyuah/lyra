@@ -367,6 +367,8 @@ struct Emitter {
         return read(info.target);
     }
 
+    Value emitNode(ExprId id, This) { return read(fn.expressions[id].target); }
+
     Value emitNode(ExprId id, const Lambda&) {
         NativeClosures closures{builder};
         auto* code = closures.function(signature(layouts.program.signatures[rawType(id).id]), native->getName() + ".lambda");
@@ -529,7 +531,7 @@ struct Emitter {
 
     Place address(ExprId id) {
         const auto& node = fn.syntax.expressions[id].node;
-        if (std::holds_alternative<Identifier>(node)) return {cell(fn.expressions[id].target)};
+        if (std::holds_alternative<Identifier>(node) || std::holds_alternative<This>(node)) return {cell(fn.expressions[id].target)};
         if (auto indexed = std::get_if<Index>(&node)) {
             auto list = emit(indexed->receiver);
             if (!live()) return {};

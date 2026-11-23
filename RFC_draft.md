@@ -129,6 +129,8 @@ user2.name = "Bob"
 assert(user1.name == "Bob")
 ```
 
+Struct 和 Class 的实例方法默认有隐式 `this`，签名不用写接收者。成员可直接访问；参数或局部名遮蔽成员时，用 `this.name` 或 `this.method()`。`static fn` 没有实例接收者，用 `User.make(...)` 这样的类型限定调用。`init` 中也可省略 `this.`，且遵守同一套字段初始化检查。规则与完整示例见[语言核心](rfc/language-core.md#实例方法与静态方法)。
+
 ### 1.3 值语义与物理存储的区别
 
 Struct 值语义不等于必须存储在栈上。
@@ -645,7 +647,7 @@ struct Box<T> {
 
 ```kotlin
 trait Comparable<T> {
-    fn compareTo(self, other: T): Int
+    fn compareTo(other: T): Int
 }
 
 fn maximum<T: Comparable<T>>(a: T, b: T): T {

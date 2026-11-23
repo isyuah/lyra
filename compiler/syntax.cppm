@@ -17,14 +17,17 @@ using ExprId = std::size_t;
 struct Identifier { std::string text; Span span; std::string linked{}; };
 struct Attribute { Identifier name; std::optional<Identifier> argument; };
 struct Argument { std::optional<Identifier> label; ExprId value; std::optional<Span> spread{}, trailing{}; };
+struct TypeQualifier { Identifier name; std::vector<Identifier> arguments{}; };
 struct Call {
     Identifier name;
     std::vector<Argument> arguments;
     std::optional<ExprId> receiver{};
     std::vector<Identifier> typeArguments{};
     std::optional<ExprId> function{};
+    std::optional<TypeQualifier> typeOwner{};
 };
 struct Member { ExprId receiver; Identifier name; };
+struct This {};
 struct ListLiteral { std::vector<ExprId> elements; };
 struct Index { ExprId receiver, offset; Span site; };
 struct StringLiteral { std::string bytes; };
@@ -74,7 +77,7 @@ enum class Jump { Break, Continue };
 
 struct Expr {
     Span span;
-    std::variant<IntegerLiteral, RealLiteral, bool, StringLiteral, BytesLiteral, CharLiteral, DisplayValue, TextTemplate, Identifier, Call, Member, Unary, Binary, Block, Binding, Conditional, While, For, Return, Raise, Attempt, Jump, TaskOp, Blocking, Deferred, EmptyOption, Propagate, Match, ListLiteral, Index, Lambda> node;
+    std::variant<IntegerLiteral, RealLiteral, bool, StringLiteral, BytesLiteral, CharLiteral, DisplayValue, TextTemplate, Identifier, This, Call, Member, Unary, Binary, Block, Binding, Conditional, While, For, Return, Raise, Attempt, Jump, TaskOp, Blocking, Deferred, EmptyOption, Propagate, Match, ListLiteral, Index, Lambda> node;
 };
 
 struct Parameter { Identifier name, type; bool variadic{}; std::optional<ExprId> defaultValue{}; std::vector<Attribute> attributes{}; };
@@ -96,6 +99,7 @@ struct Function {
     bool conversion{};
     std::vector<Bound> bounds{};
     bool initializer{};
+    bool hasReceiver{};
 };
 
 struct Field { Identifier name, type; bool writable; bool isPublic{}; std::vector<Attribute> attributes{}; };

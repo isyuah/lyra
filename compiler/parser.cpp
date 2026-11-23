@@ -150,7 +150,7 @@ public:
             while (offset < text.size() && (isLetter(text[offset]) || isDigit(text[offset]))) ++offset;
         } else if (isLetter(current)) {
             while (offset < text.size() && (isLetter(text[offset]) || isDigit(text[offset]))) ++offset;
-            constexpr std::string_view keywords[] = {"fn", "val", "var", "if", "else", "while", "for", "in", "return", "break", "continue", "true", "false", "struct", "class", "enum", "trait", "pub", "import", "as", "async", "await", "spawn", "extern", "match", "null", "implicit", "defer", "throw", "try", "catch"};
+            constexpr std::string_view keywords[] = {"fn", "val", "var", "if", "else", "while", "for", "in", "return", "break", "continue", "true", "false", "struct", "class", "enum", "trait", "pub", "import", "as", "async", "await", "spawn", "extern", "match", "null", "implicit", "defer", "throw", "try", "catch", "this", "static"};
             auto word = text.substr(start, offset - start);
             kind = std::ranges::find(keywords, word) == std::end(keywords) ? Kind::Name : Kind::Keyword;
         } else if (current == '`') {
@@ -422,11 +422,13 @@ private:
             if (asynchronous) consume();
             require("fn");
             auto name = identifier();
-            require("("); require("self");
+            require("(");
             std::vector<Parameter> parameters;
-            while (is(",")) {
-                consume(); auto parameter = identifier(); require(":");
+            while (!is(")")) {
+                auto parameter = identifier(); require(":");
                 parameters.push_back({std::move(parameter), type()});
+                if (!is(",")) break;
+                consume();
             }
             require(")"); require(":");
             declaration.methods.push_back({std::move(name), std::move(parameters), type(), asynchronous});
@@ -437,14 +439,17 @@ private:
         return declaration;
     }
 
-    bool explicitTypes(const Identifier& name) const { return explicitTypesAfter(name.span.end); }
+    enum class TypeSuffix { None, Call, Qualifier };
 
-    bool explicitTypesAfter(std::size_t nameEnd) const {
-        if (!is("<") || token.span.begin != nameEnd) return false;
+    bool explicitTypes(const Identifier& name) const { return typeSuffix(name.span.end) == TypeSuffix::Call; }
+
+    TypeSuffix typeSuffix(std::size_t nameEnd) const {
+        if (!is("<") || token.span.begin != nameEnd) return TypeSuffix::None;
         Parser look(*this, Lookahead{});
         try { look.typeList(); }
-        catch (const Diagnostic&) { return false; }
-        return look.is("(") && !look.token.newlineBefore;
+        catch (const Diagnostic&) { return TypeSuffix::None; }
+        if (look.is(".")) return TypeSuffix::Qualifier;
+        return look.is("(") && !look.token.newlineBefore ? TypeSuffix::Call : TypeSuffix::None;
     }
 
     bool visibility() { if (!is("pub")) return false; consume(); return true; }
@@ -515,9 +520,11 @@ private:
                     if (!marks.empty()) throw at(source, marks.front().name.span, "LYM0003", "此处的标记只适用于字段和形参");
                     initialized = true;
                     module.functions.push_back(function(decl.name, publicMember, decl.typeParameters, true));
-                } else if (is("fn") || is("async") || is("extern")) {
+                } else if (is("fn") || is("async") || is("extern") || is("static")) {
                     if (!marks.empty()) throw at(source, marks.front().name.span, "LYM0003", "此处的标记只适用于字段和形参");
-                    module.functions.push_back(function(decl.name, publicMember, decl.typeParameters));
+                    bool staticMember = is("static");
+                    if (staticMember) consume();
+                    module.functions.push_back(function(decl.name, publicMember, decl.typeParameters, false, staticMember));
                 } else decl.fields.push_back(field(publicMember, std::move(marks)));
                 if (is(";")) consume();
                 else if (!is("}") && !token.newlineBefore) throw at(source, token.span, "LYP0001", "成员之间需要换行或分号");
@@ -527,7 +534,7 @@ private:
         module.aggregates.push_back(std::move(decl));
     }
 
-    Function function(std::optional<Identifier> owner, bool pub, const std::vector<Identifier>& enclosing = {}, bool initializer = false) {
+    Function function(std::optional<Identifier> owner, bool pub, const std::vector<Identifier>& enclosing = {}, bool initializer = false, bool staticMember = false) {
         bool isAsync = false, foreign = false;
         if (is("async") || is("extern")) {
             isAsync = is("async"); foreign = !isAsync;
@@ -554,22 +561,19 @@ private:
         if (foreign && (owner || !typeParameters.empty())) throw at(source, name.span, "LYF0001", "extern 不支持方法或泛型");
         require("(");
         std::vector<Parameter> parameters;
-        Identifier selfType;
-        if (owner) {
-            selfType = *owner;
+        Identifier ownerType;
+        bool hasReceiver = owner && !initializer && !staticMember;
+        if (initializer || hasReceiver) {
+            ownerType = *owner;
             if (!enclosing.empty()) {
-                selfType.text += '<';
+                ownerType.text += '<';
                 for (std::size_t index = 0; index < enclosing.size(); ++index) {
-                    if (index) selfType.text += ',';
-                    selfType.text += enclosing[index].text;
+                    if (index) ownerType.text += ',';
+                    ownerType.text += enclosing[index].text;
                 }
-                selfType.text += '>';
+                ownerType.text += '>';
             }
-            if (!initializer) {
-                auto self = require("self");
-                parameters.push_back({{"self", self.span}, std::move(selfType)});
-                if (!is(")")) require(",");
-            }
+            if (hasReceiver) parameters.push_back({{"$this", name.span}, std::move(ownerType)});
         }
         while (!is(")")) {
             if (!parameters.empty() && parameters.back().variadic) throw at(source, token.span, "LYP0001", "变长形参 " + parameters.back().name.text + " 必须放在最后");
@@ -592,14 +596,14 @@ private:
         require(")");
         if (conversion && (!typeParameters.empty() || parameters.size() != 1 || parameters.front().defaultValue || parameters.front().variadic)) throw at(source, keyword.span, "LYV0001", "implicit 需要一个无默认值的普通形参");
         if (!initializer) require(":");
-        auto result = initializer ? std::move(selfType) : type();
+        auto result = initializer ? std::move(ownerType) : type();
         if (foreign) {
             require(";");
             auto symbol = name;
             return {file, std::move(name), std::move(parameters), std::move(result), {}, 0, {}, pub, {}, false, std::move(symbol)};
         }
         auto body = block();
-        return {file, std::move(name), std::move(parameters), std::move(result), std::exchange(nodes, {}), body, std::move(owner), pub, std::move(typeParameters), isAsync, {}, conversion, std::move(bounds), initializer};
+        return {file, std::move(name), std::move(parameters), std::move(result), std::exchange(nodes, {}), body, std::move(owner), pub, std::move(typeParameters), isAsync, {}, conversion, std::move(bounds), initializer, hasReceiver};
     }
 
     ExprId block() {
@@ -832,10 +836,10 @@ private:
         return add({start, end}, std::move(literal));
     }
 
-    ExprId call(std::size_t begin, Identifier name, std::optional<ExprId> receiver, std::optional<ExprId> function = {}) {
+    ExprId call(std::size_t begin, Identifier name, std::optional<ExprId> receiver, std::optional<ExprId> function = {}, std::optional<TypeQualifier> typeOwner = {}) {
         auto types = is("<") ? typeList() : std::vector<Identifier>{};
         require("(");
-        Call node{std::move(name), {}, receiver, std::move(types), function};
+        Call node{std::move(name), {}, receiver, std::move(types), function, std::move(typeOwner)};
         while (!is(")")) {
             std::optional<Identifier> label;
             if (text(next) == ":") { label = identifier(); consume(); }
@@ -871,7 +875,7 @@ private:
                         if (delimiters.empty() || delimiters.back() != '"') throw at(source, token.span, "LYP0001", "宏实参的插值内分隔符不匹配");
                         if (token.kind == Kind::TextTail) delimiters.pop_back();
                     }
-                    else if (is("<") && ((!delimiters.empty() && delimiters.back() == '>') || (followsName && explicitTypesAfter(end)))) delimiters.push_back('>');
+                    else if (is("<") && ((!delimiters.empty() && delimiters.back() == '>') || (followsName && typeSuffix(end) != TypeSuffix::None))) delimiters.push_back('>');
                     else if (is(">") && !delimiters.empty() && delimiters.back() == '>') delimiters.pop_back();
                     else if (is("(") || is("[") || is("{")) delimiters.push_back(is("(") ? ')' : is("[") ? ']' : '}');
                     else if (is(")") || is("]") || is("}")) {
@@ -938,6 +942,7 @@ private:
             return add(item.span, text(item) == "true");
         }
         if (is("null") || is("None")) return add(consume().span, EmptyOption{});
+        if (is("this")) return add(consume().span, This{});
         if (is("throw")) {
             auto site = consume().span;
             if (token.newlineBefore || is(";") || is("}") || is(")") || is(",")) return add(site, Raise{site, {}});
@@ -991,7 +996,16 @@ private:
         if (is("{")) return block();
         if (token.kind == Kind::Name || token.kind == Kind::Escaped) {
             auto name = identifier();
-            if (!explicitTypes(name) && (!is("(") || (token.newlineBefore && !inParens))) { auto span = name.span; return add(span, std::move(name)); }
+            auto suffix = typeSuffix(name.span.end);
+            if (suffix == TypeSuffix::Qualifier) {
+                TypeQualifier owner{std::move(name), typeList()};
+                require(".");
+                auto method = identifier();
+                if (explicitTypes(method) || (is("(") && (inParens || !token.newlineBefore))) return call(start, std::move(method), {}, {}, std::move(owner));
+                if (trailingBlock && is("{") && !token.newlineBefore) return add({start, method.span.end}, Call{std::move(method), {}, {}, {}, {}, std::move(owner)});
+                throw at(source, token.span, "LYP0001", "静态方法调用需要参数列表或尾部 lambda");
+            }
+            if (suffix != TypeSuffix::Call && (!is("(") || (token.newlineBefore && !inParens))) { auto span = name.span; return add(span, std::move(name)); }
             return call(start, std::move(name), {});
         }
         if (is("(")) {

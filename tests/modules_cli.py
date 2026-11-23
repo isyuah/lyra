@@ -100,7 +100,12 @@ fn main(): Unit {
     def test_generic_record_import_keeps_one_nominal_type(self):
         (self.lib / 'src/net/status.ly').write_text('''
 pub struct Status<Item>(pub val item: Item) {
-    pub fn read(self): Item { self.item }
+    pub fn read(): Item { item }
+    pub static fn make(value: Item): Status<Item> { Status(value) }
+    pub static fn from<Input>(value: Input, transform: (Input) -> Item): Status<Item> {
+        Status<Item>.make(transform(value))
+    }
+    static fn hidden(): Int { 7 }
 }
 pub fn wrap<Item>(value: Item): Status<Item> { Status(value) }
 ''')
@@ -110,10 +115,16 @@ import cfg.net.wrap
 fn show<Item>(value: Endpoint<Item>): Item { value.read() }
 fn main(): Unit {
     print(show(wrap(42)))
-    print(match Endpoint("network") { Endpoint(item: message) => message })
+    print(match Endpoint.make("network") { Endpoint(item: message) => message })
+    print(Endpoint<Int>.from<String>("abc") { it.size }.read())
+    val inferred: Endpoint<String> = Endpoint.from(7) { it.toString() }
+    print(inferred.read())
 }
 ''')
-        self.assertEqual(self.command('run', self.app, '--release').stdout, '42\nnetwork\n')
+        self.assertEqual(self.command('run', self.app, '--release').stdout, '42\nnetwork\n3\n7\n')
+        self.source.write_text('import cfg.net.Status as Endpoint\nfn main(): Unit { Endpoint<Int>.hidden(); }')
+        diagnostic, = json.loads(self.command('check', self.app, '--diagnostics=json', ok=False).stderr)
+        self.assertEqual(diagnostic['code'], 'LYN0003')
 
 
 if __name__ == '__main__':

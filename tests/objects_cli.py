@@ -36,8 +36,8 @@ class Objects(unittest.TestCase):
     def test_copy_fields_method_and_identity(self):
         (self.src / "models.ly").write_text("""
 class User(var name: String) {
-    fn label(self): String { self.name }
-    fn rename(self, name: String): Unit { self.name = name }
+    fn label(): String { name }
+    fn rename(name: String): Unit { this.name = name }
 }
 struct Profile { var title: String; val owner: User }
 struct Wrapper(val profile: Profile)
@@ -76,6 +76,56 @@ fn main(): Unit {
 }
 """, b"9\n2\n1\n7\n")
 
+    def test_implicit_receiver_respects_shadowing_defaults_and_capture(self):
+        self.run_source('''
+fn read(): Int { -1 }
+class Counter(var value: Int, val transform: (Int) -> Int) {
+    fn read(): Int { value }
+    fn update(value: Int, read: () -> Int): Int {
+        this.value = value
+        {
+            val value = read()
+            print(value)
+        }
+        transform(read() + this.read())
+    }
+    fn bump(by: Int = value): Int { value += by; read() }
+    fn callback(): () -> Int { () => { read() + this.value } }
+}
+struct Pair(val left: Int, val right: Int) {
+    static fn doubled(value: Int): Pair { Pair(value, value) }
+    fn sum(): Int { left + this.right }
+}
+fn main(): Unit {
+    val counter = Counter(3, (value: Int) => { value + 1 })
+    print(counter.update(5, () => { 9 }))
+    val callback = counter.callback()
+    print(counter.bump())
+    gcCollect()
+    print(callback())
+    print(Pair.doubled(21).sum())
+    val Pair = counter
+    print(Pair.read())
+}
+''', b'9\n15\n10\n20\n42\n10\n')
+
+    def test_static_and_instance_calls_require_the_right_receiver(self):
+        for source, code, message in (
+            ('class Box(val value: Int) { static fn get(): Int { this.value } }', 'LYT0018', 'this'),
+            ('class Box(val value: Int) { static fn get(): Int { value } }', 'LYN0001', 'value'),
+            ('class Box { static fn get(): Int { 7 } }\nfn use(): Int { Box().get() }', 'LYT0018', '类型名'),
+            ('class Box { fn get(): Int { 7 } }\nfn use(): Int { Box.get() }', 'LYT0018', '对象接收者'),
+            ('class Box { val value: Int; init(value: Int = this.value) { this.value = value } }', 'LYT0018', 'this'),
+        ):
+            with self.subTest(source=source):
+                self.main.write_text(source + '\nfn main(): Unit {}', encoding='utf-8')
+                result = subprocess.run([COMPILER, 'check', self.package, '--diagnostics=json'],
+                                        capture_output=True, timeout=10)
+                self.assertNotEqual(result.returncode, 0)
+                diagnostic, = json.loads(result.stderr)
+                self.assertEqual(diagnostic['code'], code)
+                self.assertIn(message, diagnostic['message'])
+
     def test_static_rejections(self):
         types = "struct Point(var x: Int)\nclass Box(val point: Point, var value: Int)\n"
         for body, code in (("val p = Point(1); p.x = 2", "LYT0004"),
@@ -113,15 +163,15 @@ pub class Box<Item> {
     var tag: String?
 
     pub init(value: Item, name: String = "default", early: Bool = false) {
-        self.value = value
-        self.tag = None
-        if early { self.name = "early"; return }
-        match name { "" => { self.name = "empty" }, _ => { self.name = name } }
-        defer { self.tag = Some(self.name) }
+        this.value = value
+        tag = None
+        if early { this.name = "early"; return }
+        match name { "" => { this.name = "empty" }, _ => { this.name = name } }
+        defer { tag = Some(this.name) }
     }
 
-    pub fn read(self): Item { self.value }
-    pub fn label(self): String { self.tag ?? self.name }
+    pub fn read(): Item { value }
+    pub fn label(): String { tag ?? name }
 }
 ''', encoding="utf-8")
         self.run_source('''
@@ -142,18 +192,21 @@ fn main(): Unit {
 
     def test_initialization_paths_and_escape_are_checked_statically(self):
         for body, message in (
-            ('if condition { self.text = "maybe" }', "结束 init"),
-            ('if condition { return }; self.text = "late"', "结束 init"),
-            ('self.text = self.text', "尚未"),
-            ('publish(self); self.text = "late"', "使用 self"),
-            ('val callback = () => { self.text }; self.text = "late"', "捕获 self"),
-            ('if condition { self.text = "first" }; self.text = "second"', "只能初始化一次"),
-            ('while condition { self.text = "loop" }; self.text = "done"', "不能在循环"),
-            ('try { self.text = "try" } catch { self.text = "catch" }', "try 主体"),
+            ('if condition { text = "maybe" }', "结束 init"),
+            ('if condition { return }; this.text = "late"', "结束 init"),
+            ('text = text', "尚未"),
+            ('var text = "shadowed"; text = "local"', "结束 init"),
+            ('publish(this); text = "late"', "使用 this"),
+            ('read(); text = "late"', "使用 this"),
+            ('val callback = () => { text }; text = "late"', "捕获 this"),
+            ('if condition { text = "first" }; this.text = "second"', "只能初始化一次"),
+            ('while condition { text = "loop" }; text = "done"', "不能在循环"),
+            ('try { text = "try" } catch { this.text = "catch" }', "try 主体"),
         ):
             with self.subTest(body=body):
                 self.main.write_text('class Item { val text: String; init(condition: Bool) { ' + body
-                                     + ' } }\nfn publish(item: Item): Unit {}\nfn main(): Unit {}', encoding="utf-8")
+                                     + ' }; fn read(): String { text } }\nfn publish(item: Item): Unit {}\nfn main(): Unit {}',
+                                     encoding="utf-8")
                 result = subprocess.run([COMPILER, "check", self.package, "--diagnostics=json"],
                                         capture_output=True, timeout=10)
                 self.assertNotEqual(result.returncode, 0)

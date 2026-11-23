@@ -321,7 +321,7 @@ fn main(): Unit {
     val key = macroQuote(fieldAttributeValue(1, "query"))
     "fn adapt(request: Request): String { " + target + "(request." + fieldName(0) + ", request.query(" + key + ")) }\\nfn route(): String { " + macroQuote(route) + " }"
 }''')
-        self.native('''struct Request(val id: Int) { fn query(self, key: String): String { key + "!" } }
+        self.native('''struct Request(val id: Int) { fn query(key: String): String { key + "!" } }
 #post("/teams/{id}")
 @trace
 fn show([path] id: Int, [query("tag")] text: String): String { print(id); text }
@@ -342,13 +342,17 @@ fn main(): Unit { print(route()); print(adapt(Request(7))); print(show(8, "direc
 }''')
         self.native('''fn add(left: Int, right: Int): Int { print("add"); left + right }
 fn first<A,B>(first: A, second: B): A { first }
+struct Pair<First,Second> {
+    static fn first(value: First, second: Second): First { value }
+}
 fn main(): Unit {
     val temp = 2
     print(2 * #make(true, add(temp, 1)))
     print(#make(false, add(temp, 9)))
     print(#make(true, #make(true, temp)))
     print(#make(temp < 3, first<Int,List<Int>>(4, [1, 2])))
-}''', ['add', '26', '0', '22', '14'])
+    print(#make(true, Pair<Int,List<Int>>.first(7, [3])))
+}''', ['add', '26', '0', '22', '14', '17'])
         main = self.src / 'main.ly'
         main.write_text('fn main(): Unit {\n    print(#make(true, false))\n}')
         error = self.diagnostic('LYT0001')

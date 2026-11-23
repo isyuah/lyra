@@ -20,7 +20,7 @@ fn title(score: Int): String {
 val result = join(right: mark("R"), left: mark("L"))
 ```
 
-`mark("R")` 必须先于 `mark("L")` 求值，前者的结果绑定到 `right`。位置实参在命名实参之前，每个固定形参最多绑定一次。缺省的默认表达式按形参声明顺序求值，只能引用更早的形参。
+`mark("R")` 必须先于 `mark("L")` 求值，前者的结果绑定到 `right`。位置实参在命名实参之前，每个固定形参最多绑定一次。缺省的默认表达式按形参声明顺序求值；引用形参时只能引用更早的形参，实例方法还可访问接收者。
 
 变长形参写 `name: T...`，必须在最后，接收零个或多个位置实参，逐个按元素类型 `T` 检查。函数体中 `name` 是本次调用独立的可变 `List<T>`。调用处的 `...` 首版只展开列表：`...ids` 不共用原列表，但引用元素仍指向同一对象。固定形参 `name: List<T>` 则直接接收调用者传入的 `ids`，两边访问同一个列表。见 [RFC-0002 正反例](0002-syntax-cases.md)。
 
@@ -47,21 +47,30 @@ first.owner.name = "Ada"   // 通过 Class 引用修改对象
 
 可变 `List` 赋值共享同一个集合；经一个别名修改元素，其他别名能看到。闭包捕获绑定本身，不暗中复制当前值；首版 `return` 不从调用该闭包的外层函数返回。Class 默认按对象身份相等，这里的身份不是可观察的固定地址；Struct 未实现 `Eq` 则不能用 `==` 比较。
 
+### 实例方法与静态方法
+
+- Struct 和 Class 内的 `fn` 默认是实例方法。实例方法及 `init` 的参数列表只写调用者需要传入的参数，接收者不写在签名里。`this` 指当前实例，是不可重新赋值的绑定；Struct 接收者按值传递，Class 接收者保留对象身份。
+- 裸名称先查参数和局部绑定，再查实例字段（调用时也查实例方法），最后查模块级名称。用 `this.name` 或 `this.read()` 可显式选中被遮蔽的成员。lambda 不引入新的接收者，可以捕获外层的 `this`；裸成员同样会捕获它。
+- `static fn` 属于类型，不接收实例。调用写 `Badge.defaultBadge()`；`pub static fn` 允许跨模块调用。静态方法中没有 `this`，也不自动查找实例成员。静态方法不满足 trait 的实例方法要求。
+
+### 构造与初始化
+
 Struct 按值内联的布局不能成环（包括经 `Option` 或其他内联载荷形成的环）；经 Class 或显式间接引用形成的递归可以。简单主构造写 `class Badge(val title: String)`，`Badge("NEW").title` 是 `"NEW"`。需要计算字段时，可以不写主构造参数列表，改在类里定义一个 `init`：
 
 ```lyra
 pub class Badge {
     val title: String
-    pub init(label: String = "NEW") {
-        self.title = if label == "" { "NEW" } else { label }
+    pub init(title: String = "NEW") {
+        this.title = if title == "" { "NEW" } else { title }
     }
-    pub fn label(self): String { self.title }
+    pub fn label(): String { title }
+    pub static fn defaultBadge(): Badge { Badge() }
 }
 ```
 
-调用写 `Badge()` 或 `Badge(label: "Beta")`。`init` 默认模块私有，`pub init` 可以公开构造而不公开字段。实参、默认值及泛型推断遵守普通调用规则。`init` 正常结束或执行不带值的 `return` 时返回同一个新对象。
+构造调用写 `Badge()` 或 `Badge(title: "Beta")`。`init` 默认模块私有，`pub init` 可以公开构造而不公开字段。构造形参的默认值先于对象创建求值，不能使用 `this`。`init` 正常结束或执行不带值的 `return` 时返回同一个新对象。
 
-所有字段（包括可空字段）必须在每条正常返回路径上初始化；`val` 字段只能写一次。可直接读已初始化的字段，但调用 `self` 的方法、传递或捕获 `self` 要等所有字段就绪。抛异常而未返回对象的路径无需完成初始化。`if`、`match` 的分支可分别赋值；首版不在可能重复执行或非本地中断的循环、模式守卫、被 `catch` 保护的 `try` 块中首次初始化字段，可先在局部变量计算结果再赋值。多个构造函数和静态方法入口留待后续；其他创建方式可先写普通工厂函数。
+所有字段（包括可空字段）必须在每条正常返回路径上初始化；`val` 字段只能写一次。可直接读已初始化的字段，但调用当前实例的方法、传递或捕获 `this` 要等所有字段就绪。省略 `this.` 不改变这些检查。抛异常而未返回对象的路径无需完成初始化。`if`、`match` 的分支可分别赋值；首版不在可能重复执行或非本地中断的循环、模式守卫、被 `catch` 保护的 `try` 块中首次初始化字段，可先在局部变量计算结果再赋值。每个类只定义一个 `init`；其他创建方式可写静态工厂方法。
 
 ## 类型契约
 
@@ -72,9 +81,9 @@ pub class Badge {
 结构约束示例：
 
 ```text
-trait Render { fn render(self): String }
+trait Render { fn render(): String }
 fn draw<T: Render>(item: T): String { item.render() }
-class Badge { fn render(self): String { "NEW" } }
+class Badge { fn render(): String { "NEW" } }
 draw(Badge()) // 结构签名满足约束；无需单独声明实现
 ```
 

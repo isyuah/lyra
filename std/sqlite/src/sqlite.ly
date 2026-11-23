@@ -15,39 +15,39 @@ extern fn lyraDbMessage(result: CPtr): String;
 extern fn lyraDbOperation(result: CPtr): String;
 
 pub struct DbStatus(val handle: CPtr) {
-    pub fn ok(self): Bool { lyraDbStatus(self.handle) == 0 }
-    pub fn row(self): Bool { lyraDbStatus(self.handle) == 1 }
-    pub fn done(self): Bool { lyraDbStatus(self.handle) == 2 }
-    pub fn isNull(self): Bool { lyraDbStatus(self.handle) == 3 }
-    pub fn busy(self): Bool { lyraDbStatus(self.handle) == 4 }
-    pub fn code(self): Int { lyraDbCode(self.handle) }
-    pub fn message(self): String { lyraDbMessage(self.handle) }
-    pub fn operation(self): String { lyraDbOperation(self.handle) }
+    pub fn ok(): Bool { lyraDbStatus(handle) == 0 }
+    pub fn row(): Bool { lyraDbStatus(handle) == 1 }
+    pub fn done(): Bool { lyraDbStatus(handle) == 2 }
+    pub fn isNull(): Bool { lyraDbStatus(handle) == 3 }
+    pub fn busy(): Bool { lyraDbStatus(handle) == 4 }
+    pub fn code(): Int { lyraDbCode(handle) }
+    pub fn message(): String { lyraDbMessage(handle) }
+    pub fn operation(): String { lyraDbOperation(handle) }
 }
 
 pub struct DbText(pub val status: DbStatus, pub val value: String)
 pub struct DbInt(pub val status: DbStatus, pub val value: Int)
 
 pub class Connection(val handle: CPtr) {
-    pub fn status(self): DbStatus { DbStatus(self.handle) }
-    pub fn prepare(self, sql: String): Statement { Statement(lyraDbPrepare(self.handle, sql)) }
-    pub fn close(self): DbStatus { DbStatus(lyraDbClose(self.handle)) }
+    pub fn status(): DbStatus { DbStatus(handle) }
+    pub fn prepare(sql: String): Statement { Statement(lyraDbPrepare(handle, sql)) }
+    pub fn close(): DbStatus { DbStatus(lyraDbClose(handle)) }
 }
 
 pub class Statement(val handle: CPtr) {
-    pub fn status(self): DbStatus { DbStatus(self.handle) }
-    pub fn bindInt(self, position: Int, value: Int): DbStatus { DbStatus(lyraDbBindInt(self.handle, position, value)) }
-    pub fn bindText(self, position: Int, value: String): DbStatus { DbStatus(lyraDbBindText(self.handle, position, value)) }
-    pub fn next(self): DbStatus { DbStatus(lyraDbNext(self.handle)) }
-    pub fn readText(self, column: Int): DbText {
-        val read = lyraDbTextAt(self.handle, column)
+    pub fn status(): DbStatus { DbStatus(handle) }
+    pub fn bindInt(position: Int, value: Int): DbStatus { DbStatus(lyraDbBindInt(handle, position, value)) }
+    pub fn bindText(position: Int, value: String): DbStatus { DbStatus(lyraDbBindText(handle, position, value)) }
+    pub fn next(): DbStatus { DbStatus(lyraDbNext(handle)) }
+    pub fn readText(column: Int): DbText {
+        val read = lyraDbTextAt(handle, column)
         DbText(DbStatus(read), lyraDbText(read))
     }
-    pub fn readInt(self, column: Int): DbInt {
-        val read = lyraDbIntAt(self.handle, column)
+    pub fn readInt(column: Int): DbInt {
+        val read = lyraDbIntAt(handle, column)
         DbInt(DbStatus(read), lyraDbNumber(read))
     }
-    pub fn close(self): DbStatus { DbStatus(lyraDbFinalize(self.handle)) }
+    pub fn close(): DbStatus { DbStatus(lyraDbFinalize(handle)) }
 }
 
 pub fn open(path: String): Connection { Connection(lyraDbOpen(path, false)) }

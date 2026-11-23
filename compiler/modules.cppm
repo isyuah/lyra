@@ -150,7 +150,10 @@ struct Linker {
             for (auto& expr : fn.expressions) {
                 if (auto* name = std::get_if<Identifier>(&expr.node)) reference(*name);
                 if (auto* call = std::get_if<Call>(&expr.node)) {
-                    if (!call->receiver && !call->function) reference(call->name);
+                    if (call->typeOwner) {
+                        reference(call->typeOwner->name);
+                        for (auto& type : call->typeOwner->arguments) renameType(type);
+                    } else if (!call->receiver && !call->function) reference(call->name);
                     for (auto& type : call->typeArguments) renameType(type);
                 }
                 if (auto* binding = std::get_if<Binding>(&expr.node); binding && binding->annotation) renameType(*binding->annotation);

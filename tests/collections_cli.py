@@ -108,7 +108,7 @@ fn main(): Unit {
     def test_generic_and_method_defaults_use_declaration_scope(self):
         self.native('''
 struct Start(val base: Int) {
-    fn count(self, first: Int = self.base, values: Int...): Int { first + values.size }
+    fn count(first: Int = base, values: Int...): Int { first + values.size }
 }
 fn collect<T>(item: T, values: List<T> = [item]): List<T> { values }
 fn main(): Unit {

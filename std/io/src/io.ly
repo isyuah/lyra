@@ -10,9 +10,9 @@ extern fn lyraIoWriteError(content: String): Int;
 extern fn lyraIoAssert(condition: Bool, message: String): Unit;
 
 pub struct TextRead(pub val status: Int, pub val value: String) {
-    pub fn ok(self): Bool { self.status == 0 }
-    pub fn eof(self): Bool { self.status == -1 }
-    pub fn invalidUtf8(self): Bool { lyraIoInvalidUtf8(self.status) }
+    pub fn ok(): Bool { status == 0 }
+    pub fn eof(): Bool { status == -1 }
+    pub fn invalidUtf8(): Bool { lyraIoInvalidUtf8(status) }
 }
 
 fn text(result: CPtr): TextRead { TextRead(lyraIoTextStatus(result), lyraIoTextValue(result)) }

@@ -14,28 +14,28 @@ fn bucketFor(hashCode: Int, capacity: Int): Int {
 }
 
 pub class HashMap<Key,Value>(val keyHash: (Key) -> Int, val keysEqual: (Key, Key) -> Bool, var buckets: List<HashNode<Key,Value>?>, var count: Int) {
-    pub fn size(self): Int { self.count }
+    pub fn size(): Int { count }
 
-    fn find(self, key: Key, hashCode: Int): HashNode<Key,Value>? {
-        val index = bucketFor(hashCode, self.buckets.size)
-        var current = self.buckets[index]
+    fn find(key: Key, hashCode: Int): HashNode<Key,Value>? {
+        val index = bucketFor(hashCode, buckets.size)
+        var current = buckets[index]
         while current != None {
             val node = current?
-            if node.hashCode == hashCode && self.keysEqual(node.key, key) { return Some(node) }
+            if node.hashCode == hashCode && keysEqual(node.key, key) { return Some(node) }
             current = node.next
         }
         None
     }
 
-    pub fn get(self, key: Key): Value? {
-        val node = self.find(key, self.keyHash(key))?
+    pub fn get(key: Key): Value? {
+        val node = find(key, keyHash(key))?
         Some(node.value)
     }
 
-    pub fn contains(self, key: Key): Bool { self.find(key, self.keyHash(key)) != None }
+    pub fn contains(key: Key): Bool { find(key, keyHash(key)) != None }
 
-    fn grow(self): Unit {
-        val previous = self.buckets
+    fn grow(): Unit {
+        val previous = buckets
         val larger = emptyBuckets<Key,Value>(previous.size * 2)
         for head in previous {
             var current = head
@@ -51,35 +51,35 @@ pub class HashMap<Key,Value>(val keyHash: (Key) -> Int, val keysEqual: (Key, Key
                 }
             }
         }
-        self.buckets = larger
+        buckets = larger
     }
 
-    pub fn put(self, key: Key, value: Value): Value? {
-        val hashCode = self.keyHash(key)
-        match self.find(key, hashCode) {
+    pub fn put(key: Key, value: Value): Value? {
+        val hashCode = keyHash(key)
+        match find(key, hashCode) {
             Some(node) => { val previous = node.value; node.value = value; return Some(previous) },
             None => {},
         }
-        if self.count == self.buckets.size { self.grow() }
-        val index = bucketFor(hashCode, self.buckets.size)
-        self.buckets[index] = Some(HashNode(key, hashCode, value, self.buckets[index]))
-        self.count += 1
+        if count == buckets.size { grow() }
+        val index = bucketFor(hashCode, buckets.size)
+        buckets[index] = Some(HashNode(key, hashCode, value, buckets[index]))
+        count += 1
         None
     }
 
-    pub fn remove(self, key: Key): Value? {
-        val hashCode = self.keyHash(key)
-        val index = bucketFor(hashCode, self.buckets.size)
+    pub fn remove(key: Key): Value? {
+        val hashCode = keyHash(key)
+        val index = bucketFor(hashCode, buckets.size)
         var previous: HashNode<Key,Value>? = None
-        var current = self.buckets[index]
+        var current = buckets[index]
         while current != None {
             val node = current?
-            if node.hashCode == hashCode && self.keysEqual(node.key, key) {
+            if node.hashCode == hashCode && keysEqual(node.key, key) {
                 match previous {
-                    None => { self.buckets[index] = node.next },
+                    None => { buckets[index] = node.next },
                     Some(parent) => { parent.next = node.next },
                 }
-                self.count -= 1
+                count -= 1
                 return Some(node.value)
             }
             previous = Some(node)
@@ -88,9 +88,9 @@ pub class HashMap<Key,Value>(val keyHash: (Key) -> Int, val keysEqual: (Key, Key
         None
     }
 
-    pub fn entries(self): List<MapEntry<Key,Value>> {
+    pub fn entries(): List<MapEntry<Key,Value>> {
         val snapshot: List<MapEntry<Key,Value>> = []
-        for head in self.buckets {
+        for head in buckets {
             var current = head
             while true {
                 match current {
@@ -125,11 +125,11 @@ pub fn intMap<Value>(): HashMap<Int,Value> {
 }
 
 pub class HashSet<Item>(val items: HashMap<Item,Unit>) {
-    pub fn size(self): Int { self.items.size() }
-    pub fn contains(self, item: Item): Bool { self.items.contains(item) }
-    pub fn add(self, item: Item): Bool { self.items.put(item, {}) == None }
-    pub fn remove(self, item: Item): Bool { self.items.remove(item) != None }
-    pub fn values(self): List<Item> { map(self.items.entries()) { it.key } }
+    pub fn size(): Int { items.size() }
+    pub fn contains(item: Item): Bool { items.contains(item) }
+    pub fn add(item: Item): Bool { items.put(item, {}) == None }
+    pub fn remove(item: Item): Bool { items.remove(item) != None }
+    pub fn values(): List<Item> { map(items.entries()) { it.key } }
 }
 
 pub fn hashSet<Item>(hash: (Item) -> Int, equal: (Item, Item) -> Bool): HashSet<Item> { HashSet(hashMap<Item,Unit>(hash, equal)) }

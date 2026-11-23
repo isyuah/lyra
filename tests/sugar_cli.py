@@ -22,10 +22,10 @@ class Sugar(unittest.TestCase):
     def test_list_loops_nullable_fields_methods_and_short_circuit(self):
         self.main.write_text('''
 class Meter(var calls: Int) {
-    fn tick(self): Int { self.calls += 1; self.calls }
+    fn tick(): Int { calls += 1; calls }
 }
 struct Item(val value: Int?, val nested: Option<Int?>) {
-    fn sum(self, extra: Int): Int { (self.value ?? 4) + extra }
+    fn sum(extra: Int): Int { (value ?? 4) + extra }
 }
 fn maybe(counter: Meter, present: Bool): Item? {
     counter.tick()
@@ -86,18 +86,18 @@ fn main(): Unit {
         self.main.write_text('''
 class Meter(var opens: Int, var reads: Int)
 class Cursor(val meter: Meter, var index: Int, val last: Int) {
-    fn next(self): Option<Int?> {
-        self.meter.reads += 1
-        self.index += 1
-        if self.index > self.last { None }
-        else if self.index == 1 { Some(None) }
-        else { Some(Some(self.index)) }
+    fn next(): Option<Int?> {
+        meter.reads += 1
+        index += 1
+        if index > last { None }
+        else if index == 1 { Some(None) }
+        else { Some(Some(index)) }
     }
 }
 struct Values(val meter: Meter) {
-    fn iterator(self): Cursor { self.meter.opens += 1; Cursor(self.meter, 0, 3) }
+    fn iterator(): Cursor { meter.opens += 1; Cursor(meter, 0, 3) }
 }
-trait Iterable { fn iterator(self): Cursor }
+trait Iterable { fn iterator(): Cursor }
 async fn valuesOf<T: Iterable>(values: T): Unit {
     for value in values {
         defer { print("cleanup") }
@@ -140,13 +140,13 @@ async fn main(): Unit {
 
     def test_iterator_protocol_does_not_invoke_async_or_non_optional_methods(self):
         for declaration, fragment in (
-            ('async fn next(self): Int? { None }', '同步 next()'),
-            ('fn next(self, count: Int = 0): Int? { None }', '同步 next()'),
-            ('fn next(self): Int { 1 }', '实际是 Int'),
+            ('async fn next(): Int? { None }', '同步 next()'),
+            ('fn next(count: Int = 0): Int? { None }', '同步 next()'),
+            ('fn next(): Int { 1 }', '实际是 Int'),
         ):
             with self.subTest(declaration=declaration):
                 self.main.write_text('struct Cursor { ' + declaration + ' }\n'
-                                     'struct Values { fn iterator(self): Cursor { Cursor() } }\n'
+                                     'struct Values { fn iterator(): Cursor { Cursor() } }\n'
                                      'fn main(): Unit { for item in Values() {} }', encoding='utf-8')
                 rejected = subprocess.run([COMPILER, 'check', self.package, '--diagnostics=json'], capture_output=True, timeout=10)
                 self.assertNotEqual(rejected.returncode, 0)

@@ -27,14 +27,14 @@ val explicit = identity<Int>(7)
 只有函数要使用特定成员时才需要约束，例如：
 
 ```text
-trait Render { fn render(self): String }
+trait Render { fn render(): String }
 
 fn draw<T: Render>(item: T): String {
     item.render()
 }
 
 class Badge {
-    fn render(self): String { "NEW" }
+    fn render(): String { "NEW" }
 }
 
 draw(Badge()) // 成功：Badge 的方法签名满足 Render
@@ -42,7 +42,7 @@ draw(Badge()) // 成功：Badge 的方法签名满足 Render
 
 若 `Badge.render()` 返回 `Int` 而约束要求 `String`，程序必须编译失败，诊断指出实际签名与要求的差异；不能把不匹配留到运行时。
 
-**Alpha 可用范围。** 一个类型形参可声明一个命名的结构约束；同一个 `trait` 可列出多个方法。签名包含方法名、具名形参及类型、结果和 `async`，形参名参与匹配，因为通过约束也可以按名称调用。方法须在**泛型定义所在的模块**可见。定义检查只允许调用约束中列出的方法；实例化时检查具体类型并直接生成对该实现的调用，不做运行时反射。约束可以跨包导入或在泛型之间转发，未调用的泛型函数体同样检查。这里不要求类型声明 `implements`，也不为普通对象增加所有权或线程资格标记。泛型方法签名作为约束要求、多个独立 bound 和 `dyn` 接口值留给后续版本。
+**Alpha 可用范围。** 一个类型形参可声明一个命名的结构约束；同一个 `trait` 可列出多个实例方法。签名包含方法名、具名形参及类型、结果和 `async`，形参名参与匹配，因为通过约束也可以按名称调用。方法须在**泛型定义所在的模块**可见。定义检查只允许调用约束中列出的方法；实例化时检查具体类型并直接生成对该实现的调用，不做运行时反射。约束可以跨包导入或在泛型之间转发，未调用的泛型函数体同样检查。这里不要求类型声明 `implements`，也不为普通对象增加所有权或线程资格标记。泛型方法签名作为约束要求、多个独立 bound 和 `dyn` 接口值留给后续版本。
 
 ## 泛型与动态接口的边界
 
@@ -52,16 +52,19 @@ draw(Badge()) // 成功：Badge 的方法签名满足 Render
 struct Pair<First,Second>(val first: First, val second: Second)
 
 class Cell<Item>(var value: Item, var next: Cell<Item>?) {
-    fn map<Other>(self, transform: (Item) -> Other): Cell<Other> {
-        Cell<Other>(transform(self.value), None)
+    static fn single(value: Item): Cell<Item> { Cell<Item>(value, None) }
+    fn map<Other>(transform: (Item) -> Other): Cell<Other> {
+        Cell<Other>.single(transform(value))
     }
 }
 
-val cell = Cell("Ada", None)
+val cell = Cell<String>.single("Ada")
 val length = cell.map { it.size }
 ```
 
-构造可以显式写 `Cell<String>(...)`，也可从实参和明确的结果目标推断。编译器先收集普通实参的类型，再用它们检查需要上下文的 `None`、空列表和 lambda；运行时仍按源码顺序求值。调用方法时，`Item` 固定为接收者的类型实参，方法自己的 `Other` 另行推断或显式指定。类型检查会检查尚未实例化的泛型方法；原生代码只使用具体布局。
+构造可以显式写 `Cell<String>(...)`，也可从实参和明确的结果目标推断。编译器先收集普通实参的类型，再用它们检查需要上下文的 `None`、空列表和 lambda；运行时仍按源码顺序求值。调用实例方法时，`Item` 固定为接收者的类型实参，方法自己的 `Other` 另行推断或显式指定。类型检查会检查尚未实例化的泛型方法；原生代码只使用具体布局。
+
+静态方法没有实例来提供类型实参。`Cell<String>.single("Ada")` 固定了 `Item`；`Cell.single("Ada")` 可从实参或明确的结果类型推断。若要显式指定静态方法自己的类型实参，先写齐所属类型的实参，例如 `Box<Int>.from<String>(...)`。
 
 `Pair<Int,String>` 和 `Pair<String,Int>` 是不同类型；跨模块导入别名仍指向同一个类型定义。匹配 `Pair(first: value)` 时，从被匹配值确定类型实参。Class 引用可形成递归；Struct 的内联布局不能成环。类型声明上的约束、泛型枚举及泛型声明的宏派生留在后续切片；方法自己的类型参数仍可使用结构约束。
 

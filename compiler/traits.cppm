@@ -28,8 +28,11 @@ class StructuralContracts {
 
     static std::string describe(const std::string& name, const RequiredMethod& method, const auto& typeName) {
         std::string text = method.asynchronous ? "async fn " : "fn ";
-        text += name + "(self";
-        for (std::size_t index = 0; index < method.parameters.size(); ++index) text += ", " + method.labels[index] + ": " + typeName(method.parameters[index]);
+        text += name + '(';
+        for (std::size_t index = 0; index < method.parameters.size(); ++index) {
+            if (index) text += ", ";
+            text += method.labels[index] + ": " + typeName(method.parameters[index]);
+        }
         return text + "): " + typeName(method.result);
     }
 
@@ -39,7 +42,7 @@ public:
         if (!inserted) throw at(source, trait.name.span, "LYN0002", "结构约束重复：" + trait.name.text);
         for (const auto& method : trait.methods) {
             RequiredMethod shape{{}, {}, resolve(method.result), method.asynchronous};
-            std::set<std::string> names{"self"};
+            std::set<std::string> names;
             for (const auto& parameter : method.parameters) {
                 if (!names.insert(parameter.name.text).second) throw at(source, parameter.name.span, "LYN0002", "约束方法形参重复：" + parameter.name.text);
                 shape.labels.push_back(parameter.name.text);

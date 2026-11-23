@@ -64,9 +64,9 @@ second"#)
     def test_interpolation_uses_display_and_preserves_order_across_await(self):
         self.native(r'''
 class Label(val message: String) {
-    fn toString(self): String { self.message }
+    fn toString(): String { message }
 }
-trait Display { fn toString(self): String }
+trait Display { fn toString(): String }
 fn format<T: Display>(item: T): String { "[${item}]" }
 fn number(value: Int): Int { print(value); value }
 async fn token(): Char { await blocking { gcCollect() }; '}' }

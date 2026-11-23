@@ -11,11 +11,6 @@ import lyra.check;
 
 namespace lyra {
 
-export bool isInitializerSelf(const CheckedFunction& fn, ExprId id) {
-    const auto* name = std::get_if<Identifier>(&fn.syntax.expressions[id].node);
-    return name && name->text == "self" && fn.expressions[id].target == fn.syntax.parameters.size();
-}
-
 namespace {
 enum class FieldState { Unset, Maybe, Ready };
 using State = std::vector<FieldState>;
@@ -34,6 +29,7 @@ struct Flow {
     const Source& source;
 
     Span site(ExprId id) const { return fn.syntax.expressions[id].span; }
+    bool isReceiver(ExprId id) const { return std::holds_alternative<This>(fn.syntax.expressions[id].node); }
 
     void requireReady(const State& state, Span span, const char* action) const {
         auto missing = std::ranges::find_if(state, [](auto value) { return value != FieldState::Ready; });
@@ -58,14 +54,14 @@ struct Flow {
     }
 
     bool walk(ExprId, const auto&, State&, bool) const { return true; }
-    bool walk(ExprId id, const Identifier&, State& state, bool) const {
-        if (isInitializerSelf(fn, id)) requireReady(state, site(id), "使用 self");
+    bool walk(ExprId id, This, State& state, bool) const {
+        requireReady(state, site(id), "使用 this");
         return true;
     }
 
     bool walk(ExprId id, const Member& member, State& state, bool restricted) const {
         if (fn.expressions[id].callee == Callee::Variant) return true;
-        if (!isInitializerSelf(fn, member.receiver)) return eval(member.receiver, state, restricted);
+        if (!isReceiver(member.receiver)) return eval(member.receiver, state, restricted);
         auto field = fn.expressions[id].target;
         if (state[field] != FieldState::Ready) throw at(source, member.name.span, "LYT0017", "字段尚未在所有路径初始化：" + record.syntax.fields[field].name.text);
         return true;
@@ -81,7 +77,7 @@ struct Flow {
     bool walk(ExprId, const Binary& binary, State& state, bool restricted) const {
         if (binary.op == Op::Set) {
             auto* field = std::get_if<Member>(&fn.syntax.expressions[binary.left].node);
-            if (field && isInitializerSelf(fn, field->receiver)) {
+            if (field && isReceiver(field->receiver)) {
                 if (!eval(binary.right, state, restricted)) return false;
                 auto slot = fn.expressions[binary.left].target;
                 if (!record.syntax.fields[slot].writable && state[slot] != FieldState::Unset)
@@ -148,7 +144,7 @@ struct Flow {
 
     void capture(ExprId id, const State& state) const {
         const auto& captures = fn.expressions[id].captures;
-        if (std::ranges::find(captures, fn.syntax.parameters.size()) != captures.end()) requireReady(state, site(id), "捕获 self");
+        if (std::ranges::find(captures, fn.syntax.parameters.size()) != captures.end()) requireReady(state, site(id), "捕获 this");
     }
 
     bool walk(ExprId id, const Lambda&, State& state, bool) const { capture(id, state); return true; }

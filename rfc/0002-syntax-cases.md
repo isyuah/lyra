@@ -44,7 +44,7 @@ fn renameAndReplace(replacement: Contact, values: Contact...): Contact {
 
 ## 默认值与泛型
 
-`mark(label, value)` 先记录 `label`，再返回 `value`。`identity`、`absent` 的定义见正文；`draw<T: Render>` 要求 `render(self): String`，而夹具 `WrongBadge` 的 `render` 返回 `Int`。
+`mark(label, value)` 先记录 `label`，再返回 `value`。`identity`、`absent` 的定义见正文；`draw<T: Render>` 要求实例方法 `render(): String`，而夹具 `WrongBadge` 的 `render` 返回 `Int`。
 
 ```text
 fn join(left: Int = mark("L", 1), right: Int = mark("R", left + 1)): Int {
@@ -61,7 +61,7 @@ fn lookup<Key, Value>(key: Key): Value? { null }
 | S2-012 | `join(right: 4, 2)`；另测 `join(2, left: 4)` | 分别在 `2` 报命名实参后有位置实参、在 `left:` 报重复绑定。 |
 | S2-013 | `identity(7)`；`identity<Int>(7)` | 前者从实参推得 `T = Int`，后者显式指定 `Int`；均得到 `Int` 值 `7`。`7 < identity(8)` 则是比较，得到 `true`。 |
 | S2-014 | `val name: String? = absent()`；另测 `val value = absent()` | 前者推得 `T = String`，结果是 `String?` 的 `None`。后者在 `absent()` 处报无法推断 `T`，不取 `Any`；改写为 `absent<String>()` 或给 `value` 加 `: String?` 均可通过。 |
-| S2-015 | `draw(WrongBadge())` | 在实参处指出要求 `render(self): String`，实际返回 `Int`，关联约束声明。 |
+| S2-015 | `draw(WrongBadge())` | 在实参处指出要求 `render(): String`，实际返回 `Int`，关联约束声明。 |
 | S2-027 | `left < right`（值分别为 `2`、`5`）；另测 `left<right>(7)`（`left` 与 `identity` 签名相同，`right` 只声明为值） | 前者比较得到 `true`；后者在类型实参 `right` 处报需要类型，不把调用重解析为比较。 |
 | S2-029 | `val score: Int? = lookup("Ada")`；另测 `val score = lookup("Ada")` | 前者从实参得到 `Key = String`、从目标类型得到 `Value = Int`，结果为 `None`。后者仍能确定 `Key`，在调用处报无法推断 `Value`。 |
 

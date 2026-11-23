@@ -15,25 +15,25 @@ extern fn lyraHttpRespond(request: CPtr, code: Int, mediaType: String, body: Str
 extern fn lyraHttpPathInt(target: String, prefix: String, fallback: Int): Int;
 
 pub class Listener(val handle: CPtr) {
-    pub fn status(self): Int { lyraHttpStatus(self.handle) }
-    pub fn port(self): Int { lyraHttpPort(self.handle) }
-    pub fn accept(self, timeoutMs: Int): Request { Request(lyraHttpAccept(self.handle, timeoutMs)) }
-    pub fn close(self): Unit { lyraHttpStop(self.handle) }
+    pub fn status(): Int { lyraHttpStatus(handle) }
+    pub fn port(): Int { lyraHttpPort(handle) }
+    pub fn accept(timeoutMs: Int): Request { Request(lyraHttpAccept(handle, timeoutMs)) }
+    pub fn close(): Unit { lyraHttpStop(handle) }
 }
 
 pub struct Response(pub val code: Int, pub val contentType: String, pub val body: String)
 
 pub class Request(val handle: CPtr) {
-    pub fn status(self): Int { lyraHttpRequestStatus(self.handle) }
-    pub fn method(self): String { lyraHttpMethod(self.handle) }
-    pub fn target(self): String { lyraHttpTarget(self.handle) }
-    pub fn body(self): String { lyraHttpBody(self.handle) }
-    pub fn pathInt(self, prefix: String, fallback: Int): Int { lyraHttpPathInt(self.target(), prefix, fallback) }
-    pub fn disconnected(self): Bool { lyraHttpDisconnected(self.handle) }
-    pub fn waitDisconnect(self, timeoutMs: Int): Bool { lyraHttpWaitDisconnect(self.handle, timeoutMs) }
-    pub fn watchDisconnect(self): Bool { lyraHttpWatchDisconnect(self.handle) }
-    pub fn respond(self, code: Int, mediaType: String, body: String): Int { lyraHttpRespond(self.handle, code, mediaType, body) }
-    pub fn close(self): Unit { lyraHttpDrop(self.handle) }
+    pub fn status(): Int { lyraHttpRequestStatus(handle) }
+    pub fn method(): String { lyraHttpMethod(handle) }
+    pub fn target(): String { lyraHttpTarget(handle) }
+    pub fn body(): String { lyraHttpBody(handle) }
+    pub fn pathInt(prefix: String, fallback: Int): Int { lyraHttpPathInt(target(), prefix, fallback) }
+    pub fn disconnected(): Bool { lyraHttpDisconnected(handle) }
+    pub fn waitDisconnect(timeoutMs: Int): Bool { lyraHttpWaitDisconnect(handle, timeoutMs) }
+    pub fn watchDisconnect(): Bool { lyraHttpWatchDisconnect(handle) }
+    pub fn respond(code: Int, mediaType: String, body: String): Int { lyraHttpRespond(handle, code, mediaType, body) }
+    pub fn close(): Unit { lyraHttpDrop(handle) }
 }
 
 pub fn listen(port: Int): Listener { Listener(lyraHttpListen(port)) }

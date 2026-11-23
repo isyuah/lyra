@@ -126,6 +126,7 @@ struct Symbols {
     std::vector<Names> variants{};
     std::vector<Aggregate> recordDeclarations{};
     std::vector<std::optional<std::size_t>> initializers{};
+    std::vector<Names> staticMethods{};
     mutable std::map<std::pair<std::size_t, std::vector<Type>>, Type> recordInstances{};
     mutable unsigned expandingRecord{};
 
@@ -328,6 +329,8 @@ struct Checker {
     std::vector<WorkerScope> workers{};
     std::vector<std::optional<ExprId>> catchOwners{};
     std::map<ExprId, std::vector<std::optional<Type>>> lambdaHints{};
+    std::optional<std::size_t> receiverSlot{};
+    std::vector<std::optional<ExprId>> implicitReceivers{};
 
     std::optional<ExprId> currentWorker() const { return workers.empty() ? std::nullopt : std::optional(workers.back().id); }
     std::optional<Type> returnType() const { return workers.empty() ? std::optional(fn.result) : workers.back().result; }
@@ -341,13 +344,63 @@ struct Checker {
         if (!scopes.back().emplace(localKey(name), slot).second) throw at(source, name.span, "LYN0002", "名称已在此作用域声明：" + name.text);
     }
 
+    std::optional<std::size_t> lookupLocal(const Identifier& name) const {
+        auto key = localKey(name);
+        for (auto scope = scopes.rbegin(); scope != scopes.rend(); ++scope)
+            if (auto found = scope->find(key); found != scope->end()) return found->second;
+        return {};
+    }
+
+    bool implicitMember(const Identifier& name, bool call = false) const {
+        if (!receiverSlot || source.hygieneAt(name.span)) return false;
+        auto owner = module.aggregates[fn.locals[*receiverSlot].type.id].declaration;
+        return symbols.fields[owner].contains(name.text) || (call && symbols.methods[owner].contains(name.text));
+    }
+
+    void prepareReceivers() {
+        if (!receiverSlot) return;
+        implicitReceivers.resize(fn.syntax.expressions.size());
+        for (ExprId id = 0; id < implicitReceivers.size(); ++id) {
+            const auto& node = fn.syntax.expressions[id].node;
+            const auto* name = std::get_if<Identifier>(&node);
+            const auto* call = std::get_if<Call>(&node);
+            if (call && !call->receiver && !call->function && !call->typeOwner) name = &call->name;
+            if (name && implicitMember(*name, call != nullptr)) {
+                auto site = name->span;
+                implicitReceivers[id] = fn.syntax.expressions.size();
+                fn.syntax.expressions.push_back({site, This{}});
+            }
+        }
+        fn.expressions.resize(fn.syntax.expressions.size());
+    }
+
+    void resolveReceiver(ExprId id) {
+        auto& node = fn.syntax.expressions[id].node;
+        if (id < implicitReceivers.size() && implicitReceivers[id]) {
+            auto receiver = *implicitReceivers[id];
+            if (auto* name = std::get_if<Identifier>(&node); name && !lookupLocal(*name)) node = Member{receiver, *name};
+            else if (auto* call = std::get_if<Call>(&node); call && !call->typeOwner && !lookupLocal(call->name)) call->receiver = receiver;
+        }
+        if (auto* call = std::get_if<Call>(&node); call && call->receiver) {
+            auto* name = std::get_if<Identifier>(&fn.syntax.expressions[*call->receiver].node);
+            if (name && symbols.records.contains(linkedName(*name)) && !lookupLocal(*name) && !implicitMember(*name)) {
+                call->typeOwner = TypeQualifier{*name};
+                call->receiver.reset();
+            }
+        }
+    }
+
     void run() {
         scopes.emplace_back();
-        for (std::size_t index = 0; index < fn.syntax.parameters.size(); ++index) declare(fn.syntax.parameters[index].name, index);
+        for (std::size_t index = fn.syntax.hasReceiver; index < fn.syntax.parameters.size(); ++index) declare(fn.syntax.parameters[index].name, index);
         if (fn.syntax.foreignSymbol) return;
+        if (fn.syntax.hasReceiver) receiverSlot = 0;
         if (fn.syntax.initializer) {
-            declare({"self", fn.syntax.name.span}, fn.locals.size());
+            receiverSlot = fn.locals.size();
             fn.locals.push_back({fn.result, false});
+        }
+        prepareReceivers();
+        if (fn.syntax.initializer) {
             visit(fn.syntax.body, {}, true);
             checkInitialization(fn, module.aggregates[fn.result.id], source);
         } else visit(fn.syntax.body, fn.result);
@@ -359,6 +412,7 @@ struct Checker {
     }
 
     Type inspect(ExprId id, std::optional<Type> hint, bool discard = false) {
+        resolveReceiver(id);
         const auto& expr = fn.syntax.expressions[id];
         return fn.expressions[id].type = std::visit([&](const auto& node) { return infer(id, node, hint, discard); }, expr.node);
     }
@@ -436,7 +490,7 @@ struct Checker {
             }
         }
         auto error = at(source, fn.syntax.expressions[display.value].span, "LYT0016", typeName(module, type) + " 未满足 Display，无法用于字符串插值");
-        error.hint = "提供可见的同步方法 fn toString(self): String，或在插值中显式转换。";
+        error.hint = "提供可见的同步实例方法 fn toString(): String，或在插值中显式转换。";
         throw error;
     }
 
@@ -525,7 +579,8 @@ struct Checker {
         const auto& node = fn.syntax.expressions[id].node;
         if (std::holds_alternative<EmptyOption>(node)) return true;
         const auto* call = std::get_if<Call>(&node);
-        return call && !call->receiver && call->name.text == "Some" && call->arguments.size() == 1 && untypedOption(call->arguments.front().value);
+        return call && !call->receiver && !call->function && !call->typeOwner && linkedName(call->name) == "Some" &&
+            !lookupLocal(call->name) && !implicitMember(call->name, true) && call->arguments.size() == 1 && untypedOption(call->arguments.front().value);
     }
 
     bool needsArgumentHint(ExprId id) const {
@@ -675,19 +730,24 @@ struct Checker {
         return discard && match.optional != OptionalForm::None ? Type{Type::Unit} : result.value_or(Type::Never);
     }
 
-    std::optional<std::size_t> localSlot(const Identifier& name) {
-        for (auto scope = scopes.rbegin(); scope != scopes.rend(); ++scope) {
-            if (auto found = scope->find(localKey(name)); found != scope->end()) {
-                auto slot = found->second;
-                for (const auto& worker : workers) if (slot < worker.firstLocal) {
-                    fn.locals[slot].captured = true;
-                    auto& captures = fn.expressions[worker.id].captures;
-                    if (std::ranges::find(captures, slot) == captures.end()) captures.push_back(slot);
-                }
-                return slot;
-            }
+    std::size_t captureSlot(std::size_t slot) {
+        for (const auto& worker : workers) if (slot < worker.firstLocal) {
+            fn.locals[slot].captured = true;
+            auto& captures = fn.expressions[worker.id].captures;
+            if (std::ranges::find(captures, slot) == captures.end()) captures.push_back(slot);
         }
-        return std::nullopt;
+        return slot;
+    }
+
+    std::optional<std::size_t> localSlot(const Identifier& name) {
+        if (auto slot = lookupLocal(name)) return captureSlot(*slot);
+        return {};
+    }
+
+    Type infer(ExprId id, This, auto, bool) {
+        if (!receiverSlot) throw at(source, fn.syntax.expressions[id].span, "LYT0018", "this 只能用于实例方法或 init");
+        fn.expressions[id].target = captureSlot(*receiverSlot);
+        return fn.locals[*receiverSlot].type;
     }
 
     Type infer(ExprId id, const Identifier& name, std::optional<Type> expected, bool) {
@@ -869,7 +929,8 @@ struct Checker {
 
     std::optional<Type> enumNamespace(ExprId receiver) {
         auto* name = std::get_if<Identifier>(&fn.syntax.expressions[receiver].node);
-        if (name) if (auto item = symbols.enums.find(linkedName(*name)); item != symbols.enums.end() && !localSlot(*name)) return Type{Type::Enum, item->second};
+        if (name && !lookupLocal(*name) && !implicitMember(*name))
+            if (auto item = symbols.enums.find(linkedName(*name)); item != symbols.enums.end()) return Type{Type::Enum, item->second};
         return std::nullopt;
     }
 
@@ -971,9 +1032,8 @@ struct Checker {
         return {std::move(types), exits};
     }
 
-    Type genericCall(std::size_t declaration, ExprId id, const Call& call, std::optional<Type> expected) {
+    Type genericCall(std::size_t declaration, ExprId id, const Call& call, std::optional<Type> expected, std::span<const Type> ownerTypes) {
         const auto& target = *symbols.callables[declaration].generic;
-        auto ownerTypes = call.receiver ? std::span<const Type>(module.aggregates[fn.expressions[*call.receiver].type.id].arguments) : std::span<const Type>{};
         auto [types, exits] = bindGeneric(id, call, target, expected, ownerTypes);
         if (variables.empty()) fn.expressions[id].target = symbols.instantiate(declaration, types, source, call.name.span);
         auto result = symbols.resolve(target, target.result, types);
@@ -995,9 +1055,32 @@ struct Checker {
         };
         if (call.function) return invoke(visit(*call.function));
         const auto& key = call.name.linked.empty() ? call.name.text : call.name.linked;
-        if (!call.receiver) if (auto local = localSlot(call.name)) { info.target = *local; return invoke(fn.locals[*local].type); }
+        if (!call.receiver && !call.typeOwner) if (auto local = localSlot(call.name)) { info.target = *local; return invoke(fn.locals[*local].type); }
         std::size_t declaration;
-        if (call.receiver) {
+        std::span<const Type> ownerTypes;
+        if (call.typeOwner) {
+            const auto& qualifier = *call.typeOwner;
+            auto named = symbols.records.find(linkedName(qualifier.name));
+            if (named == symbols.records.end()) throw at(source, qualifier.name.span, "LYT0003", "静态方法需要可见的 Struct 或 Class 类型");
+            auto owner = named->second;
+            auto member = symbols.staticMethods[owner].find(call.name.text);
+            if (member == symbols.staticMethods[owner].end()) {
+                if (symbols.methods[owner].contains(call.name.text) || symbols.fields[owner].contains(call.name.text))
+                    throw at(source, call.name.span, "LYT0018", "实例成员需要对象接收者：" + call.name.text);
+                throw at(source, call.name.span, "LYN0001", "找不到静态方法：" + call.name.text);
+            }
+            declaration = member->second;
+            const auto& method = symbols.declaration(symbols.callables[declaration]);
+            visible(method.file, method.isPublic, call.name);
+            if (!qualifier.arguments.empty()) {
+                std::vector<Type> arguments;
+                for (const auto& type : qualifier.arguments) arguments.push_back(symbols.resolve(fn.syntax, type, variables));
+                auto record = symbols.recordType(owner, std::move(arguments), source, qualifier.name.span);
+                ownerTypes = module.aggregates[record.id].arguments;
+            } else if (!call.typeArguments.empty() && !symbols.recordDeclarations[owner].typeParameters.empty()) {
+                throw at(source, call.name.span, "LYG0001", "显式指定静态方法的类型实参时，先指定所属类型的类型实参，例如 Box<Int>.make<String>(...)");
+            }
+        } else if (call.receiver) {
             if (auto item = enumNamespace(*call.receiver)) {
                 noTypeArgs();
                 auto index = variantIndex(*item, call.name);
@@ -1046,6 +1129,9 @@ struct Checker {
                     info.target = field->second;
                     return invoke(decl.fields[info.target]);
                 }
+                if (symbols.staticMethods[decl.declaration].contains(call.name.text))
+                    throw at(source, call.name.span, "LYT0018", "静态方法必须通过类型名调用：" + call.name.text);
+                ownerTypes = decl.arguments;
             }
             if (owner.kind == Type::Task && call.name.text == "cancel") {
                 if (!workers.empty() || !fn.syntax.isAsync) throw at(source, call.name.span, "LYT0008", "Task.cancel() 只能在 async 函数中调用，不能在同步 lambda、blocking 或 defer 中调用");
@@ -1124,7 +1210,7 @@ struct Checker {
             if (found == symbols.functions.end()) throw at(source, call.name.span, "LYN0001", "找不到函数：" + call.name.text);
             declaration = found->second;
         }
-        if (symbols.callables[declaration].generic) return genericCall(declaration, id, call, expected);
+        if (symbols.callables[declaration].generic) return genericCall(declaration, id, call, expected, ownerTypes);
         noTypeArgs();
         info.target = symbols.callables[declaration].target;
         const auto& target = module.functions[info.target];
@@ -1195,7 +1281,7 @@ struct Checker {
             if (type == Type::Never) { visit(binary.right); return type; }
             auto* member = std::get_if<Member>(&place.node);
             bool initialize = fn.syntax.initializer && workers.empty() && binary.op == Op::Set && member &&
-                isInitializerSelf(fn, member->receiver);
+                std::holds_alternative<This>(fn.syntax.expressions[member->receiver].node);
             if (!initialize && !writable(binary.left)) throw at(source, place.span, "LYT0004", "不能给此位置赋值；需要 var 绑定或可写字段");
             if (binary.op != Op::Set && !numericType(type) && !(binary.op == Op::AddSet && type == Type::String)) throw mismatch(module, source, place.span, Type::Int, type);
             return visit(binary.right, type) == Type::Never ? Type::Never : Type::Unit;
@@ -1285,7 +1371,7 @@ struct Checker {
 
     Type infer(ExprId id, const Return& ret, std::optional<Type>, bool) {
         if (fn.syntax.initializer && workers.empty()) {
-            if (ret.value) throw at(source, fn.syntax.expressions[id].span, "LYT0017", "init 只能用不带值的 return；构造结果始终是 self");
+            if (ret.value) throw at(source, fn.syntax.expressions[id].span, "LYT0017", "init 只能用不带值的 return；构造结果始终是 this");
             return Type::Never;
         }
         auto target = returnType();
@@ -1398,6 +1484,7 @@ CheckedModule check(Module module, const std::vector<Source>& sources, bool requ
     }
     symbols.fields.resize(symbols.recordDeclarations.size());
     symbols.methods.resize(symbols.recordDeclarations.size());
+    symbols.staticMethods.resize(symbols.recordDeclarations.size());
     symbols.initializers.resize(symbols.recordDeclarations.size());
     symbols.variants.resize(checked.enums.size());
     for (std::size_t id = 0; id < symbols.recordDeclarations.size(); ++id) {
@@ -1439,8 +1526,10 @@ CheckedModule check(Module module, const std::vector<Source>& sources, bool requ
         auto owner = function.owner ? std::optional(symbols.records.at(function.owner->text)) : std::nullopt;
         if (function.initializer) symbols.initializers[*owner] = symbols.callables.size();
         else {
-            auto& names = owner ? symbols.methods[*owner] : symbols.functions;
-            bool collision = owner ? symbols.fields[*owner].contains(function.name.text) : symbols.records.contains(function.name.text) || symbols.enums.contains(function.name.text) || function.name.text == "print" || function.name.text == "gcCollect";
+            auto& names = !owner ? symbols.functions : function.hasReceiver ? symbols.methods[*owner] : symbols.staticMethods[*owner];
+            bool collision = owner ? symbols.fields[*owner].contains(function.name.text) ||
+                (function.hasReceiver ? symbols.staticMethods[*owner] : symbols.methods[*owner]).contains(function.name.text)
+                : symbols.records.contains(function.name.text) || symbols.enums.contains(function.name.text) || function.name.text == "print" || function.name.text == "gcCollect";
             if (collision || !names.emplace(function.name.text, symbols.callables.size()).second)
                 throw at(source, function.name.span, "LYN0002", "函数名已声明：" + function.name.text);
         }
