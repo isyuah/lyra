@@ -331,7 +331,11 @@ void expandMacros(Module& syntax, std::vector<Source>& sources, const std::map<s
         auto& name = prefix.record ? syntax.aggregates[prefix.target].name : syntax.functions[prefix.target].name;
         std::vector<Field> fields;
         std::string bodyText;
-        if (prefix.record) fields = syntax.aggregates[prefix.target].fields;
+        if (prefix.record) {
+            const auto& record = syntax.aggregates[prefix.target];
+            if (!record.typeParameters.empty()) throw at(source, prefix.name.span, "LYM0002", "声明宏暂不接收泛型 struct 或 class");
+            fields = record.fields;
+        }
         else {
             auto& fn = syntax.functions[prefix.target];
             for (const auto& param : fn.parameters) fields.push_back({param.name, param.type, false, true, param.attributes});

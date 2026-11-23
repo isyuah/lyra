@@ -77,7 +77,7 @@ lyra pack <目录> [-o <源码包>|--registry <本地目录>]
 - 支持具名形参、按源码顺序求值的命名实参、`val` / `var`、嵌套作用域、短路 `&&` / `||`、`if` / `else`、`while`、`break`、`continue` 和 `return`。普通块以末表达式为值，空块或带末尾分号的块取 `Unit`。
 - [文本与字节](rfc/language-core.md#文本与字节)：`String` 支持 UTF-8、拼接和 `"Hello, ${name}"` 插值；单引号给出 Unicode `Char`，`b"\xFF"` 给出不可变 `Bytes`，可显式检查和转换为文本。
 - `struct` 按值复制，`class` 保留对象身份，可定义字段、主构造和方法。`gcCollect()` 可主动收集。对象由 BDWGC 管理；编译器安装目录带静态 GC 和 libuv 归档，部署应用不需要安装这两个库。见[对象验收程序](tests/fixtures/objects/src/main.ly)。
-- 泛型函数 `fn identity<T>(value: T): T { value }` 可写 `identity(42)` 或 `identity<String>("Ada")`。未调用的泛型也检查函数体，已调用的具体类型组合各生成一份原生实现。
+- 泛型函数 `fn identity<T>(value: T): T { value }` 可写 `identity(42)` 或 `identity<String>("Ada")`。Struct、Class 和方法也可带类型形参，例如 `class Cell<Item>(var value: Item)` 与 `Cell("Ada")`。未调用的泛型也检查函数体，具体类型组合各自生成原生实现。
 - `fn draw<T: Render>(item: T)` 可调用 `trait Render` 要求的方法。业务类型有可见、签名匹配的方法即可，不用声明 `implements`。结构检查发生在编译时，见[泛型与接口](rfc/generics-and-interfaces.md)。
 - [函数值与闭包](compiler/closures.md)可以返回、传参或存入集合。`apply(4) { it * 2 }` 把尾块传给末尾的固定函数形参；闭包共享被捕获的绑定，跨 `await`、GC 后仍可调用，`return` 和 `?` 只退出最近的 lambda。
 - [列表和变长参数](compiler/collections.md)支持 `[1, 2]`、按下标读写、`.size`、`.add(value)`、参数默认值、`fn sum(values: Int...)`。`sum(...ids)` 展开元素；函数收到本次调用自己的列表，更改槽位不影响调用方。如果元素是对象引用，引用的仍是同一个对象。

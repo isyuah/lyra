@@ -58,12 +58,6 @@ template<class Rename> std::string mapTypeNames(const TypeForm& form, const Rena
     return result;
 }
 
-bool genericPattern(const Function& declaration, const TypeForm& form) {
-    if (genericParameter(declaration, form.name)) return true;
-    for (const auto& argument : form.arguments) if (genericPattern(declaration, argument)) return true;
-    return false;
-}
-
 template<class Type> struct GenericArgument { std::size_t slot; Type type; Span span; };
 
 template<class Type, class TypeName, class Project, class Common>
@@ -71,16 +65,13 @@ std::vector<Type> inferGenericArguments(const Function& declaration, const Call&
         std::span<const Type> explicitTypes, std::span<const GenericArgument<Type>> arguments,
         std::optional<Type> expected, const Source& source, TypeName name, Project project, Common common) {
     const auto& parameters = declaration.typeParameters;
-    if (!explicitTypes.empty() && explicitTypes.size() != parameters.size()) {
-        throw at(source, call.name.span, "LYG0001", call.name.text + " 需要 " + std::to_string(parameters.size()) + " 个类型实参，实际为 " + std::to_string(explicitTypes.size()));
-    }
     std::vector<std::optional<Type>> bound(parameters.size());
     for (std::size_t index = 0; index < explicitTypes.size(); ++index) bound[index] = explicitTypes[index];
     auto unify = [&](auto&& self, const TypeForm& form, Type value, Span span, bool fromResult, bool widen) -> void {
         if (auto index = genericParameter(declaration, form.name)) {
             if (!bound[*index]) bound[*index] = value;
             else if (!fromResult && *bound[*index] != value) {
-                if (widen && explicitTypes.empty()) {
+                if (widen && *index >= explicitTypes.size()) {
                     if (auto joined = common(*bound[*index], value)) { bound[*index] = *joined; return; }
                 }
                 auto previous = name(*bound[*index]); auto actual = name(value);

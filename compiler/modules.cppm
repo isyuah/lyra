@@ -4,6 +4,7 @@ module;
 #include <map>
 #include <optional>
 #include <set>
+#include <span>
 #include <string>
 #include <variant>
 #include <vector>
@@ -107,13 +108,14 @@ struct Linker {
             auto generated = generatedScopes.find(file);
             return generated == generatedScopes.end() ? spaces.at(sources[file].moduleId).definitions : generated->second;
         };
-        auto renameTypeIn = [&](std::size_t file, Identifier& type) {
+        auto renameTypeIn = [&](std::size_t file, Identifier& type, std::span<const Identifier> parameters = {}) {
             const auto& scope = scopeOf(file);
             type.text = mapTypeNames(typeForm(type.text), [&](const std::string& name) {
+                if (std::ranges::any_of(parameters, [&](const auto& parameter) { return parameter.text == name; })) return name;
                 auto found = scope.find(name); return found == scope.end() ? name : found->second.name;
             });
         };
-        for (auto& record : syntax.aggregates) for (auto& field : record.fields) renameTypeIn(record.file, field.type);
+        for (auto& record : syntax.aggregates) for (auto& field : record.fields) renameTypeIn(record.file, field.type, record.typeParameters);
         for (auto& item : syntax.enums) for (auto& entry : item.cases) for (auto& field : entry.fields) renameTypeIn(item.file, field.type);
         for (auto& trait : syntax.traits) for (auto& method : trait.methods) {
             renameTypeIn(trait.file, method.result);

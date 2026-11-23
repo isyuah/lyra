@@ -1,4 +1,5 @@
 module;
+#include <compare>
 #include <cstdint>
 #include <deque>
 #include <optional>
@@ -15,7 +16,7 @@ struct Type {
     Kind kind;
     std::size_t id{};
     constexpr Type(Kind kind = Unit, std::size_t id = 0) : kind(kind), id(id) {}
-    bool operator==(const Type&) const = default;
+    auto operator<=>(const Type&) const = default;
 };
 struct Local { Type type; bool writable; std::optional<ExprId> worker{}; bool captured{}; };
 enum class Callee { Function, Constructor, Variant, Print, Collect, Sum, ListAdd, TaskCancel, Exception, Indirect, ToReal, ToIntegerChecked, ToString, ToBytes, DecodeUtf8 };
@@ -37,10 +38,10 @@ struct CheckedFunction {
     std::vector<std::optional<std::size_t>> defaultFunctions{};
     std::vector<std::optional<ExprId>> cleanupOwners{};
 };
-struct CheckedAggregate { Aggregate syntax; std::vector<Type> fields; };
+struct CheckedAggregate { Aggregate syntax; std::vector<Type> fields; std::size_t declaration; std::vector<Type> arguments; bool abstract; };
 struct CheckedEnum { Enumeration syntax; std::vector<std::vector<Type>> payloads; };
 struct SumTypes { Type success, failure; bool operator==(const SumTypes&) const = default; };
 struct FunctionShape { std::vector<Type> parameters; Type result; bool operator==(const FunctionShape&) const = default; };
-struct CheckedModule { std::deque<CheckedFunction> functions; std::optional<std::size_t> entry; std::vector<CheckedAggregate> aggregates; std::vector<std::string> variableNames; std::vector<Type> taskResults; std::vector<SumTypes> sumTypes; std::vector<Type> listElements; std::deque<FunctionShape> signatures{}; std::vector<CheckedEnum> enums{}; };
+struct CheckedModule { std::deque<CheckedFunction> functions; std::optional<std::size_t> entry; std::deque<CheckedAggregate> aggregates; std::vector<std::string> variableNames; std::vector<Type> taskResults; std::vector<SumTypes> sumTypes; std::vector<Type> listElements; std::deque<FunctionShape> signatures{}; std::vector<CheckedEnum> enums{}; };
 CheckedModule check(Module module, const std::vector<Source>& sources, bool requireEntry = true);
 }

@@ -26,7 +26,10 @@ void registerConversion(std::vector<DirectConversion>& table, const CheckedModul
         return false;
     };
     auto publicType = [&](auto&& self, Type type) -> bool {
-        if (type.kind == Type::Record) return module.aggregates[type.id].syntax.isPublic;
+        if (type.kind == Type::Record) {
+            const auto& record = module.aggregates[type.id];
+            return record.syntax.isPublic && std::ranges::all_of(record.arguments, [&](Type argument) { return self(self, argument); });
+        }
         if (type.kind == Type::Enum) return module.enums[type.id].syntax.isPublic;
         if (type.kind == Type::List) return self(self, module.listElements[type.id]);
         if (type.kind == Type::Task) return self(self, module.taskResults[type.id]);

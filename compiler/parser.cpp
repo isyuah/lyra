@@ -486,6 +486,12 @@ private:
     void aggregate(Module& module, bool pub) {
         bool reference = text(consume()) == "class";
         Aggregate decl{file, identifier(), reference, {}, pub};
+        if (is("<")) {
+            consume();
+            decl.typeParameters.push_back(identifier());
+            while (is(",")) { consume(); decl.typeParameters.push_back(identifier()); }
+            require(">");
+        }
         bool primary = is("(");
         if (primary) {
             consume();
@@ -504,7 +510,7 @@ private:
                 bool publicMember = visibility();
                 if (is("fn") || is("async") || is("extern")) {
                     if (!marks.empty()) throw at(source, marks.front().name.span, "LYM0003", "此处的标记只适用于字段和形参");
-                    module.functions.push_back(function(decl.name, publicMember));
+                    module.functions.push_back(function(decl.name, publicMember, decl.typeParameters));
                 } else decl.fields.push_back(field(publicMember, std::move(marks)));
                 if (is(";")) consume();
                 else if (!is("}") && !token.newlineBefore) throw at(source, token.span, "LYP0001", "成员之间需要换行或分号");
@@ -514,7 +520,7 @@ private:
         module.aggregates.push_back(std::move(decl));
     }
 
-    Function function(std::optional<Identifier> owner, bool pub) {
+    Function function(std::optional<Identifier> owner, bool pub, const std::vector<Identifier>& enclosing = {}) {
         bool isAsync = false, foreign = false;
         if (is("async") || is("extern")) {
             isAsync = is("async"); foreign = !isAsync;
@@ -525,7 +531,7 @@ private:
         auto keyword = require(conversion ? "implicit" : "fn");
         if (conversion && (owner || isAsync || foreign)) throw at(source, keyword.span, "LYV0001", "implicit 必须是顶层同步转换");
         auto name = conversion ? Identifier{"$implicit" + std::to_string(file) + "_" + std::to_string(keyword.span.begin), keyword.span} : identifier();
-        std::vector<Identifier> typeParameters;
+        auto typeParameters = enclosing;
         std::vector<Bound> bounds;
         if (is("<")) {
             consume();
@@ -542,7 +548,16 @@ private:
         std::vector<Parameter> parameters;
         if (owner) {
             auto self = require("self");
-            parameters.push_back({{"self", self.span}, *owner});
+            auto selfType = *owner;
+            if (!enclosing.empty()) {
+                selfType.text += '<';
+                for (std::size_t index = 0; index < enclosing.size(); ++index) {
+                    if (index) selfType.text += ',';
+                    selfType.text += enclosing[index].text;
+                }
+                selfType.text += '>';
+            }
+            parameters.push_back({{"self", self.span}, std::move(selfType)});
             if (!is(")")) require(",");
         }
         while (!is(")")) {

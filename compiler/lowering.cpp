@@ -34,8 +34,9 @@ struct Layouts {
 
     Layouts(const CheckedModule& program, Builder& builder) : program(program) {
         for (const auto& fn : program.functions) workers |= std::ranges::any_of(fn.syntax.expressions, [](const Expr& expr) { return std::holds_alternative<Blocking>(expr.node); });
-        for (const auto& record : program.aggregates) objects.push_back(llvm::StructType::create(builder.getContext(), "lyra.type." + record.syntax.name.text));
+        for (const auto& record : program.aggregates) objects.push_back(record.abstract ? nullptr : llvm::StructType::create(builder.getContext(), "lyra.type." + record.syntax.name.text));
         for (std::size_t id = 0; id < objects.size(); ++id) {
+            if (program.aggregates[id].abstract) continue;
             std::vector<llvm::Type*> fields;
             for (Type field : program.aggregates[id].fields) fields.push_back(native(builder, field));
             if (fields.empty() && program.aggregates[id].syntax.reference) fields.push_back(builder.getInt8Ty());

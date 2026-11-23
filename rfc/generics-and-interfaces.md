@@ -46,6 +46,25 @@ draw(Badge()) // 成功：Badge 的方法签名满足 Render
 
 ## 泛型与动态接口的边界
 
+泛型 Struct 和 Class 与泛型函数共用类型实参语法：
+
+```lyra
+struct Pair<First,Second>(val first: First, val second: Second)
+
+class Cell<Item>(var value: Item, var next: Cell<Item>?) {
+    fn map<Other>(self, transform: (Item) -> Other): Cell<Other> {
+        Cell<Other>(transform(self.value), None)
+    }
+}
+
+val cell = Cell("Ada", None)
+val length = cell.map { it.size }
+```
+
+构造可以显式写 `Cell<String>(...)`，也可从实参和明确的结果目标推断。编译器先收集普通实参的类型，再用它们检查需要上下文的 `None`、空列表和 lambda；运行时仍按源码顺序求值。调用方法时，`Item` 固定为接收者的类型实参，方法自己的 `Other` 另行推断或显式指定。类型检查会检查尚未实例化的泛型方法；原生代码只使用具体布局。
+
+`Pair<Int,String>` 和 `Pair<String,Int>` 是不同类型；跨模块导入别名仍指向同一个类型定义。匹配 `Pair(first: value)` 时，从被匹配值确定类型实参。Class 引用可形成递归；Struct 的内联布局不能成环。类型声明上的约束、泛型枚举及泛型声明的宏派生留在后续切片；方法自己的类型参数仍可使用结构约束。
+
 结构约束解决“这个具体类型能否传给某个泛型函数”。它本身不解决“如何在同一集合中保存不同具体类型，然后通过共同接口动态调用”。
 
 ```text

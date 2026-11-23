@@ -97,6 +97,24 @@ fn main(): Unit {
         error, = json.loads(self.command('check', self.app, '--diagnostics=json', ok=False).stderr)
         self.assertEqual(error['code'], 'LYN0003')
 
+    def test_generic_record_import_keeps_one_nominal_type(self):
+        (self.lib / 'src/net/status.ly').write_text('''
+pub struct Status<Item>(pub val item: Item) {
+    pub fn read(self): Item { self.item }
+}
+pub fn wrap<Item>(value: Item): Status<Item> { Status(value) }
+''')
+        self.source.write_text('''
+import cfg.net.Status as Endpoint
+import cfg.net.wrap
+fn show<Item>(value: Endpoint<Item>): Item { value.read() }
+fn main(): Unit {
+    print(show(wrap(42)))
+    print(match Endpoint("network") { Endpoint(item: message) => message })
+}
+''')
+        self.assertEqual(self.command('run', self.app, '--release').stdout, '42\nnetwork\n')
+
 
 if __name__ == '__main__':
     unittest.main()

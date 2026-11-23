@@ -98,7 +98,7 @@ struct Function {
 };
 
 struct Field { Identifier name, type; bool writable; bool isPublic{}; std::vector<Attribute> attributes{}; };
-struct Aggregate { std::size_t file; Identifier name; bool reference; std::vector<Field> fields; bool isPublic{}; };
+struct Aggregate { std::size_t file; Identifier name; bool reference; std::vector<Field> fields; bool isPublic{}; std::vector<Identifier> typeParameters{}; };
 struct EnumField { std::optional<Identifier> name; Identifier type; };
 struct EnumCase { Identifier name; std::vector<EnumField> fields; };
 struct Enumeration { std::size_t file; Identifier name; std::vector<EnumCase> cases; bool isPublic; };

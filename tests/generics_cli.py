@@ -29,7 +29,7 @@ class Generics(unittest.TestCase):
     def run_native(self, expected):
         for flags in ([], ['--release']):
             with self.subTest(flags=flags):
-                output = executable(self.package / 'program')
+                output = executable(self.package / ('release' if flags else 'debug'))
                 result = self.cli('build', *flags, '-o', output)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 run = subprocess.run([output], capture_output=True, text=True, timeout=5)
@@ -161,6 +161,66 @@ pub fn relay<T: Render>(value: T): String { draw(value) }''')
             fn main(): Unit { print(identity<Int,Bool>(2)) }
         ''')
         self.rejects('LYG0001')
+
+    def test_generic_values_project_types_and_match_fields(self):
+        self.program('''
+            struct Pair<First,Second>(var first: First, val second: Second)
+            class Empty<Item>()
+            fn swap<Left,Right>(pair: Pair<Left,Right>): Pair<Right,Left> {
+                match pair { Pair(first: first, second: second) => Pair(second, first) }
+            }
+            fn seeded<Item>(items: List<Item>, value: Item): Item { value }
+            fn main(): Unit {
+                var pair = Pair(first: "value", second: 7)
+                val copy = pair
+                pair.first = "changed"
+                val reversed = swap(copy)
+                print(reversed.first)
+                print(reversed.second)
+                val empty: Empty<Int> = Empty()
+                print(empty == Empty<Int>())
+                print(seeded([], 9))
+            }
+        ''')
+        self.run_native('7\nvalue\nfalse\n9\n')
+
+    def test_generic_methods_use_receiver_types_and_infer_tail_lambdas(self):
+        self.program('''
+            trait Read { fn read(self): String }
+            class Cell<Item>(val item: Item, var next: Cell<Item>?) {
+                fn read(self): Item { self.item }
+                fn map<Other>(self, transform: (Item) -> Other): Cell<Other> { Cell<Other>(transform(self.item), None) }
+                async fn getNext(self): Item? {
+                    await blocking { gcCollect() }
+                    match self.next { None => None, Some(node) => Some(node.item) }
+                }
+            }
+            fn read<Reader: Read>(value: Reader): String { value.read() }
+            async fn main(): Unit {
+                val tail = Cell(next: None, item: "text")
+                val node = Cell("head", Cell<String>("linked", None))
+                val mapped = tail.map { it.size }
+                print((await node.getNext()) ?? "missing")
+                print(read(tail))
+                print(mapped.read())
+                print(mapped.map<Bool>() { it == 4 }.read())
+            }
+        ''')
+        self.run_native('linked\ntext\n4\ntrue\n')
+
+    def test_generic_aggregate_rejections(self):
+        for source, code, text in (
+            ('struct Pair<Item,Item>(val first: Item)', 'LYN0002', 'Item'),
+            ('struct Bad<Item>(val item: Unknown)', 'LYT0003', 'Unknown'),
+            ('struct Bad<Item>(val next: Bad<Item>?)', 'LYT0007', 'Bad'),
+            ('class Bad<Item>(val next: Bad<List<Item>>?)', 'LYG0004', 'Bad'),
+            ('struct Box<Item>(val item: Item)\nfn accept(item: Box): Unit {}', 'LYG0001', 'Box'),
+            ('class Box<Item>(val item: Item) { fn bad(self): String { self.item } }', 'LYT0001', 'Item'),
+            ('struct Box<Item>(val item: Item)\nfn accept(value: Box<Int>): Unit {}\nfn wrong(): Unit { accept(Box("str")) }', 'LYT0001', 'Box<Int>'),
+        ):
+            with self.subTest(source=source):
+                self.program(source + '\nfn main(): Unit {}')
+                self.rejects(code, text)
 
 
 if __name__ == '__main__':
