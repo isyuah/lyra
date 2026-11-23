@@ -2,6 +2,11 @@ fn encodeValue(typeName: String, expression: String): String {
     if typeName == "String" { return "quoteJson(" + expression + ")" }
     if typeName == "Int" { return "intText(" + expression + ")" }
     if typeName == "Bool" { return "boolText(" + expression + ")" }
+    val element = listElement(typeName)
+    if element != "" {
+        if optionInner(optionInner(element)) != "" { return macroFail("JSON array items cannot distinguish nested optional states") }
+        return "{ val entries = " + expression + "; var arrayText = \"[\"; var pos = 0; while pos < entries.size { if pos != 0 { arrayText += \",\" }; arrayText += " + encodeValue(element, "entries[pos]") + "; pos += 1 }; arrayText + \"]\" }"
+    }
     val inner = optionInner(typeName)
     if inner != "" {
         return "match " + expression + " { None => \"null\", Some(item) => " + encodeValue(inner, "item") + " }"
@@ -11,6 +16,10 @@ fn encodeValue(typeName: String, expression: String): String {
 
 fn readValue(typeName: String, source: String, path: String): String {
     if typeName == "String" || typeName == "Int" || typeName == "Bool" { return source + ".read" + typeName + "(" + path + ")?" }
+    val element = listElement(typeName)
+    if element != "" {
+        return "{ val arrayNode = " + source + "; val arrayPath = " + path + "; if !arrayNode.isArray() { return Err(arrayPath + \": expected array\") }; var pos = 0; val entries: " + typeName + " = []; while pos < arrayNode.size() { val itemNode = arrayNode.item(pos); val itemPath = arrayPath + \"[\" + intText(pos) + \"]\"; val item: " + element + " = " + readValue(element, "itemNode", "itemPath") + "; entries.add(item); pos += 1 }; entries }"
+    }
     val inner = optionInner(typeName)
     if inner != "" { return "if " + source + ".isNull() { None } else { Some(" + readValue(inner, source, path) + ") }" }
     "read" + typeName + "Json(" + source + ", " + path + ")?"

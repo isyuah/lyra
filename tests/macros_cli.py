@@ -122,6 +122,16 @@ fn main(): Unit {
         self.assertEqual(error['range']['start']['line'], 2)
         self.assertIn('item', error['generated']['source'])
 
+    def test_nested_arrays_track_field_and_element_paths(self):
+        self.native(r'''#derive(Json)
+struct Report(pub val rows: List<List<Int?>>, pub val labels: List<String>?)
+fn show(input: String): String { match decodeReport(input) { Ok(report) => encodeReport(report), Err(reason) => reason } }
+fn main(): Unit {
+    print(show("{\"rows\":[[1,null],[],[2]],\"labels\":[\"a\",\"b\"]}"))
+    print(show("{\"rows\":[]}"))
+    print(show("{\"rows\":[[1,true]]}"))
+}''', ['{"rows":[[1,null],[],[2]],"labels":["a","b"]}', '{"rows":[]}', '$.rows[0][1]: expected Int'])
+
 
 if __name__ == '__main__':
     unittest.main()

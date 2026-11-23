@@ -32,6 +32,7 @@ fn fieldPublic(index: Int): Bool { false }
 fn targetKind(): String { "" }
 fn targetBody(): String { "" }
 fn optionInner(typeName: String): String { "" }
+fn listElement(typeName: String): String { "" }
 fn macroQuote(text: String): String { "" }
 fn macroInput(key: String): String { "" }
 fn macroFail(message: String): String { "" }
@@ -85,9 +86,10 @@ struct Machine {
         if (name == "fieldCount") return static_cast<std::int64_t>(fields.size());
         if (name == "targetKind") return kind;
         if (name == "targetBody") return body;
-        if (name == "optionInner") {
+        if (name == "optionInner" || name == "listElement") {
             auto& type = std::get<std::string>(args.front());
-            return type.starts_with("Option<") && type.ends_with('>') ? type.substr(7, type.size() - 8) : std::string{};
+            std::string prefix = name == "optionInner" ? "Option<" : "List<";
+            return type.starts_with(prefix) && type.ends_with('>') ? type.substr(prefix.size(), type.size() - prefix.size() - 1) : std::string{};
         }
         if (name == "macroFail") error(std::get<std::string>(args.front()));
         if (name == "macroQuote") return quote(std::get<std::string>(args.front()));
