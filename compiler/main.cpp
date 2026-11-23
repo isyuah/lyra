@@ -17,7 +17,7 @@ using namespace lyra;
 namespace {
 constexpr auto usage = "lyra new <目录> [--name <包名>] [--lib]\n"
                        "lyra check|build|run|test <包目录> [--locked] [--offline] [--diagnostics=json]\n"
-                       "lyra build <包目录> [-o <产物>] [--release] | run <包目录> [--release] [-- <程序实参>...]\n"
+                       "lyra build <包目录> [-o <产物>] [--release] [--link <C库>] | run <包目录> [--release] [--link <C库>] [-- <程序实参>...]\n"
                        "lyra lock|fetch <目录> [--locked] [--offline] | lock <目录> --update\n"
                        "lyra pack <目录> [-o <源码包>|--registry <本地目录>]";
 
@@ -28,6 +28,7 @@ struct Options {
     PackageOptions packages{};
     bool release{};
     std::vector<std::string_view> arguments{};
+    std::vector<fs::path> libraries{};
 };
 
 Options options(const std::vector<std::string_view>& args, const std::vector<std::string_view>& arguments, bool separator) {
@@ -41,6 +42,15 @@ Options options(const std::vector<std::string_view>& args, const std::vector<std
         else if (arg == "--offline" && !result.packages.offline) result.packages.offline = true;
         else if (arg == "--release" && command != "check" && !result.release) result.release = true;
         else if (arg == "-o" && command == "build" && !result.output && index + 1 < args.size() && !args[index + 1].starts_with('-')) result.output = args[++index];
+        else if (arg == "--link" && command != "check" && index + 1 < args.size() && !args[index + 1].starts_with('-')) {
+            auto path = fs::absolute(args[++index]);
+            if (!fs::is_regular_file(path)) throw Diagnostic{"LYI0001", "找不到原生链接输入：" + path.string()};
+            auto name = path.filename().string();
+            auto version = name.rfind(".so.");
+            bool soname = version != name.npos && version + 4 < name.size() && name.find_first_not_of("0123456789.", version + 4) == name.npos;
+            if (!soname && path.extension() != ".a" && path.extension() != ".o" && path.extension() != ".so") throw Diagnostic{"LYC0001", "--link 只接受目标文件、静态库或共享库：" + name};
+            result.libraries.push_back(std::move(path));
+        }
         else if (!arg.empty() && !arg.starts_with('-') && result.directory.empty()) result.directory = arg;
         else throw Diagnostic{"LYC0001", usage};
     }
@@ -55,7 +65,7 @@ int compile(const Options& opts, Compilation program, bool library, fs::path out
     if (fs::exists(output)) for (const auto& input : program.macroInputs) {
         if (fs::equivalent(input, output)) throw Diagnostic{"LYI0001", "输出路径不能覆盖宏或其只读输入：" + output.string()};
     }
-    build(module, program.sources, output, opts.release);
+    build(module, program.sources, output, opts.release, opts.libraries);
     return opts.command == "build" ? 0 : execute(output, opts.arguments);
 }
 

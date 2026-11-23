@@ -106,6 +106,23 @@ fn main(): Unit {
         self.assertEqual(error["code"], "LYF0001")
         self.assertEqual(error["range"]["start"]["line"], 2)
 
+    def test_link_a_user_selected_c_archive(self):
+        native = self.package / 'native helper.c'
+        target = self.package / 'helper.o'
+        archive = self.package / 'lib helper.a'
+        native.write_text('#include <stdint.h>\nint64_t fixtureScale(int64_t value) { return value * 3; }\n')
+        subprocess.run(['clang-18', '-c', native, '-o', target], check=True)
+        subprocess.run(['ar', 'rcs', archive, target], check=True)
+        self.source.write_text('extern fn fixtureScale(value: Int): Int;\nfn main(): Unit { print(fixtureScale(7)) }')
+        run = subprocess.run([COMPILER, 'run', self.package, '--link', archive], capture_output=True, timeout=30)
+        self.assertEqual((run.returncode, run.stdout, run.stderr), (0, b'21\n', b''))
+        app = self.package / 'build/debug/app'
+        previously = app.read_bytes()
+        missing = subprocess.run([COMPILER, 'build', self.package], capture_output=True, timeout=30)
+        self.assertNotEqual(missing.returncode, 0)
+        self.assertIn(b'fixtureScale', missing.stderr)
+        self.assertEqual(app.read_bytes(), previously)
+
 
 if __name__ == "__main__":
     unittest.main()

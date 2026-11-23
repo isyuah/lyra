@@ -48,7 +48,7 @@ void runClang(const std::string& driver, const std::vector<std::string>& options
     }
 }
 
-void emitExecutable(const llvm::Module& module, const fs::path& output, bool release) {
+void emitExecutable(const llvm::Module& module, const fs::path& output, bool release, const std::vector<fs::path>& libraries) {
     auto driver = llvm::sys::findProgramByName("clang-18");
     if (!driver) throw Diagnostic{"LYB0002", "找不到 clang-18；请在构建机安装并加入 PATH"};
     auto runtime = fs::canonical("/proc/self/exe").parent_path().parent_path() / "lib" / "liblyraRuntime.a";
@@ -72,22 +72,26 @@ void emitExecutable(const llvm::Module& module, const fs::path& output, bool rel
     auto target = "--target=" + module.getTargetTriple();
     runClang(*driver, {target, release ? "-O2" : "-O0", "-c", "-x", "ir", ir, "-o", object}, log);
     auto lib = runtime.parent_path();
-    runClang(*driver, {target, object, runtime.string(), (lib / "libgc.a").string(), (lib / "libuv.a").string(), (lib / "libllhttp.a").string(),
-                       (lib / "libjansson.a").string(), "-pthread", "-ldl", "-lrt", "-Wl,--as-needed", "-lsqlite3", "-o", executable.string()}, log);
+    std::vector<std::string> link{target, object, "-Wl,--as-needed"};
+    for (const auto& library : libraries) link.push_back(library.string());
+    link.insert(link.end(), {runtime.string(), (lib / "libgc.a").string(), (lib / "libuv.a").string(), (lib / "libllhttp.a").string(),
+                            (lib / "libjansson.a").string(), "-pthread", "-ldl", "-lrt", "-lsqlite3", "-o", executable.string()});
+    runClang(*driver, link, log);
     fs::rename(executable, output);
 }
 
 }
 
-void build(const CheckedModule& functions, const std::vector<Source>& sources, const fs::path& output, bool release) {
+void build(const CheckedModule& functions, const std::vector<Source>& sources, const fs::path& output, bool release, const std::vector<fs::path>& libraries) {
     if (fs::exists(output)) {
         for (const auto& source : sources) {
             if (!source.origin && fs::equivalent(source.path, output)) throw Diagnostic{"LYI0001", "输出路径不能覆盖输入源码：" + output.string()};
         }
+        for (const auto& library : libraries) if (fs::equivalent(library, output)) throw Diagnostic{"LYI0001", "输出路径不能覆盖原生链接输入：" + output.string()};
     }
     llvm::LLVMContext context;
     auto module = lower(functions, sources, context);
-    emitExecutable(*module, fs::absolute(output), release);
+    emitExecutable(*module, fs::absolute(output), release, libraries);
 }
 
 int execute(const fs::path& executable, const std::vector<std::string_view>& arguments) {

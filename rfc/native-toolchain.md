@@ -58,6 +58,8 @@ LLVM 是代码生成后端，不是语言运行时或 GC。Lyra Runtime 实现�
 
 第一版通过显式 `extern` 声明绑定 C 标量、指针和不透明句柄。字符串按每个 C 接口的契约明确传长度或使用终止符；SQLite 文本在下一次 step 或 finalize 使原缓冲失效前复制为 Lyra 字符串。首个绑定是按需导入的官方 SQLite 包：打开连接、准备/执行语句、绑定值、迭代结果、确定性关闭 statement 和 connection。C 保存 Lyra 闭包、外部线程反向回调和任意 C 头文件自动导入不纳入首版。
 
+项目自己的 C 库可在 `lyra build`、`run`、`test` 上重复传 `--link /path/to/libexample.a`（也可传目标文件或共享库）。输入按命令行顺序交给 Clang，不执行包内脚本。`check` 只检查签名；链接阶段验证符号能否解析。`Int` 对应 `int64_t`，`Bool` 对应 `uint8_t`，`CPtr` 对应不透明指针；Lyra `String` 是带长度的运行时句柄，不是 `char*`。使用共享库时要在目标机提供相同 ABI；`lyra.lock` 锁定 Lyra 源码包，不代为分发原生库。
+
 在异步任务中，可能阻塞的 SQLite 操作必须通过隔离的执行入口进行。首例可以在一次隔离的同步操作里打开数据库、执行查询并清理，再把数据值返回执行域。这样 `defer` 仍是同步的，也不会在调度线程上执行可能阻塞的关闭操作。
 
 **端到端验收（待实现）**：用真实 SQLite 内存库建表，插入 `id=7, name="Ada"`，prepare 带参数的查询，绑定 `7` 并 step，拷出 `"Ada"` 后 finalize statement，再关闭 connection。SQLite 调用失败在 Lyra 封装边界映射为可检查的 `Result::Err`，不让 C 错误码或语言异常穿过 C ABI；例如用不存在的表令 prepare 失败，并确认已有 connection 仍关闭。
