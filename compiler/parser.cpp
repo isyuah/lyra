@@ -56,7 +56,7 @@ public:
         Kind kind;
         if (isLetter(current) || isDigit(current)) {
             while (offset < text.size() && (isLetter(text[offset]) || isDigit(text[offset]))) ++offset;
-            constexpr std::string_view keywords[] = {"fn", "val", "var", "if", "else", "while", "return", "break", "continue", "true", "false", "struct", "class", "pub", "import", "as", "async", "await", "spawn", "extern", "match", "null", "implicit", "defer", "throw", "try", "catch"};
+            constexpr std::string_view keywords[] = {"fn", "val", "var", "if", "else", "while", "for", "in", "return", "break", "continue", "true", "false", "struct", "class", "pub", "import", "as", "async", "await", "spawn", "extern", "match", "null", "implicit", "defer", "throw", "try", "catch"};
             auto word = text.substr(start, offset - start);
             kind = isDigit(current) ? Kind::Number : std::ranges::find(keywords, word) == std::end(keywords) ? Kind::Name : Kind::Keyword;
         } else if (current == '"') {
@@ -123,8 +123,8 @@ std::int64_t integer(const Source& source, Span digits, bool negative) {
 struct Infix { std::string_view text; int rank; Op op; };
 constexpr Infix infix[] = {
     {"=", 1, Op::Set}, {"+=", 1, Op::AddSet}, {"-=", 1, Op::SubSet}, {"*=", 1, Op::MulSet}, {"/=", 1, Op::DivSet}, {"%=", 1, Op::RemSet},
-    {"||", 2, Op::Or}, {"&&", 3, Op::And}, {"==", 4, Op::Eq}, {"!=", 4, Op::Ne}, {"<", 4, Op::Lt}, {"<=", 4, Op::Le}, {">", 4, Op::Gt}, {">=", 4, Op::Ge},
-    {"+", 5, Op::Add}, {"-", 5, Op::Sub}, {"*", 6, Op::Mul}, {"/", 6, Op::Div}, {"%", 6, Op::Rem}
+    {"||", 3, Op::Or}, {"&&", 4, Op::And}, {"==", 5, Op::Eq}, {"!=", 5, Op::Ne}, {"<", 5, Op::Lt}, {"<=", 5, Op::Le}, {">", 5, Op::Gt}, {">=", 5, Op::Ge},
+    {"+", 6, Op::Add}, {"-", 6, Op::Sub}, {"*", 7, Op::Mul}, {"/", 7, Op::Div}, {"%", 7, Op::Rem}
 };
 
 class Parser {
@@ -400,16 +400,58 @@ private:
             auto body = block();
             return add({start, nodes[body].span.end}, While{condition, body});
         }
+        if (is("for")) return forLoop();
         return expression();
+    }
+
+    Identifier hidden(std::string_view role, Span site) {
+        return {"$" + std::string(role) + std::to_string(site.begin), site};
+    }
+
+    ExprId forLoop() {
+        auto site = consume().span;
+        auto item = identifier();
+        require("in");
+        auto source = expression(false, 1, false);
+        auto body = block();
+        auto span = Span{site.begin, nodes[body].span.end};
+        auto input = nodes[source].span;
+        auto list = hidden("list", input), count = hidden("count", site), index = hidden("index", site);
+        auto reference = [&](const Identifier& name) { return add(name.span, name); };
+        auto stored = add(input, Binding{list, false, {}, source});
+        auto length = add(input, Member{reference(list), {"size", input}, true});
+        auto extent = add(input, Binding{count, false, {}, length});
+        auto counter = add(site, Binding{index, true, {}, add(site, std::int64_t{0})});
+        auto test = add(site, Binary{Op::Lt, site, reference(index), reference(count)});
+        auto value = add(input, Index{reference(list), reference(index), input});
+        auto element = add(item.span, Binding{item, false, {}, value});
+        auto advance = add(site, Binary{Op::AddSet, site, reference(index), add(site, std::int64_t{1})});
+        auto step = add(span, Block{{{element, {}}, {advance, {}}, {body, {}}}, nodes[body].span});
+        auto loop = add(span, While{test, step});
+        return add(span, Block{{{stored, {}}, {extent, {}}, {counter, {}}, {loop, {}}}, nodes[body].span});
+    }
+
+    ExprId optional(ExprId subject, Identifier payload, ExprId present, ExprId absent, Span site, Span span, OptionalForm form) {
+        SumPattern some{site, {{SumTag::Some, site}}, PatternBinding{std::move(payload.text), payload.span}};
+        SumPattern none{site, {{SumTag::None, site}}, {}};
+        return add(span, Match{subject, {{std::move(some), present}, {std::move(none), absent}}, form, site});
     }
 
     ExprId expression(bool inParens = false, int minRank = 1, bool trailingBlock = true) {
         auto left = primary(inParens, true, trailingBlock);
         int previous = 0;
         while (inParens || !token.newlineBefore) {
+            if (is("??") && minRank <= 2) {
+                auto site = consume().span;
+                auto right = expression(inParens, 2, trailingBlock);
+                auto name = hidden("some", site);
+                auto result = add(site, name);
+                left = optional(left, name, result, right, site, {nodes[left].span.begin, nodes[right].span.end}, OptionalForm::Default);
+                continue;
+            }
             auto op = std::ranges::find(infix, text(token), &Infix::text);
             if (op == std::end(infix) || op->rank < minRank) break;
-            if ((op->rank == 4 || op->rank == 1) && previous == op->rank) throw at(source, token.span, "LYP0001", "比较或赋值不能连写");
+            if ((op->rank == 5 || op->rank == 1) && previous == op->rank) throw at(source, token.span, "LYP0001", "比较或赋值不能连写");
             previous = op->rank;
             auto site = consume().span;
             auto right = expression(inParens, op->rank + 1, trailingBlock);
@@ -433,12 +475,20 @@ private:
                 value = add({nodes[value].span.begin, site.end}, Propagate{value, site});
                 continue;
             }
-            if (!is(".")) break;
-            consume();
+            if (!is(".") && !is("?.")) break;
+            bool safe = is("?.");
+            auto site = consume().span;
             auto name = identifier();
             auto begin = nodes[value].span.begin;
+            auto subject = value;
+            std::optional<Identifier> payload;
+            if (safe) { payload = hidden("some", site); value = add(site, *payload); }
             if (explicitTypes(name) || (is("(") && (inParens || !token.newlineBefore))) value = call(begin, std::move(name), value);
             else { auto end = name.span.end; value = add({begin, end}, Member{value, std::move(name)}); }
+            if (safe) {
+                auto span = nodes[value].span;
+                value = optional(subject, std::move(*payload), value, add(site, EmptyOption{}), site, span, OptionalForm::Access);
+            }
         }
         return value;
     }

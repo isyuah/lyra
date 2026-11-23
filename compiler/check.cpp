@@ -281,19 +281,29 @@ struct Checker {
         return module.sumTypes[operand.id].success;
     }
 
+    bool untypedOption(ExprId id) const {
+        const auto& node = fn.syntax.expressions[id].node;
+        if (std::holds_alternative<EmptyOption>(node)) return true;
+        const auto* call = std::get_if<Call>(&node);
+        return call && !call->receiver && call->name.text == "Some" && call->arguments.size() == 1 && untypedOption(call->arguments.front().value);
+    }
+
     Type infer(ExprId id, const Match& match, std::optional<Type> expected, bool discard) {
-        bool defaults = match.optional == OptionalForm::Default;
-        if (defaults && std::holds_alternative<EmptyOption>(fn.syntax.expressions[match.subject].node)) {
-            auto fallback = visit(match.arms.back().value, discard ? std::nullopt : expected, discard);
-            auto element = fallback == Type::Never ? expected.value_or(Type::Unit) : fallback;
-            visit(match.subject, symbols.sum(Type::Option, element));
-            return discard ? Type{Type::Unit} : fallback;
+        std::optional<Type> subjectHint, fallback;
+        if (match.optional == OptionalForm::Default && untypedOption(match.subject)) {
+            auto element = expected;
+            if (!element) {
+                fallback = visit(match.arms.back().value);
+                element = *fallback == Type::Never ? Type{Type::Unit} : *fallback;
+            }
+            subjectHint = symbols.sum(Type::Option, *element);
         }
-        auto subject = visit(match.subject);
+        auto subject = inspect(match.subject, subjectHint);
         if (subject == Type::Never) return subject;
         if (match.optional != OptionalForm::None && subject.kind != Type::Option)
             throw at(source, match.operation, "LYT0010", "可空运算符需要 Option，实际是 " + typeName(module, subject));
         if (subject.kind != Type::Option && subject.kind != Type::Result) throw at(source, fn.syntax.expressions[match.subject].span, "LYT0011", "match 需要 Option 或 Result，实际是 " + typeName(module, subject));
+        bool discardArms = discard && match.optional == OptionalForm::None;
         std::vector<const SumPattern*> patterns;
         std::optional<Type> result;
         for (const auto& arm : match.arms) {
@@ -310,14 +320,17 @@ struct Checker {
                 fn.locals.push_back({payload, false, currentWorker()});
             }
             fn.expressions[id].argumentSlots.push_back(slot);
+            auto hint = result ? result : expected;
             Type value;
             if (match.optional == OptionalForm::Access && &arm == &match.arms.front()) {
                 value = visit(arm.value);
                 if (value != Type::Never && value.kind != Type::Option) value = fit(arm.value, value, symbols.sum(Type::Option, value));
             } else if (match.optional == OptionalForm::Access) {
-                value = visit(arm.value, result ? result : expected);
-            } else value = visit(arm.value, discard ? std::nullopt : result ? result : expected, discard);
-            if (value != Type::Never && !result) result = discard && match.optional != OptionalForm::Access ? Type::Unit : value;
+                if (!hint || hint->kind != Type::Option) hint = symbols.sum(Type::Option, Type::Unit);
+                value = visit(arm.value, hint);
+            } else if (fallback && &arm == &match.arms.back()) value = *fallback;
+            else value = visit(arm.value, discardArms ? std::nullopt : hint, discardArms);
+            if (value != Type::Never && !result) result = discardArms ? Type::Unit : value;
             scopes.pop_back();
             patterns.push_back(&arm.pattern);
         }
@@ -328,7 +341,7 @@ struct Checker {
             return std::array{SumCase<Type>{SumTag::Ok, fields.success}, SumCase<Type>{SumTag::Err, fields.failure}};
         };
         if (auto missing = missingPattern(subject, patterns, cases)) throw at(source, fn.syntax.expressions[id].span, "LYT0012", "match 未穷尽，缺少分支：" + *missing);
-        return discard && match.optional == OptionalForm::Access ? Type{Type::Unit} : result.value_or(Type::Never);
+        return discard && match.optional != OptionalForm::None ? Type{Type::Unit} : result.value_or(Type::Never);
     }
 
     Type infer(ExprId id, const Identifier& name, auto, bool) {
@@ -433,6 +446,7 @@ struct Checker {
         auto owner = visit(member.receiver);
         if (owner == Type::Never) return owner;
         if (owner.kind == Type::List && member.name.text == "size") return Type::Int;
+        if (member.iterationExtent) throw at(source, member.name.span, "LYT0014", "for ... in 需要 List，实际是 " + typeName(module, owner));
         if (owner == Type::Exception && member.name.text == "message") return Type::String;
         auto field = memberIndex(owner, member.name, symbols.fields);
         fn.expressions[id].target = field;

@@ -98,4 +98,6 @@ fn probe(): Int {
 }
 ```
 
+**可运行的循环与可空反例：** `1?.size`、`1 ?? 2` 在运算符处报需要 Option；`Some(3) ?? "wrong"` 在默认值处报预期 `Int`。若 `outer: Option<Option<Int>>` 为 `Some(None)`，`outer ?? Some(7)` 仍为空的 `Int?`，不是 `7`。对空接收者使用 `receiver?.method(next())` 时不会调用 `next()`。`for item in 7 {}` 在 `7` 处报需要 List；对应[运行测试](../tests/sugar_cli.py)也覆盖泛型列表、空列表、遍历时追加和修改元素，以及 `continue` 与 `break`。
+
 HTTP 层另用[混合输入和四条服务路径](../examples/user-service/README.md)验收。把 `?tag=a&tag=b` 解成列表、把一个 JSON 对象解成一个 body 参数，是库的输入契约，不是 S2-002 的函数变长绑定。

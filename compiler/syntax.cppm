@@ -23,7 +23,7 @@ struct Call {
     std::optional<ExprId> receiver{};
     std::vector<Identifier> typeArguments{};
 };
-struct Member { ExprId receiver; Identifier name; };
+struct Member { ExprId receiver; Identifier name; bool iterationExtent{}; };
 struct ListLiteral { std::vector<ExprId> elements; };
 struct Index { ExprId receiver, offset; Span site; };
 struct StringLiteral { std::string bytes; };
@@ -46,7 +46,8 @@ struct Deferred { ExprId body; };
 struct EmptyOption {};
 struct Propagate { ExprId operand; Span site; };
 struct MatchArm { SumPattern pattern; ExprId value; };
-struct Match { ExprId subject; std::vector<MatchArm> arms; };
+enum class OptionalForm { None, Access, Default };
+struct Match { ExprId subject; std::vector<MatchArm> arms; OptionalForm optional{}; Span operation{}; };
 enum class Jump { Break, Continue };
 
 struct Expr {

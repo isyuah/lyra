@@ -106,11 +106,14 @@ val name: String? = absent()
 
 `?.`、`??` 是完整记号，类型位置的 `T?` 是可空类型，都不是对表达式重复使用传播符。
 
+对 `record: Record?`，假设 `id: Int`、`name: String?`、`details: Option<Option<String>>`。`record?.id` 是 `Int?`，`record?.name` 是 `String?` 而不是额外套一层；若成员本来就是 Option，安全访问直接保留那个值。因此 `record?.details` 仍是 `Option<Option<String>>`：接收者为空产生 `None`；成员值为 `Some(None)` 则结果仍是 `Some(None)`。`??` 只拆掉左值的最外层：`Some(None) ?? Some("default")` 在明确的嵌套类型下得到 `None`，不会执行默认表达式。接收者不是 Option 时使用 `?.`，或对非 Option 使用 `??`，都是类型错误。
+
 接收者在实参前求值，普通二元运算先左后右，赋值先确定并只求一次写入位置再求右值。`&&`、`||`、`??` 短路；`?.` 的接收者为空时也不求被跳过调用的实参。这些短路操作、基础赋值 `=`、成员访问 `.` 和传播 `?` 不可重载；其他运算符的协议和 `Eq` 派生见后续类型规范。
 
 ## 5. 控制流与清理
 
 - 值位置的 `if` 必须有 `else`；各正常完成的分支须能得到目标类型。语句位置允许 `if id == null { return Response.status(400) }`。条件要求 `Bool`，不按数字或对象的“真假”转换。普通循环结果为 `Unit`；`while`、`for item in items` 支持不带值的 `break` / `continue`，只针对当前函数内最近的循环。
+- `for item in items` 首版接受 `List<T>`（包括泛型函数里的 `T`）。进入循环时只求值一次列表表达式并记录当时长度；每轮按下标读取当时的元素，绑定只读局部 `item`。之后追加的元素不延长当前遍历，修改尚未遍历的位置会在读取时可见。
 - 对 `Option` 和封闭枚举（含 `Result`）的 `match` 必须穷尽。被匹配值只求一次，按源码顺序选第一条命中的分支；构造器模式可嵌套，`_` 表示忽略此位置，绑定名只在本分支可见；用 `=>` 隔开模式和值，分支之间用逗号，允许末尾逗号。`Ok(None)` 与 `Err(error)` 是不同分支。
 - **已定：** 后缀 `?` 由操作数静态类型区分 `Err` 与 `None`，要求最近的函数或 lambda 返回兼容类型；对 `async fn` 检查其声明的完成值。不会把 `None` 自动变成 `Err` 或 HTTP 状态。[同步 `defer`](errors-and-resources.md) 在离开登记的块时倒序执行一次，包括 `return`、`?`、异常与协作式取消；`defer` 自身不可 `await`。
 
