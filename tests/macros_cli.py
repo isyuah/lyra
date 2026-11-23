@@ -158,12 +158,14 @@ fn main(): Unit { print(route()); print(adapt(Request(7))); print(show(8, "direc
     "{ val temp = 10; if " + argumentCode(0) + " { temp + " + argumentCode(1) + " } else { 0 } }"
 }''')
         self.native('''fn add(left: Int, right: Int): Int { print("add"); left + right }
+fn first<A,B>(first: A, second: B): A { first }
 fn main(): Unit {
     val temp = 2
     print(2 * #make(true, add(temp, 1)))
     print(#make(false, add(temp, 9)))
     print(#make(true, #make(true, temp)))
-}''', ['add', '26', '0', '22'])
+    print(#make(temp < 3, first<Int,List<Int>>(4, [1, 2])))
+}''', ['add', '26', '0', '22', '14'])
         main = self.src / 'main.ly'
         main.write_text('fn main(): Unit {\n    print(#make(true, false))\n}')
         error = self.diagnostic('LYT0001')

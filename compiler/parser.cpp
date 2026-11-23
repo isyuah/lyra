@@ -620,13 +620,17 @@ private:
                 auto string = stringLiteral(); end = string.span.end; literal = std::move(string.text);
             } else {
                 std::vector<char> delimiters;
+                bool followsName = false;
                 while (!delimiters.empty() || (!is(",") && !is(")"))) {
                     if (token.kind == Kind::End) throw at(source, open, "LYP0001", "表达式宏缺少结束括号");
-                    if (is("(") || is("[") || is("{")) delimiters.push_back(is("(") ? ')' : is("[") ? ']' : '}');
+                    if (is("<") && ((!delimiters.empty() && delimiters.back() == '>') || (followsName && explicitTypesAfter(end)))) delimiters.push_back('>');
+                    else if (is(">") && !delimiters.empty() && delimiters.back() == '>') delimiters.pop_back();
+                    else if (is("(") || is("[") || is("{")) delimiters.push_back(is("(") ? ')' : is("[") ? ']' : '}');
                     else if (is(")") || is("]") || is("}")) {
                         if (delimiters.empty() || delimiters.back() != text(token).front()) throw at(source, token.span, "LYP0001", "宏实参括号不匹配");
                         delimiters.pop_back();
                     }
+                    followsName = token.kind == Kind::Name || token.kind == Kind::Escaped;
                     end = consume().span.end;
                 }
                 if (start == end) throw at(source, token.span, "LYP0001", "表达式宏缺少实参");
