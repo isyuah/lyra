@@ -19,12 +19,12 @@ class Modules(unittest.TestCase):
         self.app = self.root / 'app'
         self.lib = self.root / 'lib'
         self.env = {**os.environ, 'LYRA_CACHE': str(self.root / 'cache')}
-        self.command('new', self.app)
-        self.command('new', self.lib, '--lib')
+        (self.app / 'src').mkdir(parents=True)
+        (self.lib / 'src/net').mkdir(parents=True)
+        (self.lib / 'lyra.json5').write_text(json.dumps(dict(name='lib', version='0.1.0', kind='lib')))
         manifest = dict(name='app', version='0.1.0', dependencies={
             'cfg': dict(name='lib', version='^0.1.0', path='../lib')})
         (self.app / 'lyra.json5').write_text(json.dumps(manifest))
-        (self.lib / 'src/net').mkdir()
         (self.lib / 'src/net/defaults.ly').write_text('fn hidden(): Int { 20 }\npub fn port(): Int { hidden() + 1 }\n')
         (self.lib / 'src/lib.ly').write_text('pub import self.net.port as defaultPort\n')
         self.source = self.app / 'src/main.ly'
@@ -41,6 +41,7 @@ class Modules(unittest.TestCase):
         self.assertEqual(self.command('run', self.app, '--locked', '--offline', '--release').stdout, '42\n')
         self.command('check', self.lib)
         self.command('build', self.lib, ok=False)
+        self.assertIn('LYC0003', self.command('test', self.lib, ok=False).stderr)
         (self.lib / 'tests').mkdir()
         (self.lib / 'tests/port.ly').write_text('import self.defaultPort\nfn main(): Unit { print(defaultPort()) }')
         self.assertIn('21\nok lib/port.ly', self.command('test', self.lib).stdout)

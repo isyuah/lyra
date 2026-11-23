@@ -4,6 +4,21 @@ Lyra 是一门使用 LLVM AOT 的编译型语言。编译器把通过静态检�
 
 **0.1 Alpha 的使用范围：** x86-64 Linux 上的单机 CLI、可发布的源码库，以及使用 SQLite 的小型 HTTP 服务。可以从下面的项目开始；语言和包格式仍处于开发期。
 
+## 用预编译 SDK 新建项目
+
+在 Ubuntu 22.04 x86-64 的构建机上准备 Clang/LLVM 18.1、系统 C 链接环境和 `libsqlite3-dev`（当前链接命令使用 `-lsqlite3`）。这个 SDK 链接 Jammy 的 `libLLVM-18.so.18.1`；Ubuntu 24.04 使用下节的源码构建，应用的部署不受编译器动态库名称影响。拿到 SDK 后，在压缩包所在目录执行：
+
+```sh
+tar -xzf lyra-0.1.0-alpha.1-ubuntu22.04-x86_64.tar.gz
+export PATH="$PWD/lyra-0.1.0-alpha.1-ubuntu22.04-x86_64/bin:$PATH"
+lyra new hello
+lyra lock hello --offline
+lyra test hello --locked --offline
+lyra run hello --release --locked --offline
+```
+
+测试运行项目自带的 `tests/answer.ly`，最后一条命令打印 `42`。编译好的 `hello/build/release/app` 可以单独复制到兼容的 Linux 服务器运行。用 `lyra new mylib --lib` 创建的库同样带一条可运行的测试。
+
 ## 从源码构建
 
 在 **x86-64 Linux** 的仓库根目录执行；Windows 开发机先进入 WSL 2 的 Ubuntu 24.04。编译器使用 C++23 命名模块，需要 Clang/LLVM 18.1、配套的 `clang-scan-deps-18`、CMake 3.28+、Ninja 1.11+ 和 Python 3（测试）。安装步骤见[原生工具链 RFC](rfc/native-toolchain.md)。
@@ -29,7 +44,7 @@ printf '%s\n' '{"station":"东区","delta":7}' '{"station":"西区","delta":-2}'
   build/dev/bin/lyra run examples/jsonlines/stats --release --locked --offline
 ```
 
-输出是 `{"rows":2,"total":5,"rejected":0}`。想做服务，可按 [HTTP/SQLite 示例](examples/http-sqlite/README.md)建库，发送一次真实的 `GET /users/7`。想新建自己的项目，使用 `lyra new <目录>`，然后 `lyra test <目录>`、`lyra run <目录>`。
+输出是 `{"rows":2,"total":5,"rejected":0}`。想做服务，可按 [HTTP/SQLite 示例](examples/http-sqlite/README.md)建库，发送一次真实的 `GET /users/7`。
 
 ## 命令与语言子集
 

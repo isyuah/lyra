@@ -56,7 +56,11 @@ class Installed(unittest.TestCase):
             library = root / 'source producer'
             run(compiler, 'new', app, '--name', 'release/consumer')
             run(compiler, 'new', library, '--name', 'release/catalog', '--lib')
-            self.assertEqual(run(compiler, 'run', app).stdout.splitlines(), ['42'])
+            frozen_args = ('--offline', '--locked')
+            for package, name in ((app, 'consumer'), (library, 'catalog')):
+                run(compiler, 'lock', package, '--offline')
+                self.assertEqual(run(compiler, 'test', package, *frozen_args).stdout.splitlines(), [f'ok release/{name}/answer.ly'])
+            self.assertEqual(run(compiler, 'run', app, *frozen_args).stdout.splitlines(), ['42'])
 
             inputs = {'declare': {'title': 'inputs/title.txt'}, 'stamp': {'snapshot': 'inputs/snapshot.txt'}}
             manifest(library, macroInputs=inputs)
@@ -149,6 +153,7 @@ pub async fn score(): Int {
 }
 async fn main(): Unit { print(label()); print(await score()) }
 ''')
+            (app / 'tests/answer.ly').unlink()
             write(app / 'tests/contract.ly', '''import self.label
 import self.score
 import std.io.assert
@@ -159,7 +164,6 @@ async fn main(): Unit { assert(label() == "relocated: 打包时的标题:v1", "w
             blocked.chmod(0o755)
             attempted = root / 'network was requested'
             environment.update(PATH=str(blocked.parent) + os.pathsep + environment['PATH'], LYRA_NETWORK_CALLED=str(attempted), UV_THREADPOOL_SIZE='2')
-            frozen_args = ('--offline', '--locked')
             run(compiler, 'fetch', app, *frozen_args)
             for mode in ([], ['--release']):
                 args = (*frozen_args, *mode, '--link', archive)

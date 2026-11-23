@@ -724,8 +724,11 @@ void newPackage(const fs::path& directory, const string& name, bool library) {
     if (fs::exists(root)) invalid("目标目录已存在：" + root.string());
     Scratch scratch(root.parent_path()); auto stage = scratch.path / "new";
     writeFile(stage / manifestFile, render(json::Object{{"name", name}, {"version", "0.1.0"}, {"kind", library ? "lib" : "app"}, {"dependencies", json::Object{}}}));
-    if (library) writeFile(stage / "src" / "lib.ly", "pub fn answer(): Int { 42 }\n");
-    else writeFile(stage / "src" / "main.ly", "fn main(): Unit { print(42) }\n");
+    string source = "pub fn answer(): Int { 42 }\n";
+    if (!library) source += "\nfn main(): Unit { print(answer()) }\n";
+    writeFile(stage / "src" / (library ? "lib.ly" : "main.ly"), source);
+    writeFile(stage / "tests" / "answer.ly", "import self.answer\nimport std.io.assert\n\n"
+              "fn main(): Unit {\n    assert(answer() == 42, \"expected 42\")\n}\n");
     fs::rename(stage, root);
     std::cout << root.string() << '\n';
 }
