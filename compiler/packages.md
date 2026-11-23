@@ -35,7 +35,7 @@ lyra pack demo/config -o config.lypkg
 lyra pack demo/config --registry ./center
 ```
 
-第一条输出可按 SHA-256 校验的确定性归档，仅含清单与 `src/` 下的普通文件；不跟随符号链接，不包含 `build/`、workspace 锁或包根的私有配置。第二条将同样的字节和索引写入本地静态中心。同一包名和版本不允许二次发布。库依赖的 `path` 或指向作者磁盘的 `registry` 也不允许发布。发布包依赖同一个中心的另一包时可写 `registry: 'self'`；跨中心依赖写明确的 HTTP(S) 基地址。
+第一条输出可按 SHA-256 校验的确定性归档，包含清单、`src/` 下的普通文件，以及 `inputs/` 下由 `macroInputs` 明确声明的[只读宏输入](../std/meta/README.md)；不跟随符号链接，不包含 `build/`、workspace 锁或包根的私有配置。第二条将同样的字节和索引写入本地静态中心。同一包名和版本不允许二次发布。库依赖的 `path` 或指向作者磁盘的 `registry` 也不允许发布。发布包依赖同一个中心的另一包时可写 `registry: 'self'`；跨中心依赖写明确的 HTTP(S) 基地址。
 
 在上例把 `cfg` 的 `path` 换成 `registry: '../../center'`，运行 `lyra lock demo` 即可从本地中心消费发布包，源代码中仍使用 `cfg`。把中心的同一目录树交给静态 HTTP(S) 服务，把 `registry` 改成服务基地址，也能使用同一份包；客户端只发 GET，不接收服务器指定的下载地址或脚本。
 

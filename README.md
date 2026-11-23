@@ -15,7 +15,7 @@ build/dev/bin/lyra build examples/compiler-smoke/pass --release
 examples/compiler-smoke/pass/build/release/app
 ```
 
-`check .../fail` 预期非零退出，在 `;` 处报告 `LYT0001`；最后一条命令应打印 `3` 并正常退出。要构建优化版编译器，把三个 preset 命令中的 `dev` 换成 `release`。用 `cmake --install build/dev --prefix <目录>` 安装工具链；`bin/lyra` 和 `lib/liblyraRuntime.a` 保持相对位置。部署**编译好的应用**只需复制产物到约定的 Linux 环境，不用带这两个文件、Clang 或 LLVM。
+`check .../fail` 预期非零退出，在 `;` 处报告 `LYT0001`；最后一条命令应打印 `3` 并正常退出。要构建优化版编译器，把三个 preset 命令中的 `dev` 换成 `release`。用 `cmake --install build/dev --prefix <目录>` 安装工具链，保留安装树的 `bin/`、`lib/`、`share/lyra/std/`。首次构建需要构建机上的 GC、libuv、SQLite、Jansson 开发包；CMake 下载并校验固定版本的 llhttp，已有源码时可设 `-DLYRA_LLHTTP_SOURCE_DIR=...` 离线配置。部署**编译好的应用**只需复制产物到约定的 Linux 环境，不用带工具链。
 
 ## 命令与语言子集
 
@@ -33,11 +33,14 @@ lyra pack <目录> [-o <源码包>|--registry <本地目录>]
 - 支持 `Int`、`Bool`、`Unit`、具名形参、按源码顺序求值的命名实参、`val` / `var`、嵌套作用域、赋值和复合赋值、整数四则与余数、比较、短路 `&&` / `||`、`if` / `else`、`while`、`break`、`continue` 和 `return`。整数溢出或除零在 Debug/Release 都带源码位置报错。普通块以末表达式为值，空块或带末尾分号的块取 `Unit`。
 - `String` 支持 UTF-8、拼接和内容相等；`struct` 按值复制，`class` 保留对象身份，可定义字段、主构造和方法。`gcCollect()` 可主动收集。对象由 BDWGC 管理；编译器安装目录带静态 GC 和 libuv 归档，部署应用不需要安装这两个库。见[对象验收程序](tests/fixtures/objects/src/main.ly)。
 - 泛型函数 `fn identity<T>(value: T): T { value }` 可写 `identity(42)` 或 `identity<String>("Ada")`。未调用的泛型也检查函数体，已调用的具体类型组合各生成一份原生实现。
-- `async fn` 调用返回冷 `Task<T>`；`await` 在需要时启动，重复等待复用结果，`spawn` 在同一串行域调度。跨挂起点存活的局部值由 GC 扫描。源码示例和独立运行时测试的边界见[异步实现说明](runtime/managed-tasks.md)。
+- `Option<T>`（简写 `T?`）和 `Result<T,E>` 支持嵌套、穷尽 `match` 和 `?` 提前返回。`None`、`Some(None)` 和 `Some(Some(value))` 是不同的值。
+- `async fn` 调用返回冷 `Task<T>`；`await` 在需要时启动，重复等待复用结果，`spawn` 在同一串行域调度。`await blocking { ... }` 把同步工作交给有界线程池，不占住当前域；跨挂起点存活的局部值由 GC 扫描。`async fn main(): Result<Unit,String>` 的 `Err` 打印到 stderr 并以非零状态退出。见[异步实现说明](runtime/managed-tasks.md)。
 - `extern fn` 通过 C ABI 调用原生函数。随工具链安装的 [std.io](std/io/README.md) 可读参数、标准流和文件；[std.sqlite](std/sqlite/README.md) 可用预编译语句查询系统 SQLite。只有使用 SQLite 的应用才需要目标机提供 `libsqlite3.so.0`。
+- [std.json](std/json/README.md) 支持显式 `#derive(Json)`，派生器本身是 [Lyra 宏](std/meta/README.md)。用 [std.http](std/http/README.md) 可以运行[真实 HTTP/SQLite 查询服务](examples/http-sqlite/README.md)，无需 VM 或外部 Web 服务器。
+- [JSON Lines 统计 CLI](examples/jsonlines/README.md) 是可直接运行的双包项目：公开库解码，命令行逐行统计，错误带行号。验收会实际发布库、移走源码和中心，再从锁和缓存重新原生编译。
 - `check` 不调用 Clang、不创建产物。`build` 默认输出 `<包目录>/build/debug/app`（`-O0`），`--release` 输出 `build/release/app`（`-O2`），`-o` 指定其他路径。类型错误或链接失败都不会覆盖已有产物。
 - 诊断写到标准错误；`--diagnostics=json` 输出诊断数组，成功为 `[]`。带源码位置时，`range.start/end` 是左闭右开区间：`offset` 为从 0 开始的原文件 UTF-8 字节偏移，`line/column` 从 1 开始，列按 Unicode 码点计，CRLF 和 LF 均算一次换行。
 
 ## 验证 Ubuntu 22.04 部署
 
-在仓库根目录运行 `docker build --platform linux/amd64 -f tests/jammy.Dockerfile --target verify .`。构建阶段在 Ubuntu 22.04 上编译工具链、运行 CTest、生成 Debug 与 Release 产物；运行阶段仅把这两个产物复制进新的 `ubuntu:22.04` 并执行。验收还通过 `readelf -dW` 检查每个程序只需要 `libc.so.6`。在 24.04 本机运行样例属于开发冒烟测试，不替代这一步。
+在仓库根目录运行 `docker build --platform linux/amd64 -f tests/jammy.Dockerfile --target verify .`。构建阶段在 Ubuntu 22.04 上编译工具链、运行 CTest，生成 Debug 与 Release 的应用；运行阶段将应用复制到新的 `ubuntu:22.04` 执行。整数、对象、标准 I/O 和 JSONL 只动态依赖 `libc.so.6`；SQLite 样例在额外安装 `libsqlite3-0` 后执行。用 `readelf -dW` 核对每个应用的依赖，在 24.04 本机运行不替代最低版本验收。

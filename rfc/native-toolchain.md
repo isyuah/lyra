@@ -26,7 +26,7 @@
 
    ```sh
    sudo apt update
-   sudo apt install build-essential clang-18 clang-tools-18 llvm-18-dev cmake ninja-build python3 libgc-dev libuv1-dev libsqlite3-dev curl
+   sudo apt install build-essential clang-18 clang-tools-18 llvm-18-dev cmake ninja-build python3 libgc-dev libuv1-dev libsqlite3-dev libjansson-dev curl
    ```
 
 3. 在同一 Ubuntu 终端做一次冒烟检查。`LLVMConfig.cmake` 应可读；IR 编译链接出的程序应返回 `42`：

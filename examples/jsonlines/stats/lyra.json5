@@ -1,0 +1,8 @@
+{
+  "name": "cli/stats",
+  "version": "1.0.0",
+  "kind": "app",
+  "dependencies": {
+    "metrics": {"name": "tools/metrics", "version": "^1.0.0", "path": "../metrics"}
+  }
+}

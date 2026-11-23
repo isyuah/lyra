@@ -52,6 +52,7 @@ LyraIoText* lyraIoDecode(const char* data, std::size_t size, int status) {
 }
 
 int64_t lyraIoTextStatus(const LyraIoText* result) { return result->status; }
+uint8_t lyraIoInvalidUtf8(int64_t status) { return status == EILSEQ; }
 const void* lyraIoTextValue(const LyraIoText* result) { return result->value; }
 
 LyraIoText* lyraIoReadLine() {

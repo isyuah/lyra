@@ -73,7 +73,7 @@ void emitExecutable(const llvm::Module& module, const fs::path& output, bool rel
     runClang(*driver, {target, release ? "-O2" : "-O0", "-c", "-x", "ir", ir, "-o", object}, log);
     auto lib = runtime.parent_path();
     runClang(*driver, {target, object, runtime.string(), (lib / "libgc.a").string(), (lib / "libuv.a").string(), (lib / "libllhttp.a").string(),
-                       "-pthread", "-ldl", "-lrt", "-Wl,--as-needed", "-lsqlite3", "-o", executable.string()}, log);
+                       (lib / "libjansson.a").string(), "-pthread", "-ldl", "-lrt", "-Wl,--as-needed", "-lsqlite3", "-o", executable.string()}, log);
     fs::rename(executable, output);
 }
 
@@ -82,7 +82,7 @@ void emitExecutable(const llvm::Module& module, const fs::path& output, bool rel
 void build(const CheckedModule& functions, const std::vector<Source>& sources, const fs::path& output, bool release) {
     if (fs::exists(output)) {
         for (const auto& source : sources) {
-            if (fs::equivalent(source.path, output)) throw Diagnostic{"LYI0001", "输出路径不能覆盖输入源码：" + output.string()};
+            if (!source.origin && fs::equivalent(source.path, output)) throw Diagnostic{"LYI0001", "输出路径不能覆盖输入源码：" + output.string()};
         }
     }
     llvm::LLVMContext context;

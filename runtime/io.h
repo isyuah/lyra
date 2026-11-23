@@ -14,6 +14,7 @@ LyraIoText* lyraIoArgument(int64_t index);
 LyraIoText* lyraIoReadLine(void);
 LyraIoText* lyraIoReadFile(const void* path);
 int64_t lyraIoTextStatus(const LyraIoText* result);
+uint8_t lyraIoInvalidUtf8(int64_t status);
 const void* lyraIoTextValue(const LyraIoText* result);
 int64_t lyraIoWriteFile(const void* path, const void* content);
 int64_t lyraIoWriteError(const void* content);

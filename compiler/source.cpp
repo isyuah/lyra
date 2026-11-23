@@ -25,16 +25,16 @@ Position Source::position(std::size_t offset) const {
     return {offset, static_cast<std::size_t>(next - lineStarts.begin()), column};
 }
 
+Site Source::site(Span span) const {
+    auto start = position(span.begin);
+    auto lineStart = lineStarts[start.line - 1];
+    auto lineEnd = text.find_first_of("\r\n", lineStart);
+    return {path.string(), start, position(span.end), text.substr(lineStart, lineEnd - lineStart), lineStart};
+}
+
 Diagnostic at(const Source& source, Span span, std::string code, std::string message) {
-    auto start = source.position(span.begin);
-    auto lineStart = source.lineStarts[start.line - 1];
-    auto lineEnd = source.text.find_first_of("\r\n", lineStart);
-    Site site{source.path.string(), start, source.position(span.end), source.text.substr(lineStart, lineEnd - lineStart), lineStart};
-    Diagnostic error{std::move(code), std::move(message), std::move(site)};
-    if (source.origin) {
-        const auto& [path, position] = *source.origin;
-        error.message += "（展开于 " + path.string() + ":" + std::to_string(position.line) + ":" + std::to_string(position.column) + "）";
-    }
+    Diagnostic error{std::move(code), std::move(message), source.site(span)};
+    if (source.origin) { error.generated = std::move(error.site); error.site = source.origin; }
     return error;
 }
 
@@ -53,6 +53,7 @@ void report(const Diagnostic& error, bool json) {
         if (!error.expected.empty()) item["expected"] = error.expected;
         if (!error.actual.empty()) item["actual"] = error.actual;
         if (!error.hint.empty()) item["hint"] = error.hint;
+        if (error.generated) item["generated"] = llvm::json::Object{{"file", error.generated->file}, {"start", jsonPosition(error.generated->start)}, {"end", jsonPosition(error.generated->end)}, {"source", error.generated->lineText}};
         stream << llvm::formatv("{0}\n", llvm::json::Value(llvm::json::Array{std::move(item)}));
         return;
     }
@@ -70,6 +71,7 @@ void report(const Diagnostic& error, bool json) {
         stream << "^\n";
     }
     if (!error.hint.empty()) stream << "提示：" << error.hint << '\n';
+    if (error.generated) stream << "展开代码 " << error.generated->file << ':' << error.generated->start.line << ": " << error.generated->lineText << '\n';
 }
 
 std::vector<Source> loadSources(const fs::path& package) {

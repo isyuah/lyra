@@ -3,6 +3,7 @@ module;
 #include <filesystem>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 export module lyra.source;
@@ -18,16 +19,6 @@ struct Position {
     std::size_t offset, line, column;
 };
 
-struct Source {
-    std::filesystem::path path;
-    std::string text;
-    std::vector<std::size_t> lineStarts;
-    std::string moduleId{};
-    std::optional<std::pair<std::filesystem::path, Position>> origin{};
-
-    Position position(std::size_t offset) const;
-};
-
 struct Site {
     std::string file;
     Position start, end;
@@ -35,10 +26,22 @@ struct Site {
     std::size_t lineStartOffset;
 };
 
+struct Source {
+    std::filesystem::path path;
+    std::string text;
+    std::vector<std::size_t> lineStarts;
+    std::string moduleId{};
+    std::optional<Site> origin{};
+
+    Position position(std::size_t offset) const;
+    Site site(Span span) const;
+};
+
 struct Diagnostic {
     std::string code, message;
     std::optional<Site> site = {};
     std::string expected = {}, actual = {}, hint = {};
+    std::optional<Site> generated{};
 };
 
 Diagnostic at(const Source& source, Span span, std::string code, std::string message);

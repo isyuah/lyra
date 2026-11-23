@@ -1,0 +1,27 @@
+{
+  "format": 1,
+  "members": [
+    "metrics",
+    "stats"
+  ],
+  "packages": [
+    {
+      "dependencies": {},
+      "id": "path:metrics|tools/metrics",
+      "name": "tools/metrics",
+      "sha256": "4fd6784bd5742850216c15af2870680559bc4ca4cbf1a05d6a7d7edc48c95c4b",
+      "source": "path:metrics",
+      "version": "1.0.0"
+    },
+    {
+      "dependencies": {
+        "metrics": "path:metrics|tools/metrics"
+      },
+      "id": "path:stats|cli/stats",
+      "name": "cli/stats",
+      "sha256": "19243d906dfb5cd7256fc4468cb5a0428a85bfad7d71b72353895190ccf4d055",
+      "source": "path:stats",
+      "version": "1.0.0"
+    }
+  ]
+}

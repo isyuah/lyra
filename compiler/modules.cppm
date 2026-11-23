@@ -11,10 +11,11 @@ module;
 export module lyra.modules;
 import lyra.generics;
 import lyra.packages;
+import lyra.macros;
 import lyra.syntax;
 
 export namespace lyra {
-struct Compilation { std::vector<Source> sources; Module syntax; };
+struct Compilation { std::vector<Source> sources; Module syntax; std::vector<std::filesystem::path> macroInputs{}; };
 Compilation loadProgram(const PackageGraph& graph, const std::string& entry, const std::optional<std::filesystem::path>& testFile = {});
 }
 
@@ -76,8 +77,13 @@ struct Linker {
     void rewrite(Module& syntax) {
         for (auto& record : syntax.aggregates) declare(record.file, record.name, record.isPublic, false);
         for (auto& fn : syntax.functions) if (!fn.owner) declare(fn.file, fn.name, fn.isPublic, true);
+        std::map<std::size_t, std::map<std::string, const Import*>> generatedImports;
         for (const auto& use : syntax.imports) {
             const auto& source = sources[use.file];
+            if (source.origin) {
+                if (!generatedImports[use.file].emplace(use.alias.text, &use).second) throw at(source, use.alias.span, "LYN0002", "生成代码中重复的导入名称：" + use.alias.text);
+                continue;
+            }
             auto& space = spaces.at(source.moduleId);
             if (space.definitions.contains(use.alias.text) || !space.imports.emplace(use.alias.text, &use).second) {
                 throw at(source, use.alias.span, "LYN0002", "导入名称已被使用：" + use.alias.text);
@@ -89,14 +95,23 @@ struct Linker {
                 space.definitions.emplace(name, resolve(*use, active));
             }
         }
+        std::map<std::size_t, std::map<std::string, Symbol>> generatedScopes;
+        for (const auto& [file, imports] : generatedImports) {
+            auto& scope = generatedScopes[file] = spaces.at(sources[file].moduleId).definitions;
+            for (const auto& [name, use] : imports) { std::set<const Import*> active; scope[name] = resolve(*use, active); }
+        }
+        auto scopeOf = [&](std::size_t file) -> const auto& {
+            auto generated = generatedScopes.find(file);
+            return generated == generatedScopes.end() ? spaces.at(sources[file].moduleId).definitions : generated->second;
+        };
         for (auto& record : syntax.aggregates) {
-            const auto& scope = spaces.at(sources[record.file].moduleId).definitions;
+            const auto& scope = scopeOf(record.file);
             for (auto& field : record.fields) field.type.text = mapTypeNames(typeForm(field.type.text), [&](const std::string& name) {
                 auto found = scope.find(name); return found == scope.end() ? name : found->second.name;
             });
         }
         for (auto& fn : syntax.functions) {
-            const auto& scope = spaces.at(sources[fn.file].moduleId).definitions;
+            const auto& scope = scopeOf(fn.file);
             auto rename = [&](Identifier& name) {
                 if (auto found = scope.find(name.text); found != scope.end()) name.text = found->second.name;
             };
@@ -165,6 +180,9 @@ Compilation loadProgram(const PackageGraph& graph, const std::string& entry, con
         program.sources.push_back(loadSource(*testFile, root));
     }
     program.syntax = parse(program.sources);
+    std::map<std::string, MacroPackage> macroPackages;
+    for (const auto& [module, space] : spaces) macroPackages.emplace(module, MacroPackage{space.package->root, space.package->macroInputs});
+    expandMacros(program.syntax, program.sources, macroPackages, program.macroInputs);
     std::map<std::string, ResolvedPackage> bundled;
     auto standard = fs::canonical("/proc/self/exe").parent_path().parent_path() / "share" / "lyra" / "std";
     for (std::size_t index = 0; index < program.syntax.imports.size(); ++index) {

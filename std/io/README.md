@@ -1,6 +1,6 @@
 # std.io：读写 UTF-8 文本
 
-`argCount()` 不含程序名，`arg(0)` 是第一个用户实参。`arg`、`readLine` 和 `readFile` 都返回 `TextRead`：`.ok()` 时 `.value` 为读到的文本，可能为空；`.eof()` 只表示标准输入已读完；其他失败的 `.status` 是正的 Linux `errno`。非法 UTF-8 视为读取错误，而不替换字节。逐行读取去掉 LF 或 CRLF，不去掉最后一个单独的 CR。文件内容和输出保留内嵌 NUL；路径拒绝 NUL。`writeFile` 以覆盖模式写入，`writeError` 原样写到标准错误，两者成功返回 `0`。
+`argCount()` 不含程序名，`arg(0)` 是第一个用户实参。`arg`、`readLine` 和 `readFile` 都返回 `TextRead`：`.ok()` 时 `.value` 为读到的文本，可能为空；`.eof()` 只表示标准输入已读完；其他失败的 `.status` 是正的 Linux `errno`。`.invalidUtf8()` 表示有非法 UTF-8 字节；`readLine` 已消费该行，可以继续读下一行。其他 I/O 错误应停止或按场景处理。逐行读取去掉 LF 或 CRLF，不去掉最后一个单独的 CR。文件内容和输出保留内嵌 NUL；路径拒绝 NUL。`writeFile` 以覆盖模式写入，`writeError` 原样写到标准错误，两者成功返回 `0`。
 
 把下面的 `main.ly` 放在应用包的 `src/` 中，编译后执行 `./app note.txt`；输入一行中文并回车即可写入文件。
 

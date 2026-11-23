@@ -35,6 +35,7 @@ struct ResolvedPackage {
     std::filesystem::path root;
     std::map<std::string, std::string> dependencies;
     bool library{};
+    std::map<std::string, std::map<std::string, std::filesystem::path>> macroInputs{};
 };
 struct PackageGraph {
     std::filesystem::path workspace;
@@ -284,6 +285,7 @@ struct Manifest {
     std::map<string, Dependency> dependencies;
     std::vector<Script> scripts;
     bool library{};
+    std::map<string, std::map<string, fs::path>> macroInputs{};
 };
 
 Manifest manifestFrom(string_view bytes, const string& where) {
@@ -324,6 +326,16 @@ Manifest manifestFrom(string_view bytes, const string& where) {
             manifest.scripts.push_back(std::move(script));
         }
     }
+    if (auto macros = obj.get("macroInputs")) {
+        for (const auto& [name, inputs] : asObject(*macros, where + ": macroInputs")) {
+            auto& granted = manifest.macroInputs[name.str()];
+            for (const auto& [key, file] : asObject(inputs, where + ": macroInputs." + name.str())) {
+                auto path = file.getAsString();
+                if (!path || !safeRelative(path->str())) invalid(where + "：宏输入必须是包内相对文件路径");
+                granted.emplace(key.str(), path->str());
+            }
+        }
+    }
     return manifest;
 }
 
@@ -332,6 +344,7 @@ Files collect(const fs::path& root) {
     std::size_t size = 0;
     auto include = [&](const fs::path& path) {
         auto name = path.lexically_relative(root).generic_string();
+        if (files.contains(name)) return;
         if (fs::is_symlink(path) || !safeRelative(name) || !fs::is_regular_file(path)) invalid("源码包包含非普通文件或无效路径：" + path.string());
         if (fs::file_size(path) + size > maxBytes || files.size() >= maxFiles) invalid("源码包超过大小或文件数限制：" + root.string());
         auto bytes = readFile(path);
@@ -342,6 +355,12 @@ Files collect(const fs::path& root) {
     if (!fs::is_directory(root / "src") || fs::is_symlink(root / "src")) invalid("缺少普通 src 目录：" + root.string());
     for (const auto& entry : fs::recursive_directory_iterator(root / "src")) {
         if (entry.is_symlink() || !entry.is_directory()) include(entry.path());
+    }
+    auto manifest = manifestFrom(files.at(manifestFile), (root / manifestFile).string());
+    for (const auto& [macro, inputs] : manifest.macroInputs) for (const auto& [key, path] : inputs) {
+        if (!path.generic_string().starts_with("src/") && !path.generic_string().starts_with("inputs/")) invalid("可发布的宏输入须放在 src/ 或 inputs/：" + path.string());
+        for (auto parent = path.parent_path(); !parent.empty(); parent = parent.parent_path()) if (fs::is_symlink(root / parent)) invalid("宏输入目录不能是符号链接：" + parent.string());
+        include(root / path);
     }
     return files;
 }
@@ -368,12 +387,19 @@ Files unpack(string_view bytes, const string& where) {
     while (!bytes.empty()) {
         auto pathSize = size(); auto dataSize = size();
         string path(take(pathSize));
-        if (!safeRelative(path) || (path != manifestFile && !path.starts_with("src/"))) invalid(where + "：无效归档路径 " + path);
+        if (!safeRelative(path) || (path != manifestFile && !path.starts_with("src/") && !path.starts_with("inputs/"))) invalid(where + "：无效归档路径 " + path);
         if (files.size() >= maxFiles || (!files.empty() && path <= files.rbegin()->first)) invalid(where + "：过多、重复或未排序的源码条目");
         files.emplace(std::move(path), string(take(dataSize)));
     }
     if (!files.contains(manifestFile)) invalid(where + "：缺少包清单");
+    auto manifest = manifestFrom(files.at(manifestFile), where);
+    std::set<string> grants;
+    for (const auto& [macro, inputs] : manifest.macroInputs) for (const auto& [key, path] : inputs) {
+        if (!files.contains(path.generic_string())) invalid(where + "：归档缺少声明的宏输入：" + path.string());
+        grants.insert(path.generic_string());
+    }
     for (const auto& [name, body] : files) {
+        if (name.starts_with("inputs/") && !grants.contains(name)) invalid(where + "：归档包含未声明的宏输入：" + name);
         for (auto prefix = fs::path(name).parent_path(); !prefix.empty(); prefix = prefix.parent_path()) if (files.contains(prefix.generic_string())) invalid(where + "：文件与目录重名：" + prefix.string());
     }
     return files;
@@ -662,7 +688,7 @@ PackageGraph resolvePackages(const fs::path& directory, PackageOptions options) 
     std::map<string, ResolvedPackage> packages;
     for (const auto& [id, node] : state.chosen) {
         const auto& manifest = node->manifest;
-        ResolvedPackage package{id, manifest.name, manifest.version, node->root, {}, manifest.library};
+        ResolvedPackage package{id, manifest.name, manifest.version, node->root, {}, manifest.library, manifest.macroInputs};
         for (const auto& [alias, dep] : manifest.dependencies) {
             auto req = store.dependency(*node, dep);
             package.dependencies.emplace(alias, identity(req.source, req.name));

@@ -52,6 +52,9 @@ int compile(const Options& opts, Compilation program, bool library, fs::path out
     auto module = check(std::move(program.syntax), program.sources, !library);
     if (opts.command == "check") return 0;
     if (library) throw Diagnostic{"LYC0002", "库没有可执行入口；使用 lyra check 或 lyra test 检查库"};
+    if (fs::exists(output)) for (const auto& input : program.macroInputs) {
+        if (fs::equivalent(input, output)) throw Diagnostic{"LYI0001", "输出路径不能覆盖宏或其只读输入：" + output.string()};
+    }
     build(module, program.sources, output, opts.release);
     return opts.command == "build" ? 0 : execute(output, opts.arguments);
 }
