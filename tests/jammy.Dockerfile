@@ -4,18 +4,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
     && mkdir -p /etc/apt/keyrings \
     && curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key -o /etc/apt/keyrings/llvm.asc \
     && echo 'deb [signed-by=/etc/apt/keyrings/llvm.asc] https://apt.llvm.org/jammy/ llvm-toolchain-jammy-18 main' > /etc/apt/sources.list.d/llvm.list \
-    && apt-get update && apt-get install -y --no-install-recommends build-essential cmake clang-18 llvm-18-dev python3
+    && apt-get update && apt-get install -y --no-install-recommends \
+       build-essential binutils clang-18 clang-tools-18 llvm-18-dev python3-pip \
+    && python3 -m pip install --no-cache-dir --no-deps --only-binary=:all: cmake==3.30.9 ninja==1.11.1.4 \
+    && clang-scan-deps-18 --version
 WORKDIR /src
-COPY CMakeLists.txt .
+COPY CMakeLists.txt CMakePresets.json ./
 COPY compiler/ compiler/
 COPY runtime/ runtime/
-COPY tests/compiler_cli.py tests/compiler_cli.py
+COPY tests/ tests/
 COPY examples/compiler-smoke/ examples/compiler-smoke/
-RUN cmake -S . -B /build -DCMAKE_C_COMPILER=clang-18 -DCMAKE_CXX_COMPILER=clang++-18 -DLLVM_DIR="$(llvm-config-18 --cmakedir)" \
-    && cmake --build /build --parallel 4 && ctest --test-dir /build --output-on-failure \
-    && /build/bin/lyra build examples/compiler-smoke/pass -o /out/debug \
-    && /build/bin/lyra build examples/compiler-smoke/pass --release -o /out/release
+RUN sh tests/jammy-smoke.sh build /out
 
 FROM ubuntu:22.04 AS verify
 COPY --from=builder /out/ /apps/
-RUN set -eu; for app in /apps/debug /apps/release; do actual=$("$app"); test "$actual" = 3; done
+COPY tests/jammy-smoke.sh /verify.sh
+RUN sh /verify.sh verify /apps
