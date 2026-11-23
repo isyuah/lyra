@@ -17,7 +17,7 @@ struct Type {
 };
 struct Local { Type type; bool writable; std::optional<ExprId> worker{}; bool captured{}; };
 enum class Callee { Function, Constructor, Print, Collect, Sum, ListAdd };
-struct CheckedExpr { Type type; std::size_t target{}; std::vector<std::size_t> argumentSlots{}; Callee callee{}; std::optional<Type> liftedFrom{}; std::vector<std::size_t> captures{}; std::vector<std::size_t> omittedDefaults{}; };
+struct CheckedExpr { Type type; std::size_t target{}; std::vector<std::size_t> argumentSlots{}; Callee callee{}; std::optional<Type> sourceType{}; std::vector<std::size_t> captures{}; std::vector<std::size_t> omittedDefaults{}; std::optional<std::size_t> conversion{}, errorConversion{}; };
 struct CheckedFunction {
     Function syntax;
     Type result;

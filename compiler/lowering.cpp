@@ -103,7 +103,7 @@ struct Emitter {
         if (live()) builder.CreateRet(tail);
     }
 
-    Type rawType(ExprId id) const { const auto& info = fn.expressions[id]; return info.liftedFrom.value_or(info.type); }
+    Type rawType(ExprId id) const { const auto& info = fn.expressions[id]; return info.sourceType.value_or(info.type); }
 
     Value makeSum(Type type, SumTag tag, Value payload = nullptr) {
         Value value = llvm::Constant::getNullValue(layouts.native(builder, type));
@@ -114,7 +114,8 @@ struct Emitter {
     Value emit(ExprId id) {
         auto value = std::visit([&](const auto& node) { return emitNode(id, node); }, fn.syntax.expressions[id].node);
         const auto& info = fn.expressions[id];
-        return live() && info.liftedFrom ? makeSum(info.type, SumTag::Some, value) : value;
+        if (!live() || !info.sourceType) return value;
+        return info.conversion ? builder.CreateCall(functions[*info.conversion], {value}) : makeSum(info.type, SumTag::Some, value);
     }
 
     Value emitNode(ExprId, std::int64_t value) { return builder.getInt64(value); }
@@ -170,14 +171,19 @@ struct Emitter {
         return builder.CreateLoad(layouts.native(builder, rawType(id)), NativeLists{builder}.get(list, offset, source, index.site));
     }
 
-    Value emitNode(ExprId, const Propagate& propagation) {
+    Value emitNode(ExprId id, const Propagate& propagation) {
         auto value = emit(propagation.operand);
         if (!live()) return unit();
         auto success = label("propagate.value"), failure = label("propagate.return");
         builder.CreateCondBr(builder.CreateExtractValue(value, 0), success, failure);
         builder.SetInsertPoint(failure);
         auto target = worker ? layouts.program.taskResults[rawType(*worker).id] : fn.result;
-        builder.CreateRet(target.kind == Type::Option ? makeSum(target, SumTag::None) : makeSum(target, SumTag::Err, builder.CreateExtractValue(value, payloadSlot(SumTag::Err))));
+        Value result = nullptr;
+        if (target.kind == Type::Result) {
+            result = builder.CreateExtractValue(value, payloadSlot(SumTag::Err));
+            if (auto conversion = fn.expressions[id].errorConversion) result = builder.CreateCall(functions[*conversion], {result});
+        }
+        builder.CreateRet(makeSum(target, target.kind == Type::Option ? SumTag::None : SumTag::Err, result));
         builder.SetInsertPoint(success);
         return builder.CreateExtractValue(value, 1);
     }

@@ -17,6 +17,7 @@ module;
 module lyra.check;
 import lyra.generics;
 import lyra.foreign;
+import lyra.conversions;
 import lyra.collections;
 
 namespace lyra {
@@ -65,6 +66,7 @@ struct Symbols {
     std::vector<Names> fields, methods;
     std::vector<Callable> callables;
     std::map<GenericInstanceKey, std::size_t> specializations;
+    std::vector<DirectConversion> conversions{};
 
     Type unaryType(Type::Kind kind, std::vector<Type>& types, Type result) const {
         auto found = std::find(types.begin(), types.end(), result);
@@ -192,8 +194,12 @@ struct Checker {
     Type fit(ExprId id, Type type, std::optional<Type> expected) {
         auto& info = fn.expressions[id];
         if (expected && type != *expected && type != Type::Never) {
-            if (expected->kind != Type::Option || module.sumTypes[expected->id].success != type) throw mismatch(module, source, fn.syntax.expressions[id].span, *expected, type);
-            info.liftedFrom = type;
+            auto site = fn.syntax.expressions[id].span;
+            if (expected->kind != Type::Option || module.sumTypes[expected->id].success != type) {
+                info.conversion = directConversion(symbols.conversions, module, symbols.sources, type, *expected, source, site);
+                if (!info.conversion) throw mismatch(module, source, site, *expected, type);
+            }
+            info.sourceType = type;
             type = *expected;
         }
         return info.type = type;
@@ -231,7 +237,7 @@ struct Checker {
         return *expected;
     }
 
-    Type infer(ExprId, const Propagate& propagation, std::optional<Type> expected, bool) {
+    Type infer(ExprId id, const Propagate& propagation, std::optional<Type> expected, bool) {
         std::optional<Type> hint;
         auto target = returnType();
         if (!target) throw at(source, propagation.site, "LYT0013", "请给 blocking 块明确的 Task<Option<T>> 或 Task<Result<T,E>> 目标类型以使用 ?");
@@ -239,6 +245,10 @@ struct Checker {
         auto operand = inspect(propagation.operand, hint);
         if (operand == Type::Never) return operand;
         if (operand.kind != Type::Option && operand.kind != Type::Result) throw at(source, propagation.site, "LYT0013", "? 需要 Option 或 Result，实际是 " + typeName(module, operand));
+        if (operand.kind == Type::Result && target->kind == Type::Result && module.sumTypes[target->id].failure != module.sumTypes[operand.id].failure) {
+            fn.expressions[id].errorConversion = directConversion(symbols.conversions, module, symbols.sources, module.sumTypes[operand.id].failure, module.sumTypes[target->id].failure, source, propagation.site);
+            if (fn.expressions[id].errorConversion) return module.sumTypes[operand.id].success;
+        }
         if (target->kind != operand.kind || (operand.kind == Type::Result && module.sumTypes[target->id].failure != module.sumTypes[operand.id].failure)) {
             throw at(source, propagation.site, "LYT0013", "? 无法将 " + typeName(module, operand) + " 的失败传播到 " + typeName(module, *target));
         }
@@ -697,6 +707,7 @@ CheckedModule check(Module module, const std::vector<Source>& sources, bool requ
         symbols.callables.push_back({checked.functions.size(), {}, {}});
         symbols.addConcrete(std::move(concrete));
     }
+    for (std::size_t index = 0; index < checked.functions.size(); ++index) if (checked.functions[index].syntax.conversion) registerConversion(symbols.conversions, checked, sources, index);
     for (const auto& callable : symbols.callables) if (callable.generic) {
         for (std::size_t slot = 0; slot < callable.generic->parameters.size(); ++slot) if (callable.generic->parameters[slot].defaultValue) {
             auto helper = symbols.prepare(defaultFunction(*callable.generic, slot), callable.variables);

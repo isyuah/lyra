@@ -62,6 +62,7 @@ struct Function {
     std::vector<Identifier> typeParameters{};
     bool isAsync{};
     std::optional<Identifier> foreignSymbol{};
+    bool conversion{};
 };
 
 struct Field { Identifier name, type; bool writable; bool isPublic{}; };
