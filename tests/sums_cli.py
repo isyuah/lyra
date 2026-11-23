@@ -128,6 +128,62 @@ async fn main(): Unit {
 }
 ''', b"10\nlost\nawaited\n")
 
+    def test_guards_run_only_after_a_match_and_keep_bindings_across_await(self):
+        self.native(r'''
+class Counter(var subjects: Int, var guards: Int)
+class Label(val text: String)
+struct Ticket(val id: Int, val label: Label)
+fn issue(counter: Counter, id: Int): Result<Ticket?,String> {
+    counter.subjects += 1
+    if id < 0 { Err("bad\0id") }
+    else if id == 0 { Ok(None) }
+    else { Ok(Some(Ticket(id, Label("ticket")))) }
+}
+async fn allow(counter: Counter, id: Int): Bool {
+    await blocking { gcCollect() }
+    counter.guards += 1
+    id == 1
+}
+async fn decide(counter: Counter, id: Int): String {
+    match issue(counter, id) {
+        Ok(Some(Ticket(id: number, label: label))) if await allow(counter, number) => label.text,
+        Ok(Some(Ticket(id: 2))) => "fallback",
+        Ok(Some(_)) => "unexpected",
+        Ok(null) => "empty",
+        Err("bad\0id") => "bad input",
+        Err(_) => "unexpected error",
+    }
+}
+async fn main(): Unit {
+    val count = Counter(0, 0)
+    print(await decide(count, 1))
+    print(await decide(count, 2))
+    print(await decide(count, 0))
+    print(await decide(count, -1))
+    print(match -27 { -27 => "negative", _ => "wrong" })
+    print(count.subjects)
+    print(count.guards)
+}
+''', b"ticket\nfallback\nempty\nbad input\nnegative\n4\n2\n")
+
+    def test_exhaustiveness_accounts_for_overlapping_fields(self):
+        self.native('''
+struct Flags(val first: Bool, val second: Bool)
+fn mark(flags: Flags): Int {
+    match flags {
+        Flags(first: true) => 1,
+        Flags(second: true) => 2,
+        Flags(first: false, second: false) => 3,
+    }
+}
+fn main(): Unit {
+    print(mark(Flags(true, true)))
+    print(mark(Flags(false, true)))
+    print(mark(Flags(false, false)))
+    print(match true { true => 4, false => 0 })
+}
+''', b"1\n2\n3\n4\n")
+
     def test_static_rejections(self):
         for body, code, fragment in (
             ("fn f(v: Option<Int?>): Int { match v { None => 0, Some(Some(x)) => x } }", "LYT0012", "Some(None)"),
@@ -138,6 +194,14 @@ async fn main(): Unit {
             ("struct Loop(val nested: Option<Loop>)", "LYT0007", "Loop"),
             ("async fn read(): Result<Int,String> { Ok(2) }\nasync fn bad(): Result<Int,String> { Ok(await (read()?)) }", "LYT0013", "Task"),
             ("fn f(v: Result<Int,String>): Bool { v == v }", "LYT0006", "Eq"),
+            ("fn f(v: Bool): Int { match v { true if true => 1, false => 0 } }", "LYT0012", "true"),
+            ("fn f(v: Int): Int { match v { 1 => 1 } }", "LYT0012", "_"),
+            ("fn f(v: Bool): Int { match v { value if 1 => 1, _ => 0 } }", "LYT0001", "Bool"),
+            ("fn f(v: Bool): Int { match v { 1 => 1, _ => 0 } }", "LYT0011", "Bool"),
+            ("struct Flags(val first: Bool, val second: Bool)\nfn f(v: Flags): Int { match v { Flags(first: true) => 1, Flags(second: true) => 2 } }", "LYT0012", "Flags(first: false, second: false)"),
+            ("struct Flags(val first: Bool, val second: Bool)\nfn f(v: Flags): Int { match v { Flags(first: name, second: name) => 1 } }", "LYN0002", "name"),
+            ("struct Flags(val first: Bool)\nfn f(v: Flags): Int { match v { Flags(first: true, first: false) => 1 } }", "LYN0002", "first"),
+            ("class Object(val id: Int)\nfn f(v: Object): Int { match v { Object(id: number) => number } }", "LYT0011", "struct"),
         ):
             with self.subTest(body=body):
                 self.rejects(body + "\nfn main(): Unit {}", code, fragment)

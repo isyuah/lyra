@@ -1,6 +1,5 @@
 module;
 #include <algorithm>
-#include <array>
 #include <cstdint>
 #include <map>
 #include <optional>
@@ -19,6 +18,7 @@ import lyra.foreign;
 import lyra.conversions;
 import lyra.traits;
 import lyra.collections;
+import lyra.patterns;
 
 namespace lyra {
 namespace {
@@ -358,6 +358,52 @@ struct Checker {
         return call && !call->receiver && call->name.text == "Some" && call->arguments.size() == 1 && untypedOption(call->arguments.front().value);
     }
 
+    CheckedPattern checkPattern(const Pattern& pattern, Type subject) {
+        const auto& node = pattern.node;
+        if (auto* binding = std::get_if<Identifier>(&node)) {
+            auto slot = fn.locals.size();
+            declare(*binding, slot);
+            fn.locals.push_back({subject, false, currentWorker()});
+            return {PatternSlot{slot}};
+        }
+        if (auto* tag = std::get_if<SumTag>(&node)) {
+            if (subject.kind != (optionTag(*tag) ? Type::Option : Type::Result))
+                throw at(source, pattern.span, "LYT0011", std::string(tagName(*tag)) + " 不能匹配 " + typeName(module, subject));
+            if (*tag == SumTag::None) return {PatternConstructor(*tag)};
+            const auto& fields = module.sumTypes[subject.id];
+            auto payload = successTag(*tag) ? fields.success : fields.failure;
+            return {PatternConstructor(*tag), {checkPattern(pattern.parts.front(), payload)}};
+        }
+        if (const auto* record = std::get_if<RecordPattern>(&node)) {
+            const auto& name = record->type;
+            const auto& key = name.linked.empty() ? name.text : name.linked;
+            auto found = symbols.records.find(key);
+            if (found == symbols.records.end() || module.aggregates[found->second].syntax.reference)
+                throw at(source, name.span, "LYT0011", "解构模式需要可见的 struct：" + name.text);
+            if (subject != Type{Type::Record, found->second})
+                throw at(source, name.span, "LYT0011", name.text + " 不能匹配 " + typeName(module, subject));
+            const auto& owner = module.aggregates[subject.id];
+            CheckedPattern result{PatternConstructor(PatternProduct{}), std::vector<CheckedPattern>(owner.fields.size())};
+            std::vector<bool> used(owner.fields.size());
+            for (std::size_t index = 0; index < record->fields.size(); ++index) {
+                const auto& field = record->fields[index];
+                auto slot = memberIndex(subject, field, symbols.fields);
+                if (used[slot]) throw at(source, field.span, "LYN0002", "解构模式重复指定字段：" + field.text);
+                used[slot] = true;
+                visible(owner.syntax.file, owner.syntax.fields[slot].isPublic, field);
+                result.parts[slot] = checkPattern(pattern.parts[index], owner.fields[slot]);
+            }
+            return result;
+        }
+        if (std::holds_alternative<std::monostate>(node)) return {};
+        auto literal = std::holds_alternative<bool>(node) ? Type::Bool : std::holds_alternative<std::int64_t>(node) ? Type::Int : Type::String;
+        if (subject != literal)
+            throw at(source, pattern.span, "LYT0011", typeName(module, literal) + " 字面量不能匹配 " + typeName(module, subject));
+        if (auto* flag = std::get_if<bool>(&node)) return {PatternConstructor(*flag)};
+        if (auto* number = std::get_if<std::int64_t>(&node)) return {*number};
+        return {std::get<StringLiteral>(node)};
+    }
+
     Type infer(ExprId id, const Match& match, std::optional<Type> expected, bool discard) {
         std::optional<Type> subjectHint, fallback;
         if (match.optional == OptionalForm::Default && untypedOption(match.subject)) {
@@ -372,25 +418,18 @@ struct Checker {
         if (subject == Type::Never) return subject;
         if (match.optional != OptionalForm::None && subject.kind != Type::Option)
             throw at(source, match.operation, "LYT0010", "可空运算符需要 Option，实际是 " + typeName(module, subject));
-        if (subject.kind != Type::Option && subject.kind != Type::Result) throw at(source, fn.syntax.expressions[match.subject].span, "LYT0011", "match 需要 Option 或 Result，实际是 " + typeName(module, subject));
         bool discardArms = discard && match.optional == OptionalForm::None;
-        std::vector<const SumPattern*> patterns;
+        auto& checked = fn.expressions[id].patterns;
+        checked.reserve(match.arms.size());
+        std::vector<const CheckedPattern*> patterns;
         std::optional<Type> result;
         for (const auto& arm : match.arms) {
-            auto payload = subject;
-            for (auto [tag, span] : arm.pattern.tags) {
-                if (payload.kind != (optionTag(tag) ? Type::Option : Type::Result)) throw at(source, span, "LYT0011", std::string(tagName(tag)) + " 不能匹配 " + typeName(module, payload));
-                const auto& fields = module.sumTypes[payload.id];
-                payload = successTag(tag) ? fields.success : fields.failure;
-            }
             scopes.emplace_back();
-            auto slot = fn.locals.size();
-            if (const auto& binding = arm.pattern.binding) {
-                declare({binding->name, binding->span}, slot);
-                fn.locals.push_back({payload, false, currentWorker()});
-            }
-            fn.expressions[id].argumentSlots.push_back(slot);
+            checked.push_back(checkPattern(arm.pattern, subject));
+            if (!arm.guard) patterns.push_back(&checked.back());
+            bool mayEnter = !arm.guard || visit(*arm.guard, Type::Bool) != Type::Never;
             auto hint = result ? result : expected;
+            auto ignoreValue = discardArms || !mayEnter;
             Type value;
             if (match.optional == OptionalForm::Access && &arm == &match.arms.front()) {
                 value = visit(arm.value);
@@ -399,18 +438,11 @@ struct Checker {
                 if (!hint || hint->kind != Type::Option) hint = symbols.sum(Type::Option, Type::Unit);
                 value = visit(arm.value, hint);
             } else if (fallback && &arm == &match.arms.back()) value = *fallback;
-            else value = visit(arm.value, discardArms ? std::nullopt : hint, discardArms);
-            if (value != Type::Never && !result) result = discardArms ? Type::Unit : value;
+            else value = visit(arm.value, ignoreValue ? std::nullopt : hint, ignoreValue);
+            if (mayEnter && value != Type::Never && !result) result = discardArms ? Type::Unit : value;
             scopes.pop_back();
-            patterns.push_back(&arm.pattern);
         }
-        auto cases = [&](Type type) -> std::optional<std::array<SumCase<Type>, 2>> {
-            if (type.kind != Type::Result && type.kind != Type::Option) return std::nullopt;
-            const auto& fields = module.sumTypes[type.id];
-            if (type.kind == Type::Option) return std::array{SumCase<Type>{SumTag::None, Type::Unit}, SumCase<Type>{SumTag::Some, fields.success}};
-            return std::array{SumCase<Type>{SumTag::Ok, fields.success}, SumCase<Type>{SumTag::Err, fields.failure}};
-        };
-        if (auto missing = missingPattern(subject, patterns, cases)) throw at(source, fn.syntax.expressions[id].span, "LYT0012", "match 未穷尽，缺少分支：" + *missing);
+        if (auto missing = missingPattern(module, subject, patterns)) throw at(source, fn.syntax.expressions[id].span, "LYT0012", "match 未穷尽，缺少分支：" + *missing);
         return discard && match.optional != OptionalForm::None ? Type{Type::Unit} : result.value_or(Type::Never);
     }
 

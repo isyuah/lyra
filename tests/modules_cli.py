@@ -66,6 +66,17 @@ class Modules(unittest.TestCase):
         self.assertEqual(self.command('run', self.app, '--locked').stdout, '42\n')
         self.command('run', self.root, ok=False)
 
+    def test_struct_patterns_resolve_import_alias_and_check_field_visibility(self):
+        (self.lib / 'src/net/box.ly').write_text('pub struct Box(pub val number: Int, val secret: Int)\n'
+                                                 'pub fn makeBox(): Box { Box(42, 7) }\n')
+        imports = 'import cfg.net.Box as Item\nimport cfg.net.makeBox\n'
+        self.source.write_text(imports + 'fn main(): Unit { print(match makeBox() { Item(number: number) => number }) }\n')
+        self.assertEqual(self.command('run', self.app).stdout, '42\n')
+        self.source.write_text(imports + 'fn main(): Unit { match makeBox() { Item(secret: _) => {} } }\n')
+        error, = json.loads(self.command('check', self.app, '--diagnostics=json', ok=False).stderr)
+        self.assertEqual(error['code'], 'LYN0003')
+        self.assertIn('secret', error['message'])
+
 
 if __name__ == '__main__':
     unittest.main()

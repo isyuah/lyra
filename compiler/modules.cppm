@@ -136,6 +136,10 @@ struct Linker {
                 if (auto found = scope.find(name.text); found != scope.end()) name.linked = found->second.name;
                 else if (name.text == "main") name.linked = sources[fn.file].moduleId + "::main";
             };
+            auto renamePattern = [&](auto&& self, Pattern& pattern) -> void {
+                if (auto* record = std::get_if<RecordPattern>(&pattern.node)) reference(record->type);
+                for (auto& part : pattern.parts) self(self, part);
+            };
             for (auto& expr : fn.expressions) {
                 if (auto* name = std::get_if<Identifier>(&expr.node)) reference(*name);
                 if (auto* call = std::get_if<Call>(&expr.node)) {
@@ -144,6 +148,7 @@ struct Linker {
                 }
                 if (auto* binding = std::get_if<Binding>(&expr.node); binding && binding->annotation) renameType(*binding->annotation);
                 if (auto* attempt = std::get_if<Attempt>(&expr.node); attempt && attempt->binding) renameType(attempt->binding->type);
+                if (auto* match = std::get_if<Match>(&expr.node)) for (auto& arm : match->arms) renamePattern(renamePattern, arm.pattern);
                 if (auto* lambda = std::get_if<Lambda>(&expr.node)) {
                     for (auto& param : lambda->parameters) if (param.type) renameType(*param.type);
                     if (lambda->result) renameType(*lambda->result);

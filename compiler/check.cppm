@@ -1,7 +1,9 @@
 module;
+#include <cstdint>
 #include <deque>
 #include <optional>
 #include <string>
+#include <variant>
 #include <vector>
 
 export module lyra.check;
@@ -17,8 +19,15 @@ struct Type {
 };
 struct Local { Type type; bool writable; std::optional<ExprId> worker{}; bool captured{}; };
 enum class Callee { Function, Constructor, Print, Collect, Sum, ListAdd, TaskCancel, Exception, Indirect };
+struct PatternSlot { std::size_t local; };
+struct PatternProduct { bool operator==(const PatternProduct&) const = default; };
+using PatternConstructor = std::variant<SumTag, bool, PatternProduct>;
+struct CheckedPattern {
+    std::variant<std::monostate, PatternSlot, PatternConstructor, std::int64_t, StringLiteral> node{};
+    std::vector<CheckedPattern> parts{};
+};
 struct IteratorPlan { std::size_t open, next; };
-struct CheckedExpr { Type type; std::size_t target{}; std::vector<std::size_t> argumentSlots{}; Callee callee{}; std::optional<Type> sourceType{}; std::vector<std::size_t> captures{}; std::vector<std::size_t> omittedDefaults{}; std::optional<std::size_t> conversion{}, errorConversion{}, functionRef{}; std::optional<Type> callableType{}; std::optional<IteratorPlan> iterator{}; };
+struct CheckedExpr { Type type; std::size_t target{}; std::vector<std::size_t> argumentSlots{}; Callee callee{}; std::optional<Type> sourceType{}; std::vector<std::size_t> captures{}; std::vector<std::size_t> omittedDefaults{}; std::optional<std::size_t> conversion{}, errorConversion{}, functionRef{}; std::optional<Type> callableType{}; std::optional<IteratorPlan> iterator{}; std::vector<CheckedPattern> patterns{}; };
 struct CheckedFunction {
     Function syntax;
     Type result;

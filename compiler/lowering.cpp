@@ -220,13 +220,14 @@ struct Emitter {
 
     Value emitNode(ExprId, std::int64_t value) { return builder.getInt64(value); }
     Value emitNode(ExprId, bool value) { return builder.getInt1(value); }
-    Value emitNode(ExprId, const StringLiteral& string) {
+    Value stringConstant(const StringLiteral& string) {
         auto data = llvm::ConstantDataArray::getString(module.getContext(), string.bytes, false);
         auto constant = llvm::ConstantStruct::getAnon({builder.getInt64(string.bytes.size()), data});
         auto global = new llvm::GlobalVariable(module, constant->getType(), true, llvm::GlobalValue::PrivateLinkage, constant, "str");
         global->setUnnamedAddr(llvm::GlobalValue::UnnamedAddr::Global);
         return global;
     }
+    Value emitNode(ExprId, const StringLiteral& string) { return stringConstant(string); }
     Value emitNode(ExprId id, const Identifier&) {
         const auto& info = fn.expressions[id];
         if (info.functionRef) {
@@ -313,6 +314,35 @@ struct Emitter {
         return builder.CreateExtractValue(value, 1);
     }
 
+    Value stringEqual(Value left, Value right) {
+        auto pointer = builder.getPtrTy();
+        auto equal = builder.CreateCall(module.getOrInsertFunction("lyraStringEqual", builder.getInt8Ty(), pointer, pointer), {left, right});
+        return builder.CreateIsNotNull(equal);
+    }
+
+    void matchTest(Value passes, Label miss) {
+        auto matched = label("match.pattern");
+        builder.CreateCondBr(passes, matched, miss);
+        builder.SetInsertPoint(matched);
+    }
+
+    void emitPattern(const CheckedPattern& pattern, Value subject, Label miss, std::vector<std::pair<std::size_t, Value>>& bindings) {
+        if (auto* slot = std::get_if<PatternSlot>(&pattern.node)) bindings.emplace_back(slot->local, subject);
+        else if (auto* number = std::get_if<std::int64_t>(&pattern.node)) matchTest(builder.CreateICmpEQ(subject, builder.getInt64(*number)), miss);
+        else if (auto* text = std::get_if<StringLiteral>(&pattern.node)) matchTest(stringEqual(subject, stringConstant(*text)), miss);
+        else if (auto* constructor = std::get_if<PatternConstructor>(&pattern.node)) {
+            if (auto* tag = std::get_if<SumTag>(constructor)) {
+                auto success = builder.CreateExtractValue(subject, 0);
+                matchTest(successTag(*tag) ? success : builder.CreateNot(success), miss);
+                if (*tag != SumTag::None) emitPattern(pattern.parts.front(), builder.CreateExtractValue(subject, payloadSlot(*tag)), miss, bindings);
+            } else if (auto* flag = std::get_if<bool>(constructor)) matchTest(*flag ? subject : builder.CreateNot(subject), miss);
+            else for (unsigned slot = 0; slot < pattern.parts.size(); ++slot) {
+                const auto& part = pattern.parts[slot];
+                if (!std::holds_alternative<std::monostate>(part.node)) emitPattern(part, builder.CreateExtractValue(subject, slot), miss, bindings);
+            }
+        }
+    }
+
     Value emitNode(ExprId id, const Match& match) {
         auto subject = emit(match.subject);
         if (!live()) return unit();
@@ -320,18 +350,18 @@ struct Emitter {
         std::vector<std::pair<Value, Label>> values;
         for (std::size_t index = 0; index < match.arms.size(); ++index) {
             const auto& arm = match.arms[index];
-            auto armBody = label("match.arm"), next = label("match.next");
-            Value payload = subject, selected = builder.getTrue();
-            for (auto step : arm.pattern.tags) {
-                auto success = builder.CreateExtractValue(payload, 0);
-                selected = builder.CreateAnd(selected, successTag(step.tag) ? success : builder.CreateNot(success));
-                if (step.tag != SumTag::None) payload = builder.CreateExtractValue(payload, payloadSlot(step.tag));
+            auto next = label("match.next");
+            std::vector<std::pair<std::size_t, Value>> bindings;
+            emitPattern(fn.expressions[id].patterns[index], subject, next, bindings);
+            for (auto [slot, payload] : bindings) initialize(slot, payload);
+            if (arm.guard) {
+                auto condition = emit(*arm.guard);
+                if (live()) matchTest(condition, next);
             }
-            builder.CreateCondBr(selected, armBody, next);
-            builder.SetInsertPoint(armBody);
-            if (arm.pattern.binding) initialize(fn.expressions[id].argumentSlots[index], payload);
-            auto value = emit(arm.value);
-            if (live()) { values.emplace_back(value, builder.GetInsertBlock()); builder.CreateBr(done); }
+            if (live()) {
+                auto value = emit(arm.value);
+                if (live()) { values.emplace_back(value, builder.GetInsertBlock()); builder.CreateBr(done); }
+            }
             builder.SetInsertPoint(next);
         }
         builder.CreateUnreachable();
@@ -582,9 +612,8 @@ struct Emitter {
         }
         if (fn.expressions[binary.left].type == Type::String) {
             if (op == Op::Add) return concatenate(left, right);
-            auto pointer = builder.getPtrTy();
-            auto equal = builder.CreateCall(module.getOrInsertFunction("lyraStringEqual", builder.getInt8Ty(), pointer, pointer), {left, right});
-            return op == Op::Eq ? builder.CreateIsNotNull(equal) : builder.CreateIsNull(equal);
+            auto equal = stringEqual(left, right);
+            return op == Op::Eq ? equal : builder.CreateNot(equal);
         }
         switch (op) {
             case Op::Eq: return builder.CreateICmpEQ(left, right);

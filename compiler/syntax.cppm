@@ -50,7 +50,13 @@ struct LambdaParameter { Identifier name; std::optional<Identifier> type; };
 struct Lambda { std::vector<LambdaParameter> parameters; std::optional<Identifier> result; ExprId body; bool implicit; };
 struct EmptyOption {};
 struct Propagate { ExprId operand; Span site; };
-struct MatchArm { SumPattern pattern; ExprId value; };
+struct RecordPattern { Identifier type; std::vector<Identifier> fields; };
+struct Pattern {
+    Span span;
+    std::variant<std::monostate, Identifier, SumTag, RecordPattern, std::int64_t, bool, StringLiteral> node;
+    std::vector<Pattern> parts{};
+};
+struct MatchArm { Pattern pattern; ExprId value; std::optional<ExprId> guard{}; };
 enum class OptionalForm { None, Access, Default };
 struct Match { ExprId subject; std::vector<MatchArm> arms; OptionalForm optional{}; Span operation{}; };
 enum class Jump { Break, Continue };

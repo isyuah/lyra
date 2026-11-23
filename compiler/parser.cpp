@@ -484,8 +484,8 @@ private:
     }
 
     ExprId optional(ExprId subject, Identifier payload, ExprId present, ExprId absent, Span site, Span span, OptionalForm form) {
-        SumPattern some{site, {{SumTag::Some, site}}, PatternBinding{std::move(payload.text), payload.span}};
-        SumPattern none{site, {{SumTag::None, site}}, {}};
+        Pattern some{site, SumTag::Some, {{payload.span, std::move(payload)}}};
+        Pattern none{site, SumTag::None};
         return add(span, Match{subject, {{std::move(some), present}, {std::move(none), absent}}, form, site});
     }
 
@@ -551,25 +551,43 @@ private:
         return value;
     }
 
-    SumPattern pattern() {
-        SumPattern result{token.span, {}, {}};
-        std::size_t open = 0;
-        for (;;) {
-            bool escaped = token.kind == Kind::Escaped;
-            auto name = identifier();
-            result.span.end = name.span.end;
-            auto tag = escaped ? std::nullopt : sumTag(name.text);
-            if (!tag) {
-                if (name.text != "_" || escaped) result.binding = PatternBinding{std::move(name.text), name.span};
-                break;
-            }
-            result.tags.push_back({*tag, name.span});
-            if (*tag == SumTag::None) break;
-            require("(");
-            ++open;
+    Pattern pattern() {
+        auto site = token.span;
+        if (token.kind == Kind::Number || (is("-") && next.kind == Kind::Number)) {
+            bool negative = is("-");
+            if (negative) consume();
+            auto digits = consume().span;
+            return {{site.begin, digits.end}, integer(source, digits, negative)};
         }
-        while (open > 0) { --open; result.span.end = require(")").span.end; }
-        return result;
+        if (token.kind == Kind::String) {
+            auto literal = stringLiteral();
+            return {literal.span, StringLiteral{std::move(literal.text)}};
+        }
+        if (is("true") || is("false")) return {site, text(consume()) == "true"};
+        if (is("null")) { consume(); return {site, SumTag::None}; }
+        bool escaped = token.kind == Kind::Escaped;
+        auto name = identifier();
+        if (!escaped) {
+            if (name.text == "_") return {site, std::monostate{}};
+            if (auto tag = sumTag(name.text)) {
+                if (*tag == SumTag::None) return {site, *tag};
+                require("(");
+                auto payload = pattern();
+                return {{site.begin, require(")").span.end}, *tag, {std::move(payload)}};
+            }
+        }
+        if (!is("(")) return {site, std::move(name)};
+        consume();
+        RecordPattern record{std::move(name), {}};
+        std::vector<Pattern> parts;
+        while (!is(")")) {
+            record.fields.push_back(identifier());
+            require(":");
+            parts.push_back(pattern());
+            if (!is(",")) break;
+            consume();
+        }
+        return {{site.begin, require(")").span.end}, std::move(record), std::move(parts)};
     }
 
     ExprId tailArgument(ExprId callee, bool allowed) {
@@ -743,8 +761,10 @@ private:
             require("{");
             while (!is("}")) {
                 auto branch = pattern();
+                std::optional<ExprId> guard;
+                if (is("if")) { consume(); guard = expression(false, 1, false); }
                 require("=>");
-                match.arms.push_back({std::move(branch), statement()});
+                match.arms.push_back({std::move(branch), statement(), guard});
                 if (!is(",")) break;
                 consume();
             }
