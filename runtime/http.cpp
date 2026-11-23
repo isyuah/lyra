@@ -6,7 +6,6 @@
 #include <climits>
 #include <cstdint>
 #include <cstdio>
-#include <cstdlib>
 #include <cstring>
 #include <llhttp.h>
 #include <netinet/in.h>
@@ -208,34 +207,6 @@ extern "C" int64_t lyraHttpRespond(Request* req, int64_t status, const void* med
     if (!error && !head) error = sendAll(req->descriptor, lyraStringBytes(body), length, deadline);
     stop(req->descriptor);
     return error;
-}
-
-extern "C" const void* lyraHttpJsonString(const void* value) {
-    auto bytes = lyraStringBytes(value);
-    auto count = lyraStringLength(value);
-    std::size_t length = 2;
-    for (std::size_t index = 0; index < count; ++index) {
-        auto byte = static_cast<unsigned char>(bytes[index]);
-        auto width = byte < 0x20 ? 6u : byte == '"' || byte == '\\' ? 2u : 1u;
-        if (length > SIZE_MAX - width) std::abort();
-        length += width;
-    }
-    auto buffer = static_cast<char*>(lyraGcAllocAtomic(length));
-    char* next = buffer;
-    *next++ = '"';
-    constexpr char hex[] = "0123456789abcdef";
-    for (std::size_t index = 0; index < count; ++index) {
-        auto byte = static_cast<unsigned char>(bytes[index]);
-        if (byte < 0x20) {
-            std::memcpy(next, "\\u00", 4); next += 4;
-            *next++ = hex[byte >> 4]; *next++ = hex[byte & 15];
-        } else {
-            if (byte == '"' || byte == '\\') *next++ = '\\';
-            *next++ = bytes[index];
-        }
-    }
-    *next = '"';
-    return lyraStringFromBytes(buffer, length);
 }
 
 extern "C" int64_t lyraHttpPathInt(const void* target, const void* prefix, int64_t fallback) {

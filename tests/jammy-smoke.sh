@@ -9,6 +9,14 @@ apps=${2:?expected an absolute application directory}
 case "$mode" in
     build)
         mkdir -p "$apps"
+        python3 - "$apps/http-fixture.db" <<'PY'
+import sqlite3
+import sys
+
+with sqlite3.connect(":memory:") as fixture, sqlite3.connect(sys.argv[1]) as output:
+    fixture.executescript("CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT); INSERT INTO users VALUES(7,'Ada');")
+    fixture.backup(output)
+PY
         for preset in dev release; do
             cmake --preset "$preset" -DLLVM_DIR="$(llvm-config-18 --cmakedir)"
             cmake --build --preset "$preset" --parallel 4
@@ -21,18 +29,19 @@ case "$mode" in
                 profile=release
                 set -- --release
             fi
-            for sample in integer objects stdio sqlite jsonlines; do
+            for sample in integer objects stdio sqlite jsonlines http; do
                 case "$sample" in
                     integer) package=examples/compiler-smoke/pass; app="$apps/$profile" ;;
                     objects) package=tests/fixtures/objects; app="$apps/objects-$profile" ;;
                     jsonlines) package=examples/jsonlines/stats; app="$apps/jsonlines-$profile" ;;
+                    http) package=examples/http-sqlite; app="$apps/http-$profile" ;;
                     stdio|sqlite) package="tests/fixtures/$sample"; app="$apps/$sample-$profile" ;;
                 esac
                 "build/$preset/bin/lyra" build "$package" "$@" -o "$app"
                 dynamic=$(readelf -dW "$app")
                 needed=$(printf '%s\n' "$dynamic" | sed -n 's/.*(NEEDED).*\[\([^]]*\)\].*/\1/p')
                 printf '%s DT_NEEDED: %s\n' "$app" "$needed"
-                if [ "$sample" = sqlite ]; then
+                if [ "$sample" = sqlite ] || [ "$sample" = http ]; then
                     test "$(printf '%s\n' "$needed" | sort)" = "$(printf '%s\n' libc.so.6 libsqlite3.so.0)"
                 else
                     test "$needed" = libc.so.6
@@ -66,6 +75,26 @@ case "$mode" in
                 printf '%s: exact stdout matched, exit=0, stderr empty (%s)\n' "$app" "$PRETTY_NAME"
             done
         done
+        if [ "$mode" = verify-sqlite ]; then
+            for profile in debug release; do
+                app="$apps/http-$profile"
+                timeout 15 bash -euo pipefail -s -- "$app" "$apps/http-fixture.db" "$scratch/stderr" <<'BASH'
+coproc service { exec stdbuf -oL "$1" "$2" 2>"$3"; }
+pid=$service_PID
+trap 'kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true' EXIT
+IFS= read -r -t 5 port <&"${service[0]}"
+exec {client}<>"/dev/tcp/127.0.0.1/$port"
+printf 'GET /users/7 HTTP/1.1\r\nHost: localhost\r\n\r\n' >&"$client"
+answer=$(cat <&"$client")
+exec {client}>&-
+[[ $answer == $'HTTP/1.1 200 OK\r\n'* && $answer == *$'\r\nContent-Type: application/json\r\n'* ]]
+body=$(printf '%s' "${answer#*$'\r\n\r\n'}" | tr -d '[:space:]')
+[[ $body == '{"id":7,"name":"Ada"}' || $body == '{"name":"Ada","id":7}' ]]
+BASH
+                test ! -s "$scratch/stderr"
+                printf '%s: GET /users/7 returned 200 application/json with Ada (%s)\n' "$app" "$PRETTY_NAME"
+            done
+        fi
         rm "$scratch/expected" "$scratch/stdout" "$scratch/stderr"
         rmdir "$scratch"
         ;;

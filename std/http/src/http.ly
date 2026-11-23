@@ -12,7 +12,6 @@ extern fn lyraHttpWaitDisconnect(request: CPtr, timeoutMs: Int): Bool;
 extern fn lyraHttpWatchDisconnect(request: CPtr): Bool;
 extern fn lyraHttpDrop(request: CPtr): Unit;
 extern fn lyraHttpRespond(request: CPtr, code: Int, mediaType: String, body: String): Int;
-extern fn lyraHttpJsonString(text: String): String;
 extern fn lyraHttpPathInt(target: String, prefix: String, fallback: Int): Int;
 
 pub class Listener(val handle: CPtr) {
@@ -36,4 +35,3 @@ pub class Request(val handle: CPtr) {
 }
 
 pub fn listen(port: Int): Listener { Listener(lyraHttpListen(port)) }
-pub fn jsonString(text: String): String { lyraHttpJsonString(text) }
