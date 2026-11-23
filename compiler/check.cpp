@@ -10,6 +10,7 @@ module;
 #include <string>
 #include <unordered_map>
 #include <utility>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -129,6 +130,11 @@ struct Checker {
     std::vector<Names> scopes;
     std::span<const Type> variables{};
     unsigned loops = 0;
+    struct WorkerScope { ExprId id; std::size_t firstLocal; std::optional<Type> result; };
+    std::vector<WorkerScope> workers{};
+
+    std::optional<ExprId> currentWorker() const { return workers.empty() ? std::nullopt : std::optional(workers.back().id); }
+    std::optional<Type> returnType() const { return workers.empty() ? std::optional(fn.result) : workers.back().result; }
 
     void declare(const Identifier& name, std::size_t slot) {
         if (!scopes.back().emplace(name.text, slot).second) throw at(source, name.span, "LYN0002", "名称已在此作用域声明：" + name.text);
@@ -172,12 +178,14 @@ struct Checker {
 
     Type infer(ExprId, const Propagate& propagation, std::optional<Type> expected, bool) {
         std::optional<Type> hint;
-        if (expected && (fn.result.kind == Type::Option || fn.result.kind == Type::Result)) hint = symbols.sum(fn.result.kind, *expected, module.sumTypes[fn.result.id].failure);
+        auto target = returnType();
+        if (!target) throw at(source, propagation.site, "LYT0013", "请给 blocking 块明确的 Task<Option<T>> 或 Task<Result<T,E>> 目标类型以使用 ?");
+        if (expected && (target->kind == Type::Option || target->kind == Type::Result)) hint = symbols.sum(target->kind, *expected, module.sumTypes[target->id].failure);
         auto operand = inspect(propagation.operand, hint);
         if (operand == Type::Never) return operand;
         if (operand.kind != Type::Option && operand.kind != Type::Result) throw at(source, propagation.site, "LYT0013", "? 需要 Option 或 Result，实际是 " + typeName(module, operand));
-        if (fn.result.kind != operand.kind || (operand.kind == Type::Result && module.sumTypes[fn.result.id].failure != module.sumTypes[operand.id].failure)) {
-            throw at(source, propagation.site, "LYT0013", "? 无法将 " + typeName(module, operand) + " 的失败传播到 " + typeName(module, fn.result));
+        if (target->kind != operand.kind || (operand.kind == Type::Result && module.sumTypes[target->id].failure != module.sumTypes[operand.id].failure)) {
+            throw at(source, propagation.site, "LYT0013", "? 无法将 " + typeName(module, operand) + " 的失败传播到 " + typeName(module, *target));
         }
         return module.sumTypes[operand.id].success;
     }
@@ -199,7 +207,7 @@ struct Checker {
             auto slot = fn.locals.size();
             if (const auto& binding = arm.pattern.binding) {
                 declare({binding->name, binding->span}, slot);
-                fn.locals.push_back({payload, false});
+                fn.locals.push_back({payload, false, currentWorker()});
             }
             fn.expressions[id].argumentSlots.push_back(slot);
             auto value = visit(arm.value, discard ? std::nullopt : result ? result : expected, discard);
@@ -220,8 +228,14 @@ struct Checker {
     Type infer(ExprId id, const Identifier& name, auto, bool) {
         for (auto scope = scopes.rbegin(); scope != scopes.rend(); ++scope) {
             if (auto found = scope->find(name.text); found != scope->end()) {
-                fn.expressions[id].target = found->second;
-                return fn.locals[found->second].type;
+                auto slot = found->second;
+                for (const auto& worker : workers) if (slot < worker.firstLocal) {
+                    fn.locals[slot].captured = true;
+                    auto& captures = fn.expressions[worker.id].captures;
+                    if (std::ranges::find(captures, slot) == captures.end()) captures.push_back(slot);
+                }
+                fn.expressions[id].target = slot;
+                return fn.locals[slot].type;
             }
         }
         throw at(source, name.span, "LYN0001", "找不到绑定：" + name.text);
@@ -233,7 +247,7 @@ struct Checker {
         auto value = visit(binding.value, annotation);
         auto slot = fn.locals.size();
         declare(binding.name, slot);
-        fn.locals.push_back({annotation.value_or(value), binding.writable});
+        fn.locals.push_back({annotation.value_or(value), binding.writable, currentWorker()});
         fn.expressions[id].target = slot;
         return value == Type::Never ? Type::Never : Type::Unit;
     }
@@ -375,11 +389,23 @@ struct Checker {
     }
 
     Type infer(ExprId, const TaskOp& op, std::optional<Type> expected, bool) {
-        if (!fn.syntax.isAsync) throw at(source, op.site, "LYT0008", "await 和 spawn 只能在 async 函数中使用");
+        if (!workers.empty() || !fn.syntax.isAsync) throw at(source, op.site, "LYT0008", "await 和 spawn 只能在 async 函数中使用，不能挂起同步 blocking 块");
         auto operand = inspect(op.operand, op.spawn || !expected ? expected : std::optional(symbols.task(*expected)));
         if (operand.kind == Type::Never) return operand;
         if (operand.kind != Type::Task) throw at(source, fn.syntax.expressions[op.operand].span, "LYT0008", "此处需要 Task，实际是 " + typeName(module, operand));
         return op.spawn ? operand : module.taskResults[operand.id];
+    }
+
+    Type infer(ExprId id, const Blocking& worker, std::optional<Type> expected, bool) {
+        auto hint = expected && expected->kind == Type::Task ? std::optional(module.taskResults[expected->id]) : std::nullopt;
+        workers.push_back({id, fn.locals.size(), hint});
+        unsigned previous = std::exchange(loops, 0);
+        auto body = visit(worker.body, hint);
+        auto result = workers.back().result.value_or(body);
+        fit(worker.body, body, result);
+        workers.pop_back();
+        loops = previous;
+        return symbols.task(result);
     }
 
     bool writable(ExprId id) const {
@@ -463,8 +489,10 @@ struct Checker {
     }
 
     Type infer(ExprId id, const Return& ret, std::optional<Type>, bool) {
-        if (ret.value) visit(*ret.value, fn.result);
-        else if (fn.result != Type::Unit) throw mismatch(module, source, fn.syntax.expressions[id].span, fn.result, Type::Unit);
+        auto target = returnType();
+        auto value = ret.value ? visit(*ret.value, target) : Type{Type::Unit};
+        if (target && value != Type::Never && *target != value) throw mismatch(module, source, fn.syntax.expressions[id].span, *target, value);
+        if (!target && value != Type::Never) workers.back().result = value;
         return Type::Never;
     }
 
@@ -553,7 +581,10 @@ CheckedModule check(Module module, const std::vector<Source>& sources, bool requ
         const auto& syntax = concrete.syntax;
         if (!owner && requireEntry && syntax.name.text == "main") {
             if (!syntax.parameters.empty()) throw at(source, syntax.name.span, "LYT0002", "main 不能接收形参");
-            if (concrete.result != Type::Unit) throw mismatch(checked, source, syntax.result.span, Type::Unit, concrete.result);
+            if (syntax.isAsync && concrete.result != Type::Unit) {
+                auto expected = symbols.sum(Type::Result, Type::Unit, Type::String);
+                if (concrete.result != expected) throw mismatch(checked, source, syntax.result.span, expected, concrete.result);
+            } else if (concrete.result != Type::Unit) throw mismatch(checked, source, syntax.result.span, Type::Unit, concrete.result);
             checked.entry = checked.functions.size();
         }
         symbols.callables.push_back({checked.functions.size(), {}, {}});

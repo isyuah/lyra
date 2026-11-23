@@ -1,5 +1,6 @@
 module;
 #include <cstdint>
+#include <span>
 #include <vector>
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/InstIterator.h>
@@ -58,8 +59,85 @@ export llvm::Value* asyncSpawn(llvm::IRBuilder<>& builder, llvm::Value* task) {
     return marker(builder, "lyra.spawn", builder.getPtrTy(), task);
 }
 
-export llvm::Value* asyncEntry(llvm::IRBuilder<>& builder, llvm::Value* coldRoot) {
-    return builder.CreateCall(runtime(builder, "lyraTaskRunRoot", builder.getInt32Ty(), {builder.getPtrTy()}), {coldRoot});
+export llvm::Value* asyncEntry(llvm::IRBuilder<>& builder, llvm::Value* coldRoot, llvm::Type* resultType) {
+    auto* status = builder.CreateCall(runtime(builder, "lyraTaskRunRoot", builder.getInt32Ty(), {builder.getPtrTy()}), {coldRoot});
+    if (!resultType) return status;
+    auto* start = builder.GetInsertBlock();
+    auto* main = start->getParent();
+    auto* check = llvm::BasicBlock::Create(builder.getContext(), "root.result", main);
+    auto* error = llvm::BasicBlock::Create(builder.getContext(), "root.error", main);
+    auto* done = llvm::BasicBlock::Create(builder.getContext(), "root.done", main);
+    builder.CreateCondBr(builder.CreateIsNull(status), check, done);
+    builder.SetInsertPoint(check);
+    auto* box = builder.CreateCall(runtime(builder, "lyraTaskOutcome", builder.getPtrTy(), {builder.getPtrTy()}), {coldRoot});
+    auto* result = builder.CreateLoad(resultType, box);
+    builder.CreateCondBr(builder.CreateExtractValue(result, 0), done, error);
+    builder.SetInsertPoint(error);
+    auto* failed = builder.CreateCall(runtime(builder, "lyraReportStringError", builder.getInt32Ty(), {builder.getPtrTy()}), {builder.CreateExtractValue(result, 2)});
+    builder.CreateBr(done);
+    builder.SetInsertPoint(done);
+    auto* exit = builder.CreatePHI(builder.getInt32Ty(), 3);
+    exit->addIncoming(status, start);
+    exit->addIncoming(status, check);
+    exit->addIncoming(failed, error);
+    return exit;
+}
+
+export llvm::Value* asyncCell(llvm::IRBuilder<>& builder, llvm::Type* type) { return allocate(builder, type); }
+
+namespace {
+
+llvm::AllocaInst* scratch(Builder& builder, llvm::Type* type) {
+    auto& entry = builder.GetInsertBlock()->getParent()->getEntryBlock();
+    Builder prologue(&entry, entry.getFirstInsertionPt());
+    return prologue.CreateAlloca(type);
+}
+
+void sharedCopy(Builder& builder, llvm::Value* destination, llvm::Value* source, llvm::Type* type) {
+    auto* pointer = builder.getPtrTy();
+    builder.CreateCall(runtime(builder, "lyraTaskSharedCopy", builder.getVoidTy(), {pointer, pointer, builder.getInt64Ty()}), {destination, source, llvm::ConstantExpr::getSizeOf(type)});
+}
+
+}
+
+export llvm::Value* sharedRead(llvm::IRBuilder<>& builder, llvm::Type* type, llvm::Value* address) {
+    auto* cell = scratch(builder, type);
+    sharedCopy(builder, cell, address, type);
+    return builder.CreateLoad(type, cell);
+}
+
+export void sharedWrite(llvm::IRBuilder<>& builder, llvm::Value* value, llvm::Value* address) {
+    auto* cell = scratch(builder, value->getType());
+    builder.CreateStore(value, cell);
+    sharedCopy(builder, address, cell, value->getType());
+}
+
+export struct BlockingCode {
+    llvm::Function* body;
+    llvm::StructType* environment;
+};
+
+export BlockingCode blockingCode(llvm::Function& owner, llvm::Type* result, std::size_t captures) {
+    auto* pointer = llvm::PointerType::getUnqual(owner.getContext());
+    auto* signature = llvm::FunctionType::get(result, std::vector<llvm::Type*>(captures, pointer), false);
+    auto* body = llvm::Function::Create(signature, llvm::Function::InternalLinkage, owner.getName() + ".worker", owner.getParent());
+    auto* environment = llvm::StructType::create(owner.getContext(), signature->params(), body->getName().str() + ".env");
+    return {body, environment};
+}
+
+export llvm::Value* blockingTask(llvm::IRBuilder<>& builder, BlockingCode code, std::span<llvm::Value* const> cells) {
+    auto* pointer = builder.getPtrTy();
+    auto* captured = allocate(builder, code.environment);
+    for (std::size_t index = 0; index < cells.size(); ++index) builder.CreateStore(cells[index], builder.CreateStructGEP(code.environment, captured, index));
+    auto* thunk = llvm::Function::Create(llvm::FunctionType::get(pointer, {pointer}, false), llvm::Function::InternalLinkage, code.body->getName() + ".call", &moduleAt(builder));
+    Builder worker(llvm::BasicBlock::Create(builder.getContext(), "capture", thunk));
+    std::vector<llvm::Value*> args;
+    for (std::size_t index = 0; index < cells.size(); ++index) args.push_back(worker.CreateLoad(pointer, worker.CreateStructGEP(code.environment, thunk->getArg(0), index)));
+    auto* value = worker.CreateCall(code.body, args);
+    auto* boxed = allocate(worker, value->getType());
+    worker.CreateStore(value, boxed);
+    worker.CreateRet(boxed);
+    return builder.CreateCall(runtime(builder, "lyraTaskBlocking", pointer, {pointer, pointer}), {thunk, captured});
 }
 
 export void lowerAsync(llvm::Function& factory, llvm::Function& body) {

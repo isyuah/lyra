@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -83,11 +84,102 @@ async fn depth(count: Int): Int {
 async fn main(): Unit { print(await depth(5000)) }
 """, "5000\n")
 
+    def test_blocking_closures_capture_bindings_and_have_their_own_return(self):
+        self.run_source("""
+fn escaped(): Task<Int> {
+    var number = 3
+    val job = blocking { gcCollect(); number += 2; return number }
+    number = 9
+    job
+}
+async fn main(): Unit {
+    val work = escaped()
+    gcCollect()
+    print(await work)
+    print(await work)
+    var label = "before"
+    val text = blocking { label = label + "!"; label }
+    label = "after"
+    print(await text)
+    print(label)
+    var first = blocking { 0 }
+    var second = blocking { 0 }
+    var index = 0
+    while index < 2 {
+        val saved = index + 5
+        val job = blocking { saved }
+        if index == 0 { first = job } else { second = job }
+        index += 1
+    }
+    print(await first)
+    print(await second)
+    val nested = blocking { blocking { label } }
+    print(await (await nested))
+}
+""", "11\n11\nafter!\nafter!\n5\n6\nafter!\n")
+
+    def test_propagate_in_blocking_exits_only_the_closure(self):
+        self.run_source('''
+fn absent(): Int? { None }
+async fn main(): Unit {
+    val pending: Task<Int?> = blocking { val value = absent()?; value + 1 }
+    print(match await pending { None => 9, Some(number) => number })
+    print(3)
+}
+''', "9\n3\n")
+
+    def test_business_error_main_drains_children_and_reports_the_message(self):
+        for outcome, status, message in (("Ok({})", 0, b""), ('Err("数据\\0错误")', 1, "数据\0错误\n".encode())):
+            self.main.write_text('async fn child(): Unit { print(1) }\n'
+                                 'async fn main(): Result<Unit,String> { spawn child(); ' + outcome + ' }', encoding="utf-8")
+            for mode in ([], ["--release"]):
+                with self.subTest(outcome=outcome, mode=mode):
+                    app = self.package / "app"
+                    built = subprocess.run([COMPILER, "build", self.package, *mode, "-o", app], capture_output=True, timeout=30)
+                    self.assertEqual(built.returncode, 0, built.stderr.decode())
+                    run = subprocess.run([app], capture_output=True, timeout=10)
+                    self.assertEqual((run.returncode, run.stdout, run.stderr), (status, b"1\n", message))
+
+    def test_blocking_io_leaves_domain_free_and_sqlite_results_survive(self):
+        (self.package / "lyra.json5").write_text("{name:'test/blocking',version:'1.0.0'}")
+        self.main.write_text('''
+import std.io.assert
+import std.io.readFile
+import std.io.writeFile
+import std.sqlite.open
+async fn release(): Unit { assert(writeFile("gate", "ready") == 0, "open FIFO writer") }
+async fn main(): Unit {
+    val reading = spawn blocking { readFile("gate").value }
+    spawn release();
+    print(await reading)
+    val result = await blocking {
+        val db = open(":memory:")
+        val query = db.prepare("SELECT 'after close'")
+        assert(query.next().row(), "read")
+        val text = query.readText(0).value
+        assert(query.close().ok() && db.close().ok(), "close")
+        gcCollect()
+        text
+    }
+    gcCollect()
+    print(result)
+}
+''', encoding="utf-8")
+        os.mkfifo(self.package / "gate")
+        for flags in ([], ["--release"]):
+            with self.subTest(flags=flags):
+                app = self.package / "app"
+                built = subprocess.run([COMPILER, "build", self.package, "-o", app, *flags], capture_output=True, timeout=30)
+                self.assertEqual(built.returncode, 0, built.stderr.decode())
+                ran = subprocess.run([app], cwd=self.package, env={**os.environ, "UV_THREADPOOL_SIZE": "1"}, capture_output=True, timeout=10)
+                self.assertEqual((ran.returncode, ran.stdout, ran.stderr), (0, b"ready\nafter close\n", b""))
+
     def test_invalid_task_operations(self):
         for source, marked in (("fn main(): Unit { val bad = await work() } async fn work(): Unit {}", "await"),
                                ("fn main(): Unit { val bad = spawn work() } async fn work(): Unit {}", "spawn"),
                                ("async fn main(): Unit { val bad = await 4 }", "4"),
-                               ("async fn main(): Unit { val bad = spawn 5 }", "5")):
+                               ("async fn main(): Unit { val bad = spawn 5 }", "5"),
+                               ("async fn main(): Unit { val bad = blocking { await never() } }", "await")):
             with self.subTest(source=source):
                 self.main.write_text(source)
                 result = subprocess.run([COMPILER, "check", self.package, "--diagnostics=json"], capture_output=True, timeout=10)

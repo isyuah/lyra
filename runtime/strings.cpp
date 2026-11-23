@@ -69,3 +69,9 @@ void lyraPrintString(const void* value) {
     std::fwrite(lyraStringBytes(value), 1, lyraStringLength(value), stdout);
     std::putchar('\n');
 }
+
+int lyraReportStringError(const void* value) {
+    std::fwrite(lyraStringBytes(value), 1, lyraStringLength(value), stderr);
+    std::fputc('\n', stderr);
+    return EXIT_FAILURE;
+}

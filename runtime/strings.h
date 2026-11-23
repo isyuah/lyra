@@ -15,6 +15,7 @@ uint8_t lyraUtf8Valid(const char* bytes, size_t length);
 const void* lyraStringConcat(const void* left, const void* right);
 uint8_t lyraStringEqual(const void* left, const void* right);
 void lyraPrintString(const void* value);
+int lyraReportStringError(const void* value);
 
 #ifdef __cplusplus
 }

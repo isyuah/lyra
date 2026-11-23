@@ -344,15 +344,15 @@ private:
         }
         if (is("while")) {
             consume();
-            auto condition = expression();
+            auto condition = expression(false, 1, false);
             auto body = block();
             return add({start, nodes[body].span.end}, While{condition, body});
         }
         return expression();
     }
 
-    ExprId expression(bool inParens = false, int minRank = 1) {
-        auto left = primary(inParens);
+    ExprId expression(bool inParens = false, int minRank = 1, bool trailingBlock = true) {
+        auto left = primary(inParens, true, trailingBlock);
         int previous = 0;
         while (inParens || !token.newlineBefore) {
             auto op = std::ranges::find(infix, text(token), &Infix::text);
@@ -360,14 +360,14 @@ private:
             if ((op->rank == 4 || op->rank == 1) && previous == op->rank) throw at(source, token.span, "LYP0001", "比较或赋值不能连写");
             previous = op->rank;
             auto site = consume().span;
-            auto right = expression(inParens, op->rank + 1);
+            auto right = expression(inParens, op->rank + 1, trailingBlock);
             left = add({nodes[left].span.begin, nodes[right].span.end}, Binary{op->op, site, left, right});
         }
         return left;
     }
 
-    ExprId primary(bool inParens, bool propagate = true) {
-        auto value = atom(inParens);
+    ExprId primary(bool inParens, bool propagate = true, bool trailingBlock = true) {
+        auto value = atom(inParens, trailingBlock);
         while (true) {
             if (propagate && is("?") && (inParens || !token.newlineBefore)) {
                 auto site = consume().span;
@@ -420,7 +420,7 @@ private:
         return add({begin, close.end}, std::move(node));
     }
 
-    ExprId atom(bool inParens) {
+    ExprId atom(bool inParens, bool trailingBlock) {
         auto start = token.span.begin;
         if (token.kind == Kind::String) {
             auto item = consume();
@@ -444,12 +444,12 @@ private:
         }
         if (is("await") || is("spawn")) {
             auto op = consume();
-            auto operand = primary(inParens, false);
+            auto operand = primary(inParens, false, trailingBlock);
             return add({start, nodes[operand].span.end}, TaskOp{text(op) == "spawn", op.span, operand});
         }
         if (is("-") || is("!")) {
             auto item = consume();
-            auto operand = primary(inParens);
+            auto operand = primary(inParens, true, trailingBlock);
             return add({start, nodes[operand].span.end}, Unary{text(item) == "!" ? Op::Not : Op::Sub, item.span, operand});
         }
         if (is("true") || is("false")) {
@@ -459,7 +459,7 @@ private:
         if (is("null") || is("None")) return add(consume().span, EmptyOption{});
         if (is("match")) {
             consume();
-            Match match{expression(), {}};
+            Match match{expression(false, 1, false), {}};
             require("{");
             while (!is("}")) {
                 auto branch = pattern();
@@ -473,11 +473,16 @@ private:
         }
         if (is("if")) {
             consume();
-            auto condition = expression();
+            auto condition = expression(false, 1, false);
             auto yes = block();
             std::optional<ExprId> no;
             if (is("else")) { consume(); no = is("if") ? primary(false) : block(); }
             return add({start, nodes[no.value_or(yes)].span.end}, Conditional{condition, yes, no});
+        }
+        if (trailingBlock && is("blocking") && text(next) == "{" && !next.newlineBefore) {
+            consume();
+            auto body = block();
+            return add({start, nodes[body].span.end}, Blocking{body});
         }
         if (is("{")) return block();
         if (token.kind == Kind::Name || token.kind == Kind::Escaped) {

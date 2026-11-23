@@ -24,6 +24,7 @@ void lyraDomainDestroy(LyraDomain *domain);
 
 LyraTask *lyraTaskCreate(LyraTaskStep step, void *frame);
 LyraTask *lyraTaskBlocking(LyraBlockingBody body, void *environment);
+void lyraTaskSharedCopy(void *destination, const void *source, size_t bytes);
 int lyraTaskWatchDisconnect(int socketFd);
 void lyraTaskStart(LyraDomain *domain, LyraTask *task);
 int lyraTaskAwait(LyraTask *waiter, LyraTask *target);

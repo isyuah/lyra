@@ -1,5 +1,6 @@
 module;
 #include <limits>
+#include <algorithm>
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/Intrinsics.h>
 #include <llvm/IR/Module.h>
@@ -23,8 +24,10 @@ using Label = llvm::BasicBlock*;
 struct Layouts {
     const CheckedModule& program;
     std::vector<llvm::StructType*> objects;
+    bool workers{};
 
     Layouts(const CheckedModule& program, Builder& builder) : program(program) {
+        for (const auto& fn : program.functions) workers |= std::ranges::any_of(fn.syntax.expressions, [](const Expr& expr) { return std::holds_alternative<Blocking>(expr.node); });
         for (const auto& record : program.aggregates) objects.push_back(llvm::StructType::create(builder.getContext(), "lyra.type." + record.syntax.name.text));
         for (std::size_t id = 0; id < objects.size(); ++id) {
             std::vector<llvm::Type*> fields;
@@ -61,17 +64,41 @@ struct Emitter {
     Builder builder{module.getContext()};
     std::vector<Value> locals{};
     std::vector<std::pair<Label, Label>> loops{};
+    std::optional<ExprId> worker{};
 
     Label label(const char* name) { return llvm::BasicBlock::Create(module.getContext(), name, native); }
     bool live() const { return builder.GetInsertBlock() != nullptr; }
     Value unit() { return builder.getInt8(0); }
     void end() { builder.ClearInsertionPoint(); }
 
-    void run() {
+    Value cell(std::size_t slot) {
+        return fn.locals[slot].captured ? builder.CreateLoad(builder.getPtrTy(), locals[slot]) : locals[slot];
+    }
+
+    void initialize(std::size_t slot, Value value) {
+        if (fn.locals[slot].captured) {
+            auto address = asyncCell(builder, value->getType());
+            builder.CreateStore(value, address);
+            builder.CreateStore(address, locals[slot]);
+        } else builder.CreateStore(value, locals[slot]);
+    }
+
+    void run(std::optional<ExprId> workerId = {}) {
+        worker = workerId;
         builder.SetInsertPoint(label("entry"));
-        for (auto local : fn.locals) locals.push_back(builder.CreateAlloca(layouts.native(builder, local.type)));
-        for (auto& arg : native->args()) builder.CreateStore(&arg, locals[arg.getArgNo()]);
-        auto tail = emit(fn.syntax.body);
+        locals.resize(fn.locals.size());
+        for (std::size_t slot = 0; slot < fn.locals.size(); ++slot) {
+            const auto& local = fn.locals[slot];
+            if (local.worker == worker) locals[slot] = builder.CreateAlloca(local.captured ? builder.getPtrTy() : layouts.native(builder, local.type));
+        }
+        for (auto& arg : native->args()) {
+            if (worker) {
+                auto slot = fn.expressions[*worker].captures[arg.getArgNo()];
+                locals[slot] = builder.CreateAlloca(builder.getPtrTy());
+                builder.CreateStore(&arg, locals[slot]);
+            } else initialize(arg.getArgNo(), &arg);
+        }
+        auto tail = emit(worker ? std::get<Blocking>(fn.syntax.expressions[*worker].node).body : fn.syntax.body);
         if (live()) builder.CreateRet(tail);
     }
 
@@ -99,13 +126,26 @@ struct Emitter {
         return global;
     }
     Value emitNode(ExprId id, const Identifier&) {
-        return builder.CreateLoad(layouts.native(builder, rawType(id)), locals[fn.expressions[id].target]);
+        auto slot = fn.expressions[id].target;
+        auto* type = layouts.native(builder, rawType(id));
+        auto pointer = cell(slot);
+        return fn.locals[slot].captured ? sharedRead(builder, type, pointer) : builder.CreateLoad(type, pointer);
     }
 
     Value emitNode(ExprId id, const TaskOp& op) {
         auto task = emit(op.operand);
         if (!live()) return unit();
         return op.spawn ? asyncSpawn(builder, task) : asyncAwait(builder, layouts.native(builder, rawType(id)), task);
+    }
+
+    Value emitNode(ExprId id, const Blocking&) {
+        const auto& captures = fn.expressions[id].captures;
+        auto result = layouts.program.taskResults[rawType(id).id];
+        auto code = blockingCode(*native, layouts.native(builder, result), captures.size());
+        Emitter{fn, source, module, code.body, functions, layouts}.run(id);
+        std::vector<Value> cells;
+        for (auto slot : captures) cells.push_back(cell(slot));
+        return blockingTask(builder, code, cells);
     }
 
     Value emitNode(ExprId id, const EmptyOption&) { return makeSum(rawType(id), SumTag::None); }
@@ -116,7 +156,8 @@ struct Emitter {
         auto success = label("propagate.value"), failure = label("propagate.return");
         builder.CreateCondBr(builder.CreateExtractValue(value, 0), success, failure);
         builder.SetInsertPoint(failure);
-        builder.CreateRet(fn.result.kind == Type::Option ? makeSum(fn.result, SumTag::None) : makeSum(fn.result, SumTag::Err, builder.CreateExtractValue(value, payloadSlot(SumTag::Err))));
+        auto target = worker ? layouts.program.taskResults[rawType(*worker).id] : fn.result;
+        builder.CreateRet(target.kind == Type::Option ? makeSum(target, SumTag::None) : makeSum(target, SumTag::Err, builder.CreateExtractValue(value, payloadSlot(SumTag::Err))));
         builder.SetInsertPoint(success);
         return builder.CreateExtractValue(value, 1);
     }
@@ -137,7 +178,7 @@ struct Emitter {
             }
             builder.CreateCondBr(selected, armBody, next);
             builder.SetInsertPoint(armBody);
-            if (arm.pattern.binding) builder.CreateStore(payload, locals[fn.expressions[id].argumentSlots[index]]);
+            if (arm.pattern.binding) initialize(fn.expressions[id].argumentSlots[index], payload);
             auto value = emit(arm.value);
             if (live()) { values.emplace_back(value, builder.GetInsertBlock()); builder.CreateBr(done); }
             builder.SetInsertPoint(next);
@@ -154,7 +195,7 @@ struct Emitter {
 
     Value address(ExprId id) {
         const auto& node = fn.syntax.expressions[id].node;
-        if (std::holds_alternative<Identifier>(node)) return locals[fn.expressions[id].target];
+        if (std::holds_alternative<Identifier>(node)) return cell(fn.expressions[id].target);
         const auto& member = std::get<Member>(node);
         auto owner = fn.expressions[member.receiver].type;
         auto base = layouts.reference(owner) ? emit(member.receiver) : address(member.receiver);
@@ -169,12 +210,13 @@ struct Emitter {
         auto slot = static_cast<unsigned>(fn.expressions[id].target);
         if (!layouts.reference(owner)) return builder.CreateExtractValue(object, slot);
         auto field = builder.CreateStructGEP(layouts.objects[owner.id], object, slot);
-        return builder.CreateLoad(layouts.native(builder, rawType(id)), field);
+        auto* type = layouts.native(builder, rawType(id));
+        return layouts.workers ? sharedRead(builder, type, field) : builder.CreateLoad(type, field);
     }
 
     Value emitNode(ExprId id, const Binding& binding) {
         auto value = emit(binding.value);
-        if (live()) builder.CreateStore(value, locals[fn.expressions[id].target]);
+        if (live()) initialize(fn.expressions[id].target, value);
         return unit();
     }
 
@@ -280,14 +322,16 @@ struct Emitter {
             auto slot = address(binary.left);
             if (!live()) return unit();
             auto type = fn.expressions[binary.left].type;
-            auto left = op == Op::Set ? nullptr : builder.CreateLoad(layouts.native(builder, type), slot);
+            auto shared = layouts.workers && (!std::holds_alternative<Identifier>(fn.syntax.expressions[binary.left].node) || fn.locals[fn.expressions[binary.left].target].captured);
+            auto left = op == Op::Set ? nullptr : shared ? sharedRead(builder, layouts.native(builder, type), slot) : builder.CreateLoad(layouts.native(builder, type), slot);
             auto right = emit(binary.right);
             if (!live()) return unit();
             constexpr Op compound[] = {Op::Add, Op::Sub, Op::Mul, Op::Div, Op::Rem};
             if (op != Op::Set) {
                 right = type == Type::String ? concatenate(left, right) : arithmetic(compound[static_cast<int>(op) - 1], left, right, binary.site);
             }
-            builder.CreateStore(right, slot);
+            if (shared) sharedWrite(builder, right, slot);
+            else builder.CreateStore(right, slot);
             return unit();
         }
         auto left = emit(binary.left);
@@ -417,7 +461,8 @@ std::unique_ptr<llvm::Module> lower(const CheckedModule& program, const std::vec
     if (commandLine) builder.CreateCall(module->getOrInsertFunction("lyraIoSetArgs", builder.getVoidTy(), builder.getInt32Ty(), builder.getPtrTy()), {main->getArg(0), main->getArg(1)});
     auto entry = program.entry.value();
     auto result = builder.CreateCall(functions[entry]);
-    if (program.functions[entry].syntax.isAsync) builder.CreateRet(asyncEntry(builder, result));
+    const auto& root = program.functions[entry];
+    if (root.syntax.isAsync) builder.CreateRet(asyncEntry(builder, result, root.result.kind == Type::Result ? layouts.native(builder, root.result) : nullptr));
     else builder.CreateRet(builder.getInt32(0));
     std::string reason;
     llvm::raw_string_ostream log(reason);

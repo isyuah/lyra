@@ -3,8 +3,10 @@
 
 #include <fcntl.h>
 #include <new>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 #include <uv.h>
 
@@ -55,6 +57,7 @@ struct DisconnectWatch {
 namespace {
 
 thread_local LyraTask *currentTask;
+pthread_mutex_t sharedAccess = PTHREAD_MUTEX_INITIALIZER;
 
 void require(bool condition, const char *error) {
     if (!condition) {
@@ -273,6 +276,12 @@ LyraTask *lyraTaskCreate(LyraTaskStep step, void *frame) {
 LyraTask *lyraTaskBlocking(LyraBlockingBody body, void *environment) {
     auto *closure = ::new (lyraGcAlloc(sizeof(BlockingClosure))) BlockingClosure{body, environment, nullptr, false};
     return lyraTaskCreate(blockingStep, closure);
+}
+
+void lyraTaskSharedCopy(void *destination, const void *source, size_t bytes) {
+    pthread_mutex_lock(&sharedAccess);
+    memcpy(destination, source, bytes);
+    pthread_mutex_unlock(&sharedAccess);
 }
 
 int lyraTaskWatchDisconnect(int socketFd) {

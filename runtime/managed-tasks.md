@@ -25,13 +25,39 @@
 
 LLVM 后端给每个异步函数生成一个用于创建冷 Task 的普通函数，以及一个根据恢复点分派的 `step` 回调。局部变量、赋值目标、已求值的实参和跨基本块使用的临时值保存在堆帧上。等待就绪时直接读取结果，否则保存恢复点并返回调度循环；恢复后重新观察终态，不需要嵌套执行事件循环。一次完成值装入受管理的结果盒：重复 `await` 得到独立的 Struct 值或同一 Class 引用。
 
-`async fn main(): Unit` 由 `lyraTaskRunRoot` 建立串行域并启动。现有[源码用例](../tests/async_cli.py)在 Debug 和 `--release` 下验证冷实参求值、未启动 Task、丢弃句柄后的收尾、跨挂起 GC 与赋值顺序、重复读取结果及 5,000 层递归等待。[泛型 Task 用例](../tests/generics_tasks_cli.py)验证跨模块的 `Task<Task<T>>` 与类型诊断。`Result<Unit, E>` 入口、嵌套任务组失败时取消兄弟，以及完整异步异常链仍是后续验收项。
+`async fn main(): Unit` 和 `async fn main(): Result<Unit,String>` 都由 `lyraTaskRunRoot` 建立串行域并启动。首次 `await`/`spawn` 激活的冷任务登记到当前任务；已启动的目标不改归属。父任务在自己的子任务全部收尾后才进入终态。根入口返回 `Ok({})` 时退出码为 0，`Err(message)` 时先等子任务收尾，再向标准错误输出完整 UTF-8 消息（含内嵌 NUL）和换行，进程非零退出。业务 `Err` 是成功交付的值，不触发组取消。
+
+[源码用例](../tests/async_cli.py)在 Debug 和 `--release` 下验证冷实参求值、未启动 Task、丢弃句柄后的收尾、跨挂起 GC 与赋值顺序、重复读取结果、5,000 层递归等待及上述两种入口。[泛型 Task 用例](../tests/generics_tasks_cli.py)验证跨模块的 `Task<Task<T>>` 与类型诊断。
+
+### 在 Worker 执行同步代码
+
+`blocking { ... }` 创建冷 `Task<T>`，本身不阻塞，`await` 或 `spawn` 首次启动后将块提交给 libuv 阻塞池。闭包捕获绑定而非当前值：同一个外层 `var` 经同步函数返回、GC 和挂起仍可读写，循环中的新绑定则每轮独立。同步块有自己的返回目标，`return` 和 `?` 均只退出块；没有上下文可推断 `?` 的目标时可给绑定写 `Task<T?>` 或 `Task<Result<T,E>>` 注解。块内不可直接 `await`/`spawn`。对于跨 Worker 共享的捕获与对象字段，编译器对一次读或一次写同步复制；`number += 1` 的读、改、写仍不是一个原子操作。
+
+```text
+import std.sqlite.open
+async fn main(): Unit {
+    val answer = await blocking {
+        val db = open(":memory:")
+        val query = db.prepare("SELECT 42")
+        query.next()
+        val number = query.readInt(0).value
+        query.close()
+        db.close()
+        number
+    }
+    print(answer)
+}
+```
+
+源码验收还用同一域的写任务放行 FIFO 中阻塞的读任务。在 `UV_THREADPOOL_SIZE=1` 时也能推进；另从真实 SQLite 查询读取文本，确定性关闭后触发 GC，最后在原域读取结果。
 
 ### 原生阻塞工作
 
 `lyraTaskBlock(self, work, nativeData)` 将同步 C 回调交给 libuv 进程级有界线程池，当前任务挂起，同域仍能执行其他步骤。存有 GC 引用的工作载荷须用 `lyraGcAlloc` 分配；运行时在操作期间保活载荷并注册 Worker，允许原生封装分配对象、复制结果（如 [SQLite 文本](sqlite.md)）。普通 `malloc` 载荷内部仍不扫描。工作线程不调用 Task API；不要同时无同步地修改同一个 C/C++ 字段。被接纳的工作运行中收到取消时，仍等 C 返回才在所属域恢复清理；提交前已经取消则不发起工作。可以用 `UV_THREADPOOL_SIZE=1` 重跑测试，验证不需要额外 Worker 解围。
 
-**当前边界：**多个串行域由同一主线程驱动，原生测试可验证跨域等待与恢复归属。源码端显式 CPU 并行域、`blocking` 块、上下文/deadline 和取消清理还需各自的端到端验收。
+`lyraTaskWatchDisconnect(fd)` 从当前域内的任务注册连接断开通知，不读取或关闭调用者的 fd；Linux 后端使用自持的重复 fd。断连时在所属域请求取消当前任务及其激活的孩子；只有 C 工作已返回后才允许父任务执行取消清理。未捕获的原生任务失败取消仍在运行的兄弟，多个失败用 `lyraTaskFailureCount/At` 按登记顺序遍历。实际 socketpair 断开、取消安全与逆序发生的两个失败由[原生任务用例](../tests/runtime_tasks.cpp)验证。
+
+**当前边界：**多个串行域由同一主线程驱动，原生测试验证跨域等待与恢复归属。显式 CPU 并行域、上下文/deadline、用户代码中的异常抛出与异步原因链、词法 `defer` 清理仍需各自的端到端验收。
 
 ## 独立验证（Linux）
 

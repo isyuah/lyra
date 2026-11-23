@@ -15,9 +15,9 @@ struct Type {
     constexpr Type(Kind kind = Unit, std::size_t id = 0) : kind(kind), id(id) {}
     bool operator==(const Type&) const = default;
 };
-struct Local { Type type; bool writable; };
+struct Local { Type type; bool writable; std::optional<ExprId> worker{}; bool captured{}; };
 enum class Callee { Function, Constructor, Print, Collect, Sum };
-struct CheckedExpr { Type type; std::size_t target{}; std::vector<std::size_t> argumentSlots{}; Callee callee{}; std::optional<Type> liftedFrom{}; };
+struct CheckedExpr { Type type; std::size_t target{}; std::vector<std::size_t> argumentSlots{}; Callee callee{}; std::optional<Type> liftedFrom{}; std::vector<std::size_t> captures{}; };
 struct CheckedFunction {
     Function syntax;
     Type result;
