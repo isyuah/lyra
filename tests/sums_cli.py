@@ -184,6 +184,47 @@ fn main(): Unit {
 }
 ''', b"1\n2\n3\n4\n")
 
+    def test_enum_variants_with_named_and_positional_payloads(self):
+        self.native('''
+enum FetchResult { Pending, Ok(status: Int, body: String), Err(String) }
+fn status(value: Int): Int { print(value); value }
+fn body(value: String): String { print(value); value }
+fn display(result: FetchResult): String {
+    match result {
+        FetchResult.Pending => "pending",
+        Ok(body: text, status: 200) => text,
+        Ok(code, _) => { print(code); "not found" },
+        Err(message) => message,
+    }
+}
+fn main(): Unit {
+    print(display(FetchResult.Pending))
+    print(display(FetchResult.Ok(body: body("arrived"), status: status(200))))
+    print(display(FetchResult.Ok(404, "missing")))
+    print(display(FetchResult.Err("failed")))
+}
+''', b"pending\narrived\n200\narrived\n404\nnot found\nfailed\n")
+
+    def test_recursive_enum_payloads_survive_await_and_gc(self):
+        self.native('''
+class Label(val text: String)
+struct Entry(val label: Label?)
+enum Chain { End, Link(Entry, Chain) }
+fn chain(): Chain { Chain.Link(Entry(Label("rooted")), Chain.Link(Entry(null), Chain.End)) }
+fn exhaust(value: Chain): Int {
+    match value { End => 0, Link(_, End) => 1, Link(_, Link(_, _)) => 2 }
+}
+async fn main(): Unit {
+    val value = chain()
+    await blocking { gcCollect() }
+    print(exhaust(value))
+    print(match value {
+        Link(Entry(label: Some(label)), Link(Entry(label: None), End)) => label.text,
+        _ => "lost",
+    })
+}
+''', b"2\nrooted\n")
+
     def test_static_rejections(self):
         for body, code, fragment in (
             ("fn f(v: Option<Int?>): Int { match v { None => 0, Some(Some(x)) => x } }", "LYT0012", "Some(None)"),
@@ -202,6 +243,14 @@ fn main(): Unit {
             ("struct Flags(val first: Bool, val second: Bool)\nfn f(v: Flags): Int { match v { Flags(first: name, second: name) => 1 } }", "LYN0002", "name"),
             ("struct Flags(val first: Bool)\nfn f(v: Flags): Int { match v { Flags(first: true, first: false) => 1 } }", "LYN0002", "first"),
             ("class Object(val id: Int)\nfn f(v: Object): Int { match v { Object(id: number) => number } }", "LYT0011", "struct"),
+            ("enum Decision { Left, Right(Bool) }\nfn f(v: Decision): Int { match v { Left => 0, Right(true) => 1 } }", "LYT0012", "Right(false)"),
+            ("enum Decision { Left, Right(Bool) }\nfn f(v: Decision): Int { match v { Right => 1, _ => 0 } }", "LYT0011", "Right"),
+            ("enum Decision { Left }\nfn f(): Decision { Decision.Lost }", "LYN0001", "Lost"),
+            ("enum Decision { Right(Bool) }\nfn f(): Decision { Decision.Right }", "LYT0002", "Right"),
+            ("enum Decision { Left, Left }", "LYN0002", "Left"),
+            ("enum Decision { Right(value: Bool, value: Int) }", "LYN0002", "value"),
+            ("enum Decision { Left }\nenum Other { Left }\nfn f(v: Decision): Int { match v { Other.Left => 1, _ => 0 } }", "LYT0011", "Decision"),
+            ("enum Decision { Left }\nfn f(v: Decision): Bool { v == v }", "LYT0006", "Eq"),
         ):
             with self.subTest(body=body):
                 self.rejects(body + "\nfn main(): Unit {}", code, fragment)

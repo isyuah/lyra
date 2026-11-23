@@ -92,6 +92,30 @@ implicit (user: User): Response { Response.json(user) }
 
 后缀 `?` 同时支持 `Result` 和 `Option`；由静态类型决定是传播 `Err`，还是从返回兼容 Optional 的函数提前返回 `None`，两者不隐式互转。嵌套类型可用 `Option<Option<T>>` 明确表达。
 
+## 封闭枚举与匹配
+
+```text
+enum FetchResult { Pending, Ok(status: Int, body: String), Err(String) }
+
+fn display(value: FetchResult): String {
+    match value {
+        Pending => "加载中",
+        Ok(200, body) => body,
+        Ok(_, _) => "请求失败",
+        Err(message) => message,
+    }
+}
+
+val pending = FetchResult.Pending
+val loaded = FetchResult.Ok(body: "内容", status: 200)
+```
+
+- `enum` 至少有一个分支。同一枚举内分支名唯一；每个分支可以不带载荷、带位置载荷或给载荷槽位命名。构造用 `类型名.分支名`；无载荷分支可省括号。命名实参仍按源码从左到右求值，再放入目标槽位。
+- 模式按待匹配表达式的类型解析分支，因此自定义的 `Ok` / `Err` 不会被当作 `Result`。也可显式写 `FetchResult.Pending` 或用导入的类型别名限定。匹配时可按位置或按名解构载荷；写 `_` 忽略某个槽位。裸名称与当前枚举的分支同名时先解释为分支；要绑定整个值可换个名称或用反引号。
+- `match` 从上到下检查分支；守卫只在结构和字面量已经匹配后执行，带守卫的分支不计入穷尽性检查。穷尽检查会继续检查内部的封闭类型，例如 `Right(true)` 不覆盖同一分支的 `Right(false)`。
+- 枚举是值，复制枚举不深拷贝其载荷里引用的对象；分支载荷不能原地改写。递归枚举可直接带本类型作载荷；当前后端把有载荷的分支存入 GC 可扫描的对象，不由此给枚举增加对象身份语义。首版不为枚举默认提供 `==`，也不暴露枚举的 C ABI 布局。
+- `pub enum` 可跨模块导入，分支随类型可见，不能作为独立声明导入。枚举的定义模块可像 Struct/Class 的定义模块一样，为枚举声明直接 `implicit` 转换。
+
 ## 算术与库表达
 
 - 提供 `Int8/16/32/64`、`UInt8/16/32/64`；`Int`、`UInt` 分别是 64 位别名。普通整数运算在 Debug 和 Release 下均检查溢出；除零也报错，不静默回绕。无符号值不可取负。字面量默认 `Int`，有明确数值目标时直接按目标类型解释；超出目标整数范围在编译时报错。

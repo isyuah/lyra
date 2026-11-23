@@ -77,6 +77,26 @@ class Modules(unittest.TestCase):
         self.assertEqual(error['code'], 'LYN0003')
         self.assertIn('secret', error['message'])
 
+    def test_enum_variants_and_implicit_conversion_across_modules(self):
+        (self.lib / 'src/net/status.ly').write_text('''
+enum Internal { Wait }
+pub enum Status { Wait, Ready(Int) }
+pub implicit (value: Status): Int { match value { Wait => 0, Ready(port) => port } }
+''')
+        self.source.write_text('''
+import cfg.net.Status as Endpoint
+fn identity<T>(value: T): T { value }
+fn show(value: Int): Unit { print(value) }
+fn main(): Unit {
+    show(identity(Endpoint.Ready(42)))
+    print(match identity(Endpoint.Wait) { Endpoint.Wait => 1, Ready(_) => 0 })
+}
+''')
+        self.assertEqual(self.command('run', self.app, '--release').stdout, '42\n1\n')
+        self.source.write_text('import cfg.net.Internal\nfn main(): Unit {}')
+        error, = json.loads(self.command('check', self.app, '--diagnostics=json', ok=False).stderr)
+        self.assertEqual(error['code'], 'LYN0003')
+
 
 if __name__ == '__main__':
     unittest.main()

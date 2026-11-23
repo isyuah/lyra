@@ -29,6 +29,7 @@ using Label = llvm::BasicBlock*;
 struct Layouts {
     const CheckedModule& program;
     std::vector<llvm::StructType*> objects;
+    std::vector<std::vector<llvm::StructType*>> payloads;
     bool workers{};
 
     Layouts(const CheckedModule& program, Builder& builder) : program(program) {
@@ -39,6 +40,14 @@ struct Layouts {
             for (Type field : program.aggregates[id].fields) fields.push_back(native(builder, field));
             if (fields.empty() && program.aggregates[id].syntax.reference) fields.push_back(builder.getInt8Ty());
             objects[id]->setBody(fields);
+        }
+        for (const auto& item : program.enums) {
+            auto& cases = payloads.emplace_back();
+            for (const auto& payload : item.payloads) {
+                std::vector<llvm::Type*> fields;
+                for (auto field : payload) fields.push_back(native(builder, field));
+                cases.push_back(llvm::StructType::get(builder.getContext(), fields));
+            }
         }
     }
 
@@ -53,6 +62,7 @@ struct Layouts {
         case Type::String: case Type::Task: case Type::CPtr: case Type::List: case Type::Exception: case Type::Closure: return builder.getPtrTy();
         case Type::Variable: llvm_unreachable("abstract type reached LLVM lowering");
         case Type::Record: return reference(type) ? static_cast<llvm::Type*>(builder.getPtrTy()) : objects[type.id];
+        case Type::Enum: return llvm::StructType::get(builder.getContext(), {builder.getInt32Ty(), builder.getPtrTy()});
         case Type::Option: return llvm::StructType::get(builder.getContext(), {builder.getInt1Ty(), native(builder, program.sumTypes[type.id].success)});
         case Type::Result: return llvm::StructType::get(builder.getContext(), {builder.getInt1Ty(), native(builder, program.sumTypes[type.id].success), native(builder, program.sumTypes[type.id].failure)});
         }
@@ -211,6 +221,18 @@ struct Emitter {
         Value value = llvm::Constant::getNullValue(layouts.native(builder, type));
         value = builder.CreateInsertValue(value, builder.getInt1(successTag(tag)), 0);
         return payload ? builder.CreateInsertValue(value, payload, payloadSlot(tag)) : value;
+    }
+
+    Value makeVariant(ExprId id, llvm::ArrayRef<Value> values = {}) {
+        auto type = rawType(id);
+        auto index = fn.expressions[id].target;
+        auto tag = builder.getInt32(static_cast<unsigned>(index));
+        Value result = builder.CreateInsertValue(llvm::Constant::getNullValue(layouts.native(builder, type)), tag, 0);
+        if (values.empty()) return result;
+        auto storage = layouts.payloads[type.id][index];
+        auto payload = asyncCell(builder, storage);
+        for (unsigned slot = 0; slot < values.size(); ++slot) builder.CreateStore(values[slot], builder.CreateStructGEP(storage, payload, slot));
+        return builder.CreateInsertValue(result, payload, 1);
     }
 
     Value castNumber(Value value, Type from, Type to) {
@@ -394,6 +416,16 @@ struct Emitter {
                 auto success = builder.CreateExtractValue(subject, 0);
                 matchTest(successTag(*tag) ? success : builder.CreateNot(success), miss);
                 if (*tag != SumTag::None) emitPattern(pattern.parts.front(), builder.CreateExtractValue(subject, payloadSlot(*tag)), miss, bindings);
+            } else if (auto* variant = std::get_if<VariantTag>(constructor)) {
+                matchTest(builder.CreateICmpEQ(builder.CreateExtractValue(subject, 0), builder.getInt32(variant->index)), miss);
+                auto payload = builder.CreateExtractValue(subject, 1);
+                auto storage = layouts.payloads[variant->owner][variant->index];
+                for (unsigned slot = 0; slot < pattern.parts.size(); ++slot) {
+                    const auto& part = pattern.parts[slot];
+                    if (std::holds_alternative<std::monostate>(part.node)) continue;
+                    auto value = builder.CreateLoad(storage->getElementType(slot), builder.CreateStructGEP(storage, payload, slot));
+                    emitPattern(part, value, miss, bindings);
+                }
             } else if (auto* flag = std::get_if<bool>(constructor)) matchTest(*flag ? subject : builder.CreateNot(subject), miss);
             else for (unsigned slot = 0; slot < pattern.parts.size(); ++slot) {
                 const auto& part = pattern.parts[slot];
@@ -461,6 +493,7 @@ struct Emitter {
     }
 
     Value emitNode(ExprId id, const Member& member) {
+        if (fn.expressions[id].callee == Callee::Variant) return makeVariant(id);
         auto object = emit(member.receiver);
         if (!live()) return unit();
         auto owner = fn.expressions[member.receiver].type;
@@ -519,9 +552,9 @@ struct Emitter {
             if (shape.result == Type::Never) { builder.CreateUnreachable(); end(); }
             return value;
         }
-        auto skip = static_cast<std::size_t>(call.receiver.has_value());
+        auto skip = static_cast<std::size_t>(call.receiver && info.callee != Callee::Variant);
         Value receiver = nullptr;
-        if (call.receiver) {
+        if (skip) {
             receiver = emit(*call.receiver);
             if (!live()) return unit();
         }
@@ -551,6 +584,7 @@ struct Emitter {
                 return unit();
             case Callee::ListAdd: lists.add(args[0], args[1]); return unit();
             case Callee::Sum: return makeSum(rawType(id), static_cast<SumTag>(info.target), args[0]);
+            case Callee::Variant: return makeVariant(id, args);
             case Callee::ToReal: return castNumber(receiver, fn.expressions[*call.receiver].type, rawType(id));
             case Callee::ToIntegerChecked: return checkedInteger(receiver, fn.expressions[*call.receiver].type, rawType(id));
             case Callee::Print: {

@@ -20,9 +20,14 @@ void registerConversion(std::vector<DirectConversion>& table, const CheckedModul
     const auto& fn = module.functions[index];
     const auto& site = sources[fn.syntax.file];
     auto source = fn.locals.front().type, target = fn.result;
-    auto owner = [&](Type type) { return type.kind == Type::Record && sources[module.aggregates[type.id].syntax.file].moduleId == site.moduleId; };
+    auto owner = [&](Type type) {
+        if (type.kind == Type::Record) return sources[module.aggregates[type.id].syntax.file].moduleId == site.moduleId;
+        if (type.kind == Type::Enum) return sources[module.enums[type.id].syntax.file].moduleId == site.moduleId;
+        return false;
+    };
     auto publicType = [&](auto&& self, Type type) -> bool {
         if (type.kind == Type::Record) return module.aggregates[type.id].syntax.isPublic;
+        if (type.kind == Type::Enum) return module.enums[type.id].syntax.isPublic;
         if (type.kind == Type::List) return self(self, module.listElements[type.id]);
         if (type.kind == Type::Task) return self(self, module.taskResults[type.id]);
         if (type.kind == Type::Option || type.kind == Type::Result) {

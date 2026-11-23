@@ -21,6 +21,12 @@ std::vector<Constructor> constructors(const CheckedModule& module, Type type) {
         case Type::Bool: return {{true, {}}, {false, {}}};
         case Type::Option: return {{SumTag::None, {}}, {SumTag::Some, {&module.sumTypes[type.id].success, 1}}};
         case Type::Result: return {{SumTag::Ok, {&module.sumTypes[type.id].success, 1}}, {SumTag::Err, {&module.sumTypes[type.id].failure, 1}}};
+        case Type::Enum: {
+            std::vector<Constructor> result;
+            const auto& payloads = module.enums[type.id].payloads;
+            for (unsigned index = 0; index < payloads.size(); ++index) result.push_back({VariantTag{type.id, index}, payloads[index]});
+            return result;
+        }
         case Type::Record:
             if (!module.aggregates[type.id].syntax.reference) return {{PatternProduct{}, module.aggregates[type.id].fields}};
             break;
@@ -39,6 +45,16 @@ std::string display(const CheckedModule& module, Type type, const Constructor& c
         return fields.empty() ? name : name + "(" + fields.front() + ")";
     }
     if (const auto* flag = std::get_if<bool>(&constructor.key)) return *flag ? "true" : "false";
+    if (const auto* variant = std::get_if<VariantTag>(&constructor.key)) {
+        auto text = module.enums[type.id].syntax.cases[variant->index].name.text;
+        if (fields.empty()) return text;
+        text += '(';
+        for (std::size_t slot = 0; slot < fields.size(); ++slot) {
+            if (slot) text += ", ";
+            text += fields[slot];
+        }
+        return text + ')';
+    }
     const auto& record = module.aggregates[type.id].syntax;
     const auto separator = record.name.text.rfind("::");
     std::string text = record.name.text.substr(separator == std::string::npos ? 0 : separator + 2) + "(";

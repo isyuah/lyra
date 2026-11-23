@@ -11,17 +11,18 @@ export import lyra.syntax;
 
 export namespace lyra {
 struct Type {
-    enum Kind { Unit, Int, UInt, Real, Bool, String, Never, Record, Variable, Task, CPtr, Option, Result, List, Exception, Closure };
+    enum Kind { Unit, Int, UInt, Real, Bool, String, Never, Record, Enum, Variable, Task, CPtr, Option, Result, List, Exception, Closure };
     Kind kind;
     std::size_t id{};
     constexpr Type(Kind kind = Unit, std::size_t id = 0) : kind(kind), id(id) {}
     bool operator==(const Type&) const = default;
 };
 struct Local { Type type; bool writable; std::optional<ExprId> worker{}; bool captured{}; };
-enum class Callee { Function, Constructor, Print, Collect, Sum, ListAdd, TaskCancel, Exception, Indirect, ToReal, ToIntegerChecked };
+enum class Callee { Function, Constructor, Variant, Print, Collect, Sum, ListAdd, TaskCancel, Exception, Indirect, ToReal, ToIntegerChecked };
 struct PatternSlot { std::size_t local; };
 struct PatternProduct { bool operator==(const PatternProduct&) const = default; };
-using PatternConstructor = std::variant<SumTag, bool, PatternProduct>;
+struct VariantTag { std::size_t owner; unsigned index; bool operator==(const VariantTag&) const = default; };
+using PatternConstructor = std::variant<SumTag, bool, PatternProduct, VariantTag>;
 struct CheckedPattern {
     std::variant<std::monostate, PatternSlot, PatternConstructor, std::uint64_t, StringLiteral> node{};
     std::vector<CheckedPattern> parts{};
@@ -37,8 +38,9 @@ struct CheckedFunction {
     std::vector<std::optional<ExprId>> cleanupOwners{};
 };
 struct CheckedAggregate { Aggregate syntax; std::vector<Type> fields; };
+struct CheckedEnum { Enumeration syntax; std::vector<std::vector<Type>> payloads; };
 struct SumTypes { Type success, failure; bool operator==(const SumTypes&) const = default; };
 struct FunctionShape { std::vector<Type> parameters; Type result; bool operator==(const FunctionShape&) const = default; };
-struct CheckedModule { std::deque<CheckedFunction> functions; std::optional<std::size_t> entry; std::vector<CheckedAggregate> aggregates; std::vector<std::string> variableNames; std::vector<Type> taskResults; std::vector<SumTypes> sumTypes; std::vector<Type> listElements; std::deque<FunctionShape> signatures{}; };
+struct CheckedModule { std::deque<CheckedFunction> functions; std::optional<std::size_t> entry; std::vector<CheckedAggregate> aggregates; std::vector<std::string> variableNames; std::vector<Type> taskResults; std::vector<SumTypes> sumTypes; std::vector<Type> listElements; std::deque<FunctionShape> signatures{}; std::vector<CheckedEnum> enums{}; };
 CheckedModule check(Module module, const std::vector<Source>& sources, bool requireEntry = true);
 }

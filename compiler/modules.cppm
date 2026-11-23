@@ -78,6 +78,7 @@ struct Linker {
     void rewrite(Module& syntax) {
         for (auto& trait : syntax.traits) declare(trait.file, trait.name, trait.isPublic, false);
         for (auto& record : syntax.aggregates) declare(record.file, record.name, record.isPublic, false);
+        for (auto& item : syntax.enums) declare(item.file, item.name, item.isPublic, false);
         for (auto& fn : syntax.functions) if (!fn.owner) declare(fn.file, fn.name, fn.isPublic, true);
         std::map<std::size_t, std::map<std::string, const Import*>> generatedImports;
         for (const auto& use : syntax.imports) {
@@ -113,6 +114,7 @@ struct Linker {
             });
         };
         for (auto& record : syntax.aggregates) for (auto& field : record.fields) renameTypeIn(record.file, field.type);
+        for (auto& item : syntax.enums) for (auto& entry : item.cases) for (auto& field : entry.fields) renameTypeIn(item.file, field.type);
         for (auto& trait : syntax.traits) for (auto& method : trait.methods) {
             renameTypeIn(trait.file, method.result);
             for (auto& parameter : method.parameters) renameTypeIn(trait.file, parameter.type);
@@ -137,7 +139,10 @@ struct Linker {
                 else if (name.text == "main") name.linked = sources[fn.file].moduleId + "::main";
             };
             auto renamePattern = [&](auto&& self, Pattern& pattern) -> void {
-                if (auto* record = std::get_if<RecordPattern>(&pattern.node)) reference(record->type);
+                if (auto* name = std::get_if<PatternName>(&pattern.node)) {
+                    if (name->owner) reference(*name->owner);
+                    else if (name->labels) reference(name->name);
+                }
                 for (auto& part : pattern.parts) self(self, part);
             };
             for (auto& expr : fn.expressions) {

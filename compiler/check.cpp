@@ -27,6 +27,8 @@ namespace {
 
 using Names = std::unordered_map<std::string, std::size_t>;
 
+const std::string& linkedName(const Identifier& name) { return name.linked.empty() ? name.text : name.linked; }
+
 std::string typeName(const CheckedModule& module, Type type, bool canonical = false) {
     auto name = [&](Type nested) { return typeName(module, nested, canonical); };
     switch (type.kind) {
@@ -38,6 +40,11 @@ std::string typeName(const CheckedModule& module, Type type, bool canonical = fa
         case Type::Exception: return "Exception";
         case Type::CPtr: return "CPtr";
         case Type::Record: return module.aggregates[type.id].syntax.name.text;
+        case Type::Enum: {
+            const auto& full = module.enums[type.id].syntax.name.text;
+            auto separator = full.rfind("::");
+            return canonical || separator == full.npos ? full : full.substr(separator + 2);
+        }
         case Type::Variable: return module.variableNames[type.id];
         case Type::Task: return "Task<" + name(module.taskResults[type.id]) + ">";
         case Type::List: return "List<" + name(module.listElements[type.id]) + ">";
@@ -82,6 +89,8 @@ struct Symbols {
     std::map<GenericInstanceKey, std::size_t> specializations;
     std::vector<DirectConversion> conversions{};
     StructuralContracts contracts{};
+    Names enums{};
+    std::vector<Names> variants{};
 
     void requireBounds(const Function& target, std::span<const Type> types, const Source& use, Span site) const {
         contracts.require(target, types, use, site, [&](Type receiver, const std::string& name) -> std::optional<RequiredMethod> {
@@ -150,6 +159,7 @@ struct Symbols {
             if (auto type = numberType(form.name)) return type;
             for (Type type : {Type::Bool, Type::String, Type::Unit, Type::CPtr, Type::Exception}) if (form.name == typeName(module, type)) return type;
             if (auto found = records.find(form.name); found != records.end()) return Type{Type::Record, found->second};
+            if (auto found = enums.find(form.name); found != enums.end()) return Type{Type::Enum, found->second};
         } else {
             std::vector<Type> arguments;
             for (const auto& part : form.arguments) {
@@ -395,43 +405,87 @@ struct Checker {
         return call && !call->receiver && call->name.text == "Some" && call->arguments.size() == 1 && untypedOption(call->arguments.front().value);
     }
 
-    CheckedPattern checkPattern(const Pattern& pattern, Type subject) {
-        const auto& node = pattern.node;
-        if (auto* binding = std::get_if<Identifier>(&node)) {
-            auto slot = fn.locals.size();
-            declare(*binding, slot);
-            fn.locals.push_back({subject, false, currentWorker()});
-            return {PatternSlot{slot}};
+    CheckedPattern sumPattern(const Pattern& pattern, Type subject, SumTag tag) {
+        if (subject.kind != (optionTag(tag) ? Type::Option : Type::Result))
+            throw at(source, pattern.span, "LYT0011", std::string(tagName(tag)) + " 不能匹配 " + typeName(module, subject));
+        if (tag == SumTag::None) return {PatternConstructor(tag)};
+        const auto& fields = module.sumTypes[subject.id];
+        auto payload = successTag(tag) ? fields.success : fields.failure;
+        return {PatternConstructor(tag), {checkPattern(pattern.parts.front(), payload)}};
+    }
+
+    CheckedPattern variantPattern(const Pattern& pattern, Type subject, const PatternName& name, std::size_t index) {
+        const auto& item = module.enums[subject.id];
+        const auto& entry = item.syntax.cases[index];
+        const auto& fields = item.payloads[index];
+        if (pattern.parts.size() != fields.size()) throw at(source, pattern.span, "LYT0011", name.name.text + " 模式需要 " + std::to_string(fields.size()) + " 个载荷模式");
+        CheckedPattern result{PatternConstructor(VariantTag{subject.id, static_cast<unsigned>(index)}), std::vector<CheckedPattern>(fields.size())};
+        if (!name.labels) return result;
+        std::vector<ParameterShape> parameters;
+        for (const auto& field : entry.fields) parameters.push_back({field.name ? std::string_view(field.name->text) : std::string_view{}, false, false});
+        std::vector<ArgumentShape> shapes;
+        for (std::size_t part = 0; part < pattern.parts.size(); ++part) {
+            const auto& label = (*name.labels)[part];
+            shapes.push_back({label ? std::optional<std::string_view>(label->text) : std::nullopt, false, label ? label->span : pattern.parts[part].span});
         }
-        if (auto* tag = std::get_if<SumTag>(&node)) {
-            if (subject.kind != (optionTag(*tag) ? Type::Option : Type::Result))
-                throw at(source, pattern.span, "LYT0011", std::string(tagName(*tag)) + " 不能匹配 " + typeName(module, subject));
-            if (*tag == SumTag::None) return {PatternConstructor(*tag)};
-            const auto& fields = module.sumTypes[subject.id];
-            auto payload = successTag(*tag) ? fields.success : fields.failure;
-            return {PatternConstructor(*tag), {checkPattern(pattern.parts.front(), payload)}};
+        auto plan = bindArguments(parameters, shapes, source, name.name.span, name.name.text);
+        for (std::size_t part = 0; part < pattern.parts.size(); ++part) {
+            auto slot = plan.explicitSlots[part].index;
+            result.parts[slot] = checkPattern(pattern.parts[part], fields[slot]);
         }
-        if (const auto* record = std::get_if<RecordPattern>(&node)) {
-            const auto& name = record->type;
-            const auto& key = name.linked.empty() ? name.text : name.linked;
-            auto found = symbols.records.find(key);
+        return result;
+    }
+
+    CheckedPattern namedPattern(const Pattern& pattern, Type subject, const PatternName& named) {
+        const auto& name = named.name;
+        if (named.owner) {
+            auto owner = symbols.enums.find(linkedName(*named.owner));
+            if (owner == symbols.enums.end()) throw at(source, named.owner->span, "LYT0011", "分支模式需要可见的 enum：" + named.owner->text);
+            if (subject != Type{Type::Enum, owner->second}) throw at(source, named.owner->span, "LYT0011", named.owner->text + " 不能匹配 " + typeName(module, subject));
+            return variantPattern(pattern, subject, named, variantIndex(subject, name));
+        }
+        if (!named.escaped || named.labels) {
+            if (subject.kind == Type::Enum) {
+                const auto& variants = symbols.variants[subject.id];
+                if (auto found = variants.find(name.text); found != variants.end()) return variantPattern(pattern, subject, named, found->second);
+            }
+            if (!named.escaped) if (auto tag = sumTag(name.text)) {
+                auto count = *tag == SumTag::None ? 0u : 1u;
+                if (pattern.parts.size() != count || (*tag == SumTag::None && named.labels) || (count && named.labels && named.labels->front()))
+                    throw at(source, pattern.span, "LYT0011", name.text + (count ? " 模式需要一个位置载荷" : " 模式不接收载荷"));
+                return sumPattern(pattern, subject, *tag);
+            }
+        }
+        if (named.labels) {
+            auto found = symbols.records.find(linkedName(name));
             if (found == symbols.records.end() || module.aggregates[found->second].syntax.reference)
-                throw at(source, name.span, "LYT0011", "解构模式需要可见的 struct：" + name.text);
+                throw at(source, name.span, "LYT0011", "此模式需要可见的 struct 或匹配类型的枚举分支：" + name.text);
             if (subject != Type{Type::Record, found->second})
                 throw at(source, name.span, "LYT0011", name.text + " 不能匹配 " + typeName(module, subject));
             const auto& owner = module.aggregates[subject.id];
             CheckedPattern result{PatternConstructor(PatternProduct{}), std::vector<CheckedPattern>(owner.fields.size())};
             std::vector<bool> used(owner.fields.size());
-            for (std::size_t index = 0; index < record->fields.size(); ++index) {
-                const auto& field = record->fields[index];
-                auto slot = memberIndex(subject, field, symbols.fields);
-                if (used[slot]) throw at(source, field.span, "LYN0002", "解构模式重复指定字段：" + field.text);
+            for (std::size_t index = 0; index < named.labels->size(); ++index) {
+                const auto& field = (*named.labels)[index];
+                if (!field) throw at(source, pattern.parts[index].span, "LYT0011", "struct 解构需要字段名");
+                auto slot = memberIndex(subject, *field, symbols.fields);
+                if (used[slot]) throw at(source, field->span, "LYN0002", "解构模式重复指定字段：" + field->text);
                 used[slot] = true;
-                visible(owner.syntax.file, owner.syntax.fields[slot].isPublic, field);
+                visible(owner.syntax.file, owner.syntax.fields[slot].isPublic, *field);
                 result.parts[slot] = checkPattern(pattern.parts[index], owner.fields[slot]);
             }
             return result;
         }
+        auto slot = fn.locals.size();
+        declare(name, slot);
+        fn.locals.push_back({subject, false, currentWorker()});
+        return {PatternSlot{slot}};
+    }
+
+    CheckedPattern checkPattern(const Pattern& pattern, Type subject) {
+        const auto& node = pattern.node;
+        if (auto* named = std::get_if<PatternName>(&node)) return namedPattern(pattern, subject, *named);
+        if (auto* tag = std::get_if<SumTag>(&node)) return sumPattern(pattern, subject, *tag);
         if (std::holds_alternative<std::monostate>(node)) return {};
         if (auto* literal = std::get_if<IntegerLiteral>(&node)) {
             if (!integerType(subject)) throw at(source, pattern.span, "LYT0011", "整数字面量不能匹配 " + typeName(module, subject));
@@ -679,7 +733,27 @@ struct Checker {
         if (!isPublic && symbols.sources[declaringFile].moduleId != source.moduleId) throw at(source, name.span, "LYN0003", "此成员是模块私有的：" + name.text);
     }
 
+    std::optional<Type> enumNamespace(ExprId receiver) {
+        auto* name = std::get_if<Identifier>(&fn.syntax.expressions[receiver].node);
+        if (name) if (auto item = symbols.enums.find(linkedName(*name)); item != symbols.enums.end() && !localSlot(*name)) return Type{Type::Enum, item->second};
+        return std::nullopt;
+    }
+
+    std::size_t variantIndex(Type owner, const Identifier& name) const {
+        const auto& variants = symbols.variants[owner.id];
+        if (auto found = variants.find(name.text); found != variants.end()) return found->second;
+        throw at(source, name.span, "LYN0001", typeName(module, owner) + " 没有分支：" + name.text);
+    }
+
     Type infer(ExprId id, const Member& member, auto, bool) {
+        if (auto item = enumNamespace(member.receiver)) {
+            auto index = variantIndex(*item, member.name);
+            if (!module.enums[item->id].payloads[index].empty()) throw at(source, member.name.span, "LYT0002", "带载荷的分支需要传入实参：" + member.name.text);
+            auto& info = fn.expressions[id];
+            info.callee = Callee::Variant;
+            info.target = index;
+            return *item;
+        }
         auto owner = visit(member.receiver);
         if (owner == Type::Never) return owner;
         if (owner.kind == Type::List && member.name.text == "size") return Type::Int;
@@ -771,6 +845,18 @@ struct Checker {
         if (!call.receiver) if (auto local = localSlot(call.name)) { info.target = *local; return invoke(fn.locals[*local].type); }
         std::size_t declaration;
         if (call.receiver) {
+            if (auto item = enumNamespace(*call.receiver)) {
+                noTypeArgs();
+                auto index = variantIndex(*item, call.name);
+                const auto& decl = module.enums[item->id];
+                info.callee = Callee::Variant;
+                info.target = index;
+                bool exits = arguments(id, call, decl.payloads[index].size(), [&](auto slot) -> std::string_view {
+                    const auto& label = decl.syntax.cases[index].fields[slot].name;
+                    return label ? std::string_view(label->text) : std::string_view{};
+                }, [&](auto slot) { return decl.payloads[index][slot]; });
+                return exits ? Type{Type::Never} : *item;
+            }
             auto owner = visit(*call.receiver);
             if (owner == Type::Never) return owner;
             if (numericType(owner) && call.name.text.starts_with("to")) {
@@ -977,7 +1063,7 @@ struct Checker {
             return binary.op <= Op::Ge ? Type{Type::Bool} : *common;
         }
         right = fit(binary.right, right, left);
-        if (equality && (left.kind == Type::Option || left.kind == Type::Result || left.kind == Type::Closure || left.kind == Type::Variable || (left.kind == Type::Record && !module.aggregates[left.id].syntax.reference))) throw at(source, binary.site, "LYT0006", typeName(module, left) + " 未提供 Eq，不能用 == 或 != 比较");
+        if (equality && (left.kind == Type::Option || left.kind == Type::Result || left.kind == Type::Enum || left.kind == Type::Closure || left.kind == Type::Variable || (left.kind == Type::Record && !module.aggregates[left.id].syntax.reference))) throw at(source, binary.site, "LYT0006", typeName(module, left) + " 未提供 Eq，不能用 == 或 != 比较");
         if (binary.op == Op::Add && left == Type::String) return Type::String;
         if (!equality) throw mismatch(module, source, binary.site, Type::Int, left);
         return Type::Bool;
@@ -1099,22 +1185,30 @@ CheckedModule check(Module module, const std::vector<Source>& sources, bool requ
     }
     CheckedModule checked{};
     Symbols symbols{checked, sources, {}, {}, {}, {}, {}, {}};
-    for (auto& decl : module.aggregates) {
-        auto id = checked.aggregates.size();
+    auto reserveType = [&](const auto& decl, Names& names, std::size_t index) {
         const auto& declaration = decl.name.text;
         auto separator = declaration.rfind("::");
         auto name = std::string_view(declaration).substr(separator == declaration.npos ? 0 : separator + 2);
         if (numberType(name)) throw at(sources[decl.file], decl.name.span, "LYN0002", "类型名与内置类型冲突：" + std::string(name));
         for (Type builtin : {Type::Bool, Type::String, Type::Unit, Type::Never, Type::CPtr, Type::Exception}) {
-            if (decl.name.text == typeName(checked, builtin)) throw at(sources[decl.file], decl.name.span, "LYN0002", "类型名与内置类型冲突：" + decl.name.text);
+            if (name == typeName(checked, builtin)) throw at(sources[decl.file], decl.name.span, "LYN0002", "类型名与内置类型冲突：" + std::string(name));
         }
-        if (decl.name.text == "print" || decl.name.text == "gcCollect" || !symbols.records.emplace(decl.name.text, id).second) throw at(sources[decl.file], decl.name.span, "LYN0002", "类型名称已声明：" + decl.name.text);
+        if (decl.name.text == "print" || decl.name.text == "gcCollect" || !names.emplace(declaration, index).second) throw at(sources[decl.file], decl.name.span, "LYN0002", "类型名称已声明：" + decl.name.text);
+    };
+    for (auto& decl : module.aggregates) {
+        reserveType(decl, symbols.records, checked.aggregates.size());
         checked.aggregates.push_back({std::move(decl), {}});
     }
+    for (auto& decl : module.enums) {
+        if (symbols.records.contains(decl.name.text)) throw at(sources[decl.file], decl.name.span, "LYN0002", "类型名称已声明：" + decl.name.text);
+        reserveType(decl, symbols.enums, checked.enums.size());
+        checked.enums.push_back({std::move(decl), {}});
+    }
     symbols.fields.resize(checked.aggregates.size());
+    symbols.variants.resize(checked.enums.size());
     for (const auto& trait : module.traits) {
         const auto& source = sources[trait.file];
-        if (symbols.records.contains(trait.name.text)) throw at(source, trait.name.span, "LYN0002", "类型名称已声明：" + trait.name.text);
+        if (symbols.records.contains(trait.name.text) || symbols.enums.contains(trait.name.text)) throw at(source, trait.name.span, "LYN0002", "类型名称已声明：" + trait.name.text);
         symbols.contracts.define(trait, source, [&](const Identifier& type) { return symbols.resolve(source, type); });
     }
     symbols.methods.resize(checked.aggregates.size());
@@ -1124,6 +1218,19 @@ CheckedModule check(Module module, const std::vector<Source>& sources, bool requ
         for (const auto& field : record.syntax.fields) {
             if (!symbols.fields[id].emplace(field.name.text, record.fields.size()).second) throw at(source, field.name.span, "LYN0002", "字段重复：" + field.name.text);
             record.fields.push_back(symbols.resolve(source, field.type));
+        }
+    }
+    for (std::size_t id = 0; id < checked.enums.size(); ++id) {
+        auto& item = checked.enums[id];
+        const auto& source = sources[item.syntax.file];
+        for (const auto& entry : item.syntax.cases) {
+            if (!symbols.variants[id].emplace(entry.name.text, item.payloads.size()).second) throw at(source, entry.name.span, "LYN0002", "枚举分支重复：" + entry.name.text);
+            auto& payload = item.payloads.emplace_back();
+            std::set<std::string> labels;
+            for (const auto& field : entry.fields) {
+                if (field.name && !labels.insert(field.name->text).second) throw at(source, field.name->span, "LYN0002", "枚举分支载荷名重复：" + field.name->text);
+                payload.push_back(symbols.resolve(source, field.type));
+            }
         }
     }
     enum class Mark { Unseen, Visiting, Done };
@@ -1151,7 +1258,7 @@ CheckedModule check(Module module, const std::vector<Source>& sources, bool requ
         const auto& source = sources[function.file];
         auto owner = function.owner ? std::optional(symbols.resolve(source, *function.owner).id) : std::nullopt;
         auto& names = owner ? symbols.methods[*owner] : symbols.functions;
-        bool collision = owner ? symbols.fields[*owner].contains(function.name.text) : symbols.records.contains(function.name.text) || function.name.text == "print" || function.name.text == "gcCollect";
+        bool collision = owner ? symbols.fields[*owner].contains(function.name.text) : symbols.records.contains(function.name.text) || symbols.enums.contains(function.name.text) || function.name.text == "print" || function.name.text == "gcCollect";
         if (collision || !names.emplace(function.name.text, symbols.callables.size()).second) {
             throw at(source, function.name.span, "LYN0002", "函数名已声明：" + function.name.text);
         }

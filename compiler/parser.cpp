@@ -69,7 +69,7 @@ public:
             while (offset < text.size() && (isLetter(text[offset]) || isDigit(text[offset]))) ++offset;
         } else if (isLetter(current)) {
             while (offset < text.size() && (isLetter(text[offset]) || isDigit(text[offset]))) ++offset;
-            constexpr std::string_view keywords[] = {"fn", "val", "var", "if", "else", "while", "for", "in", "return", "break", "continue", "true", "false", "struct", "class", "trait", "pub", "import", "as", "async", "await", "spawn", "extern", "match", "null", "implicit", "defer", "throw", "try", "catch"};
+            constexpr std::string_view keywords[] = {"fn", "val", "var", "if", "else", "while", "for", "in", "return", "break", "continue", "true", "false", "struct", "class", "enum", "trait", "pub", "import", "as", "async", "await", "spawn", "extern", "match", "null", "implicit", "defer", "throw", "try", "catch"};
             auto word = text.substr(start, offset - start);
             kind = std::ranges::find(keywords, word) == std::end(keywords) ? Kind::Name : Kind::Keyword;
         } else if (current == '"') {
@@ -173,6 +173,11 @@ public:
             if (is("trait")) {
                 if (firstPrefix != module.expansions.size()) throw at(source, module.expansions[firstPrefix].name.span, "LYM0001", "不能修饰 trait 约束声明");
                 module.traits.push_back(trait(pub));
+                continue;
+            }
+            if (is("enum")) {
+                if (firstPrefix != module.expansions.size()) throw at(source, module.expansions[firstPrefix].name.span, "LYM0001", "此版本不能修饰 enum 声明");
+                module.enums.push_back(enumeration(pub));
                 continue;
             }
             for (auto index = firstPrefix; index < module.expansions.size(); ++index) {
@@ -337,6 +342,32 @@ private:
     }
 
     bool visibility() { if (!is("pub")) return false; consume(); return true; }
+
+    Enumeration enumeration(bool pub) {
+        require("enum");
+        Enumeration result{file, identifier(), {}, pub};
+        require("{");
+        if (is("}")) throw at(source, token.span, "LYP0001", "enum 至少声明一个分支");
+        while (!is("}")) {
+            EnumCase entry{identifier(), {}};
+            if (is("(")) {
+                consume();
+                while (!is(")")) {
+                    std::optional<Identifier> name;
+                    if (text(next) == ":") { name = identifier(); consume(); }
+                    entry.fields.push_back({std::move(name), type()});
+                    if (!is(",")) break;
+                    consume();
+                }
+                require(")");
+            }
+            result.cases.push_back(std::move(entry));
+            if (is(",")) consume();
+            else if (!token.newlineBefore) break;
+        }
+        require("}");
+        return result;
+    }
 
     Field field(bool pub, std::vector<Attribute> marks) {
         if (!is("var") && !is("val")) throw at(source, token.span, "LYP0001", "字段声明需要 val 或 var");
@@ -512,7 +543,7 @@ private:
     }
 
     ExprId optional(ExprId subject, Identifier payload, ExprId present, ExprId absent, Span site, Span span, OptionalForm form) {
-        Pattern some{site, SumTag::Some, {{payload.span, std::move(payload)}}};
+        Pattern some{site, SumTag::Some, {{payload.span, PatternName{std::move(payload)}}}};
         Pattern none{site, SumTag::None};
         return add(span, Match{subject, {{std::move(some), present}, {std::move(none), absent}}, form, site});
     }
@@ -596,28 +627,28 @@ private:
         if (is("true") || is("false")) return {site, text(consume()) == "true"};
         if (is("null")) { consume(); return {site, SumTag::None}; }
         bool escaped = token.kind == Kind::Escaped;
-        auto name = identifier();
-        if (!escaped) {
-            if (name.text == "_") return {site, std::monostate{}};
-            if (auto tag = sumTag(name.text)) {
-                if (*tag == SumTag::None) return {site, *tag};
-                require("(");
-                auto payload = pattern();
-                return {{site.begin, require(")").span.end}, *tag, {std::move(payload)}};
-            }
+        PatternName name{identifier(), {}, {}, escaped};
+        if (is(".")) {
+            consume();
+            name.owner = std::move(name.name);
+            name.escaped = token.kind == Kind::Escaped;
+            name.name = identifier();
         }
+        if (!name.owner && !name.escaped && name.name.text == "_") return {site, std::monostate{}};
+        site.end = name.name.span.end;
         if (!is("(")) return {site, std::move(name)};
         consume();
-        RecordPattern record{std::move(name), {}};
+        auto& labels = name.labels.emplace();
         std::vector<Pattern> parts;
         while (!is(")")) {
-            record.fields.push_back(identifier());
-            require(":");
+            std::optional<Identifier> label;
+            if (text(next) == ":") { label = identifier(); consume(); }
+            labels.push_back(std::move(label));
             parts.push_back(pattern());
             if (!is(",")) break;
             consume();
         }
-        return {{site.begin, require(")").span.end}, std::move(record), std::move(parts)};
+        return {{site.begin, require(")").span.end}, std::move(name), std::move(parts)};
     }
 
     ExprId tailArgument(ExprId callee, bool allowed) {
