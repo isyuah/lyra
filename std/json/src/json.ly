@@ -14,17 +14,25 @@ extern fn lyraJsonQuote(text: String): String;
 extern fn lyraJsonSimpleKey(key: String): Bool;
 extern fn lyraJsonIntText(value: Int): String;
 
-pub struct JsonValue(val handle: CPtr) {
+pub struct JsonValue(val handle: CPtr, pub val rejectsUnknownFields: Bool) {
     pub fn missing(self): Bool { lyraJsonKind(self.handle) == 0 }
     pub fn isNull(self): Bool { lyraJsonKind(self.handle) == 1 }
     pub fn isObject(self): Bool { lyraJsonKind(self.handle) == 2 }
     pub fn isArray(self): Bool { lyraJsonKind(self.handle) == 3 }
     pub fn size(self): Int { lyraJsonSize(self.handle) }
     pub fn key(self, index: Int): String { lyraJsonKey(self.handle, index) }
-    pub fn item(self, index: Int): JsonValue { JsonValue(lyraJsonIndex(self.handle, index)) }
-    pub fn field(self, name: String): JsonValue { JsonValue(lyraJsonField(self.handle, name)) }
+    pub fn ignoringUnknownFields(self): JsonValue { JsonValue(self.handle, false) }
+    pub fn item(self, index: Int): JsonValue { JsonValue(lyraJsonIndex(self.handle, index), self.rejectsUnknownFields) }
+    pub fn field(self, name: String): JsonValue { JsonValue(lyraJsonField(self.handle, name), self.rejectsUnknownFields) }
     pub fn readString(self, path: String): Result<String,String> {
         if lyraJsonKind(self.handle) == 4 { Ok(lyraJsonText(self.handle)) } else { Err(path + ": expected String") }
+    }
+    pub fn readChar(self, path: String): Result<Char,String> {
+        if lyraJsonKind(self.handle) == 4 {
+            val text = lyraJsonText(self.handle)
+            if text.byteSize <= 4 && text.size == 1 { return Ok(text[0]) }
+        }
+        Err(path + ": expected Char (a string containing one Unicode scalar)")
     }
     fn integer(self, path: String, name: String): Result<Int,String> {
         if lyraJsonKind(self.handle) == 5 { Ok(lyraJsonNumber(self.handle)) } else { Err(path + ": expected " + name) }
@@ -69,7 +77,7 @@ pub struct JsonValue(val handle: CPtr) {
 
 pub fn parseJson(text: String): Result<JsonValue,String> {
     val value = lyraJsonParse(text)
-    if lyraJsonKind(value) == 8 { Err(lyraJsonText(value)) } else { Ok(JsonValue(value)) }
+    if lyraJsonKind(value) == 8 { Err(lyraJsonText(value)) } else { Ok(JsonValue(value, true)) }
 }
 pub fn quoteJson(text: String): String { lyraJsonQuote(text) }
 pub fn keyPath(key: String): String { if lyraJsonSimpleKey(key) { "." + key } else { "[" + quoteJson(key) + "]" } }

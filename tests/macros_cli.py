@@ -201,6 +201,57 @@ fn main(): Unit {
                 (self.src / 'main.ly').write_text('#derive(Json)\nstruct Bad(pub val value: ' + annotation + ')\nfn main(): Unit {}')
                 self.diagnostic('LYM0002', 'UInt/UInt64')
 
+    def test_json_char_is_exactly_one_unicode_scalar(self):
+        expected_char = ': expected Char (a string containing one Unicode scalar)'
+        self.native(r'''#derive(Json)
+struct Marks([jsonName("display-mark")] pub val symbol: Char, pub val rows: List<List<Char?>>)
+fn show(text: String): String { match decodeMarks(text) { Ok(value) => encodeMarks(value), Err(error) => error } }
+fn main(): Unit {
+    val marks = Marks('🙂', [[Some('中'), None], [Some('\0'), Some('"')]])
+    print(show(encodeMarks(marks)))
+    print(show(r#"{"display-mark":"\ud83d\ude42","rows":[["a","é","\\"]]}"#))
+    print(show(r#"{"display-mark":"","rows":[]}"#))
+    print(show(r#"{"display-mark":"ab","rows":[]}"#))
+    print(show(r#"{"display-mark":101,"rows":[]}"#))
+    print(show(r#"{"rows":[]}"#))
+    print(show(r#"{"display-mark":"é","rows":[[],["e\u0301"]]}"#))
+    print(match decodeMarks(r#"{"display-mark":"\ud800","rows":[]}"#) { Ok(_) => "accepted", Err(_) => "invalid Unicode rejected" })
+}''', [json.dumps({'display-mark': '🙂', 'rows': [['中', None], ['\0', '"']]}, ensure_ascii=False, separators=(',', ':')),
+       json.dumps({'display-mark': '🙂', 'rows': [['a', 'é', '\\']]}, ensure_ascii=False, separators=(',', ':')),
+       *(['$["display-mark"]' + expected_char] * 4), '$.rows[1][0]' + expected_char, 'invalid Unicode rejected'])
+
+    def test_json_ignores_unknown_fields_only_on_the_selected_view(self):
+        self.native(r'''import std.json.JsonValue
+import std.json.parseJson
+#derive(Json)
+struct User([jsonName("user-id")] pub val id: Int)
+struct Tagged(pub val user: User)
+fn encodeTagged(value: Tagged): String { encodeUser(value.user) }
+fn readTaggedJson(value: JsonValue, path: String): Result<Tagged,String> { Ok(Tagged(readUserJson(value, path)?)) }
+#derive(Json)
+struct Batch(pub val items: List<Tagged?>?)
+fn show(text: String, decode: (String) -> Result<Batch,String>): String {
+    match decode(text) { Ok(batch) => encodeBatch(batch), Err(error) => error }
+}
+fn readBoth(text: String): Result<String,String> {
+    val root = parseJson(text)?
+    val batch = readBatchJson(root.ignoringUnknownFields(), "$")?
+    match readBatchJson(root, "$") { Ok(_) => Ok("unexpected strict success"), Err(error) => Ok(encodeBatch(batch) + " / " + error) }
+}
+fn main(): Unit {
+    val top = r#"{"items":[null,{"user-id":7,"future.key":[true]}],"extra":{"name":42}}"#
+    val nested = r#"{"items":[null,{"user-id":7,"future.key":[true]}]}"#
+    print(show(top, decodeBatch)); print(show(top, decodeBatchIgnoringUnknownFields))
+    print(match readBoth(nested) { Ok(message) => message, Err(error) => error })
+    print(show(r#"{"items":[{"id":7}]}"#, decodeBatchIgnoringUnknownFields))
+    print(show(r#"{"items":[{"extra":1,"user-id":false}]}"#, decodeBatchIgnoringUnknownFields))
+    print(show(r#"{"items":{}}"#, decodeBatchIgnoringUnknownFields))
+    print(match decodeBatchIgnoringUnknownFields(r#"{"ignored":{"duplicate":1,"duplicate":2}}"#) { Ok(_) => "accepted", Err(_) => "duplicate rejected" })
+}''', ['$.extra: unknown field', '{"items":[null,{"user-id":7}]}',
+       '{"items":[null,{"user-id":7}]} / $.items[1]["future.key"]: unknown field',
+       '$.items[0]["user-id"]: expected Int', '$.items[0]["user-id"]: expected Int',
+       '$.items: expected array', 'duplicate rejected'])
+
     def test_nested_arrays_track_field_and_element_paths(self):
         self.native(r'''#derive(Json)
 struct Report(pub val rows: List<List<Int?>>, pub val labels: List<String>?)

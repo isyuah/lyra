@@ -1,6 +1,6 @@
 # `std.json` 与 `#derive(Json)`
 
-在有 `lyra.json5` 的包中，给结构体显式加上声明宏，即可生成当前模块私有的 `encode类型名`、`decode类型名` 两个入口。要跨包提供稳定 API，由库作者写普通 `pub fn` 包装。只写 `struct` 不会生成编解码器。
+在有 `lyra.json5` 的包中，给结构体显式加上声明宏，即可使用当前模块私有的 `encode类型名` 和 `decode类型名`。要跨包提供稳定 API，由库作者写普通 `pub fn` 包装。只写 `struct` 不会生成编解码器。
 
 ```lyra
 #derive(Json)
@@ -17,11 +17,14 @@ fn main(): Unit {
 
 这里编码得到 `{"id":7,"display-name":"Ada"}`。解码只认 `display-name`，Lyra 代码仍访问 `user.name`。两个字段最终映射到同一个键（无论是否都写了标记）会在 `#derive(Json)` 处报错，不等收到数据才发现。
 
-- 支持下表的数值类型、`String`、`Bool`、同模块有编解码实现的嵌套结构体、`List<T>` 及可空字段。字符串值中的多字节字符、引号和 NUL 都保留。派生的键名非空且不含 NUL；可含空格、点号、引号、换行或 `$`，会按 JSON 字符串规则编码。
-- 解析拒绝重复键、无效 JSON、整数越界；派生器拒绝未知键。错误路径使用输入中的键名：普通标识符用点号，其余键用方括号包住 JSON 字符串，如 `$.users[2]["display-name"]: expected String`。`$["user.name"]` 指一个带点的键，而 `$.user.name` 指两层对象。
+- 支持下表的数值类型、`String`、`Char`、`Bool`、同模块有编解码实现的嵌套结构体、`List<T>` 及可空字段。字符串值中的多字节字符、引号和 NUL 都保留。派生的键名非空且不含 NUL；可含空格、点号、引号、换行或 `$`，会按 JSON 字符串规则编码。
+- `Char` 在 JSON 中是恰含一个 Unicode 标量的字符串：`"🙂"`、`"\ud83d\ude42"`、`"\u0000"` 都能解码；`""`、`"ab"`、数字 `65` 和由 `e` 加组合重音构成的 `"e\u0301"` 会报字段路径错误。解码不做 Unicode 归一化。
+- `decodeUser(text)` 默认拒绝未知键。只有接口明确允许对方添加字段时才调用 `decodeUserIgnoringUnknownFields(text)`：它在整个派生对象树忽略额外键，包括列表里的嵌套对象；重新编码只写已声明字段。已知字段的类型、必填要求不变，重复键（即使藏在忽略的字段内）、无效 JSON 和解析器范围外的整数仍报错。
+- 错误路径使用输入中的键名：普通标识符用点号，其余键用方括号包住 JSON 字符串，如 `$.users[2]["display-name"]: expected String`。`$["user.name"]` 指一个带点的键，而 `$.user.name` 指两层对象。
 - `T?` 字段为 `None` 时省略键；缺键或 `null` 均解为 `None`。`Option<T?>` 区分缺键 `None`、显式 `null` 即 `Some(None)`、非空值 `Some(Some(value))`。更深的可空层没有不丢信息的 JSON 表示，要求手写映射。
 - 当前派生范围为可通过公开字段构造的 `struct`。私有必填字段、`class` 身份图及自定义字段默认值没有自动映射。编码和解码都是普通 Lyra 函数，不需要运行时反射。
-- 非固定 schema 可 `import std.json.parseJson`：它返回 `Result<JsonValue,String>`。用 `isObject()`、`isArray()`、`size()`、`key(index)`、`field(name)`、`item(index)` 检查结构，用 `readString(path)`、`readBool(path)` 或 `read` 加数值类型名（如 `readUInt16(path)`、`readFloat32(path)`）读取标量。`missing()` 和 `isNull()` 可分别检查缺键和显式空值。
+- 非固定 schema 可 `import std.json.parseJson`：它返回 `Result<JsonValue,String>`。用 `isObject()`、`isArray()`、`size()`、`key(index)`、`field(name)`、`item(index)` 检查结构，用 `readString(path)`、`readChar(path)`、`readBool(path)` 或 `read` 加数值类型名（如 `readUInt16(path)`、`readFloat32(path)`）读取标量。`missing()` 和 `isNull()` 可分别检查缺键和显式空值。
+- 手写 `read类型名Json(value: JsonValue, path: String)` 时，可把 `value.field(name)`、`value.item(index)` 直接交给其他解码器，它们继承当前视图的策略。若手动遍历未知键，按 `value.rejectsUnknownFields` 决定是否报错。`value.ignoringUnknownFields()` 与原视图共用解析结果，不修改原视图。
 
 ### 数值怎样映射
 

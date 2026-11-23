@@ -4,6 +4,7 @@ fn jsonInteger(typeName: String): Bool {
 
 fn encodeValue(typeName: String, expression: String): String {
     if typeName == "String" { return "quoteJson(" + expression + ")" }
+    if typeName == "Char" { return "quoteJson((" + expression + ").toString())" }
     if jsonInteger(typeName) { return "intText(" + expression + ")" }
     if typeName == "Float32" { return "float32Text(" + expression + ")" }
     if typeName == "Float" || typeName == "Float64" { return "float64Text(" + expression + ")" }
@@ -22,7 +23,7 @@ fn encodeValue(typeName: String, expression: String): String {
 }
 
 fn readValue(typeName: String, source: String, path: String): String {
-    if typeName == "String" || typeName == "Bool" || jsonInteger(typeName) || typeName == "Float" || typeName == "Float32" || typeName == "Float64" { return source + ".read" + typeName + "(" + path + ")?" }
+    if typeName == "String" || typeName == "Char" || typeName == "Bool" || jsonInteger(typeName) || typeName == "Float" || typeName == "Float32" || typeName == "Float64" { return source + ".read" + typeName + "(" + path + ")?" }
     val element = listElement(typeName)
     if element != "" {
         return "{ val arrayNode = " + source + "; val arrayPath = " + path + "; if !arrayNode.isArray() { return Err(arrayPath + \": expected array\") }; var pos = 0; val entries: " + typeName + " = []; while pos < arrayNode.size() { val itemNode = arrayNode.item(pos); val itemPath = arrayPath + \"[\" + intText(pos) + \"]\"; val item: " + element + " = " + readValue(element, "itemNode", "itemPath") + "; entries.add(item); pos += 1 }; entries }"
@@ -79,7 +80,8 @@ fn derive(target: String, argument: String): String {
         index += 1
     }
     val imports = "import std.json.JsonValue\nimport std.json.parseJson\nimport std.json.intText\nimport std.json.float32Text\nimport std.json.float64Text\nimport std.json.quoteJson\nimport std.json.boolText\nimport std.json.keyPath\n"
-    val head = "fn read" + target + "Json(value: JsonValue, path: String): Result<`" + target + "`,String> {\nif !value.isObject() { return Err(path + \": expected object\") }\nvar index = 0\nwhile index < value.size() { val key = value.key(index); if !(" + known + ") { return Err(path + keyPath(key) + \": unknown field\") }; index += 1 }\n"
+    val head = "fn read" + target + "Json(value: JsonValue, path: String): Result<`" + target + "`,String> {\nif !value.isObject() { return Err(path + \": expected object\") }\nif value.rejectsUnknownFields { var index = 0; while index < value.size() { val key = value.key(index); if !(" + known + ") { return Err(path + keyPath(key) + \": unknown field\") }; index += 1 } }\n"
     val decoder = "fn decode" + target + "(text: String): Result<`" + target + "`,String> { read" + target + "Json(parseJson(text)?, \"$\") }\n"
-    imports + encoding + "output + \"}\"\n}\n" + head + decoding + "Ok(`" + target + "`(" + args + "))\n}\n" + decoder
+    val ignoring = "fn decode" + target + "IgnoringUnknownFields(text: String): Result<`" + target + "`,String> { read" + target + "Json((parseJson(text)?).ignoringUnknownFields(), \"$\") }\n"
+    imports + encoding + "output + \"}\"\n}\n" + head + decoding + "Ok(`" + target + "`(" + args + "))\n}\n" + decoder + ignoring
 }
