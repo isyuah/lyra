@@ -105,6 +105,49 @@ fn main(): Unit {
 }
 ''', b"20\nitem 12\nfalse\nitem 7\n19\nupdated\n19\npresent null\ntrue\ntrue\nfalse\ntrue\n0\n")
 
+    def test_hash_collection_loops_traverse_shallow_snapshots(self):
+        (self.package / 'lyra.json5').write_text('{name:"test/hash-iteration",version:"0.1.0"}')
+        self.native('''
+import std.collections.hashSet
+import std.collections.intMap
+
+fn main(): Unit {
+    val scores = intMap<Int>()
+    val set = hashSet<Int?>((value) => { value ?? -1 }, (left, right) => { (left ?? -1) == (right ?? -1) })
+    var emptyVisits = 0
+    for entry in scores { emptyVisits += 1 }
+    for value in set { emptyVisits += 1 }
+    print(emptyVisits)
+
+    scores.put(2, 20)
+    scores.put(5, 50)
+    var mapVisits = 0
+    var keySum = 0
+    var scoreSum = 0
+    for entry in scores {
+        mapVisits += 1
+        if mapVisits == 1 { scores.remove(2); scores.put(5, 500); scores.put(9, 90); }
+        keySum += entry.key
+        scoreSum += entry.value
+    }
+    print(mapVisits); print(keySum); print(scoreSum)
+
+    set.add(None)
+    set.add(7)
+    var setVisits = 0
+    var nullVisits = 0
+    var sum = 0
+    for value in set {
+        setVisits += 1
+        if setVisits == 1 { set.remove(None); set.remove(7); set.add(10); }
+        if value == None { nullVisits += 1 }
+        sum += value ?? 0
+    }
+    print(setVisits); print(nullVisits); print(sum)
+    for value in set { print(value ?? -1) }
+}
+''', b"0\n2\n7\n70\n2\n1\n7\n10\n")
+
     def test_generic_and_method_defaults_use_declaration_scope(self):
         self.native('''
 struct Start(val base: Int) {

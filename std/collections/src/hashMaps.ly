@@ -1,5 +1,14 @@
 pub struct MapEntry<Key,Value>(pub val key: Key, pub val value: Value)
 
+pub class SnapshotIterator<Item>(val snapshot: List<Item>, var position: Int = 0) {
+    pub fn next(): Option<Item> {
+        if position == snapshot.size { return None }
+        val item = snapshot[position]
+        position += 1
+        Some(item)
+    }
+}
+
 class HashNode<Key,Value>(val key: Key, val hashCode: Int, var value: Value, var next: HashNode<Key,Value>?)
 
 fn emptyBuckets<Key,Value>(capacity: Int): List<HashNode<Key,Value>?> {
@@ -104,6 +113,8 @@ pub class HashMap<Key,Value>(val keyHash: (Key) -> Int, val keysEqual: (Key, Key
         }
         snapshot
     }
+
+    pub fn iterator(): SnapshotIterator<MapEntry<Key,Value>> { SnapshotIterator(entries()) }
 }
 
 pub fn hashMap<Key,Value>(hash: (Key) -> Int, equal: (Key, Key) -> Bool): HashMap<Key,Value> {
@@ -130,6 +141,7 @@ pub class HashSet<Item>(val items: HashMap<Item,Unit>) {
     pub fn add(item: Item): Bool { items.put(item, {}) == None }
     pub fn remove(item: Item): Bool { items.remove(item) != None }
     pub fn values(): List<Item> { map(items.entries()) { it.key } }
+    pub fn iterator(): SnapshotIterator<Item> { SnapshotIterator(values()) }
 }
 
 pub fn hashSet<Item>(hash: (Item) -> Int, equal: (Item, Item) -> Bool): HashSet<Item> { HashSet(hashMap<Item,Unit>(hash, equal)) }

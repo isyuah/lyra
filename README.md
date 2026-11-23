@@ -85,7 +85,7 @@ lyra pack <目录> [-o <源码包>|--registry <本地目录>]
 - [列表和变长参数](compiler/collections.md)支持 `[1, 2]`、按下标读写、`.size`、`.add(value)`、参数默认值、`fn sum(values: Int...)`。`sum(...ids)` 展开元素；函数收到本次调用自己的列表，更改槽位不影响调用方。如果元素是对象引用，引用的仍是同一个对象。
 - `Option<T>`（简写 `T?`）和 `Result<T,E>` 支持嵌套和 `?` 提前返回。可用 [`enum`](rfc/language-core.md#封闭枚举与匹配) 定义带位置或命名载荷的分支。`match` 要求穷尽，支持嵌套分支、字面量、按名解构 Struct，以及 `Some(x) if x > 0 => x` 形式的守卫。
 - `for value in values` 遍历列表，或通过可见的同步 `iterator()`、`next(): Option<T>` 遍历自定义集合。整数循环可写 `for i in 0..<count`（不包含 `count`）或 `for i in 1..count`（包含 `count`）。`user?.name ?? "unknown"` 只在接收者有值时访问成员，只在结果为空时计算兜底表达式。
-- [std.collections](std/collections/README.md) 提供普通泛型函数 `map`、`filter` 和 `fold`，例如 `map(values) { it * 2 }`。
+- [std.collections](std/collections/README.md) 提供普通泛型函数 `map`、`filter` 和 `fold`，例如 `map(values) { it * 2 }`。`HashMap` 和 `HashSet` 可直接用 `for` 遍历进入循环时的快照。
 - 在源或目标类型的定义模块写 `implicit (user: User): Response { ... }`，即可在需要 `Response` 时直接传入或返回 `User`。不同具体错误之间的 `?` 也用同一种直接转换；不额外声明 trait、不串接转换，两端各有一条可见转换时在使用处报歧义。
 - `async fn` 调用返回冷 `Task<T>`；`await` 在需要时启动，重复等待复用结果，`spawn` 在同一串行域调度。`await blocking { ... }` 把同步工作交给有界线程池，不占住当前域；跨挂起点存活的局部值由 GC 扫描。`async fn main(): Result<Unit,String>` 的 `Err` 打印到 stderr 并以非零状态退出。见[异步实现说明](runtime/managed-tasks.md)。
 - 普通异常写 `throw Exception("reason")`，用 `try { ... } catch e: Exception { ... }` 或 `catch { ... }` 捕获。`defer` 在退出当前块时倒序清理；取消独立于异常。使用 [std.task](std/task/README.md) 给一棵任务树设置 trace 或 deadline，不需要逐层传 `context`。
