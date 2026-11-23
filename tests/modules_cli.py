@@ -271,6 +271,59 @@ async fn main(): Unit {
         for options in ((), ('--release',)):
             self.assertEqual(self.command('run', self.app, *options).stdout, 'true\nfalse\nfalse\ntrue\nchanged\nonly via Any\n')
 
+    def test_dyn_dispatches_heterogeneous_methods_including_async(self):
+        (self.lib / 'src/net/render.ly').write_text('''
+pub trait Renderer { fn render(prefix: String): String; async fn later(): String }
+pub trait Label { fn render(prefix: String): String }
+pub struct Badge(pub val name: String) {
+    pub fn render(prefix: Int): String { "unexpected overload" }
+    pub fn render(prefix: String): String { prefix + name }
+    pub async fn later(): String { print("activated"); name }
+}
+pub class Lamp<T>(pub var name: T) {
+    pub fn render(prefix: String): String { prefix + "lamp" }
+    pub async fn later(): String { "dynamic async" }
+}
+pub class Hidden() { fn render(prefix: String): String { prefix } }
+pub fn pack<T: Renderer>(value: T): dyn Renderer { value as dyn Renderer }
+''')
+        (self.lib / 'src/lib.ly').write_text('pub import self.net.Renderer as View\n')
+        imports = '''import cfg.View
+import cfg.net.Label
+import cfg.net.Badge
+import cfg.net.Lamp
+import cfg.net.Hidden
+import cfg.net.pack
+'''
+        self.source.write_text(imports + '''
+async fn main(): Unit {
+    val all: List<dyn View> = [Badge("badge") as dyn View, pack(Lamp(42))]
+    await blocking { gcCollect() }
+    for item in all { print(item.render(prefix: "view ")) }
+    val task = all[0].later()
+    print("cold"); print(await task); print(await all[1].later())
+    val simple = all[1] as dyn Label
+    print(simple.render("simple "))
+    val boxed: Any = all[0]
+    match boxed as? dyn View {
+        Some(view) => print(view.render("boxed ")),
+        None => print("lost"),
+    }
+}
+''')
+        for options in ((), ('--release',)):
+            self.assertEqual(self.command('run', self.app, *options).stdout,
+                             'view badge\nview lamp\ncold\nactivated\nbadge\ndynamic async\nsimple lamp\nboxed badge\n')
+        for body, code, detail in (
+            ('val item: dyn View = Badge("badge")', 'LYT0001', 'dyn Renderer'),
+            ('val items = [Badge("badge")]; val refs: List<dyn View> = items', 'LYT0001', 'List<dyn Renderer>'),
+            ('val hidden = Hidden() as dyn Label', 'LYG0005', 'render'),
+        ):
+            self.source.write_text(imports + 'fn main(): Unit { ' + body + ' }')
+            error, = json.loads(self.command('check', self.app, '--diagnostics=json', ok=False).stderr)
+            self.assertEqual(error['code'], code)
+            self.assertIn(detail, error['message'])
+
 
 if __name__ == '__main__':
     unittest.main()

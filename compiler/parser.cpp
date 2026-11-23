@@ -398,8 +398,13 @@ private:
             while (is("?")) { name.span.end = consume().span.end; name.text = "Option<" + name.text + ">"; }
             return name;
         }
-        auto name = identifier();
-        if (is("<")) {
+        auto name = [&] {
+            if (!is("dyn") || next.newlineBefore || (next.kind != Kind::Name && next.kind != Kind::Escaped)) return identifier();
+            auto start = consume().span.begin;
+            auto trait = identifier();
+            return Identifier{"$dyn:" + trait.text, {start, trait.span.end}};
+        }();
+        if (!name.text.starts_with("$dyn:") && is("<")) {
             consume();
             name.text += '<' + type().text;
             while (is(",")) { consume(); name.text += ',' + type().text; }
@@ -765,8 +770,9 @@ private:
                 auto operation = is("is") ? TypeOperator::Is : TypeOperator::CheckedCast;
                 auto site = consume().span;
                 if (operation == TypeOperator::CheckedCast) {
-                    if (!is("?") || token.span.begin != site.end) throw at(source, site, "LYP0001", "检查转换写作 as? T");
-                    site.end = consume().span.end;
+                    if (is("?") && token.span.begin == site.end) site.end = consume().span.end;
+                    else if (is("dyn")) operation = TypeOperator::InterfaceCast;
+                    else throw at(source, site, "LYP0001", "类型转换写作 as? T 或 as dyn Trait");
                 }
                 auto target = type();
                 auto span = Span{nodes[left].span.begin, target.span.end};

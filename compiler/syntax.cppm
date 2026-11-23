@@ -43,7 +43,7 @@ struct RealLiteral { std::string digits; std::optional<unsigned> width; };
 enum class Op { Set, AddSet, SubSet, MulSet, DivSet, RemSet, Or, And, Eq, Ne, Lt, Le, Gt, Ge, Add, Sub, Mul, Div, Rem, Not };
 struct Unary { Op op; Span site; ExprId operand; };
 struct Binary { Op op; Span site; ExprId left, right; };
-enum class TypeOperator { Is, CheckedCast };
+enum class TypeOperator { Is, CheckedCast, InterfaceCast };
 struct TypeOperation { TypeOperator op; ExprId value; Identifier type; Span site; };
 struct Statement { ExprId expression; std::optional<Span> semicolon; };
 struct Block { std::vector<Statement> statements; Span end; };

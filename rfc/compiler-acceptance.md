@@ -33,7 +33,7 @@ H 由作者委托设计。顺序是先证明**写错能指出原因、写对能�
 
 运行 `ctest --preset dev --output-on-failure` 执行这些套件；`release` preset 另测优化版编译器。最低部署目标由[Jammy 两阶段验收](../tests/jammy-smoke.sh)分别验证只有 libc 的应用和额外依赖系统 SQLite 的应用；量测条件和结果见[原生工具链](native-toolchain.md)。
 
-**仍属设计、不能当作现有 API：** `dyn` 动态接口值、用户自定义异常子类及过滤捕获、运行时字段反射和 TOML 派生。编辑器集成、`fmt` 和 `doc` 另行交付。[设计服务](../examples/user-service/README.md)保留最终写法；目前编译运行的是[原生服务](../examples/http-sqlite/README.md)。
+**仍属设计、不能当作现有 API：** 用户自定义异常子类及过滤捕获、运行时字段反射和 TOML 派生。编辑器集成、`fmt` 和 `doc` 另行交付。[设计服务](../examples/user-service/README.md)保留最终写法；目前编译运行的是[原生服务](../examples/http-sqlite/README.md)。
 
 ## 后续扩展仍要守住的三个验收点
 

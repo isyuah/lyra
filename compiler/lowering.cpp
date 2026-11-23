@@ -6,6 +6,7 @@ module;
 #include <llvm/IR/Module.h>
 #include <llvm/IR/Verifier.h>
 #include <map>
+#include <span>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -32,6 +33,7 @@ struct Layouts {
     std::vector<llvm::StructType*> objects;
     std::vector<std::vector<llvm::StructType*>> payloads;
     mutable std::map<Type, llvm::Constant*> typeTokens{};
+    mutable std::map<std::vector<std::size_t>, llvm::Constant*> interfaceTables{};
     bool workers{};
 
     Layouts(const CheckedModule& program, Builder& builder) : program(program) {
@@ -64,6 +66,31 @@ struct Layouts {
         return entry->second;
     }
 
+    llvm::Constant* interfaceTable(Builder& builder, const std::vector<std::size_t>& methods,
+            std::span<llvm::Function* const> functions) const {
+        auto [entry, inserted] = interfaceTables.try_emplace(methods);
+        if (!inserted) return entry->second;
+        auto& module = *builder.GetInsertBlock()->getModule();
+        std::vector<llvm::Constant*> addresses;
+        for (auto method : methods) {
+            auto* implementation = functions[method];
+            auto shape = implementation->getFunctionType()->params();
+            std::vector<llvm::Type*> parameters(shape.begin(), shape.end());
+            parameters[0] = builder.getPtrTy();
+            auto* signature = llvm::FunctionType::get(implementation->getReturnType(), parameters, false);
+            auto* bridge = llvm::Function::Create(signature, llvm::Function::InternalLinkage, implementation->getName() + ".interface", module);
+            Builder thunk(llvm::BasicBlock::Create(builder.getContext(), "dispatch", bridge));
+            std::vector<Value> arguments{thunk.CreateLoad(shape[0], bridge->getArg(0))};
+            for (std::size_t slot = 1; slot < parameters.size(); ++slot) arguments.push_back(bridge->getArg(slot));
+            thunk.CreateRet(thunk.CreateCall(implementation, arguments));
+            addresses.push_back(bridge);
+        }
+        auto* type = llvm::ArrayType::get(builder.getPtrTy(), addresses.size());
+        entry->second = new llvm::GlobalVariable(module, type, true, llvm::GlobalValue::PrivateLinkage,
+            llvm::ConstantArray::get(type, addresses), "lyra.interface.dispatch");
+        return entry->second;
+    }
+
     llvm::Type* native(Builder& builder, Type type) const {
         switch (type.kind) {
         case Type::Int: case Type::UInt: return builder.getIntNTy(numberWidth(type));
@@ -73,7 +100,7 @@ struct Layouts {
         case Type::Unit: case Type::Never: return builder.getInt8Ty();
         case Type::String: case Type::Bytes: case Type::Task: case Type::CPtr: case Type::List: case Type::Exception: case Type::Closure: return builder.getPtrTy();
         case Type::Variable: llvm_unreachable("abstract type reached LLVM lowering");
-        case Type::Any: return llvm::StructType::get(builder.getContext(), {builder.getPtrTy(), builder.getPtrTy()});
+        case Type::Any: case Type::Dyn: return llvm::StructType::get(builder.getContext(), {builder.getPtrTy(), builder.getPtrTy()});
         case Type::Record: return reference(type) ? static_cast<llvm::Type*>(builder.getPtrTy()) : objects[type.id];
         case Type::Enum: return llvm::StructType::get(builder.getContext(), {builder.getInt32Ty(), builder.getPtrTy()});
         case Type::Option: return llvm::StructType::get(builder.getContext(), {builder.getInt1Ty(), native(builder, program.sumTypes[type.id].success)});
@@ -667,6 +694,20 @@ struct Emitter {
         }
         switch (info.callee) {
             case Callee::Indirect: llvm_unreachable("indirect call already emitted");
+            case Callee::Dynamic: {
+                auto* pointer = builder.getPtrTy();
+                auto table = builder.CreateExtractValue(receiver, 1);
+                auto method = builder.CreateLoad(pointer, builder.CreateInBoundsGEP(pointer, table, builder.getInt64(info.target)));
+                args[0] = builder.CreateExtractValue(receiver, 0);
+                if (!info.interfaceAsync) args.push_back(errorSlot);
+                std::vector<llvm::Type*> parameters;
+                for (auto value : args) parameters.push_back(value->getType());
+                auto signature = llvm::FunctionType::get(layouts.native(builder, rawType(id)), parameters, false);
+                auto value = builder.CreateCall(signature, method, args);
+                if (info.interfaceAsync) return NativeExceptions{builder}.created(value, source, call.name.span);
+                guard(builder.CreateLoad(pointer, errorSlot), handlers.size(), call.name.span, "call");
+                return value;
+            }
             case Callee::Exception: return NativeExceptions{builder}.create(args.front());
             case Callee::TaskCancel:
                 builder.CreateCall(module.getOrInsertFunction("lyraTaskRequestCancel", builder.getVoidTy(), builder.getPtrTy()), args);
@@ -771,6 +812,27 @@ struct Emitter {
         auto value = emit(operation.value);
         if (!live()) return unit();
         auto target = *fn.expressions[id].testedType;
+        if (operation.op == TypeOperator::InterfaceCast) {
+            auto from = fn.expressions[operation.value].type;
+            if (from == target) return value;
+            const auto& methods = fn.expressions[id].interfaceMethods;
+            Value data, table;
+            if (from.kind == Type::Dyn) {
+                auto* pointer = builder.getPtrTy();
+                auto original = builder.CreateExtractValue(value, 1);
+                data = builder.CreateExtractValue(value, 0);
+                table = asyncCell(builder, llvm::ArrayType::get(pointer, methods.size()));
+                for (std::size_t slot = 0; slot < methods.size(); ++slot) {
+                    auto method = builder.CreateLoad(pointer, builder.CreateInBoundsGEP(pointer, original, builder.getInt64(methods[slot])));
+                    builder.CreateStore(method, builder.CreateInBoundsGEP(pointer, table, builder.getInt64(slot)));
+                }
+            } else {
+                data = NativeLists{builder}.box(value);
+                table = layouts.interfaceTable(builder, methods, functions);
+            }
+            auto record = builder.CreateInsertValue(llvm::PoisonValue::get(layouts.native(builder, target)), data, 0);
+            return builder.CreateInsertValue(record, table, 1);
+        }
         if (target == Type::Any) return operation.op == TypeOperator::Is ? static_cast<Value>(builder.getTrue()) : makeSum(rawType(id), SumTag::Some, value);
         auto matches = builder.CreateICmpEQ(builder.CreateExtractValue(value, 0), layouts.typeToken(builder, target));
         if (operation.op == TypeOperator::Is) return matches;

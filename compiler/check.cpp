@@ -49,6 +49,7 @@ std::optional<Type> hiddenType(const CheckedModule& module, Type type) {
             if (auto hidden = hiddenType(module, sum.success)) return hidden;
             return hiddenType(module, sum.failure);
         }
+        case Type::Dyn: return module.traits[type.id].isPublic ? std::nullopt : std::optional(type);
         case Type::Closure: {
             const auto& shape = module.signatures[type.id];
             if (auto hidden = arguments(shape.parameters)) return hidden;
@@ -82,6 +83,12 @@ std::string typeName(const CheckedModule& module, Type type, bool canonical = fa
         case Type::Exception: return "Exception";
         case Type::CPtr: return "CPtr";
         case Type::Any: return "Any";
+        case Type::Dyn: {
+            const auto& full = module.traits[type.id].name.text;
+            if (canonical) return "$dyn:" + full;
+            auto separator = full.rfind("::");
+            return "dyn " + (separator == full.npos ? full : full.substr(separator + 2));
+        }
         case Type::Record: case Type::Enum: {
             const auto& full = type.kind == Type::Record ? module.aggregates[type.id].syntax.name.text : module.enums[type.id].syntax.name.text;
             const auto& arguments = type.kind == Type::Record ? module.aggregates[type.id].arguments : module.enums[type.id].arguments;
@@ -224,6 +231,7 @@ struct Symbols {
     std::map<GenericInstanceKey, std::size_t> specializations;
     std::vector<DirectConversion> conversions{};
     StructuralContracts contracts{};
+    Names traitNames{};
     Names enums{};
     std::vector<Names> variants{};
     std::vector<Enumeration> enumDeclarations{};
@@ -359,6 +367,10 @@ struct Symbols {
 
     void requireBounds(std::span<const Bound> bounds, std::size_t file, std::span<const Type> types, const Source& use, Span site) {
         contracts.require(bounds, types, use, site, [&](Type receiver, const std::string& name, const RequiredMethod& expected) -> std::optional<RequiredMethod> {
+            if (receiver.kind == Type::Dyn) {
+                if (auto method = contracts.member(module.traits[receiver.id].name.text, name)) return *method;
+                return {};
+            }
             const auto& definition = sources[file];
             auto result = shapedMethod(receiver, name, definition, [&](const auto& shape) { return shape == expected; });
             if (!result) result = shapedMethod(receiver, name, definition, [](const auto&) { return true; });
@@ -525,6 +537,11 @@ struct Symbols {
             auto found = std::ranges::find(parameters, form.name, &Identifier::text);
             if (found != parameters.end()) return lookup(static_cast<std::size_t>(found - parameters.begin()));
             if (auto type = numberType(form.name)) return type;
+            if (form.name.starts_with("$dyn:")) {
+                auto trait = traitNames.find(form.name.substr(5));
+                if (trait == traitNames.end()) throw at(source, span, "LYG0005", "找不到动态接口 trait：" + form.name.substr(5));
+                return Type{Type::Dyn, trait->second};
+            }
             for (Type type : scalarTypes) if (form.name == typeName(module, type)) return type;
         }
         std::vector<Type> arguments;
@@ -820,8 +837,34 @@ struct Checker {
         auto target = symbols.resolve(fn.syntax, operation.type, variables);
         auto actual = visit(operation.value);
         if (actual == Type::Never) return actual;
-        if (actual != Type::Any) throw at(source, operation.site, "LYT0021", "is 与 as? 需要 Any 值，实际是 " + typeName(module, actual));
         fn.expressions[id].testedType = target;
+        if (target.kind == Type::Dyn) {
+            const auto& trait = module.traits[target.id];
+            refer(operation.type, trait.file, trait.name.span);
+        }
+        if (operation.op == TypeOperator::InterfaceCast) {
+            if (target.kind != Type::Dyn) throw at(source, operation.type.span, "LYT0021", "as dyn 需要一个非可空的接口类型");
+            if (actual == target) return target;
+            const auto& trait = module.traits[target.id];
+            Bound bound{0, trait.name};
+            symbols.requireBounds({&bound, 1}, fn.syntax.file, {&actual, 1}, source, operation.site);
+            if (materializing()) for (const auto& method : trait.methods) {
+                auto& implementations = fn.expressions[id].interfaceMethods;
+                if (actual.kind == Type::Dyn) {
+                    const auto& available = module.traits[actual.id].methods;
+                    auto found = std::ranges::find(available, method.name.text, [](const TraitMethod& item) { return item.name.text; });
+                    implementations.push_back(found - available.begin());
+                } else {
+                    const auto& expected = *symbols.contracts.member(trait.name.text, method.name.text);
+                    auto selected = symbols.shapedMethod(actual, method.name.text, source, [&](const auto& shape) { return shape == expected; }).value().first;
+                    const auto& entry = symbols.callables[selected];
+                    auto function = entry.generic ? symbols.instantiate(selected, module.aggregates[actual.id].arguments, source, operation.site) : entry.target;
+                    implementations.push_back(function);
+                }
+            }
+            return target;
+        }
+        if (actual != Type::Any) throw at(source, operation.site, "LYT0021", "is 与 as? 需要 Any 值，实际是 " + typeName(module, actual));
         return operation.op == TypeOperator::Is ? Type{Type::Bool} : symbols.sum(Type::Option, target);
     }
 
@@ -1683,6 +1726,19 @@ struct Checker {
                     return exits ? Type{Type::Never} : method->asynchronous ? symbols.task(method->result) : method->result;
                 }
             }
+            if (owner.kind == Type::Dyn) {
+                const auto& trait = module.traits[owner.id];
+                if (auto method = symbols.contracts.member(trait.name.text, call.name.text)) {
+                    noTypeArgs();
+                    auto declaration = std::ranges::find(trait.methods, call.name.text, [](const TraitMethod& candidate) { return candidate.name.text; });
+                    refer(call.name, trait.file, declaration->name.span);
+                    info.callee = Callee::Dynamic;
+                    info.target = declaration - trait.methods.begin();
+                    info.interfaceAsync = method->asynchronous;
+                    bool exits = arguments(id, call, method->parameters.size(), [&](auto slot) -> std::string_view { return method->labels[slot]; }, [&](auto slot) { return method->parameters[slot]; });
+                    return exits ? Type{Type::Never} : method->asynchronous ? symbols.task(method->result) : method->result;
+                }
+            }
             if (owner.kind == Type::Record) {
                 const auto& decl = module.aggregates[owner.id];
                 ownerTypes = decl.arguments;
@@ -1907,7 +1963,7 @@ struct Checker {
             return binary.op <= Op::Ge ? Type{Type::Bool} : *common;
         }
         right = fit(binary.right, right, left);
-        if (equality && (left.kind == Type::Option || left.kind == Type::Result || left.kind == Type::Enum || left.kind == Type::Closure || left.kind == Type::Any || left.kind == Type::Variable || (left.kind == Type::Record && !module.aggregates[left.id].syntax.reference))) throw at(source, binary.site, "LYT0006", typeName(module, left) + " 未提供 Eq，不能用 == 或 != 比较");
+        if (equality && (left.kind == Type::Option || left.kind == Type::Result || left.kind == Type::Enum || left.kind == Type::Closure || left.kind == Type::Any || left.kind == Type::Dyn || left.kind == Type::Variable || (left.kind == Type::Record && !module.aggregates[left.id].syntax.reference))) throw at(source, binary.site, "LYT0006", typeName(module, left) + " 未提供 Eq，不能用 == 或 != 比较");
         if (binary.op == Op::Add && left == Type::String) return Type::String;
         if (!equality) throw mismatch(module, source, binary.site, Type::Int, left);
         return Type::Bool;
@@ -2123,6 +2179,8 @@ CheckedModule check(Module module, const std::vector<Source>& sources, bool requ
         const auto& source = sources[trait.file];
         if (symbols.records.contains(trait.name.text) || symbols.enums.contains(trait.name.text)) throw at(source, trait.name.span, "LYN0002", "类型名称已声明：" + trait.name.text);
         symbols.contracts.declare(trait, source);
+        symbols.traitNames.emplace(trait.name.text, checked.traits.size());
+        checked.traits.push_back(trait);
     }
     auto typeVariables = [&](const auto& syntax) {
         std::set<std::string> seen;

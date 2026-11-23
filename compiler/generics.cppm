@@ -46,7 +46,7 @@ TypeForm typeForm(std::string_view canonical) {
 }
 
 template<class Rename> std::string mapTypeNames(const TypeForm& form, const Rename& rename) {
-    auto result = rename(form.name);
+    auto result = form.name.starts_with("$dyn:") ? "$dyn:" + rename(form.name.substr(5)) : rename(form.name);
     if (!form.arguments.empty()) {
         result += '<';
         for (std::size_t index = 0; index < form.arguments.size(); ++index) {
