@@ -18,36 +18,82 @@ class SQLite(unittest.TestCase):
             (package / "lyra.json5").write_text("{name:'test/query',version:'1.0.0'}")
             (package / "src" / "main.ly").write_text(r'''
 import std.io.assert
+import std.sqlite.Busy
+import std.sqlite.Connection
+import std.sqlite.DbError
+import std.sqlite.DbErrorKind
 import std.sqlite.open
 import std.sqlite.openReadOnly
+
+fn require<T>(result: Result<T, DbError>): T {
+    match result { Ok(value) => value, Err(error) => throw Exception(error.message()) }
+}
+
+fn failure<T>(result: Result<T, DbError>, operation: String): DbError {
+    match result {
+        Ok(_) => throw Exception("expected SQLite failure"),
+        Err(error) => {
+            assert(error.operation == operation && error.code != 0 && error.message() != "", "missing error details")
+            error
+        },
+    }
+}
+
+fn insertPerson(db: Connection): Result<Unit, DbError> {
+    val insert = db.prepare("INSERT INTO people VALUES(?1,?2)")?
+    defer insert.close()
+    insert.bindInt(1, 7)?
+    insert.bindText(2, "李\0Ada")?
+    assert(!insert.next()?, "insert unexpectedly returned a row")
+    Ok({})
+}
+
 fn main(): Unit {
-    val bad = openReadOnly("does-not-exist.db")
-    assert(!bad.status().ok() && bad.status().code() != 0, "missing file")
-    assert(!bad.prepare("SELECT 1").status().ok(), "failed open")
-    val db = open(":memory:")
-    assert(db.status().ok(), "open")
-    val create = db.prepare("CREATE TABLE people(id INTEGER PRIMARY KEY, name TEXT)")
-    assert(create.next().done() && create.close().ok(), "table")
-    val insert = db.prepare("INSERT INTO people VALUES(?1,?2)")
-    assert(insert.bindInt(1, 7).ok() && insert.bindText(2, "李\0Ada").ok(), "parameters")
-    assert(insert.next().done() && insert.close().ok(), "insert")
-    val query = db.prepare("SELECT name, id, NULL, '' FROM people WHERE id=?1")
-    assert(query.bindInt(1, 7).ok() && query.next().row(), "row")
-    val text = query.readText(0)
-    assert(text.status.ok() && query.readInt(1).value == 7, "typed reads")
-    assert(query.readText(2).status.isNull() && query.readText(3).status.ok(), "null vs empty")
-    assert(!query.readInt(0).status.ok() && !query.readInt(4294967296).status.ok(), "invalid column")
-    assert(db.close().busy() && query.next().done(), "active statement")
-    assert(query.close().ok() && query.close().ok(), "finalize")
-    val invalidText = db.prepare("SELECT CAST(x'ff' AS TEXT)")
-    assert(invalidText.next().row(), "read invalid text")
-    assert(!invalidText.readText(0).status.ok() && invalidText.close().ok(), "validate SQLite UTF-8")
-    val invalid = db.prepare("malformed query")
-    assert(!invalid.status().ok() && invalid.status().operation() == "prepare", "SQL diagnostic")
-    assert(invalid.status().message() != "" && !invalid.next().row(), "failed statement")
-    assert(db.close().ok() && db.close().ok(), "close")
+    val missingFile = failure(openReadOnly("does-not-exist.db"), "open")
+    assert(match missingFile.kind { DbErrorKind.Sqlite => true, _ => false }, "missing file")
+    val db = require(open(":memory:"))
+    val alias = db
+    val missingTable = failure(db.prepare("SELECT * FROM missing"), "prepare")
+    assert(match missingTable.kind { DbErrorKind.Sqlite => true, _ => false }, "missing table")
+    val create = require(db.prepare("CREATE TABLE people(id INTEGER PRIMARY KEY, name TEXT)"))
+    assert(!require(create.next()), "table")
+    create.close()
+    require(insertPerson(db))
+    val duplicate = failure(insertPerson(db), "next")
+    assert(match duplicate.kind { DbErrorKind.Sqlite => true, _ => false }, "step error stayed a Result after defer")
+    val missingRow = require(db.prepare("SELECT name FROM people WHERE id=8"))
+    assert(!require(missingRow.next()) && !require(missingRow.next()), "no row is success")
+    missingRow.close()
+    val query = require(db.prepare("SELECT name, id, NULL, '' FROM people WHERE id=?1"))
+    val queryAlias = query
+    require(query.bindInt(1, 7))
+    assert(require(query.next()), "row")
+    val text = match require(query.readText(0)) { Some(value) => value, None => throw Exception("missing text") }
+    assert(match require(query.readInt(1)) { Some(7) => true, _ => false }, "typed reads")
+    assert(require(query.readText(2)) == null && require(query.readInt(2)) == null, "SQL NULL is empty Option")
+    assert(match require(query.readText(3)) { Some("") => true, _ => false }, "empty text is not SQL NULL")
+    val wrongType = failure(query.readInt(0), "readInt")
+    assert(match wrongType.kind { DbErrorKind.Invalid => true, _ => false }, "invalid storage type")
+    failure(query.readInt(4294967296), "readInt");
+    val busy = try { alias.close(); false } catch error: Busy { error.message != "" }
+    assert(busy && !require(query.next()), "busy close kept connection open for statement")
+    query.close()
+    queryAlias.close()
+    val closedQuery = failure(queryAlias.next(), "next")
+    assert(match closedQuery.kind { DbErrorKind.Closed => true, _ => false }, "statement alias shares close")
+    val invalidText = require(db.prepare("SELECT CAST(x'ff' AS TEXT)"))
+    assert(require(invalidText.next()), "read invalid text")
+    val invalidUtf8 = failure(invalidText.readText(0), "readText")
+    assert(match invalidUtf8.kind { DbErrorKind.Invalid => true, _ => false }, "validate SQLite UTF-8")
+    invalidText.close()
+    failure(db.prepare("malformed query"), "prepare");
+    alias.close()
+    db.close()
+    val closedDb = failure(db.prepare("SELECT 1"), "prepare")
+    assert(match closedDb.kind { DbErrorKind.Closed => true, _ => false }, "connection alias shares close")
     gcCollect()
-    print(text.value)
+    assert(missingTable.message() != "", "error details survive close and GC")
+    print(text)
 }
 ''', encoding="utf-8")
             for flags in ([], ["--release"]):

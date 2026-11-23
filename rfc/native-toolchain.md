@@ -131,9 +131,9 @@ int64_t writeText(const LyraString *text) {
 
 在异步任务中，可能阻塞的 SQLite 操作必须通过隔离的执行入口进行。首例可以在一次隔离的同步操作里打开数据库、执行查询并清理，再把数据值返回执行域。这样 `defer` 仍是同步的，也不会在调度线程上执行可能阻塞的关闭操作。
 
-**已通过的端到端验收**：[原生句柄测试](../tests/runtime_sqlite.cpp)在系统 SQLite 的内存库中建表、写入 `7 / Ada` 并参数化查询；缺表时保留 `prepare` 的操作名、错误码和消息，关闭 statement、连接并触发 GC 后，拷出的文本仍有效。[Lyra 源码测试](../tests/sqlite_cli.py)还区分 SQL `NULL` 与空串，保留文本中的 NUL，并检查未关闭的 statement 使 `db.close()` 返回 `busy`。[真实 HTTP 服务](../tests/http_cli.py)在隔离线程执行查询，命中、缺失、数据库失败分别返回 200、404、500，并测到请求取消后的安全收尾。
+**已通过的端到端验收**：[原生句柄测试](../tests/runtime_sqlite.cpp)在系统 SQLite 的内存库中建表、写入 `7 / Ada` 并参数化查询；缺表时保留 `prepare` 的操作名、错误码和消息，关闭 statement、连接并触发 GC 后，拷出的文本仍有效。[Lyra 源码测试](../tests/sqlite_cli.py)还区分 SQL `NULL` 与空串，保留文本中的 NUL，并检查 `close()` 抛出 `Busy` 后可以继续用游标，释放游标后再经连接别名成功关闭。[真实 HTTP 服务](../tests/http_cli.py)在隔离线程执行查询，命中、无行、缺文件或缺表分别返回 200、404、500，并测到请求取消后的安全收尾。
 
-**当前库 API 与目标**：[std.sqlite](../std/sqlite/README.md) 目前通过 `DbStatus` 的 `row()`、`done()`、`ok()` 等方法区分结果，失败时可读 `operation()`、`code()` 和 `message()`。服务在[应用代码](../examples/http-sqlite/src/main.ly)中把状态转换为 `Result<User?,String>`。让库本身返回 `Result<T,DbError>` 是后续 API 设计，不是使用当前绑定的前置条件。
+**公开 API**：[std.sqlite](../std/sqlite/README.md) 的数据库操作直接返回 `Result<T, DbError>`。`next()` 的 `Ok(false)` 表示游标正常结束；列读取用 `Ok(None)` 表示 SQL `NULL`。`DbError` 保留 `kind`、`operation`、`code` 和 `message()`；[服务代码](../examples/http-sqlite/src/main.ly)用 `?` 传播为 `Result<User?, DbError>`，不再翻译原生状态。同步 `close()` 的 `Busy` 等清理失败走异常通道。
 
 取消路径单独验收：用可控的测试门闩停住隔离操作，同域另一 Task 应仍能推进。取消拥有该操作的作用域时，**不能在原生操作还可能使用句柄时释放它**；放行并等它安全返回，清理后任务组才可退出。不要求不支持中断的 C 调用立即停止。这两条用例不用定时睡眠来猜调度顺序。
 

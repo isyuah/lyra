@@ -3,7 +3,17 @@ import std.http.Request
 import std.io.arg
 import std.io.assert
 import std.io.readLine
+import std.sqlite.DbError
+import std.sqlite.Statement
 import std.sqlite.openReadOnly
+
+fn require<T>(result: Result<T, DbError>): T {
+    match result { Ok(value) => value, Err(error) => throw Exception(error.message()) }
+}
+
+fn currentId(query: Statement): Int {
+    match require(query.readInt(0)) { Some(id) => id, None => throw Exception("missing id") }
+}
 
 async fn observe(target: Task<Unit>): Unit { await target }
 async fn group(child: Task<Unit>): Unit { spawn child; }
@@ -26,14 +36,14 @@ async fn main(): Unit {
     assert(request.status() == 0, "accept")
     val path = arg(0).value
     val work = blocking {
-        val db = openReadOnly(path)
-        defer { assert(db.close().ok(), "close database"); print("database closed") }
-        val query = db.prepare("SELECT id FROM rows ORDER BY id")
-        defer { assert(query.close().ok(), "close cursor"); print("cursor closed") }
-        assert(query.next().row() && query.readInt(0).value == 7, "first row")
+        val db = require(openReadOnly(path))
+        defer { db.close(); print("database closed") }
+        val query = require(db.prepare("SELECT id FROM rows ORDER BY id"))
+        defer { query.close(); print("cursor closed") }
+        assert(require(query.next()) && currentId(query) == 7, "first row")
         print("cursor open")
         assert(readLine().value == "continue", "release worker")
-        assert(query.next().row() && query.readInt(0).value == 8 && query.next().done(), "cursor still usable")
+        assert(require(query.next()) && currentId(query) == 8 && !require(query.next()), "cursor still usable")
     }
     val probe = observe(work)
     val serving = spawn group(handle(request, work, probe))

@@ -5,7 +5,7 @@ import std.io.arg
 import std.io.assert
 import std.io.writeError
 import std.sqlite.Connection
-import std.sqlite.DbStatus
+import std.sqlite.DbError
 import std.sqlite.Statement
 import std.sqlite.openReadOnly
 
@@ -15,42 +15,25 @@ struct User(pub val id: Int, pub val name: String)
 implicit (user: User): Response { Response(200, "application/json", encodeUser(user)) }
 
 fn text(code: Int, body: String): Response { Response(code, "text/plain", body) }
-fn cause(status: DbStatus): String { status.operation() + ": " + status.message() }
 
-fn prepareUserById(db: Connection, sql: String, id: Int): Result<Statement,String> {
-    val query = db.prepare(sql)
-    if !query.status().ok() { return Err(cause(query.status())) }
-    val bound = query.bindInt(1, id)
-    if !bound.ok() {
-        val reason = cause(bound)
-        query.close()
-        return Err(reason)
+fn prepareUserById(db: Connection, sql: String, id: Int): Result<Statement, DbError> {
+    val query = db.prepare(sql)?
+    match query.bindInt(1, id) {
+        Ok(_) => Ok(query),
+        Err(error) => { query.close(); Err(error) },
     }
-    Ok(query)
 }
 
-fn readUser(query: Statement, id: Int): Result<User?,String> {
-    val cursor = query.next()
-    if cursor.done() { return Ok(None) }
-    if !cursor.row() { return Err(cause(cursor)) }
-    val name = query.readText(0)
-    if !name.status.ok() { return Err(cause(name.status)) }
-    Ok(Some(User(id, name.value)))
-}
-
-fn lookup(path: String, id: Int): Result<User?,String> {
-    val db = openReadOnly(path)
-    if !db.status().ok() { return Err(cause(db.status())) }
-    val query = match #userQuery(db, "SELECT name FROM users WHERE id=?1", id) {
-        Ok(cursor) => cursor,
-        Err(reason) => { db.close(); return Err(reason) },
+fn lookup(path: String, id: Int): Result<User?, DbError> {
+    val db = openReadOnly(path)?
+    defer db.close()
+    val query = #userQuery(db, "SELECT name FROM users WHERE id=?1", id)?
+    defer query.close()
+    if !query.next()? { return Ok(None) }
+    match query.readText(0)? {
+        Some(name) => Ok(Some(User(id, name))),
+        None => Err(DbError.typeMismatch("readText", "users.name must not be NULL")),
     }
-    val result = readUser(query, id)
-    val cursorClosed = query.close()
-    val dbClosed = db.close()
-    if !cursorClosed.ok() { return Err(cause(cursorClosed)) }
-    if !dbClosed.ok() { return Err(cause(dbClosed)) }
-    result
 }
 
 async fn route(request: Request, path: String): Response {
@@ -61,7 +44,7 @@ async fn route(request: Request, path: String): Response {
     match result {
         Ok(Some(user)) => user,
         Ok(None) => text(404, "not found"),
-        Err(message) => { writeError("GET " + request.target() + ": " + message + "\n"); text(500, "database error") },
+        Err(error) => { writeError("GET ${request.target()}: ${error.operation}: ${error.message()}\n"); text(500, "database error") },
     }
 }
 

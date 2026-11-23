@@ -14,41 +14,83 @@ extern fn lyraDbText(result: CPtr): String;
 extern fn lyraDbMessage(result: CPtr): String;
 extern fn lyraDbOperation(result: CPtr): String;
 
-pub struct DbStatus(val handle: CPtr) {
-    pub fn ok(): Bool { lyraDbStatus(handle) == 0 }
-    pub fn row(): Bool { lyraDbStatus(handle) == 1 }
-    pub fn done(): Bool { lyraDbStatus(handle) == 2 }
-    pub fn isNull(): Bool { lyraDbStatus(handle) == 3 }
-    pub fn busy(): Bool { lyraDbStatus(handle) == 4 }
-    pub fn code(): Int { lyraDbCode(handle) }
-    pub fn message(): String { lyraDbMessage(handle) }
-    pub fn operation(): String { lyraDbOperation(handle) }
+pub enum DbErrorKind { Busy, Closed, Sqlite, Invalid }
+
+pub struct DbError(pub val kind: DbErrorKind, pub val code: Int, pub val operation: String, val detail: String) {
+    pub fn message(): String { detail }
+    pub static fn typeMismatch(operation: String, message: String): DbError {
+        DbError(DbErrorKind.Invalid, 20, operation, message)
+    }
 }
 
-pub struct DbText(pub val status: DbStatus, pub val value: String)
-pub struct DbInt(pub val status: DbStatus, pub val value: Int)
+pub exception Busy
+pub exception CloseError
+
+fn dbError(result: CPtr): DbError {
+    val kind = match lyraDbStatus(result) {
+        4 => DbErrorKind.Busy,
+        5 => DbErrorKind.Closed,
+        6 => DbErrorKind.Sqlite,
+        7 => DbErrorKind.Invalid,
+        _ => throw Exception("unexpected SQLite error status"),
+    }
+    DbError(kind, lyraDbCode(result), lyraDbOperation(result), lyraDbMessage(result))
+}
+
+fn bound(result: CPtr): Result<Unit, DbError> {
+    if lyraDbStatus(result) == 0 { Ok({}) } else { Err(dbError(result)) }
+}
+
+fn checkClose(result: CPtr): Unit {
+    val status = lyraDbStatus(result)
+    if status == 0 { return }
+    val message = lyraDbOperation(result) + ": " + lyraDbMessage(result)
+    if status == 4 { throw Busy(message) }
+    throw CloseError(message)
+}
 
 pub class Connection(val handle: CPtr) {
-    pub fn status(): DbStatus { DbStatus(handle) }
-    pub fn prepare(sql: String): Statement { Statement(lyraDbPrepare(handle, sql)) }
-    pub fn close(): DbStatus { DbStatus(lyraDbClose(handle)) }
+    pub fn prepare(sql: String): Result<Statement, DbError> {
+        val result = lyraDbPrepare(handle, sql)
+        if lyraDbStatus(result) == 0 { Ok(Statement(result)) } else { Err(dbError(result)) }
+    }
+    pub fn close(): Unit { checkClose(lyraDbClose(handle)) }
 }
 
 pub class Statement(val handle: CPtr) {
-    pub fn status(): DbStatus { DbStatus(handle) }
-    pub fn bindInt(position: Int, value: Int): DbStatus { DbStatus(lyraDbBindInt(handle, position, value)) }
-    pub fn bindText(position: Int, value: String): DbStatus { DbStatus(lyraDbBindText(handle, position, value)) }
-    pub fn next(): DbStatus { DbStatus(lyraDbNext(handle)) }
-    pub fn readText(column: Int): DbText {
-        val read = lyraDbTextAt(handle, column)
-        DbText(DbStatus(read), lyraDbText(read))
+    pub fn bindInt(position: Int, value: Int): Result<Unit, DbError> { bound(lyraDbBindInt(handle, position, value)) }
+    pub fn bindText(position: Int, value: String): Result<Unit, DbError> { bound(lyraDbBindText(handle, position, value)) }
+    pub fn next(): Result<Bool, DbError> {
+        val result = lyraDbNext(handle)
+        match lyraDbStatus(result) {
+            1 => Ok(true),
+            2 => Ok(false),
+            _ => Err(dbError(result)),
+        }
     }
-    pub fn readInt(column: Int): DbInt {
-        val read = lyraDbIntAt(handle, column)
-        DbInt(DbStatus(read), lyraDbNumber(read))
+    pub fn readText(column: Int): Result<String?, DbError> {
+        val result = lyraDbTextAt(handle, column)
+        match lyraDbStatus(result) {
+            0 => Ok(Some(lyraDbText(result))),
+            3 => Ok(None),
+            _ => Err(dbError(result)),
+        }
     }
-    pub fn close(): DbStatus { DbStatus(lyraDbFinalize(handle)) }
+    pub fn readInt(column: Int): Result<Int?, DbError> {
+        val result = lyraDbIntAt(handle, column)
+        match lyraDbStatus(result) {
+            0 => Ok(Some(lyraDbNumber(result))),
+            3 => Ok(None),
+            _ => Err(dbError(result)),
+        }
+    }
+    pub fn close(): Unit { checkClose(lyraDbFinalize(handle)) }
 }
 
-pub fn open(path: String): Connection { Connection(lyraDbOpen(path, false)) }
-pub fn openReadOnly(path: String): Connection { Connection(lyraDbOpen(path, true)) }
+fn connect(path: String, readOnly: Bool): Result<Connection, DbError> {
+    val result = lyraDbOpen(path, readOnly)
+    if lyraDbStatus(result) == 0 { Ok(Connection(result)) } else { Err(dbError(result)) }
+}
+
+pub fn open(path: String): Result<Connection, DbError> { connect(path, false) }
+pub fn openReadOnly(path: String): Result<Connection, DbError> { connect(path, true) }

@@ -69,7 +69,14 @@ fn main(): Unit {
     def test_worker_cleanup_closes_sqlite_before_repeated_await(self):
         self.run_source('''
 import std.io.assert
+import std.sqlite.DbError
+import std.sqlite.DbErrorKind
 import std.sqlite.open
+
+fn require<T>(result: Result<T, DbError>): T {
+    match result { Ok(value) => value, Err(error) => throw Exception(error.message()) }
+}
+
 class Label(val text: String)
 async fn collect(): Unit { gcCollect() }
 async fn started(): Unit { print(23) }
@@ -84,18 +91,21 @@ async fn main(): Unit {
         await collect()
     }
     val job = blocking {
-        val connection = open(":memory:")
-        defer assert(connection.close().ok(), "close connection")
-        val query = connection.prepare("SELECT 73")
-        defer assert(query.close().ok(), "finalize query")
-        assert(query.next().row(), "row")
-        print(query.readInt(0).value)
+        val connection = require(open(":memory:"))
+        defer connection.close()
+        val query = require(connection.prepare("SELECT 73"))
+        defer query.close()
+        assert(require(query.next()), "row")
+        match require(query.readInt(0)) { Some(number) => print(number), None => throw Exception("expected an integer") }
         connection
     }
     val closed = await job
-    assert(!closed.prepare("SELECT 1").status().ok(), "defer did not close native handle")
+    assert(match closed.prepare("SELECT 1") {
+        Err(error) => match error.kind { DbErrorKind.Closed => true, _ => false },
+        Ok(_) => false,
+    }, "defer did not close native handle")
     val alias = await job
-    assert(alias.close().ok(), "idempotent close")
+    alias.close()
     await quit()
     print(25)
 }

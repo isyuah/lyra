@@ -81,6 +81,9 @@ class HTTP(unittest.TestCase):
                     self.assertEqual(exchange(port, "POST", "/users/7", b"body")[0], 405)
                     database.unlink()
                     self.assertEqual(exchange(port, "GET", "/users/7")[0], 500)
+                    with contextlib.closing(sqlite3.connect(database)) as empty:
+                        empty.execute("CREATE TABLE unrelated(id INTEGER PRIMARY KEY)")
+                    self.assertEqual(exchange(port, "GET", "/users/7")[0], 500)
                     self.assertIsNone(process.poll())
                 assert_linkage(self, app, 'libsqlite3.so.0')
 

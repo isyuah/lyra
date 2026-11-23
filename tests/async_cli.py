@@ -147,23 +147,34 @@ async fn main(): Unit {
         self.main.write_text('''
 import std.io.assert
 import std.io.readLine
+import std.sqlite.DbError
 import std.sqlite.open
+
+fn readDatabase(): Result<String?, DbError> {
+    val db = open(":memory:")?
+    defer db.close()
+    val query = db.prepare("SELECT 'after close'")?
+    defer query.close()
+    assert(query.next()?, "read")
+    query.readText(0)
+}
+
 async fn release(): Unit { print("domain still running") }
 async fn main(): Unit {
     val reading = spawn blocking { readLine().value }
     spawn release();
     print(await reading)
     val result = await blocking {
-        val db = open(":memory:")
-        val query = db.prepare("SELECT 'after close'")
-        assert(query.next().row(), "read")
-        val text = query.readText(0).value
-        assert(query.close().ok() && db.close().ok(), "close")
+        val read = readDatabase()
         gcCollect()
-        text
+        read
     }
     gcCollect()
-    print(result)
+    match result {
+        Ok(Some(text)) => print(text),
+        Ok(None) => throw Exception("expected a text result"),
+        Err(error) => throw Exception(error.message()),
+    }
 }
 ''', encoding="utf-8")
         for flags in ([], ["--release"]):
