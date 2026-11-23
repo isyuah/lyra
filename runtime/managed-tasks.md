@@ -63,7 +63,9 @@ async fn main(): Unit {
 
 `lyraTaskWatchDisconnect(fd)` 从当前域内的任务注册连接断开通知，不读取或关闭调用者的 fd；Linux 后端使用自持的重复 fd。断连时在所属域请求取消当前任务及其激活的孩子；只有 C 工作已返回后才允许父任务执行取消清理。未捕获的原生任务失败取消仍在运行的兄弟，多个失败用 `lyraTaskFailureCount/At` 按登记顺序遍历。实际 socketpair 断开、取消安全与逆序发生的两个失败由[原生任务用例](../tests/runtime_tasks.cpp)验证。
 
-**当前边界：**多个串行域由同一主线程驱动，原生测试验证跨域等待与恢复归属。显式 CPU 并行域、上下文/deadline、普通异常的抛出、异步原因链与清理异常仍需各自的端到端验收。
+**任务上下文：**[std.task](../std/task/README.md) 用普通泛型函数提供隐式 trace 和 deadline。冷 Task 创建时没有快照，首次启动时从所有者继承；重复等待不重设。阻塞请求在提交时保留不可变快照，Worker 仅在调用期间可读，不能登记超时或 socket watch。每个更严格的作用域在所属事件循环安装单调时钟定时器；继承同一期限的子任务由上层传播取消，无需另建定时器。只有已经激活的所有者承担收尾责任。[源码用例](../tests/context_cli.py)用单 Worker 和 FIFO 固定等待顺序；[原生用例](../tests/runtime_context.cpp)验证任务局部的 GC 保活、提前结束时撤掉定时器及已挂起任务到期后被唤醒。
+
+**当前边界：**多个串行域由同一主线程驱动，原生测试验证跨域等待与恢复归属。显式 CPU 并行域、普通异常的抛出、异步原因链与清理异常仍需各自的端到端验收。
 
 ## 独立验证（Linux）
 
@@ -72,7 +74,7 @@ async fn main(): Unit {
 ```sh
 out=$(mktemp -d)
 clang-18 -std=c++23 -O2 -I runtime runtime/managed.cpp tests/runtime_managed.cpp $(pkg-config --cflags --libs bdw-gc) -o "$out/managed"
-clang-18 -std=c++23 -O2 -I runtime runtime/managed.cpp runtime/tasks.cpp tests/runtime_tasks.cpp $(pkg-config --cflags --libs bdw-gc libuv) -o "$out/tasks"
+clang++-18 -std=c++23 -O2 -I runtime runtime/managed.cpp runtime/tasks.cpp runtime/strings.cpp runtime/context.cpp runtime/exceptions.cpp tests/runtime_tasks.cpp $(pkg-config --cflags --libs bdw-gc libuv) -o "$out/tasks"
 "$out/managed" && "$out/tasks" && UV_THREADPOOL_SIZE=1 "$out/tasks"
 readelf -d "$out/tasks" | grep NEEDED
 ```

@@ -1,4 +1,5 @@
 #include "tasks.h"
+#include "context.h"
 #include "managed.h"
 
 #include <fcntl.h>
@@ -20,6 +21,7 @@ struct LyraDomain {
 };
 
 struct DisconnectWatch;
+struct DeadlineWatch;
 struct Failure {
     size_t ordinal;
     void *cause;
@@ -41,6 +43,8 @@ struct LyraTask {
     size_t ordinal, nextOrdinal;
     Failure *failures;
     DisconnectWatch *watches;
+    const LyraContext *context;
+    DeadlineWatch *deadlineWatch;
     LyraTaskState state;
     LyraTaskState pendingState;
     bool cancelRequested;
@@ -55,9 +59,12 @@ struct DisconnectWatch {
     int fd;
 };
 
+struct DeadlineWatch { uv_timer_t timer; LyraTask *task; };
+
 namespace {
 
 thread_local LyraTask *currentTask;
+thread_local const LyraContext *workerContext;
 pthread_mutex_t sharedAccess = PTHREAD_MUTEX_INITIALIZER;
 
 void require(bool condition, const char *error) {
@@ -112,12 +119,16 @@ struct BlockingRequest {
     LyraNativeWork work;
     void *nativeData;
     LyraGcRoot *payloadRoot;
+    const LyraContext *context;
 };
 
 void runBlocking(uv_work_t *work) {
     auto *request = static_cast<BlockingRequest *>(work->data);
     auto registration = lyraGcEnterWorker();
+    auto *previous = workerContext;
+    workerContext = request->context;
     request->work(request->nativeData);
+    workerContext = previous;
     lyraGcLeaveWorker(registration);
 }
 
@@ -166,6 +177,28 @@ void closeWatch(DisconnectWatch *watch) {
     });
 }
 
+void stopDeadline(LyraTask *task) {
+    if (auto *watch = task->deadlineWatch) {
+        task->deadlineWatch = nullptr;
+        uv_timer_stop(&watch->timer);
+        uv_close(reinterpret_cast<uv_handle_t *>(&watch->timer), [](uv_handle_t *handle) { free(handle->data); });
+    }
+}
+
+void armDeadline(LyraTask *task, int64_t remaining) {
+    if (remaining == 0) { lyraTaskRequestCancel(task); return; }
+    auto *watch = static_cast<DeadlineWatch *>(calloc(1, sizeof(DeadlineWatch)));
+    require(watch != nullptr, "cannot allocate deadline timer");
+    require(uv_timer_init(&task->domain->loop, &watch->timer) == 0, "cannot initialize deadline timer");
+    watch->task = task;
+    watch->timer.data = watch;
+    task->deadlineWatch = watch;
+    uv_update_time(&task->domain->loop);
+    require(uv_timer_start(&watch->timer, [](uv_timer_t *timer) {
+        lyraTaskRequestCancel(static_cast<DeadlineWatch *>(timer->data)->task);
+    }, static_cast<uint64_t>(remaining), 0) == 0, "cannot schedule deadline");
+}
+
 void finish(LyraTask *task, LyraTaskState state, void *outcome) {
     require(task->state == LYRA_TASK_RUNNING, "only a running task can finish");
     task->pendingState = state;
@@ -197,6 +230,8 @@ void finish(LyraTask *task, LyraTaskState state, void *outcome) {
         task->state = terminal;
         task->frame = nullptr;
         task->step = nullptr;
+        stopDeadline(task);
+        task->context = nullptr;
         while (auto *watch = task->watches) {
             task->watches = watch->next;
             closeWatch(watch);
@@ -247,6 +282,21 @@ void blockingStep(LyraTask *self, void *storage) {
     else { closure->submitted = true; lyraTaskBlock(self, runClosure, closure); }
 }
 
+}
+
+const LyraContext *lyraContextCurrent() { return currentTask ? currentTask->context : workerContext; }
+
+uint8_t lyraContextEnter(const LyraContext *context) {
+    if (!currentTask) return false;
+    auto deadline = lyraContextDeadline(context);
+    auto previous = lyraContextDeadline(currentTask->context);
+    if (previous >= 0 && (deadline < 0 || previous < deadline)) return false;
+    currentTask->context = context;
+    if (deadline != previous) {
+        stopDeadline(currentTask);
+        armDeadline(currentTask, lyraContextRemaining(context));
+    }
+    return true;
 }
 
 LyraDomain *lyraDomainCreate() {
@@ -324,6 +374,7 @@ void lyraTaskStart(LyraDomain *domain, LyraTask *task) {
     if (task->state != LYRA_TASK_COLD) return;
     task->activeRoot = lyraGcRootCreate(task);
     task->domain = domain;
+    task->context = task->owner ? task->owner->context : nullptr;
     ++domain->live;
     enqueue(task);
 }
@@ -395,6 +446,7 @@ void lyraTaskBlock(LyraTask *task, LyraNativeWork work, void *nativeData) {
     request->work = work;
     request->nativeData = nativeData;
     request->payloadRoot = lyraGcRootCreate(nativeData);
+    request->context = task->context;
     request->request.data = request;
     task->state = LYRA_TASK_SUSPENDED;
     task->blocking = true;
