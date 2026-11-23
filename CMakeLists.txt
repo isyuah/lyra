@@ -1,0 +1,20 @@
+cmake_minimum_required(VERSION 3.20)
+project(Lyra LANGUAGES C CXX)
+
+if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" OR NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
+    message(FATAL_ERROR "This compiler slice targets x86-64 Linux. On Windows configure it inside WSL.")
+endif()
+
+find_package(LLVM 18.1 REQUIRED CONFIG)
+add_executable(lyra compiler/main.cpp compiler/source.cpp compiler/parser.cpp compiler/check.cpp)
+target_compile_features(lyra PRIVATE cxx_std_20)
+target_compile_options(lyra PRIVATE -Wall -Wextra -Wpedantic)
+target_include_directories(lyra SYSTEM PRIVATE ${LLVM_INCLUDE_DIRS})
+target_link_libraries(lyra PRIVATE LLVM)
+set_target_properties(lyra PROPERTIES CXX_EXTENSIONS OFF RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+
+include(CTest)
+if(BUILD_TESTING)
+    find_package(Python3 REQUIRED COMPONENTS Interpreter)
+    add_test(NAME frontend COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/compiler_cli.py $<TARGET_FILE:lyra> Frontend)
+endif()
