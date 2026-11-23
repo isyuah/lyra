@@ -31,8 +31,7 @@ int main(int argc, char** argv) {
         }
         if (!package) throw lyra::Diagnostic{"LYC0001", usage};
         auto sources = lyra::loadSources(*package);
-        auto module = lyra::parse(sources);
-        lyra::check(module, sources);
+        auto module = lyra::check(lyra::parse(sources), sources);
         if (building) lyra::build(module, sources, output.value_or(*package / "build" / (release ? "release" : "debug") / "app"), release);
         if (json) std::cerr << "[]\n";
         return 0;

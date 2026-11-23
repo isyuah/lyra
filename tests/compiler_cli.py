@@ -46,6 +46,28 @@ class PackageTest(unittest.TestCase):
 
 
 class Frontend(PackageTest):
+    def test_checked_bindings_and_control_flow(self):
+        cases = [
+            ("fn main(): Unit { val size = 2; size = 3 }", "size = 3", "LYT0004"),
+            ("fn main(): Unit { print(unknown) }", "unknown", "LYN0001"),
+            ("fn main(): Unit { val x = 1; val x = 2 }", "x = 2", "LYN0002"),
+            ("fn f(x: Bool): Int { x } fn main(): Unit {}", "x }", "LYT0001"),
+            ("fn main(): Unit { if 1 { print(0) } }", "1 {", "LYT0001"),
+            ("fn main(): Unit { while false { val x = 0 }; print(x) }", "x)", "LYN0001"),
+            ("fn main(): Unit { break }", "break", "LYT0005"),
+            ("fn main(): Unit { val x = 1 < 2 == true }", "==", "LYP0001"),
+            ("fn f(): Int { return\n42 } fn main(): Unit {}", "return", "LYT0001"),
+            ("fn main(num: Int): Unit {}", "main", "LYT0002"),
+        ]
+        for source, marker, code in cases:
+            with self.subTest(source=source):
+                self.main.write_text(source)
+                result = self.cli("check", "--diagnostics=json")
+                self.assertNotEqual(result.returncode, 0)
+                error, = json.loads(result.stderr)
+                self.assertEqual((error["code"], error["range"]["start"]["offset"]),
+                                 (code, source.index(marker)))
+
     def test_cc001_check(self):
         self.fixture("fail")
         diagnostic = self.semicolon_error(self.cli("check", "--diagnostics=json"))
@@ -83,6 +105,54 @@ class Frontend(PackageTest):
 
 
 class Native(PackageTest):
+    def test_loop_branches_and_evaluation_order(self):
+        self.main.write_text('''
+fn sum(limit: Int): Int {
+    var index = 0
+    var total: Int = 0
+    while true {
+        index += 1
+        if index > limit { break }
+        if index % 2 == 0 { continue }
+        total = total + index
+    }
+    total
+}
+fn mark(value: Int): Int { print(value); value }
+fn diff(left: Int, right: Int): Int { left - right }
+fn noisy(): Bool { print(999); true }
+fn nested(flag: Bool): Int {
+    if flag { return 3; } else { return 4; }
+}
+fn main(): Unit {
+    print(sum(6))
+    print(diff(mark(1), mark(2)))
+    if false && noisy() || !true { print(999) }
+    print(if true || noisy() { nested(false) * -2 } else { 0 })
+    val outer = 5
+    { val outer = 6; print(outer) }
+    print(outer)
+}
+''')
+        for flags in ([], ["--release"]):
+            output = self.package / "app"
+            result = self.cli("build", "-o", output, *flags)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(subprocess.check_output([output], timeout=5), b"9\n1\n2\n-1\n-8\n6\n5\n")
+
+    def test_invalid_integer_operations(self):
+        for expression in ("-(-9223372036854775808)", "-9223372036854775808 - 1",
+                           "9223372036854775807 * 2", "-9223372036854775808 / -1", "1 / 0", "1 % 0"):
+            self.main.write_text(f"fn main(): Unit {{ print({expression}) }}")
+            for flags in ([], ["--release"]):
+                with self.subTest(expression=expression, flags=flags):
+                    output = self.package / "app"
+                    result = self.cli("build", "-o", output, *flags)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    run = subprocess.run([output], capture_output=True, text=True, timeout=5)
+                    self.assertGreater(run.returncode, 0)
+                    self.assertIn("main.ly:1:", run.stderr)
+
     def test_cc001_no_output(self):
         self.fixture("fail")
         output = self.package / "out"

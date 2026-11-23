@@ -1,10 +1,12 @@
 module;
 #include <charconv>
+#include <algorithm>
 #include <cstdint>
 #include <limits>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -13,7 +15,7 @@ module lyra.syntax;
 namespace lyra {
 namespace {
 
-enum class Kind { Fn, Name, Number, LeftParen, RightParen, LeftBrace, RightBrace, Colon, Comma, Plus, Minus, Semi, End };
+enum class Kind { Name, Keyword, Escaped, Number, Symbol, End };
 
 struct Token {
     Kind kind;
@@ -54,21 +56,22 @@ public:
         Kind kind;
         if (isLetter(current) || isDigit(current)) {
             while (offset < text.size() && (isLetter(text[offset]) || isDigit(text[offset]))) ++offset;
-            kind = isDigit(current) ? Kind::Number : text.substr(start, offset - start) == "fn" ? Kind::Fn : Kind::Name;
+            constexpr std::string_view keywords[] = {"fn", "val", "var", "if", "else", "while", "return", "break", "continue", "true", "false"};
+            auto word = text.substr(start, offset - start);
+            kind = isDigit(current) ? Kind::Number : std::ranges::find(keywords, word) == std::end(keywords) ? Kind::Name : Kind::Keyword;
+        } else if (current == '`') {
+            if (offset == text.size() || !isLetter(text[offset])) throw at(source, {start, offset}, "LYL0001", "反引号内需要标识符");
+            while (offset < text.size() && (isLetter(text[offset]) || isDigit(text[offset]))) ++offset;
+            if (offset == text.size() || text[offset] != '`') throw at(source, {start, offset}, "LYL0001", "标识符缺少结束反引号");
+            ++offset;
+            kind = Kind::Escaped;
         } else {
-            switch (current) {
-                case '(': kind = Kind::LeftParen; break;
-                case ')': kind = Kind::RightParen; break;
-                case '{': kind = Kind::LeftBrace; break;
-                case '}': kind = Kind::RightBrace; break;
-                case ':': kind = Kind::Colon; break;
-                case ',': kind = Kind::Comma; break;
-                case '+': kind = Kind::Plus; break;
-                case '-': kind = Kind::Minus; break;
-                case ';': kind = Kind::Semi; break;
-                default:
-                    while (offset < text.size() && (static_cast<unsigned char>(text[offset]) & 0xc0) == 0x80) ++offset;
-                    throw at(source, {start, offset}, "LYL0001", "此处不是受支持的 Lyra 记号");
+            kind = Kind::Symbol;
+            constexpr std::string_view doubles[] = {"+=", "-=", "*=", "/=", "%=", "==", "!=", "<=", ">=", "&&", "||"};
+            if (std::ranges::find(doubles, text.substr(start, 2)) != std::end(doubles)) ++offset;
+            else if (std::string_view("(){},:;+-*/%=<>!").find(current) == text.npos) {
+                while (offset < text.size() && (static_cast<unsigned char>(text[offset]) & 0xc0) == 0x80) ++offset;
+                throw at(source, {start, offset}, "LYL0001", "此处不是受支持的 Lyra 记号");
             }
         }
         return {kind, {start, offset}, newline};
@@ -104,9 +107,16 @@ std::int64_t integer(const Source& source, Span digits, bool negative) {
     return negative ? -static_cast<std::int64_t>(number) : static_cast<std::int64_t>(number);
 }
 
+struct Infix { std::string_view text; int rank; Op op; };
+constexpr Infix infix[] = {
+    {"=", 1, Op::Set}, {"+=", 1, Op::AddSet}, {"-=", 1, Op::SubSet}, {"*=", 1, Op::MulSet}, {"/=", 1, Op::DivSet}, {"%=", 1, Op::RemSet},
+    {"||", 2, Op::Or}, {"&&", 3, Op::And}, {"==", 4, Op::Eq}, {"!=", 4, Op::Ne}, {"<", 4, Op::Lt}, {"<=", 4, Op::Le}, {">", 4, Op::Gt}, {">=", 4, Op::Ge},
+    {"+", 5, Op::Add}, {"-", 5, Op::Sub}, {"*", 6, Op::Mul}, {"/", 6, Op::Div}, {"%", 6, Op::Rem}
+};
+
 class Parser {
 public:
-    Parser(const Source& source, std::size_t file) : source(source), file(file), lexer(source), token(lexer.next()) {}
+    Parser(const Source& source, std::size_t file) : source(source), file(file), lexer(source), token(lexer.next()), next(lexer.next()) {}
 
     void appendTo(Module& module) {
         while (token.kind != Kind::End) module.push_back(function());
@@ -116,87 +126,166 @@ private:
     const Source& source;
     std::size_t file;
     Lexer lexer;
-    Token token;
+    Token token, next;
+    std::vector<Expr> nodes;
 
     Token consume() {
         auto previous = token;
-        token = lexer.next();
+        token = next;
+        next = lexer.next();
         return previous;
     }
 
-    Token require(Kind kind, const char* message) {
-        if (token.kind != kind) throw at(source, token.span, "LYP0001", message);
+    std::string_view text(Token item) const { return std::string_view(source.text).substr(item.span.begin, item.span.end - item.span.begin); }
+    bool is(std::string_view word) const { return text(token) == word; }
+    Token require(std::string_view word) {
+        if (!is(word)) throw at(source, token.span, "LYP0001", "此处需要 " + std::string(word));
         return consume();
     }
 
-    std::string spelling(Span span) const { return source.text.substr(span.begin, span.end - span.begin); }
-
-    Function function() {
-        require(Kind::Fn, "期望以 fn 开始的具名函数声明");
-        auto name = require(Kind::Name, "fn 后需要函数名").span;
-        require(Kind::LeftParen, "函数名后需要 (");
-        require(Kind::RightParen, "此切片只支持无参函数，期望 )");
-        require(Kind::Colon, "此切片需要显式返回类型 : Int 或 : Unit");
-        auto result = require(Kind::Name, "需要返回类型").span;
-        auto type = spelling(result);
-        if (type != "Int" && type != "Unit") throw at(source, result, "LYT0003", "不支持的返回类型：" + type);
-        Function parsed{file, spelling(name), name, type == "Int" ? Type::Int : Type::Unit, result, {}, {}, {}};
-        require(Kind::LeftBrace, "函数体需要 {");
-        while (token.kind != Kind::RightBrace) {
-            if (token.kind == Kind::End) throw at(source, token.span, "LYP0001", "函数体缺少 }");
-            auto value = expression(parsed, false);
-            std::optional<Span> semi;
-            if (token.kind == Kind::Semi) semi = consume().span;
-            else if (token.kind != Kind::RightBrace && token.kind != Kind::End && !token.newlineBefore) {
-                throw at(source, token.span, "LYP0001", "表达式之间需要换行或分号");
-            }
-            parsed.body.push_back({value, semi});
-        }
-        parsed.closingBrace = consume().span;
-        return parsed;
+    Identifier identifier() {
+        if (token.kind != Kind::Name && token.kind != Kind::Escaped) throw at(source, token.span, "LYP0001", "此处需要标识符");
+        auto item = consume();
+        auto word = text(item);
+        if (item.kind == Kind::Escaped) word = word.substr(1, word.size() - 2);
+        return {std::string(word), item.span};
+    }
+    ExprId add(Span span, auto node) {
+        nodes.push_back({span, std::move(node)});
+        return nodes.size() - 1;
     }
 
-    ExprId expression(Function& parsed, bool inParens) {
-        auto left = primary(parsed, inParens);
-        while (token.kind == Kind::Plus && (inParens || !token.newlineBefore)) {
-            auto operation = consume().span;
-            auto right = primary(parsed, inParens);
-            Span span{parsed.expressions[left].span.begin, parsed.expressions[right].span.end};
-            parsed.expressions.push_back({span, Add{left, right, operation}});
-            left = parsed.expressions.size() - 1;
+    Function function() {
+        require("fn");
+        auto name = identifier();
+        require("(");
+        std::vector<Parameter> parameters;
+        while (!is(")")) {
+            auto parameter = identifier();
+            require(":");
+            parameters.push_back({std::move(parameter), identifier()});
+            if (!is(",")) break;
+            consume();
+        }
+        require(")");
+        require(":");
+        auto result = identifier();
+        auto body = block();
+        return {file, std::move(name), std::move(parameters), std::move(result), std::exchange(nodes, {}), body};
+    }
+
+    ExprId block() {
+        auto start = require("{").span.begin;
+        Block body;
+        while (!is("}")) {
+            if (token.kind == Kind::End) throw at(source, token.span, "LYP0001", "块缺少 }");
+            auto value = statement();
+            std::optional<Span> semi;
+            if (is(";")) semi = consume().span;
+            else if (!is("}") && token.kind != Kind::End && !token.newlineBefore) {
+                throw at(source, token.span, "LYP0001", "表达式之间需要换行或分号");
+            }
+            body.statements.push_back({value, semi});
+        }
+        body.end = consume().span;
+        auto span = Span{start, body.end.end};
+        return add(span, std::move(body));
+    }
+
+    ExprId statement() {
+        auto start = token.span.begin;
+        if (is("val") || is("var")) {
+            bool writable = text(consume()) == "var";
+            auto name = identifier();
+            std::optional<Identifier> annotation;
+            if (is(":")) { consume(); annotation = identifier(); }
+            require("=");
+            auto value = expression();
+            return add({start, nodes[value].span.end}, Binding{std::move(name), writable, std::move(annotation), value});
+        }
+        if (is("return")) {
+            auto site = consume().span;
+            if (token.newlineBefore || is(";") || is("}")) return add(site, Return{});
+            auto value = expression();
+            return add({start, nodes[value].span.end}, Return{value});
+        }
+        if (is("break") || is("continue")) {
+            auto item = consume();
+            return add(item.span, text(item) == "break" ? Jump::Break : Jump::Continue);
+        }
+        if (is("while")) {
+            consume();
+            auto condition = expression();
+            auto body = block();
+            return add({start, nodes[body].span.end}, While{condition, body});
+        }
+        return expression();
+    }
+
+    ExprId expression(bool inParens = false, int minRank = 1) {
+        auto left = primary(inParens);
+        int previous = 0;
+        while (inParens || !token.newlineBefore) {
+            auto op = std::ranges::find(infix, text(token), &Infix::text);
+            if (op == std::end(infix) || op->rank < minRank) break;
+            if ((op->rank == 4 || op->rank == 1) && previous == op->rank) throw at(source, token.span, "LYP0001", "比较或赋值不能连写");
+            previous = op->rank;
+            auto site = consume().span;
+            auto right = expression(inParens, op->rank + 1);
+            left = add({nodes[left].span.begin, nodes[right].span.end}, Binary{op->op, site, left, right});
         }
         return left;
     }
 
-    ExprId primary(Function& parsed, bool inParens) {
+    ExprId primary(bool inParens) {
         auto start = token.span.begin;
-        if (token.kind == Kind::Number || token.kind == Kind::Minus) {
-            bool negative = token.kind == Kind::Minus;
+        if (token.kind == Kind::Number || (is("-") && next.kind == Kind::Number)) {
+            bool negative = is("-");
             if (negative) consume();
-            auto digits = require(Kind::Number, "此切片的负号后需要整数字面量").span;
-            parsed.expressions.push_back({{start, digits.end}, integer(source, digits, negative)});
-        } else if (token.kind == Kind::Name) {
-            auto name = consume().span;
-            if (token.newlineBefore && !inParens) throw at(source, name, "LYP0001", "此处需要函数调用");
-            require(Kind::LeftParen, "此处需要函数调用，函数名后需要 (");
-            Call call{spelling(name), name, {}};
-            if (token.kind != Kind::RightParen) {
-                for (;;) {
-                    call.arguments.push_back(expression(parsed, true));
-                    if (token.kind != Kind::Comma) break;
-                    consume();
-                }
-            }
-            auto close = require(Kind::RightParen, "调用缺少 )").span;
-            parsed.expressions.push_back({{start, close.end}, std::move(call)});
-        } else if (token.kind == Kind::LeftParen) {
+            auto digits = consume().span;
+            return add({start, digits.end}, integer(source, digits, negative));
+        }
+        if (is("-") || is("!")) {
+            auto item = consume();
+            auto operand = primary(inParens);
+            return add({start, nodes[operand].span.end}, Unary{text(item) == "!" ? Op::Not : Op::Sub, item.span, operand});
+        }
+        if (is("true") || is("false")) {
+            auto item = consume();
+            return add(item.span, text(item) == "true");
+        }
+        if (is("if")) {
             consume();
-            auto value = expression(parsed, true);
-            auto close = require(Kind::RightParen, "分组表达式缺少 )").span;
-            parsed.expressions[value].span = {start, close.end};
+            auto condition = expression();
+            auto yes = block();
+            std::optional<ExprId> no;
+            if (is("else")) { consume(); no = is("if") ? primary(false) : block(); }
+            return add({start, nodes[no.value_or(yes)].span.end}, Conditional{condition, yes, no});
+        }
+        if (is("{")) return block();
+        if (token.kind == Kind::Name || token.kind == Kind::Escaped) {
+            auto name = identifier();
+            if (!is("(") || (token.newlineBefore && !inParens)) { auto span = name.span; return add(span, std::move(name)); }
+            consume();
+            Call call{std::move(name), {}};
+            while (!is(")")) {
+                std::optional<Identifier> label;
+                if (text(next) == ":") { label = identifier(); consume(); }
+                call.arguments.push_back({std::move(label), expression(true)});
+                if (!is(",")) break;
+                consume();
+            }
+            auto close = require(")").span;
+            return add({start, close.end}, std::move(call));
+        }
+        if (is("(")) {
+            consume();
+            auto value = expression(true);
+            auto close = require(")").span;
+            nodes[value].span = {start, close.end};
             return value;
-        } else throw at(source, token.span, "LYP0001", "期望整数、函数调用或括号表达式");
-        return parsed.expressions.size() - 1;
+        }
+        throw at(source, token.span, "LYP0001", "此处需要表达式");
     }
 };
 

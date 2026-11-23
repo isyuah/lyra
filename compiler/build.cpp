@@ -77,7 +77,7 @@ void emitExecutable(const llvm::Module& module, const fs::path& output, bool rel
 
 }
 
-void build(const Module& functions, const std::vector<Source>& sources, const fs::path& output, bool release) {
+void build(const CheckedModule& functions, const std::vector<Source>& sources, const fs::path& output, bool release) {
     if (fs::exists(output)) {
         for (const auto& source : sources) {
             if (fs::equivalent(source.path, output)) throw Diagnostic{"LYI0001", "输出路径不能覆盖输入源码：" + output.string()};

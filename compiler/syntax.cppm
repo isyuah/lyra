@@ -11,38 +11,39 @@ export import lyra.source;
 
 export namespace lyra {
 
-enum class Type { Int, Unit };
 using ExprId = std::size_t;
 
+struct Identifier { std::string text; Span span; };
+struct Argument { std::optional<Identifier> label; ExprId value; };
 struct Call {
-    std::string name;
-    Span nameSpan;
-    std::vector<ExprId> arguments;
+    Identifier name;
+    std::vector<Argument> arguments;
 };
 
-struct Add {
-    ExprId left, right;
-    Span operatorSpan;
-};
+enum class Op { Set, AddSet, SubSet, MulSet, DivSet, RemSet, Or, And, Eq, Ne, Lt, Le, Gt, Ge, Add, Sub, Mul, Div, Rem, Not };
+struct Unary { Op op; Span site; ExprId operand; };
+struct Binary { Op op; Span site; ExprId left, right; };
+struct Statement { ExprId expression; std::optional<Span> semicolon; };
+struct Block { std::vector<Statement> statements; Span end; };
+struct Binding { Identifier name; bool writable; std::optional<Identifier> annotation; ExprId value; };
+struct Conditional { ExprId condition, yes; std::optional<ExprId> no; };
+struct While { ExprId condition, body; };
+struct Return { std::optional<ExprId> value; };
+enum class Jump { Break, Continue };
 
 struct Expr {
     Span span;
-    std::variant<std::int64_t, Call, Add> node;
+    std::variant<std::int64_t, bool, Identifier, Call, Unary, Binary, Block, Binding, Conditional, While, Return, Jump> node;
 };
 
-struct Statement {
-    ExprId expression;
-    std::optional<Span> semicolon;
-};
-
+struct Parameter { Identifier name, type; };
 struct Function {
     std::size_t file;
-    std::string name;
-    Span nameSpan;
-    Type result;
-    Span resultSpan, closingBrace;
+    Identifier name;
+    std::vector<Parameter> parameters;
+    Identifier result;
     std::vector<Expr> expressions;
-    std::vector<Statement> body;
+    ExprId body;
 };
 
 using Module = std::vector<Function>;
