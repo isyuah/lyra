@@ -24,7 +24,7 @@ struct Call {
     std::vector<Identifier> typeArguments{};
     std::optional<ExprId> function{};
 };
-struct Member { ExprId receiver; Identifier name; bool iterationExtent{}; };
+struct Member { ExprId receiver; Identifier name; };
 struct ListLiteral { std::vector<ExprId> elements; };
 struct Index { ExprId receiver, offset; Span site; };
 struct StringLiteral { std::string bytes; };
@@ -37,6 +37,8 @@ struct Block { std::vector<Statement> statements; Span end; };
 struct Binding { Identifier name; bool writable; std::optional<Identifier> annotation; ExprId value; };
 struct Conditional { ExprId condition, yes; std::optional<ExprId> no; };
 struct While { ExprId condition, body; };
+struct ForRange { ExprId end; bool inclusive; };
+struct For { Identifier item; ExprId input, body; std::optional<ForRange> range; };
 struct Return { std::optional<ExprId> value; };
 struct Raise { Span site; std::optional<ExprId> value; };
 struct CatchBinding { Identifier name, type; };
@@ -55,7 +57,7 @@ enum class Jump { Break, Continue };
 
 struct Expr {
     Span span;
-    std::variant<std::int64_t, bool, StringLiteral, Identifier, Call, Member, Unary, Binary, Block, Binding, Conditional, While, Return, Raise, Attempt, Jump, TaskOp, Blocking, Deferred, EmptyOption, Propagate, Match, ListLiteral, Index, Lambda> node;
+    std::variant<std::int64_t, bool, StringLiteral, Identifier, Call, Member, Unary, Binary, Block, Binding, Conditional, While, For, Return, Raise, Attempt, Jump, TaskOp, Blocking, Deferred, EmptyOption, Propagate, Match, ListLiteral, Index, Lambda> node;
 };
 
 struct Parameter { Identifier name, type; bool variadic{}; std::optional<ExprId> defaultValue{}; std::vector<Attribute> attributes{}; };

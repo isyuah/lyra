@@ -113,10 +113,12 @@ val name: String? = absent()
 ## 5. 控制流与清理
 
 - 值位置的 `if` 必须有 `else`；各正常完成的分支须能得到目标类型。语句位置允许 `if id == null { return Response.status(400) }`。条件要求 `Bool`，不按数字或对象的“真假”转换。普通循环结果为 `Unit`；`while`、`for item in items` 支持不带值的 `break` / `continue`，只针对当前函数内最近的循环。
-- `for item in items` 首版接受 `List<T>`（包括泛型函数里的 `T`）。进入循环时只求值一次列表表达式并记录当时长度；每轮按下标读取当时的元素，绑定只读局部 `item`。之后追加的元素不延长当前遍历，修改尚未遍历的位置会在读取时可见。
+- `for item in items` 只求值一次输入，每轮建立新的只读绑定。对 `List<T>` 记录开始时的长度；随后追加的元素不延长遍历，修改尚未遍历的下标会在读取时可见。
+- `for i in start..<end` 遍历半开区间，`for i in start..end` 包含终点。两个 `Int` 端点从左到右各求值一次，步长为 `1`；起点大于终点时遍历为空，闭区间到达 `Int` 最大值后直接结束。区间写法目前只在 `for` 的头部使用。
+- 其他类型通过可见的同步方法 `iterator(): I` 和 `I.next(): Option<T>` 参与遍历，两个方法除接收者外不接收参数，也不声明类型形参。进入循环时调用一次 `iterator()`，每轮调用一次 `next()`；只有最外层的 `None` 才结束，`Some(None)` 仍是一个元素。协议按静态类型检查；有状态的游标可以用 Class 保存可变位置。`...` 的展开仍只接受 `List<T>`。
 - 对 `Option` 和封闭枚举（含 `Result`）的 `match` 必须穷尽。被匹配值只求一次，按源码顺序选第一条命中的分支；构造器模式可嵌套，`_` 表示忽略此位置，绑定名只在本分支可见；用 `=>` 隔开模式和值，分支之间用逗号，允许末尾逗号。`Ok(None)` 与 `Err(error)` 是不同分支。
 - **已定：** 后缀 `?` 由操作数静态类型区分 `Err` 与 `None`，要求最近的函数或 lambda 返回兼容类型；对 `async fn` 检查其声明的完成值。不会把 `None` 自动变成 `Err` 或 HTTP 状态。[同步 `defer`](errors-and-resources.md) 在离开登记的块时倒序执行一次，包括 `return`、`?`、异常与协作式取消；`defer` 自身不可 `await`。
 
 ## 评审边界
 
-[调用与解析正反例](0002-syntax-cases.md)列出首版验收用例。模式守卫、循环标签和自定义迭代协议暂缓。HTTP 的 path/query/body 怎样解码和怎么省掉 `request` 样板，单独在[同一请求的手写版和短写提案](../examples/user-service/README.md)比较，不占用新的函数调用规则。
+[调用与解析正反例](0002-syntax-cases.md)列出首版验收用例。模式守卫和循环标签暂缓。HTTP 的 path/query/body 怎样解码和怎么省掉 `request` 样板，单独在[同一请求的手写版和短写提案](../examples/user-service/README.md)比较，不占用新的函数调用规则。

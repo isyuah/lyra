@@ -79,8 +79,8 @@ public:
             kind = Kind::Escaped;
         } else {
             kind = Kind::Symbol;
-            constexpr std::string_view doubles[] = {"+=", "-=", "*=", "/=", "%=", "==", "!=", "<=", ">=", "&&", "||", "=>", "?.", "??", "->"};
-            if (text.substr(start, 3) == "...") offset += 2;
+            constexpr std::string_view doubles[] = {"+=", "-=", "*=", "/=", "%=", "==", "!=", "<=", ">=", "&&", "||", "=>", "?.", "??", "->", ".."};
+            if (text.substr(start, 3) == "..." || text.substr(start, 3) == "..<") offset += 2;
             else if (std::ranges::find(doubles, text.substr(start, 2)) != std::end(doubles)) ++offset;
             else if (std::string_view("()[]{},.:;+-*/%=<>!#@?").find(current) == text.npos) {
                 while (offset < text.size() && (static_cast<unsigned char>(text[offset]) & 0xc0) == 0x80) ++offset;
@@ -473,23 +473,14 @@ private:
         auto site = consume().span;
         auto item = identifier();
         require("in");
-        auto source = expression(false, 1, false);
+        auto input = expression(false, 1, false);
+        std::optional<ForRange> range;
+        if (!token.newlineBefore && (is("..") || is("..<"))) {
+            bool inclusive = text(consume()) == "..";
+            range = ForRange{expression(false, 1, false), inclusive};
+        }
         auto body = block();
-        auto span = Span{site.begin, nodes[body].span.end};
-        auto input = nodes[source].span;
-        auto list = hidden("list", input), count = hidden("count", site), index = hidden("index", site);
-        auto reference = [&](const Identifier& name) { return add(name.span, name); };
-        auto stored = add(input, Binding{list, false, {}, source});
-        auto length = add(input, Member{reference(list), {"size", input}, true});
-        auto extent = add(input, Binding{count, false, {}, length});
-        auto counter = add(site, Binding{index, true, {}, add(site, std::int64_t{0})});
-        auto test = add(site, Binary{Op::Lt, site, reference(index), reference(count)});
-        auto value = add(input, Index{reference(list), reference(index), input});
-        auto element = add(item.span, Binding{item, false, {}, value});
-        auto advance = add(site, Binary{Op::AddSet, site, reference(index), add(site, std::int64_t{1})});
-        auto step = add(span, Block{{{element, {}}, {advance, {}}, {body, {}}}, nodes[body].span});
-        auto loop = add(span, While{test, step});
-        return add(span, Block{{{stored, {}}, {extent, {}}, {counter, {}}, {loop, {}}}, nodes[body].span});
+        return add({site.begin, nodes[body].span.end}, For{std::move(item), input, body, range});
     }
 
     ExprId optional(ExprId subject, Identifier payload, ExprId present, ExprId absent, Span site, Span span, OptionalForm form) {

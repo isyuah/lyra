@@ -625,6 +625,13 @@ struct Emitter {
         return value;
     }
 
+    void loopBody(ExprId body, Label next, Label done) {
+        loops.push_back({next, done, cleanupMark(), handlers.size()});
+        emit(body);
+        loops.pop_back();
+        if (live()) builder.CreateBr(next);
+    }
+
     Value emitNode(ExprId, const While& loop) {
         auto test = label("while.test");
         builder.CreateBr(test);
@@ -634,12 +641,63 @@ struct Emitter {
         auto body = label("while.body"), done = label("while.end");
         builder.CreateCondBr(condition, body, done);
         builder.SetInsertPoint(body);
-        loops.push_back({test, done, cleanupMark(), handlers.size()});
-        emit(loop.body);
-        loops.pop_back();
-        if (live()) builder.CreateBr(test);
+        loopBody(loop.body, test, done);
         builder.SetInsertPoint(done);
         return unit();
+    }
+
+    template<class Element>
+    Value countedLoop(const For& loop, std::size_t slot, Value first, Value last, bool inclusive, Element element) {
+        auto entry = builder.GetInsertBlock();
+        auto test = label("for.test"), body = label("for.body"), step = label("for.step"), done = label("for.end");
+        builder.CreateBr(test);
+        builder.SetInsertPoint(test);
+        auto index = builder.CreatePHI(builder.getInt64Ty(), 2, "for.index");
+        index->addIncoming(first, entry);
+        builder.CreateCondBr(inclusive ? builder.CreateICmpSLE(index, last) : builder.CreateICmpSLT(index, last), body, done);
+        builder.SetInsertPoint(body);
+        initialize(slot, element(index));
+        loopBody(loop.body, step, done);
+        builder.SetInsertPoint(step);
+        if (inclusive) {
+            auto increment = label("for.increment");
+            builder.CreateCondBr(builder.CreateICmpEQ(index, last), done, increment);
+            builder.SetInsertPoint(increment);
+        }
+        index->addIncoming(builder.CreateAdd(index, builder.getInt64(1)), builder.GetInsertBlock());
+        builder.CreateBr(test);
+        builder.SetInsertPoint(done);
+        return unit();
+    }
+
+    Value emitNode(ExprId id, const For& loop) {
+        auto input = emit(loop.input);
+        if (!live()) return unit();
+        auto slot = fn.expressions[id].target;
+        if (loop.range) {
+            auto last = emit(loop.range->end);
+            if (!live()) return unit();
+            return countedLoop(loop, slot, input, last, loop.range->inclusive, [](Value index) { return index; });
+        }
+        auto site = fn.syntax.expressions[loop.input].span;
+        if (const auto& plan = fn.expressions[id].iterator) {
+            auto iterator = callFunction(plan->open, {input}, site);
+            auto test = label("for.next"), body = label("for.body"), done = label("for.end");
+            builder.CreateBr(test);
+            builder.SetInsertPoint(test);
+            auto next = callFunction(plan->next, {iterator}, site);
+            builder.CreateCondBr(builder.CreateExtractValue(next, 0), body, done);
+            builder.SetInsertPoint(body);
+            initialize(slot, builder.CreateExtractValue(next, 1));
+            loopBody(loop.body, test, done);
+            builder.SetInsertPoint(done);
+            return unit();
+        }
+        NativeLists lists{builder};
+        auto type = layouts.native(builder, fn.locals[slot].type);
+        return countedLoop(loop, slot, builder.getInt64(0), lists.size(input), false, [&](Value index) {
+            return builder.CreateLoad(type, lists.get(input, index, source, site));
+        });
     }
 
     Value emitNode(ExprId, const Return& ret) {

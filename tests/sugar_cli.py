@@ -82,11 +82,84 @@ fn main(): Unit {
                 ran = subprocess.run([app], capture_output=True, timeout=5)
                 self.assertEqual((ran.returncode, ran.stdout, ran.stderr), (0, b'7\n7\n3\n8\n6\n5\n11\n1\n3\n8\n7\ntext\n7\n1\n42\n', b''))
 
+    def test_integer_bounds_and_static_iterators(self):
+        self.main.write_text('''
+class Meter(var opens: Int, var reads: Int)
+class Cursor(val meter: Meter, var index: Int, val last: Int) {
+    fn next(self): Option<Int?> {
+        self.meter.reads += 1
+        self.index += 1
+        if self.index > self.last { None }
+        else if self.index == 1 { Some(None) }
+        else { Some(Some(self.index)) }
+    }
+}
+struct Values(val meter: Meter) {
+    fn iterator(self): Cursor { self.meter.opens += 1; Cursor(self.meter, 0, 3) }
+}
+trait Iterable { fn iterator(self): Cursor }
+async fn valuesOf<T: Iterable>(values: T): Unit {
+    for value in values {
+        defer { print("cleanup") }
+        await blocking { gcCollect() }
+        if value == null { print("empty item"); continue }
+        print(value ?? 0)
+        if (value ?? 0) == 3 { break }
+    }
+}
+fn mark(value: Int): Int { print(value); value }
+async fn main(): Unit {
+    for number in mark(-2)..<mark(2) {
+        if number < 0 { continue }
+        print(number)
+    }
+    for number in 2..1 { print(99) }
+    for number in 2..<2 { print(99) }
+    for number in 9223372036854775807..9223372036854775807 { print(number); continue }
+    val readers: List<() -> Int> = []
+    for number in 5..6 { readers.add(() => { number }) }
+    print(readers[0]())
+    print(readers[1]())
+    val meter = Meter(0, 0)
+    await valuesOf(Values(meter))
+    print(meter.opens)
+    print(meter.reads)
+    for item in Values(meter) { print(item ?? 0) }
+    print(meter.opens)
+    print(meter.reads)
+}
+''', encoding='utf-8')
+        expected = b'-2\n2\n0\n1\n9223372036854775807\n5\n6\nempty item\ncleanup\n2\ncleanup\n3\ncleanup\n1\n3\n0\n2\n3\n2\n7\n'
+        for flags in ([], ['--release']):
+            with self.subTest(flags=flags):
+                app = executable(self.package / 'app')
+                built = subprocess.run([COMPILER, 'build', self.package, *flags, '-o', app], capture_output=True, timeout=30)
+                self.assertEqual(built.returncode, 0, built.stderr.decode())
+                ran = subprocess.run([app], capture_output=True, timeout=5)
+                self.assertEqual((ran.returncode, ran.stdout, ran.stderr), (0, expected, b''))
+
+    def test_iterator_protocol_does_not_invoke_async_or_non_optional_methods(self):
+        for declaration, fragment in (
+            ('async fn next(self): Int? { None }', '同步 next()'),
+            ('fn next(self, count: Int = 0): Int? { None }', '同步 next()'),
+            ('fn next(self): Int { 1 }', '实际是 Int'),
+        ):
+            with self.subTest(declaration=declaration):
+                self.main.write_text('struct Cursor { ' + declaration + ' }\n'
+                                     'struct Values { fn iterator(self): Cursor { Cursor() } }\n'
+                                     'fn main(): Unit { for item in Values() {} }', encoding='utf-8')
+                rejected = subprocess.run([COMPILER, 'check', self.package, '--diagnostics=json'], capture_output=True, timeout=10)
+                self.assertNotEqual(rejected.returncode, 0)
+                issue, = json.loads(rejected.stderr)
+                self.assertEqual(issue['code'], 'LYT0014')
+                self.assertIn(fragment, issue['message'])
+
     def test_wrong_operands_report_source_sites(self):
         for code, expression, token in [('LYT0010', '1?.size', '?.'), ('LYT0010', '1 ?? 2', '??'),
                                         ('LYT0001', 'Some(3) ?? "wrong"', '"wrong"'),
                                         ('LYT0004', 'var value = 1; (None ?? value) = 2', '??'),
                                         ('LYT0014', 'for value in 7 {}', '7'),
+                                        ('LYT0001', 'for value in 1..<"wrong" {}', '"wrong"'),
                                         ('LYT0004', 'for value in [3] { value = 2 }', 'value'),
                                         ('LYT0001', 'val value: Option<Int?> = Some(None); val flat: Int = value ?? 7', '??')]:
             with self.subTest(expression=expression):

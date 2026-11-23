@@ -610,7 +610,6 @@ struct Checker {
         auto owner = visit(member.receiver);
         if (owner == Type::Never) return owner;
         if (owner.kind == Type::List && member.name.text == "size") return Type::Int;
-        if (member.iterationExtent) throw at(source, member.name.span, "LYT0014", "for ... in 需要 List，实际是 " + typeName(module, owner));
         if (owner == Type::Exception && member.name.text == "message") return Type::String;
         auto field = memberIndex(owner, member.name, symbols.fields);
         fn.expressions[id].target = field;
@@ -917,6 +916,57 @@ struct Checker {
         visit(loop.body, {}, true);
         --loops;
         return condition == Type::Never ? Type::Never : Type::Unit;
+    }
+
+    struct IterationMethod { Type result; std::optional<std::size_t> function; };
+
+    IterationMethod iterationMethod(Type owner, const std::string& name, Span site) const {
+        if (owner.kind == Type::Variable) {
+            if (const auto* method = symbols.contracts.member(owner, name); method && method->parameters.empty() && !method->asynchronous)
+                return {method->result, {}};
+        } else if (owner.kind == Type::Record) {
+            const auto& methods = symbols.methods[owner.id];
+            if (auto found = methods.find(name); found != methods.end()) {
+                const auto& entry = symbols.callables[found->second];
+                if (!entry.generic) {
+                    const auto& target = module.functions[entry.target];
+                    visible(target.syntax.file, target.syntax.isPublic, {name, site});
+                    if (target.syntax.parameters.size() == 1 && !target.syntax.isAsync) return {target.result, entry.target};
+                }
+            }
+        }
+        auto expected = name == "iterator" ? "可见的同步 iterator()，或使用 List、整数区间" : "可见的同步 next(): Option<T>";
+        throw at(source, site, "LYT0014", "for ... in 需要" + std::string(expected) + "，实际是 " + typeName(module, owner));
+    }
+
+    Type infer(ExprId id, const For& loop, auto, bool) {
+        auto input = visit(loop.input, loop.range ? std::optional(Type{Type::Int}) : std::nullopt);
+        auto element = input;
+        bool exits = input == Type::Never;
+        if (loop.range) {
+            exits |= visit(loop.range->end, Type::Int) == Type::Never;
+            element = Type::Int;
+        } else if (input.kind == Type::List) {
+            element = module.listElements[input.id];
+        } else if (!exits) {
+            auto site = fn.syntax.expressions[loop.input].span;
+            auto iterator = iterationMethod(input, "iterator", site);
+            auto next = iterationMethod(iterator.result, "next", site);
+            if (next.result.kind != Type::Option)
+                throw at(source, site, "LYT0014", "for ... in 的 next() 必须返回 Option<T>，实际是 " + typeName(module, next.result));
+            element = module.sumTypes[next.result.id].success;
+            if (iterator.function && next.function) fn.expressions[id].iterator = IteratorPlan{*iterator.function, *next.function};
+        }
+        scopes.emplace_back();
+        auto slot = fn.locals.size();
+        declare(loop.item, slot);
+        fn.locals.push_back({element, false, currentWorker()});
+        fn.expressions[id].target = slot;
+        ++loops;
+        visit(loop.body, {}, true);
+        --loops;
+        scopes.pop_back();
+        return exits ? Type::Never : Type::Unit;
     }
 
     Type infer(ExprId id, Jump, auto, bool) {
