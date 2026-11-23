@@ -1,6 +1,6 @@
 # Lyra 首版编译器与运行时：按可观察结果验收
 
-H 由作者委托设计。顺序是先证明**写错能指出原因、写对能独立运行**，再让 GC、异步和 FFI 分别过自己的关。下面是实现要通过的契约，不是运行报告；C1 和 F1 都不阻塞第一个切片。
+H 由作者委托设计。顺序是先证明**写错能指出原因、写对能独立运行**，再让 GC、异步和 FFI 分别过自己的关。下面是稳定的验收契约；已验证的范围单独列出。
 
 ## 第一个切片：同一个程序，只差一个分号
 
@@ -10,6 +10,8 @@ H 由作者委托设计。顺序是先证明**写错能指出原因、写对能�
 |---|---|---|
 | CC-001 | [fail/src/main.ly](../examples/compiler-smoke/fail/src/main.ly) | `check` 和 `build` 非零退出；返回类型不匹配码 `LYT0001`，主源码范围指向 `total` 末尾的 `;`，实际 `Unit`、期望 `Int`。文本提示可去掉分号；机器可读诊断给出相同的码和范围。此次构建不产生可执行文件。 |
 | CC-002 | [pass/src/main.ly](../examples/compiler-smoke/pass/src/main.ly) | `check` 成功；`build` 产出 Linux 原生文件。在[最低验收镜像](native-toolchain.md)上只复制产物、使用列明的系统库，不安装 Lyra 或 LLVM；运行输出 `3` 并正常退出。Debug 和优化构建结果相同。 |
+
+**首片实测：CC-001、CC-002 已通过。** [命令行验收用例](../tests/compiler_cli.py)在 WSL Ubuntu 24.04 和 Ubuntu 22.04 构建环境均通过。在 22.04 链接的 Debug、Release 产物分别复制进干净的官方 Ubuntu Base 22.04.5 amd64 根文件系统；不安装 Lyra、LLVM 或 Clang，均输出 `3` 和换行、退出码为 `0`，ELF 的 `DT_NEEDED` 仅含 `libc.so.6`。[构建说明](../README.md)提供用两阶段容器复现的命令。
 
 首个同步入口为 `fn main(): Unit`，正常返回时进程退出码为 0。`test` 后续把同一批输入分为应通过、应拒绝、应运行三类；断言错误类别、源范围和值，不比较整段措辞或 LLVM IR 文本。先有可信的 `check/build/test`，再补 `fmt/doc` 与编辑器集成。
 

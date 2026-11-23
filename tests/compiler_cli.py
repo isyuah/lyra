@@ -140,6 +140,24 @@ class Native(PackageTest):
         self.assertIn("clang-18", json.loads(result.stderr)[0]["message"])
         self.assertEqual(output.read_bytes(), b"previous artifact")
 
+    def test_link_failure_preserves_old_output(self):
+        self.fixture("pass")
+        toolchain = self.package / "toolchain"
+        (toolchain / "bin").mkdir(parents=True)
+        (toolchain / "lib").mkdir()
+        compiler = toolchain / "bin" / "lyra"
+        shutil.copy2(COMPILER, compiler)
+        (toolchain / "lib" / "liblyraRuntime.a").write_bytes(b"not a runtime archive")
+        output = self.package / "existing"
+        output.write_bytes(b"previous artifact")
+        before = set(self.package.iterdir())
+        result = subprocess.run([compiler, "build", self.package, "--diagnostics=json", "-o", output],
+                                capture_output=True, text=True, timeout=15)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(json.loads(result.stderr)[0]["code"], "LYB0002")
+        self.assertEqual(output.read_bytes(), b"previous artifact")
+        self.assertEqual(set(self.package.iterdir()), before)
+
 
 if __name__ == "__main__":
     unittest.main()

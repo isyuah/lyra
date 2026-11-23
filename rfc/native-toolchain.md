@@ -8,7 +8,7 @@
 - 编译模型为 LLVM 后端的 AOT 原生编译。
 - 用户程序不得依赖 JVM、CLR 或 Lyra 托管虚拟机；程序可以携带语言 Runtime。应用与 Runtime 的代码被本机 linker 链接。
 - 首期工作流以 Windows 开发机通过 WSL/Linux 环境构建并部署到 Linux 服务器为目标。允许依赖系统动态库；Lyra、LLVM 和语言 VM 不需要安装在目标机。
-- 首个验收目标是 Linux x86-64/glibc，以 Ubuntu 22.04 x86-64 为最低测试镜像，用相应目标库链接；SQLite 使用并列出系统动态库。二进制的架构、libc 和动态库依赖须可检查。这是待实测的部署目标，不是已有测试报告。
+- 首个验收目标是 Linux x86-64/glibc，以 Ubuntu 22.04 x86-64 为最低测试镜像，用相应目标库链接。二进制的架构、libc 和动态库依赖须可检查。[整数切片已实测](compiler-acceptance.md)，仅动态依赖系统 libc；后续 SQLite 切片还须使用并列出系统 SQLite 动态库。
 - 类 Go `scratch` 的零基础镜像/全静态交付是后续优化目标，不是首期门槛。不得以支持 scratch 为由让第一版构建链无法运行。
 
 程序包大小与常驻内存分别看待。目标是内置 Runtime/GC 但不用虚拟机、单程序易分发且能够在服务器上多进程运行；目前不设与 Go 对比的硬 MB 上限。建立可执行服务后，再以等价负载与 Go 对照报告多进程总内存、二进制大小、启动时间、吞吐和尾延迟。
@@ -19,7 +19,7 @@
 
 ### 开发机准备：WSL 2 + Ubuntu 24.04
 
-写规范、设计一致性用例不需要安装 LLVM。第一次验证原生后端时，在 WSL 内做开发机冒烟测试即可；不用在 Windows 和 Linux 两边配两套 SDK，也不用从源码编译 LLVM。以下以 Ubuntu 24.04 仓库的 LLVM 18 为例，不锁定最终 LLVM 版本。正式验收另用 22.04 目标环境或对应 sysroot 构建，并在最低镜像上执行，不能拿 24.04 本机链接、运行成功代替。
+写规范、设计一致性用例不需要安装 LLVM。要构建当前编译器，只在 WSL/Linux 安装 LLVM 18.1 开发包和 Clang 18 即可，不用在 Windows 再配 SDK，也不用从源码编译 LLVM。正式验收另用 22.04 目标环境或对应 sysroot 构建，并在最低镜像上执行，不能拿 24.04 本机链接、运行成功代替。
 
 1. 在 PowerShell 运行 `wsl -l -v`。已有 `Ubuntu-24.04`（版本 2）就直接 `wsl -d Ubuntu-24.04`；新开发机没有该发行版时才运行 `wsl --install -d Ubuntu-24.04`，按系统提示完成首次启动。
 2. 进入 **Ubuntu 终端**后，先运行 `clang-18 --version`、`llvm-config-18 --version --host-target --cmakedir` 和 `cmake --version`。头文件、库和 `LLVMConfig.cmake` 来自开发包，不能只验证 `clang`。缺包时才安装：
@@ -44,7 +44,7 @@
    )
    ```
 
-后端需要链接 LLVM 开发库时，用同一套 `llvm-config-18` 查路径；CMake 项目可传 `-DLLVM_DIR="$(llvm-config-18 --cmakedir)"` 给 `find_package(LLVM CONFIG)`。Make 已足够，选用 Ninja 生成器时才需 `ninja-build`。GC 和 SQLite 开发包留到各自原型，不是这一步的前置条件。
+用同一套 `llvm-config-18` 查开发库路径；构建命令和 CTest 用法见[仓库说明](../README.md)。Make 已足够，选用 Ninja 生成器时才需 `ninja-build`。GC 和 SQLite 开发包留到各自原型，不是这一步的前置条件。
 
 ## 编译器、Runtime 和 GC
 

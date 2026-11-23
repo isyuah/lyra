@@ -30,6 +30,7 @@ struct Site {
     std::string file;
     Position start, end;
     std::string lineText;
+    std::size_t lineStartOffset;
 };
 
 struct Diagnostic {

@@ -5,6 +5,7 @@
 #include <iterator>
 #include <llvm/Support/FormatVariadic.h>
 #include <llvm/Support/JSON.h>
+#include <llvm/Support/Unicode.h>
 #include <llvm/Support/raw_ostream.h>
 
 namespace lyra {
@@ -25,7 +26,7 @@ Diagnostic at(const Source& source, Span span, std::string code, std::string mes
     auto start = source.position(span.begin);
     auto lineStart = source.lineStarts[start.line - 1];
     auto lineEnd = source.text.find_first_of("\r\n", lineStart);
-    Site site{source.path.string(), start, source.position(span.end), source.text.substr(lineStart, lineEnd - lineStart)};
+    Site site{source.path.string(), start, source.position(span.end), source.text.substr(lineStart, lineEnd - lineStart), lineStart};
     return {std::move(code), std::move(message), std::move(site)};
 }
 
@@ -51,12 +52,12 @@ void report(const Diagnostic& error, bool json) {
     stream << error.code << ": " << error.message << '\n';
     if (error.site) {
         stream << error.site->lineText << '\n';
-        for (std::size_t index = 0, column = 1; column < error.site->start.column; ++index) {
-            auto byte = static_cast<unsigned char>(error.site->lineText[index]);
-            if ((byte & 0xc0) != 0x80) {
-                stream << (byte == '\t' ? '\t' : ' ');
-                ++column;
-            }
+        auto prefix = llvm::StringRef(error.site->lineText).take_front(error.site->start.offset - error.site->lineStartOffset);
+        while (!prefix.empty()) {
+            auto [segment, rest] = prefix.split('\t');
+            stream.indent(std::max(0, llvm::sys::unicode::columnWidthUTF8(segment)));
+            if (segment.size() != prefix.size()) stream << '\t';
+            prefix = rest;
         }
         stream << "^\n";
     }

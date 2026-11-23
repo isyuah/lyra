@@ -6,15 +6,22 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" OR NOT CMAKE_SYSTEM_PROCESSOR MATCHES 
 endif()
 
 find_package(LLVM 18.1 REQUIRED CONFIG)
-add_executable(lyra compiler/main.cpp compiler/source.cpp compiler/parser.cpp compiler/check.cpp)
+add_library(lyraRuntime STATIC runtime/core.c)
+target_compile_features(lyraRuntime PRIVATE c_std_11)
+set_target_properties(lyraRuntime PROPERTIES C_EXTENSIONS OFF ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib")
+
+add_executable(lyra compiler/main.cpp compiler/source.cpp compiler/parser.cpp compiler/check.cpp compiler/lowering.cpp compiler/build.cpp)
+add_dependencies(lyra lyraRuntime)
 target_compile_features(lyra PRIVATE cxx_std_20)
 target_compile_options(lyra PRIVATE -Wall -Wextra -Wpedantic)
 target_include_directories(lyra SYSTEM PRIVATE ${LLVM_INCLUDE_DIRS})
 target_link_libraries(lyra PRIVATE LLVM)
 set_target_properties(lyra PROPERTIES CXX_EXTENSIONS OFF RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+install(TARGETS lyra lyraRuntime RUNTIME DESTINATION bin ARCHIVE DESTINATION lib)
 
 include(CTest)
 if(BUILD_TESTING)
     find_package(Python3 REQUIRED COMPONENTS Interpreter)
     add_test(NAME frontend COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/compiler_cli.py $<TARGET_FILE:lyra> Frontend)
+    add_test(NAME native COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/compiler_cli.py $<TARGET_FILE:lyra> Native)
 endif()

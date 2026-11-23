@@ -1139,7 +1139,7 @@ Runtime 调度器在迁移 Task 时不得改变其上下文语义。
 | FFI-002 | 用门闩停住使用句柄的同步查询，在此期间请求取消 | 同域其他任务可推进，原生调用返回前句柄有效，清理完成后任务组才退出 |
 | DIAG-001 | 异步异常调用栈 | 显示 `await`、创建 Task 和异常源的用户源码位置 |
 
-用[按 ID 查用户的小服务](examples/user-service/README.md)验收日常写法。[Lyra 源码](examples/user-service/src/main.ly)区分 `Ok(Some(user))`、`Ok(None)` 和 `Err`；请求中途取消由作用域传播，文中另列清理断言。[首个编译器切片](rfc/compiler-acceptance.md)先验证一对只差分号的程序，不要求一次跑通服务。函数调用、换行和控制流见 [RFC-0002 正反例](rfc/0002-syntax-cases.md)；泛型与重载见 [RFC-0003](rfc/0003-types.md) 的 `T3-001` 至 `T3-024`。以上都是待实现的测试契约。
+用[按 ID 查用户的小服务](examples/user-service/README.md)验收日常写法。[Lyra 源码](examples/user-service/src/main.ly)区分 `Ok(Some(user))`、`Ok(None)` 和 `Err`；请求中途取消由作用域传播，文中另列清理断言。[首个编译器切片](rfc/compiler-acceptance.md)已用一对只差分号的程序验证源码诊断与 LLVM AOT 交付。完整服务仍是后续验收目标。函数调用、换行和控制流见 [RFC-0002 正反例](rfc/0002-syntax-cases.md)；泛型与重载见 [RFC-0003](rfc/0003-types.md) 的 `T3-001` 至 `T3-024`。
 
 ### 9.3 LLVM 优化测试
 
