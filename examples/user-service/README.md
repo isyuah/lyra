@@ -2,7 +2,7 @@
 
 先读 [src/main.ly](src/main.ly) 里的 `getUser(request: Request)`：`GET /users/7` 命中时回 JSON，查不到回 404，数据库报错回 500。代码里没有第四个“已取消”的 `match` 分支——客户端断开是请求停止执行，不是一种数据库查询结果。
 
-这是设计样例，目前没有可运行它的 Lyra 编译器或库。`async fn`、冷 Task、`?`、块末值、`defer` 和 `blocking` 按各专题使用；异步入口见[编译器验收设计](../../rfc/compiler-acceptance.md)。HTTP 路由与具体 SQLite 方法名仍是示例 API。`#derive(Json)` 在编译期为 `User` 生成编解码实现。只删这行而保留 `User → Response` 转换，类型检查就会在转换体的 `Response.json(user)` 报缺少编码实现；反过来，只删转换声明，报错的是 handler 返回 `user` 的分支。
+这是最终库 API 的设计样例。**要编译并运行服务，请用 [examples/http-sqlite](../http-sqlite/README.md)**：它已经能接收真实请求、查询系统 SQLite，正常返回、客户端断开或查询失败均有验收。此处的 `server.get`、`Response.json` 等接口名用于讨论目标写法。按本例契约，删去 `#derive(Json)` 会在转换体中缺少编码实现；只删 `User → Response` 转换，则报错的是 handler 返回 `user` 的分支。
 
 ## 从请求到资源释放
 

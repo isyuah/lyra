@@ -15,7 +15,25 @@ H 由作者委托设计。顺序是先证明**写错能指出原因、写对能�
 
 首个同步入口为 `fn main(): Unit`，正常返回时进程退出码为 0。`test` 后续把同一批输入分为应通过、应拒绝、应运行三类；断言错误类别、源范围和值，不比较整段措辞或 LLVM IR 文本。先有可信的 `check/build/test`，再补 `fmt/doc` 与编辑器集成。
 
-## 接下来的三个验收点
+## Alpha 的交付门槛与复现
+
+一份可信的 Alpha 交付要过三道门：能用自己的包写程序；写错时能定位到业务源码；把编译好的应用复制到没有 Lyra 的服务器仍能运行。以下用例分别验证这些条件；预期值和失败路径在测试里，不依赖手工看 IR。
+
+| 范围 | 可重复验证的行为 |
+|---|---|
+| M0–M1：工具链、诊断与核心 | `cmake --preset dev` 使用 Clang 18、C++23 命名模块和 Ninja。[前端与原生用例](../tests/compiler_cli.py)覆盖分号返回 `Unit`、副作用顺序、溢出和失败时不覆盖产物。 |
+| M2：数据与 GC | [对象测试](../tests/objects_cli.py)检查值复制、引用身份和 UTF-8 字符串。[原生任务测试](../tests/runtime_tasks.cpp)让 GC 在任务挂起期间运行；恢复后能读到同一对象。 |
+| M3：类型、集合与调用 | [泛型](../tests/generics_cli.py)、[集合](../tests/collections_cli.py)、[和类型](../tests/sums_cli.py)、[隐式转换](../tests/conversions_cli.py)以及[可空与遍历](../tests/sugar_cli.py)分别核对推断、默认值、展开、空值层数、提前返回和转换歧义。 |
+| M4：模块、包与工具分发 | [安装验收](../tests/installed_cli.py)搬迁完整工具链、发布库、锁定并拉取源码，移走注册中心和生产者源码，在仓库外用离线缓存原生编译并执行。 |
+| M5：异步、异常与收尾 | [词法清理](../tests/defer_cli.py)、[异常](../tests/exceptions_cli.py)和[Context](../tests/context_cli.py)区分完成值、普通异常和取消，检查阻塞池、任务树及 `await` 的源位置。 |
+| M6：C ABI 与服务 | [HTTP/SQLite](../tests/http_cli.py)使用真实 TCP 和系统 SQLite。另一个连接断开时，数据库工作安全收尾，释放 statement 和连接；服务仍接受后续请求。 |
+| M7：宏与独立应用 | [宏](../tests/macros_cli.py)检查显式派生、嵌套字段/数组错误路径、标记、入口装饰器、表达式拼接和受控文件输入。[JSONL CLI](../tests/jsonlines_cli.py)检查正确输入、坏行、流错误以及工具链外的双包部署。 |
+
+运行 `ctest --preset dev --output-on-failure` 执行这些套件；`release` preset 另测优化版编译器。最低部署目标由[Jammy 两阶段验收](../tests/jammy-smoke.sh)分别验证只有 libc 的应用和额外依赖系统 SQLite 的应用；量测条件和结果见[原生工具链](native-toolchain.md)。
+
+**仍属设计、不能当作现有 API：** 结构约束与 `dyn`、完整的数值类型和重载排序、用户自定义异常子类及过滤捕获、运行时字段反射和 TOML 派生。编辑器集成、`fmt` 和 `doc` 另行交付。[设计服务](../examples/user-service/README.md)保留最终写法；目前编译运行的是[原生服务](../examples/http-sqlite/README.md)。
+
+## 后续扩展仍要守住的三个验收点
 
 1. **GC 与对象。** 引入 `class` 和现成收集器，先在优化构建中验证局部值、闭包捕获和集合持有的引用在触发 GC 后仍可读。测试存活性与对象身份，不规定地址、精确回收时刻或固定内存数字。
 2. **异步与诊断。** 用测试门闩让 Task 挂起，只留下异步帧持有对象；触发 GC 后恢复并读取原值。冷 Task 重复等待只执行一次；跨域等待在等待者域恢复。让子任务抛出未捕获异常，报告要能关联抛出、任务创建、`await` 的源码位置。加入 `async fn main(): Result<Unit, E>`（`E` 为业务错误）入口：由根任务组启动并收尾，`Ok` 携带 `Unit` 表示正常完成，`Err` 打印原因链到标准错误并非零退出，不把业务错误转成异常。
