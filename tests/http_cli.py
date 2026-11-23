@@ -62,7 +62,8 @@ class HTTP(unittest.TestCase):
 
     def test_sqlite_service(self):
         package = self.root / "service"
-        shutil.copytree(SERVICE, package, ignore=shutil.ignore_patterns("build", "lyra.lock"))
+        shutil.copytree(SERVICE, package, ignore=shutil.ignore_patterns("build"))
+        subprocess.run([COMPILER, 'check', package, '--locked', '--offline'], check=True, capture_output=True, timeout=30)
         for profile, app in self.profiles(package):
             with self.subTest(profile=profile):
                 database = self.root / (profile + ".db")

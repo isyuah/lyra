@@ -8,7 +8,7 @@
       "dependencies": {},
       "id": "path:.|example/http-sqlite",
       "name": "example/http-sqlite",
-      "sha256": "829664284bb004052b45944f31251ace4e0e8b04cf61d8a83a63f8015a05327e",
+      "sha256": "de66f41848b3c2602750eb7d787db27f0a07a7f4c3da9585e93c7df19f6bf9d1",
       "source": "path:.",
       "version": "0.1.0"
     }
