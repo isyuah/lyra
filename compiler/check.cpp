@@ -176,7 +176,7 @@ Identifier nominalAnnotation(const auto& declaration) {
 Function constructorSignature(const Aggregate& record) {
     std::vector<Parameter> parameters;
     for (const auto& field : record.fields) parameters.push_back({field.name, field.type});
-    return {record.file, record.name, std::move(parameters), nominalAnnotation(record), {}, 0, {}, record.isPublic, record.typeParameters};
+    return {record.file, record.name, std::move(parameters), nominalAnnotation(record), {}, 0, {}, record.isPublic, record.typeParameters, false, {}, false, record.bounds};
 }
 
 struct Symbols {
@@ -196,15 +196,20 @@ struct Symbols {
     std::vector<Aggregate> recordDeclarations{};
     std::vector<std::optional<std::size_t>> initializers{};
     std::vector<Overloads> staticMethods{};
-    mutable std::map<std::pair<std::size_t, std::vector<Type>>, Type> recordInstances{};
-    mutable std::map<std::pair<std::size_t, std::vector<Type>>, Type> enumInstances{};
-    mutable unsigned expandingNominal{};
+    std::map<std::pair<std::size_t, std::vector<Type>>, Type> recordInstances{};
+    std::map<std::pair<std::size_t, std::vector<Type>>, Type> enumInstances{};
+    unsigned expandingNominal{};
+    struct NominalCheck { Type type; const Source* source; Span site; };
+    std::vector<NominalCheck> nominalChecks{};
+    std::size_t nextNominalCheck{};
+    bool boundsReady{};
 
     struct TypeTrial {
         Symbols& symbols;
         std::size_t aggregates = symbols.module.aggregates.size(), enums = symbols.module.enums.size(), tasks = symbols.module.taskResults.size(),
             sums = symbols.module.sumTypes.size(), lists = symbols.module.listElements.size(), signatures = symbols.module.signatures.size();
         unsigned expanding = symbols.expandingNominal;
+        std::size_t nominal = symbols.nominalChecks.size(), nextNominal = symbols.nextNominalCheck;
 
         ~TypeTrial() {
             if (symbols.module.aggregates.size() != aggregates) {
@@ -216,6 +221,8 @@ struct Symbols {
                 symbols.module.enums.resize(enums);
             }
             symbols.expandingNominal = expanding;
+            symbols.nominalChecks.resize(nominal);
+            symbols.nextNominalCheck = nextNominal;
             symbols.module.taskResults.resize(tasks);
             symbols.module.sumTypes.resize(sums);
             symbols.module.listElements.resize(lists);
@@ -305,13 +312,29 @@ struct Symbols {
         return {};
     }
 
-    void requireBounds(const Function& target, std::span<const Type> types, const Source& use, Span site) {
-        contracts.require(target, types, use, site, [&](Type receiver, const std::string& name, const RequiredMethod& expected) -> std::optional<RequiredMethod> {
-            const auto& definition = sources[target.file];
+    void requireBounds(std::span<const Bound> bounds, std::size_t file, std::span<const Type> types, const Source& use, Span site) {
+        contracts.require(bounds, types, use, site, [&](Type receiver, const std::string& name, const RequiredMethod& expected) -> std::optional<RequiredMethod> {
+            const auto& definition = sources[file];
             auto result = shapedMethod(receiver, name, definition, [&](const auto& shape) { return shape == expected; });
             if (!result) result = shapedMethod(receiver, name, definition, [](const auto&) { return true; });
             return result ? std::optional(std::move(result->second)) : std::nullopt;
         }, [&](Type type) { return typeName(module, type); });
+    }
+
+    void requireBounds(const Function& target, std::span<const Type> types, const Source& use, Span site) {
+        requireBounds(target.bounds, target.file, types, use, site);
+    }
+
+    void validateNominalBounds() {
+        if (!boundsReady || expandingNominal) return;
+        while (nextNominalCheck < nominalChecks.size()) {
+            const auto pending = nominalChecks[nextNominalCheck++];
+            auto validate = [&](const auto& instance) {
+                requireBounds(instance.syntax.bounds, instance.syntax.file, instance.arguments, *pending.source, pending.site);
+            };
+            if (pending.type.kind == Type::Record) validate(module.aggregates[pending.type.id]);
+            else validate(module.enums[pending.type.id]);
+        }
     }
 
     Type unaryType(Type::Kind kind, std::vector<Type>& types, Type result) const {
@@ -378,7 +401,7 @@ struct Symbols {
         }
     }
 
-    Type recordType(std::size_t declaration, std::vector<Type> arguments, const Source& source, Span span) const {
+    Type recordType(std::size_t declaration, std::vector<Type> arguments, const Source& source, Span span) {
         const auto& syntax = recordDeclarations[declaration];
         if (arguments.size() != syntax.typeParameters.size())
             throw at(source, span, "LYG0001", syntax.name.text + " 需要 " + std::to_string(syntax.typeParameters.size()) + " 个类型实参");
@@ -396,10 +419,12 @@ struct Symbols {
             record.fields.push_back(resolved.value());
         }
         --expandingNominal;
+        if (!syntax.bounds.empty()) nominalChecks.push_back({type, &source, span});
+        validateNominalBounds();
         return type;
     }
 
-    Type enumType(std::size_t declaration, std::vector<Type> arguments, const Source& source, Span span) const {
+    Type enumType(std::size_t declaration, std::vector<Type> arguments, const Source& source, Span span) {
         const auto& syntax = enumDeclarations[declaration];
         if (arguments.size() != syntax.typeParameters.size())
             throw at(source, span, "LYG0001", syntax.name.text + " 需要 " + std::to_string(syntax.typeParameters.size()) + " 个类型实参");
@@ -420,11 +445,13 @@ struct Symbols {
             }
         }
         --expandingNominal;
+        if (!syntax.bounds.empty()) nominalChecks.push_back({type, &source, span});
+        validateNominalBounds();
         return type;
     }
 
     template<class Lookup>
-    std::optional<Type> resolveWith(const TypeForm& form, const Source& source, Span span, std::span<const Identifier> parameters, const Lookup& lookup) const {
+    std::optional<Type> resolveWith(const TypeForm& form, const Source& source, Span span, std::span<const Identifier> parameters, const Lookup& lookup) {
         if (form.arguments.empty()) {
             auto found = std::ranges::find(parameters, form.name, &Identifier::text);
             if (found != parameters.end()) return lookup(static_cast<std::size_t>(found - parameters.begin()));
@@ -451,19 +478,19 @@ struct Symbols {
         throw at(source, span, "LYT0003", "找不到类型或类型实参数量不符：" + form.name);
     }
 
-    Type resolveForm(const TypeForm& form, const Source& source, Span span, const Function* signature, std::span<const Type> types) const {
+    Type resolveForm(const TypeForm& form, const Source& source, Span span, const Function* signature, std::span<const Type> types) {
         return resolveWith(form, source, span, signature ? std::span<const Identifier>(signature->typeParameters) : std::span<const Identifier>{}, [&](std::size_t slot) { return types[slot]; }).value();
     }
 
-    Type resolve(const Source& source, const Identifier& name) const {
+    Type resolve(const Source& source, const Identifier& name) {
         return resolveForm(typeForm(name.text), source, name.span, nullptr, {});
     }
 
-    Type resolve(const Function& signature, const Identifier& name, std::span<const Type> types) const {
+    Type resolve(const Function& signature, const Identifier& name, std::span<const Type> types) {
         return resolveForm(typeForm(name.text), sources[signature.file], name.span, &signature, types);
     }
 
-    CheckedFunction prepare(Function syntax, std::span<const Type> arguments = {}) const {
+    CheckedFunction prepare(Function syntax, std::span<const Type> arguments = {}) {
         auto result = syntax.result.text.empty() ? Type{Type::Unit} : resolve(syntax, syntax.result, arguments);
         std::vector<Local> locals;
         for (const auto& param : syntax.parameters) {
@@ -1278,7 +1305,7 @@ struct Checker {
         refer(call.name, syntax.file, entry.name.span);
         std::vector<Parameter> payload;
         for (const auto& field : entry.fields) payload.push_back({field.name.value_or(Identifier{"", field.type.span}), field.type});
-        Function signature{syntax.file, entry.name, std::move(payload), nominalAnnotation(syntax), {}, 0, {}, syntax.isPublic, syntax.typeParameters};
+        Function signature{syntax.file, entry.name, std::move(payload), nominalAnnotation(syntax), {}, 0, {}, syntax.isPublic, syntax.typeParameters, false, {}, false, syntax.bounds};
         Call construction{call.name, call.arguments, {}, qualifier.arguments};
         if (expected && expected->kind == Type::Option) expected = module.sumTypes[expected->id].success;
         auto [types, exits] = bindGeneric(id, construction, signature, expected);
@@ -1947,6 +1974,11 @@ CheckedModule check(Module module, const std::vector<Source>& sources, bool requ
     symbols.staticMethods.resize(symbols.recordDeclarations.size());
     symbols.initializers.resize(symbols.recordDeclarations.size());
     symbols.variants.resize(symbols.enumDeclarations.size());
+    for (const auto& trait : module.traits) {
+        const auto& source = sources[trait.file];
+        if (symbols.records.contains(trait.name.text) || symbols.enums.contains(trait.name.text)) throw at(source, trait.name.span, "LYN0002", "类型名称已声明：" + trait.name.text);
+        symbols.contracts.declare(trait, source);
+    }
     auto typeVariables = [&](const auto& syntax) {
         std::set<std::string> seen;
         std::vector<Type> variables;
@@ -1955,6 +1987,7 @@ CheckedModule check(Module module, const std::vector<Source>& sources, bool requ
             variables.emplace_back(Type::Variable, checked.variableNames.size());
             checked.variableNames.push_back(parameter.text);
         }
+        for (const auto& bound : syntax.bounds) symbols.contracts.bind(variables[bound.parameter], bound.trait, sources[syntax.file]);
         return variables;
     };
     for (std::size_t id = 0; id < symbols.recordDeclarations.size(); ++id) {
@@ -1968,7 +2001,6 @@ CheckedModule check(Module module, const std::vector<Source>& sources, bool requ
     }
     for (const auto& trait : module.traits) {
         const auto& source = sources[trait.file];
-        if (symbols.records.contains(trait.name.text) || symbols.enums.contains(trait.name.text)) throw at(source, trait.name.span, "LYN0002", "类型名称已声明：" + trait.name.text);
         symbols.contracts.define(trait, source, [&](const Identifier& type) { return symbols.resolve(source, type); });
     }
     for (std::size_t id = 0; id < symbols.enumDeclarations.size(); ++id) {
@@ -2015,7 +2047,6 @@ CheckedModule check(Module module, const std::vector<Source>& sources, bool requ
         if (!function.typeParameters.empty()) {
             if (!owner && requireEntry && function.name.text == "main") throw at(source, function.name.span, "LYG0001", "main 不能声明类型形参");
             auto variables = typeVariables(function);
-            for (const auto& bound : function.bounds) symbols.contracts.bind(variables[bound.parameter], bound.trait, source);
             symbols.callables.push_back({0, std::move(function), std::move(variables)});
             continue;
         }
@@ -2033,6 +2064,8 @@ CheckedModule check(Module module, const std::vector<Source>& sources, bool requ
         symbols.addConcrete(std::move(concrete));
     }
     for (std::size_t index = 0; index < checked.functions.size(); ++index) if (checked.functions[index].syntax.conversion) registerConversion(symbols.conversions, checked, sources, index);
+    symbols.boundsReady = true;
+    symbols.validateNominalBounds();
     using FunctionSite = std::pair<std::size_t, std::size_t>;
     std::map<FunctionSite, std::vector<FunctionSite>> dependencies;
     auto rememberReferences = [&](const CheckedFunction& fn) {

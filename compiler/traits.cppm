@@ -37,9 +37,12 @@ class StructuralContracts {
     }
 
 public:
+    void declare(const Trait& trait, const Source& source) {
+        if (!traits.try_emplace(trait.name.text).second) throw at(source, trait.name.span, "LYN0002", "结构约束重复：" + trait.name.text);
+    }
+
     void define(const Trait& trait, const Source& source, const auto& resolve) {
-        auto [entry, inserted] = traits.try_emplace(trait.name.text);
-        if (!inserted) throw at(source, trait.name.span, "LYN0002", "结构约束重复：" + trait.name.text);
+        auto& members = traits.at(trait.name.text);
         for (const auto& method : trait.methods) {
             RequiredMethod shape{{}, {}, resolve(method.result), method.asynchronous};
             std::set<std::string> names;
@@ -48,7 +51,7 @@ public:
                 shape.labels.push_back(parameter.name.text);
                 shape.parameters.push_back(resolve(parameter.type));
             }
-            if (!entry->second.emplace(method.name.text, std::move(shape)).second) throw at(source, method.name.span, "LYN0002", "约束方法重复：" + method.name.text);
+            if (!members.emplace(method.name.text, std::move(shape)).second) throw at(source, method.name.span, "LYN0002", "约束方法重复：" + method.name.text);
         }
     }
 
@@ -74,8 +77,8 @@ public:
         return bound ? member(*bound, name) : nullptr;
     }
 
-    void require(const Function& target, std::span<const Type> arguments, const Source& use, Span site, const auto& concrete, const auto& typeName) const {
-        for (const auto& bound : target.bounds) {
+    void require(std::span<const Bound> bounds, std::span<const Type> arguments, const Source& use, Span site, const auto& concrete, const auto& typeName) const {
+        for (const auto& bound : bounds) {
             auto actual = arguments[bound.parameter];
             for (const auto& [name, expected] : traits.at(bound.trait.text)) {
                 std::optional<RequiredMethod> found;

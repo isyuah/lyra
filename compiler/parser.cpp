@@ -456,18 +456,22 @@ private:
 
     bool visibility() { if (!is("pub")) return false; consume(); return true; }
 
-    std::vector<Identifier> typeParameters() {
-        if (!is("<")) return {};
+    void typeParameters(std::vector<Identifier>& parameters, std::vector<Bound>& bounds) {
+        if (!is("<")) return;
         consume();
-        std::vector<Identifier> parameters{identifier()};
-        while (is(",")) { consume(); parameters.push_back(identifier()); }
+        for (;;) {
+            parameters.push_back(identifier());
+            if (is(":")) { consume(); bounds.push_back({parameters.size() - 1, identifier()}); }
+            if (!is(",")) break;
+            consume();
+        }
         require(">");
-        return parameters;
     }
 
     Enumeration enumeration(bool pub) {
         require("enum");
-        Enumeration result{file, identifier(), {}, pub, typeParameters()};
+        Enumeration result{file, identifier(), {}, pub};
+        typeParameters(result.typeParameters, result.bounds);
         require("{");
         if (is("}")) throw at(source, token.span, "LYP0001", "enum 至少声明一个分支");
         while (!is("}")) {
@@ -502,7 +506,7 @@ private:
             auto body = expression(inParens);
             member.defaultValue = FieldDefault{module.functions.size(), std::holds_alternative<EmptyOption>(nodes[body].node)};
             Identifier helper{fieldDefaultName(record.name.text, member.name.text), member.name.span};
-            module.functions.push_back({file, std::move(helper), {}, member.type, std::exchange(nodes, {}), body, {}, false, record.typeParameters});
+            module.functions.push_back({file, std::move(helper), {}, member.type, std::exchange(nodes, {}), body, {}, false, record.typeParameters, false, {}, false, record.bounds});
         }
         record.fields.push_back(std::move(member));
     }
@@ -535,7 +539,8 @@ private:
 
     void aggregate(Module& module, bool pub) {
         bool reference = text(consume()) == "class";
-        Aggregate decl{file, identifier(), reference, {}, pub, typeParameters()};
+        Aggregate decl{file, identifier(), reference, {}, pub};
+        typeParameters(decl.typeParameters, decl.bounds);
         bool primary = is("(");
         std::optional<std::size_t> initializer;
         if (primary) {
@@ -558,12 +563,12 @@ private:
                         throw at(source, token.span, "LYP0001", "仅没有主构造参数列表的 class 可以声明一个 init 构造函数");
                     if (!marks.empty()) throw at(source, marks.front().name.span, "LYM0003", "此处的标记只适用于字段和形参");
                     initializer = module.functions.size();
-                    module.functions.push_back(function(decl.name, publicMember, decl.typeParameters, true));
+                    module.functions.push_back(function(decl.name, publicMember, decl.typeParameters, true, false, decl.bounds));
                 } else if (is("fn") || is("async") || is("extern") || is("static")) {
                     if (!marks.empty()) throw at(source, marks.front().name.span, "LYM0003", "此处的标记只适用于字段和形参");
                     bool staticMember = is("static");
                     if (staticMember) consume();
-                    module.functions.push_back(function(decl.name, publicMember, decl.typeParameters, false, staticMember));
+                    module.functions.push_back(function(decl.name, publicMember, decl.typeParameters, false, staticMember, decl.bounds));
                 } else field(module, decl, publicMember, std::move(marks), false);
                 if (is(";")) consume();
                 else if (!is("}") && !token.newlineBefore) throw at(source, token.span, "LYP0001", "成员之间需要换行或分号");
@@ -574,7 +579,7 @@ private:
         module.aggregates.push_back(std::move(decl));
     }
 
-    Function function(std::optional<Identifier> owner, bool pub, const std::vector<Identifier>& enclosing = {}, bool initializer = false, bool staticMember = false) {
+    Function function(std::optional<Identifier> owner, bool pub, const std::vector<Identifier>& enclosing = {}, bool initializer = false, bool staticMember = false, const std::vector<Bound>& enclosingBounds = {}) {
         bool isAsync = false, foreign = false;
         if (is("async") || is("extern")) {
             isAsync = is("async"); foreign = !isAsync;
@@ -586,19 +591,10 @@ private:
         if (conversion && (owner || isAsync || foreign)) throw at(source, keyword.span, "LYV0001", "implicit 必须是顶层同步转换");
         auto name = initializer ? Identifier{"$init$" + owner->text, keyword.span}
                   : conversion ? Identifier{"$implicit" + std::to_string(file) + "_" + std::to_string(keyword.span.begin), keyword.span} : identifier();
-        auto typeParameters = enclosing;
-        std::vector<Bound> bounds;
-        if (!initializer && is("<")) {
-            consume();
-            for (;;) {
-                typeParameters.push_back(identifier());
-                if (is(":")) { consume(); bounds.push_back({typeParameters.size() - 1, identifier()}); }
-                if (!is(",")) break;
-                consume();
-            }
-            require(">");
-        }
-        if (foreign && (owner || !typeParameters.empty())) throw at(source, name.span, "LYF0001", "extern 不支持方法或泛型");
+        auto generics = enclosing;
+        auto bounds = enclosingBounds;
+        if (!initializer) typeParameters(generics, bounds);
+        if (foreign && (owner || !generics.empty())) throw at(source, name.span, "LYF0001", "extern 不支持方法或泛型");
         require("(");
         std::vector<Parameter> parameters;
         Identifier ownerType;
@@ -634,7 +630,7 @@ private:
             consume();
         }
         require(")");
-        if (conversion && (!typeParameters.empty() || parameters.size() != 1 || parameters.front().defaultValue || parameters.front().variadic)) throw at(source, keyword.span, "LYV0001", "implicit 需要一个无默认值的普通形参");
+        if (conversion && (!generics.empty() || parameters.size() != 1 || parameters.front().defaultValue || parameters.front().variadic)) throw at(source, keyword.span, "LYV0001", "implicit 需要一个无默认值的普通形参");
         auto result = Identifier{"", token.span};
         if (initializer) result = std::move(ownerType);
         else if (is(":")) { consume(); result = type(); }
@@ -646,7 +642,7 @@ private:
             return {file, std::move(name), std::move(parameters), std::move(result), {}, 0, {}, pub, {}, false, std::move(symbol)};
         }
         auto body = block();
-        return {file, std::move(name), std::move(parameters), std::move(result), std::exchange(nodes, {}), body, std::move(owner), pub, std::move(typeParameters), isAsync, {}, conversion, std::move(bounds), initializer, hasReceiver};
+        return {file, std::move(name), std::move(parameters), std::move(result), std::exchange(nodes, {}), body, std::move(owner), pub, std::move(generics), isAsync, {}, conversion, std::move(bounds), initializer, hasReceiver};
     }
 
     ExprId block() {

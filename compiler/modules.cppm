@@ -119,8 +119,14 @@ struct Linker {
                 auto found = scope.find(name); return found == scope.end() ? name : found->second.name;
             });
         };
-        for (auto& record : syntax.aggregates) for (auto& field : record.fields) renameTypeIn(record.file, field.type, record.typeParameters);
-        for (auto& item : syntax.enums) for (auto& entry : item.cases) for (auto& field : entry.fields) renameTypeIn(item.file, field.type, item.typeParameters);
+        for (auto& record : syntax.aggregates) {
+            for (auto& bound : record.bounds) renameTypeIn(record.file, bound.trait);
+            for (auto& field : record.fields) renameTypeIn(record.file, field.type, record.typeParameters);
+        }
+        for (auto& item : syntax.enums) {
+            for (auto& bound : item.bounds) renameTypeIn(item.file, bound.trait);
+            for (auto& entry : item.cases) for (auto& field : entry.fields) renameTypeIn(item.file, field.type, item.typeParameters);
+        }
         for (auto& trait : syntax.traits) for (auto& method : trait.methods) {
             renameTypeIn(trait.file, method.result);
             for (auto& parameter : method.parameters) renameTypeIn(trait.file, parameter.type);

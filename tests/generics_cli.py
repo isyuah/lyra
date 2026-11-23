@@ -224,6 +224,38 @@ pub fn relay<T: Render>(value: T): String { draw(value) }''')
                 self.program(source + '\nfn main(): Unit {}')
                 self.rejects(code, text)
 
+    def test_nominal_constraints_cover_constructor_members_and_annotations(self):
+        self.program('''
+            trait Render { fn render(): String }
+            class Name(val text: String) { fn render(): String { text } }
+            class Card<T: Render>(val item: T, val label: String = item.render()) {
+                fn read(): String { item.render() + ":" + label }
+                static fn make(value: T): Card<T> { Card(value) }
+            }
+            enum Load<T: Render> { Ready(T), Wait }
+            fn card<T: Render>(state: Load<T>): Card<T>? {
+                match state { Ready(item) => Some(Card.make(item)), Wait => None }
+            }
+            fn main(): Unit {
+                print(Card(Name("card")).read())
+                print(card(Load.Ready(Name("load")))?.read() ?? "missing")
+            }
+        ''')
+        self.run_native('card:card\nload:load\n')
+        for body in (
+            'fn main(): Unit { Card(7); }',
+            'fn main(): Unit { val wait = Load<Int>.Wait }',
+            'fn main(): Unit { val wait: Load<Int> = Load.Wait }',
+            'fn illegal<T>(value: T): Card<T> { Card(value) }\nfn main(): Unit {}',
+            'struct Wrapper(val state: Load<Int>)\nfn main(): Unit {}',
+        ):
+            with self.subTest(body=body):
+                self.program('''trait Render { fn render(): String }
+                    struct Card<T: Render>(val item: T)
+                    enum Load<T: Render> { Ready(T), Wait }
+                ''' + body)
+                self.rejects('LYG0005', 'Render')
+
 
 if __name__ == '__main__':
     unittest.main()

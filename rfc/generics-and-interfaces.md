@@ -66,7 +66,9 @@ val length = cell.map { it.size }
 
 静态方法没有实例来提供类型实参。`Cell<String>.single("Ada")` 固定了 `Item`；`Cell.single("Ada")` 可从实参或明确的结果类型推断。若要显式指定静态方法自己的类型实参，先写齐所属类型的实参，例如 `Box<Int>.from<String>(...)`。
 
-`Pair<Int,String>` 和 `Pair<String,Int>` 是不同类型；跨模块导入别名仍指向同一个类型定义。匹配 `Pair(first: value)` 时，从被匹配值确定类型实参。Class 引用可形成递归；Struct 的内联布局不能成环。类型声明上的约束及泛型声明的宏派生留在后续切片；方法自己的类型参数仍可使用结构约束。
+`Pair<Int,String>` 和 `Pair<String,Int>` 是不同类型；跨模块导入别名仍指向同一个类型定义。匹配 `Pair(first: value)` 时，从被匹配值确定类型实参。Class 引用可形成递归；Struct 的内联布局不能成环。泛型声明的宏派生留在后续切片。
+
+类型声明可为每个类型形参声明一个结构约束，例如 `struct Card<T: Render>(val item: T)`。约束同时作用于类型标注、构造（含 `init`）、静态和实例方法、字段默认值以及枚举分支。方法还可对自己的类型形参另加约束。查找满足约束的方法时使用声明约束的模块的可见性，不由调用点临时引入成员。
 
 `enum Load<T> { Pending, Ready(T), Failed(String) }` 的每个实例共享分支集合，载荷按类型实参具体化。`Load.Ready(42)` 从载荷推断 `T`；`Load.Pending` 需要明确的目标类型，否则写 `Load<Int>.Pending`。模式仍写 `Load.Pending` 或 `Ready(value)`，由被匹配值决定类型实参；跨包导入别名不产生新的枚举身份。
 

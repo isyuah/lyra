@@ -107,10 +107,10 @@ struct Function {
 struct FieldDefault { std::size_t function; bool emptyOption; };
 struct Field { Identifier name, type; bool writable; bool isPublic{}; std::vector<Attribute> attributes{}; std::optional<FieldDefault> defaultValue{}; };
 std::string fieldDefaultName(const std::string& record, const std::string& field) { return record + "$fieldDefault$" + field; }
-struct Aggregate { std::size_t file; Identifier name; bool reference; std::vector<Field> fields; bool isPublic{}; std::vector<Identifier> typeParameters{}; };
+struct Aggregate { std::size_t file; Identifier name; bool reference; std::vector<Field> fields; bool isPublic{}; std::vector<Identifier> typeParameters{}; std::vector<Bound> bounds{}; };
 struct EnumField { std::optional<Identifier> name; Identifier type; };
 struct EnumCase { Identifier name; std::vector<EnumField> fields; };
-struct Enumeration { std::size_t file; Identifier name; std::vector<EnumCase> cases; bool isPublic; std::vector<Identifier> typeParameters{}; };
+struct Enumeration { std::size_t file; Identifier name; std::vector<EnumCase> cases; bool isPublic; std::vector<Identifier> typeParameters{}; std::vector<Bound> bounds{}; };
 struct Import { std::size_t file; bool isPublic; std::vector<Identifier> path; Identifier alias; };
 struct Expansion { std::size_t file; Identifier name; std::optional<Identifier> argument; bool decorator; bool record; std::size_t target; };
 struct MacroArgument { Span span; std::optional<std::string> literal; };
