@@ -274,6 +274,11 @@ public:
                 module.enums.push_back(enumeration(pub));
                 continue;
             }
+            if (is("extension")) {
+                if (firstPrefix != module.expansions.size()) throw at(source, module.expansions[firstPrefix].name.span, "LYM0001", "此版本不能修饰扩展组声明");
+                extension(module, pub);
+                continue;
+            }
             for (auto index = firstPrefix; index < module.expansions.size(); ++index) {
                 auto& prefix = module.expansions[index];
                 if (is("import")) throw at(source, prefix.name.span, "LYM0001", "不能修饰 import");
@@ -579,7 +584,25 @@ private:
         module.aggregates.push_back(std::move(decl));
     }
 
-    Function function(std::optional<Identifier> owner, bool pub, const std::vector<Identifier>& enclosing = {}, bool initializer = false, bool staticMember = false, const std::vector<Bound>& enclosingBounds = {}) {
+    void extension(Module& module, bool pub) {
+        require("extension");
+        Extension decl{file, identifier(), {}, pub};
+        typeParameters(decl.typeParameters, decl.bounds);
+        require("for");
+        decl.receiver = type();
+        require("{");
+        if (is("}")) throw at(source, token.span, "LYP0001", "扩展组至少声明一个实例方法");
+        while (!is("}")) {
+            if (!is("fn") && !is("async")) throw at(source, token.span, "LYP0001", "扩展组只声明实例方法，公开性由扩展组决定");
+            module.functions.push_back(function({}, pub, decl.typeParameters, false, false, decl.bounds, &decl));
+            if (is(";")) consume();
+            else if (!is("}") && !token.newlineBefore) throw at(source, token.span, "LYP0001", "成员之间需要换行或分号");
+        }
+        consume();
+        module.extensions.push_back(std::move(decl));
+    }
+
+    Function function(std::optional<Identifier> owner, bool pub, const std::vector<Identifier>& enclosing = {}, bool initializer = false, bool staticMember = false, const std::vector<Bound>& enclosingBounds = {}, const Extension* extension = nullptr) {
         bool isAsync = false, foreign = false;
         if (is("async") || is("extern")) {
             isAsync = is("async"); foreign = !isAsync;
@@ -588,18 +611,19 @@ private:
         }
         bool conversion = is("implicit");
         auto keyword = require(initializer ? "init" : conversion ? "implicit" : "fn");
-        if (conversion && (owner || isAsync || foreign)) throw at(source, keyword.span, "LYV0001", "implicit 必须是顶层同步转换");
+        if (conversion && (owner || extension || isAsync || foreign)) throw at(source, keyword.span, "LYV0001", "implicit 必须是顶层同步转换");
         auto name = initializer ? Identifier{"$init$" + owner->text, keyword.span}
                   : conversion ? Identifier{"$implicit" + std::to_string(file) + "_" + std::to_string(keyword.span.begin), keyword.span} : identifier();
         auto generics = enclosing;
         auto bounds = enclosingBounds;
         if (!initializer) typeParameters(generics, bounds);
-        if (foreign && (owner || !generics.empty())) throw at(source, name.span, "LYF0001", "extern 不支持方法或泛型");
+        if (foreign && (owner || extension || !generics.empty())) throw at(source, name.span, "LYF0001", "extern 不支持方法或泛型");
         require("(");
         std::vector<Parameter> parameters;
         Identifier ownerType;
-        bool hasReceiver = owner && !initializer && !staticMember;
-        if (initializer || hasReceiver) {
+        bool hasReceiver = (owner || extension) && !initializer && !staticMember;
+        if (extension) parameters.push_back({{"$this", name.span}, extension->receiver});
+        else if (initializer || hasReceiver) {
             ownerType = *owner;
             if (!enclosing.empty()) {
                 ownerType.text += '<';
@@ -634,7 +658,7 @@ private:
         auto result = Identifier{"", token.span};
         if (initializer) result = std::move(ownerType);
         else if (is(":")) { consume(); result = type(); }
-        else if (pub || foreign || conversion || (!owner && name.text == "main"))
+        else if (pub || foreign || conversion || (!owner && !extension && name.text == "main"))
             throw at(source, token.span, "LYP0001", "此声明需要用 : 标注返回类型");
         if (foreign) {
             require(";");
@@ -642,7 +666,7 @@ private:
             return {file, std::move(name), std::move(parameters), std::move(result), {}, 0, {}, pub, {}, false, std::move(symbol)};
         }
         auto body = block();
-        return {file, std::move(name), std::move(parameters), std::move(result), std::exchange(nodes, {}), body, std::move(owner), pub, std::move(generics), isAsync, {}, conversion, std::move(bounds), initializer, hasReceiver};
+        return {file, std::move(name), std::move(parameters), std::move(result), std::exchange(nodes, {}), body, std::move(owner), pub, std::move(generics), isAsync, {}, conversion, std::move(bounds), initializer, hasReceiver, extension ? std::optional(extension->name) : std::nullopt};
     }
 
     ExprId block() {

@@ -84,6 +84,7 @@ struct Expr {
 
 struct Parameter { Identifier name, type; bool variadic{}; std::optional<ExprId> defaultValue{}; std::vector<Attribute> attributes{}; };
 struct Bound { std::size_t parameter; Identifier trait; };
+struct Extension { std::size_t file; Identifier name, receiver; bool isPublic; std::vector<Identifier> typeParameters{}; std::vector<Bound> bounds{}; };
 struct TraitMethod { Identifier name; std::vector<Parameter> parameters; Identifier result; bool asynchronous; };
 struct Trait { std::size_t file; Identifier name; std::vector<TraitMethod> methods; bool isPublic; };
 struct Function {
@@ -102,6 +103,7 @@ struct Function {
     std::vector<Bound> bounds{};
     bool initializer{};
     bool hasReceiver{};
+    std::optional<Identifier> extensionGroup{};
 };
 
 struct FieldDefault { std::size_t function; bool emptyOption; };
@@ -116,7 +118,7 @@ struct Expansion { std::size_t file; Identifier name; std::optional<Identifier> 
 struct MacroArgument { Span span; std::optional<std::string> literal; };
 struct ExpressionExpansion { Identifier name; Span span, argumentsSpan; std::vector<MacroArgument> arguments; };
 struct MacroSplice { Span span; std::size_t argument; };
-struct Module { std::vector<Function> functions; std::vector<Aggregate> aggregates; std::vector<Import> imports; std::vector<Expansion> expansions; std::vector<Trait> traits{}; std::vector<Enumeration> enums{}; };
+struct Module { std::vector<Function> functions; std::vector<Aggregate> aggregates; std::vector<Import> imports; std::vector<Expansion> expansions; std::vector<Trait> traits{}; std::vector<Enumeration> enums{}; std::vector<Extension> extensions{}; std::vector<std::vector<std::string>> importedExtensions{}; };
 Module parse(const std::vector<Source>& sources);
 void parseFile(Module& module, const Source& source, std::size_t file, std::vector<ExpressionExpansion>* expressions = nullptr);
 std::vector<MacroSplice> macroSplices(const Source& generated, std::size_t count);

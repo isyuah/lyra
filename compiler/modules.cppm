@@ -25,7 +25,7 @@ namespace lyra {
 namespace fs = std::filesystem;
 namespace {
 
-struct Symbol { std::string name; bool visible; bool callable; bool imported{}; };
+struct Symbol { std::string name; bool visible; bool callable; bool imported{}; bool extension{}; };
 struct Space {
     const ResolvedPackage* package;
     std::map<std::string, Symbol> definitions{};
@@ -38,11 +38,11 @@ struct Linker {
     const std::map<std::string, std::string>& prefixes;
     std::string entry;
 
-    void declare(std::size_t file, Identifier& id, bool visible, bool callable) {
+    void declare(std::size_t file, Identifier& id, bool visible, bool callable, bool extension = false) {
         auto scope = sources[file].moduleId;
         auto& defs = spaces.at(scope).definitions;
         auto name = scope == entry && callable && id.text == "main" ? id.text : scope + "::" + id.text;
-        auto [symbol, inserted] = defs.try_emplace(id.text, Symbol{name, visible, callable});
+        auto [symbol, inserted] = defs.try_emplace(id.text, Symbol{name, visible, callable, false, extension});
         if (!inserted) {
             if (!callable || !symbol->second.callable || name == "main") throw at(sources[file], id.span, "LYN0002", "名称已声明：" + id.text);
             symbol->second.visible |= visible;
@@ -72,7 +72,7 @@ struct Linker {
         auto found = spaces.find(target);
         if (found == spaces.end()) throw at(source, name.span, "LYN0003", "导入的源码模块不存在");
         auto& space = found->second;
-        if (auto hit = space.definitions.find(name.text); hit != space.definitions.end() && hit->second.visible) return {hit->second.name, use.isPublic, hit->second.callable, true};
+        if (auto hit = space.definitions.find(name.text); hit != space.definitions.end() && hit->second.visible) return {hit->second.name, use.isPublic, hit->second.callable, true, hit->second.extension};
         if (auto alias = space.imports.find(name.text); alias != space.imports.end() && alias->second->isPublic) {
             auto symbol = resolve(*alias->second, active);
             return {std::move(symbol.name), use.isPublic, symbol.callable, true};
@@ -84,7 +84,8 @@ struct Linker {
         for (auto& trait : syntax.traits) declare(trait.file, trait.name, trait.isPublic, false);
         for (auto& record : syntax.aggregates) declare(record.file, record.name, record.isPublic, false);
         for (auto& item : syntax.enums) declare(item.file, item.name, item.isPublic, false);
-        for (auto& fn : syntax.functions) if (!fn.owner) declare(fn.file, fn.name, fn.isPublic, true);
+        for (auto& extension : syntax.extensions) declare(extension.file, extension.name, extension.isPublic, false, true);
+        for (auto& fn : syntax.functions) if (!fn.owner && !fn.extensionGroup) declare(fn.file, fn.name, fn.isPublic, true);
         std::map<std::size_t, std::map<std::string, const Import*>> generatedImports;
         for (const auto& use : syntax.imports) {
             const auto& source = sources[use.file];
@@ -119,6 +120,16 @@ struct Linker {
                 auto found = scope.find(name); return found == scope.end() ? name : found->second.name;
             });
         };
+        syntax.importedExtensions.resize(sources.size());
+        if (!syntax.extensions.empty()) for (std::size_t file = 0; file < sources.size(); ++file) {
+            std::set<std::string> groups;
+            for (const auto& [alias, symbol] : scopeOf(file)) if (symbol.imported && symbol.extension) groups.insert(symbol.name);
+            syntax.importedExtensions[file].assign(groups.begin(), groups.end());
+        }
+        for (auto& extension : syntax.extensions) {
+            renameTypeIn(extension.file, extension.receiver, extension.typeParameters);
+            for (auto& bound : extension.bounds) renameTypeIn(extension.file, bound.trait);
+        }
         for (auto& record : syntax.aggregates) {
             for (auto& bound : record.bounds) renameTypeIn(record.file, bound.trait);
             for (auto& field : record.fields) renameTypeIn(record.file, field.type, record.typeParameters);
@@ -143,6 +154,7 @@ struct Linker {
                 });
             };
             if (fn.owner) rename(*fn.owner);
+            if (fn.extensionGroup) rename(*fn.extensionGroup);
             for (auto& bound : fn.bounds) rename(bound.trait);
             if (!fn.result.text.empty()) renameType(fn.result);
             for (auto& param : fn.parameters) renameType(param.type);

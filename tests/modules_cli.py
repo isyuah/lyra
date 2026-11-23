@@ -162,6 +162,56 @@ fn main(): Unit {
             self.assertEqual(error['code'], code)
             self.assertIn(detail, error['message'])
 
+    def test_extension_group_visibility_priority_and_ambiguity(self):
+        (self.lib / 'src/net/extensions.ly').write_text('''
+pub class Box(val secret: Int) {
+    pub fn choose(value: Int?): String { "member" }
+    fn display(): String { "private" }
+}
+pub fn box(): Box { Box(42) }
+pub extension BoxOps for Box {
+    fn reveal(): Int { secret }
+    fn choose(value: Int): String { "extension" }
+    fn display(): String { "extension display" }
+}
+pub extension ListOps<T> for List<T> {
+    fn transform<R>(body: (T) -> R): List<R> {
+        val result: List<R> = []
+        for item in this { result.add(body(item)) }
+        result
+    }
+}
+pub extension ExtraListOps<T> for List<T> {
+    fn transform<R>(body: (T) -> R): List<R> { [] }
+}
+''')
+        (self.lib / 'src/lib.ly').write_text('pub import self.net.ListOps as ChainOps\n')
+        imports = '''import cfg.ChainOps as Chain
+import cfg.net.BoxOps
+import cfg.net.box
+'''
+        self.source.write_text(imports + '''fn main(): Unit {
+    print(box().reveal())
+    print(box().choose(1))
+    print(box().display())
+    val mapped = [1, 2].transform { it.toString() }.transform { it + "!" }
+    print(mapped[1])
+}
+''')
+        for options in ((), ('--release',)):
+            self.assertEqual(self.command('run', self.app, *options).stdout, '42\nmember\nextension display\n2!\n')
+        cases = (
+            ('fn main(): Unit { [7].transform { it }; }', 'LYN0001', 'transform'),
+            (imports + 'import cfg.net.ExtraListOps\nfn main(): Unit { [7].transform { it }; }', 'LYT0019', 'ExtraListOps'),
+            ('import cfg.net.Box\nextension Bypass for Box { fn read(): Int { this.secret } }\nfn main(): Unit {}', 'LYN0003', 'secret'),
+            ('extension Unbound<T> for Int { fn read(): Int { this } }\nfn main(): Unit {}', 'LYG0002', 'T'),
+        )
+        for body, code, detail in cases:
+            self.source.write_text(body)
+            error, = json.loads(self.command('check', self.app, '--diagnostics=json', ok=False).stderr)
+            self.assertEqual(error['code'], code)
+            self.assertIn(detail, error['message'])
+
 
 if __name__ == '__main__':
     unittest.main()
