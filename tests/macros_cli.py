@@ -122,6 +122,85 @@ fn main(): Unit {
         self.assertEqual(error['range']['start']['line'], 2)
         self.assertIn('item', error['generated']['source'])
 
+    def test_derive_fixed_width_integers_check_the_wire_value(self):
+        types = ('Int8', 'Int16', 'Int32', 'Int64', 'UInt8', 'UInt16', 'UInt32')
+        names = ('a', 'b', 'c', 'd', 'e', 'f', 'g')
+        minima = (-128, -32768, -2147483648, -9223372036854775808, 0, 0, 0)
+        maxima = (127, 32767, 2147483647, 9223372036854775807, 255, 65535, 4294967295)
+        code = '#derive(Json)\nstruct Widths(' + ', '.join(f'pub val {name}: {kind}' for name, kind in zip(names, types)) + ')\n'
+        code += '#derive(Json)\nstruct Packet(pub val rows: List<List<UInt8?>>)\n'
+        code += 'fn show(text: String): String { match decodeWidths(text) { Ok(value) => encodeWidths(value), Err(error) => error } }\nfn main(): Unit {\n'
+        expected = []
+
+        def trial(values, error=None):
+            wire = json.dumps(dict(zip(names, values)), separators=(',', ':'))
+            expected.append(wire if error is None else error)
+            return 'print(show(' + json.dumps(wire) + '))\n'
+
+        code += trial(minima) + trial(maxima)
+        for index, kind in enumerate(types):
+            if kind != 'Int64':
+                for rejected in (minima[index] - 1, maxima[index] + 1):
+                    values = list(maxima)
+                    values[index] = rejected
+                    code += trial(values, f'$.{names[index]}: out of range for {kind}')
+            values = list(minima)
+            values[index] = 1.0
+            code += trial(values, f'$.{names[index]}: expected {kind}')
+        code += r'print(match decodePacket("{\"rows\":[[],[0,null,256]]}") { Ok(data) => encodePacket(data), Err(error) => error })'
+        self.native(code + '}', expected + ['$.rows[1][2]: out of range for UInt8'])
+
+    def test_derive_floats_roundtrip_and_report_nested_failures(self):
+        self.native(r'''import std.json.parseJson
+#derive(Json)
+struct Measure([jsonName("wide-real")] pub val wide: Float, pub val entries: List<List<Float32?>>, pub val extra: Option<Float64?>)
+fn show(text: String): String { match decodeMeasure(text) { Ok(value) => encodeMeasure(value), Err(error) => error } }
+fn invalid(text: String): String { match parseJson(text) { Ok(_) => "accepted", Err(_) => "parse rejected" } }
+fn main(): Unit {
+    print(show("{\"wide-real\":-0.0,\"entries\":[[0.125,null],[2]],\"extra\":null}"))
+    print(show("{\"wide-real\":1.25e2,\"entries\":[[]]}"))
+    print(show("{\"wide-real\":17,\"entries\":[],\"extra\":0.12345678901234568}"))
+    print(show("{\"wide-real\":true,\"entries\":[]}"))
+    print(show("{\"wide-real\":1,\"entries\":[[null,\"3.5\"]]}"))
+    print(show("{\"wide-real\":1,\"entries\":[[],[1e40]]}"))
+    print(show("{\"wide-real\":0,\"entries\":[[-1e-80]]}"))
+    val binary32: Float32 = 0.1
+    val sample = Measure(0.12345678901234568, [[Some(binary32)]], None)
+    match decodeMeasure(encodeMeasure(sample)) {
+        Ok(again) => { if again.wide == sample.wide && (again.entries[0][0] ?? 0) == binary32 { print("float roundtrip") } },
+        Err(error) => print(error),
+    }
+    val input = "{\"wide-real\":9007199254740993,\"entries\":[[4611686293305294849]],\"extra\":5e-324}"
+    match decodeMeasure(input) {
+        Ok(value) => {
+            val number: Int = 4611686293305294849
+            val item: Float32 = value.entries[0][0] ?? 0
+            if value.wide == 9007199254740992.0 && item == number.toFloat32() && item > 4611686018427387904.0f32 { print("integer conversion") }
+            match decodeMeasure(encodeMeasure(value)) {
+                Ok(again) => { val tiny: Float = (again.extra ?? None) ?? 0; if tiny > 0 { print("subnormal survives") } },
+                Err(error) => print(error),
+            }
+        }, Err(error) => print(error),
+    }
+    val zero: Float = 0
+    val infinity = 1.0 / zero
+    print(try { encodeMeasure(Measure(infinity, [], None)) } catch error: Exception { error.message })
+    print(try { encodeMeasure(Measure(0, [[Some((-infinity).toFloat32())]], None)) } catch error: Exception { error.message })
+    print(try { encodeMeasure(Measure(0, [], Some(Some(zero / zero)))) } catch error: Exception { error.message })
+    print(invalid("9223372036854775808")); print(invalid("1e400")); print(invalid("NaN"))
+}''', ['{"wide-real":-0.0,"entries":[[0.125,null],[2.0]],"extra":null}', '{"wide-real":125.0,"entries":[[]]}',
+       '{"wide-real":17.0,"entries":[],"extra":0.12345678901234568}', '$["wide-real"]: expected Float64',
+       '$.entries[0][1]: expected Float32', '$.entries[1][0]: out of range for Float32', '{"wide-real":0.0,"entries":[[-0.0]]}',
+       'float roundtrip', 'integer conversion', 'subnormal survives',
+       'JSON cannot encode a non-finite Float64', 'JSON cannot encode a non-finite Float32', 'JSON cannot encode a non-finite Float64',
+       'parse rejected', 'parse rejected', 'parse rejected'])
+
+    def test_json_uint64_requires_an_explicit_representation(self):
+        for annotation in ('UInt', 'List<UInt64?>'):
+            with self.subTest(annotation=annotation):
+                (self.src / 'main.ly').write_text('#derive(Json)\nstruct Bad(pub val value: ' + annotation + ')\nfn main(): Unit {}')
+                self.diagnostic('LYM0002', 'UInt/UInt64')
+
     def test_nested_arrays_track_field_and_element_paths(self):
         self.native(r'''#derive(Json)
 struct Report(pub val rows: List<List<Int?>>, pub val labels: List<String>?)

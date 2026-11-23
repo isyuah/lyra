@@ -2,11 +2,13 @@
 #include "strings.h"
 
 #include <charconv>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <jansson.h>
+#include <limits>
 
 namespace {
 enum class Kind : std::int64_t { Missing, Null, Object, Array, Text, Integer, Boolean, Real, Invalid };
@@ -14,7 +16,7 @@ struct Node;
 struct Entry { const void* key; Node* value; };
 struct Node {
     Kind kind;
-    std::int64_t number;
+    union { std::int64_t number; double real; };
     const void* text;
     std::size_t size;
     Entry* entries;
@@ -22,11 +24,19 @@ struct Node {
 
 Node* node(Kind kind) {
     auto* value = static_cast<Node*>(lyraGcAlloc(sizeof(Node)));
-    *value = {kind, 0, nullptr, 0, nullptr};
+    *value = {kind, {0}, nullptr, 0, nullptr};
     return value;
 }
 
 const void* str(const char* value) { return lyraStringFromBytes(value, std::strlen(value)); }
+
+const void* scalarText(json_t* value, std::size_t flags = 0) {
+    if (!value) std::abort();
+    auto* bytes = json_dumps(value, JSON_ENCODE_ANY | JSON_COMPACT | flags);
+    json_decref(value);
+    if (!bytes) std::abort();
+    auto* result = str(bytes); std::free(bytes); return result;
+}
 
 Node* convert(json_t* json, unsigned depth) {
     if (depth > 128) return nullptr;
@@ -47,7 +57,7 @@ Node* convert(json_t* json, unsigned depth) {
         value->kind = Kind::Text; value->text = lyraStringFromBytes(json_string_value(json), json_string_length(json));
     } else if (json_is_integer(json)) { value->kind = Kind::Integer; value->number = json_integer_value(json); }
     else if (json_is_boolean(json)) { value->kind = Kind::Boolean; value->number = json_is_true(json); }
-    else if (json_is_real(json)) value->kind = Kind::Real;
+    else if (json_is_real(json)) { value->kind = Kind::Real; value->real = json_real_value(json); }
     return value;
 }
 }
@@ -71,6 +81,10 @@ const Node* lyraJsonParse(const void* input) {
 std::int64_t lyraJsonKind(const Node* value) { return static_cast<std::int64_t>(value ? value->kind : Kind::Missing); }
 std::int64_t lyraJsonSize(const Node* value) { return value ? static_cast<std::int64_t>(value->size) : 0; }
 std::int64_t lyraJsonNumber(const Node* value) { return value->number; }
+double lyraJsonReal(const Node* value) { return value->real; }
+std::uint8_t lyraJsonIsFinite(double value) { return std::isfinite(value); }
+const void* lyraJsonFloat32Text(float value) { return scalarText(json_real(value), JSON_REAL_PRECISION(std::numeric_limits<float>::max_digits10)); }
+const void* lyraJsonFloat64Text(double value) { return scalarText(json_real(value), JSON_REAL_PRECISION(std::numeric_limits<double>::max_digits10)); }
 const void* lyraJsonText(const Node* value) { return value->text; }
 const void* lyraJsonKey(const Node* value, std::int64_t index) {
     return value && value->kind == Kind::Object && index >= 0 && static_cast<std::size_t>(index) < value->size ? value->entries[index].key : str("");
@@ -96,12 +110,7 @@ std::uint8_t lyraJsonSimpleKey(const void* key) {
 }
 
 const void* lyraJsonQuote(const void* text) {
-    auto* json = json_stringn_nocheck(lyraStringBytes(text), lyraStringLength(text));
-    if (!json) std::abort();
-    auto* bytes = json_dumps(json, JSON_ENCODE_ANY | JSON_COMPACT);
-    json_decref(json);
-    if (!bytes) std::abort();
-    auto* result = str(bytes); std::free(bytes); return result;
+    return scalarText(json_stringn_nocheck(lyraStringBytes(text), lyraStringLength(text)));
 }
 const void* lyraJsonIntText(std::int64_t value) {
     char buffer[32];
