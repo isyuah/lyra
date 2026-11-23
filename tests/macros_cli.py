@@ -83,7 +83,7 @@ async fn main(): Unit { val pending = work(); print("cold"); print(await pending
         self.diagnostic('LYM0002', '公开')
         self.macro('"fn wrong(): Int { false }"')
         error = self.diagnostic('LYT0001')
-        self.assertEqual((error['file'], error['range']['start']['line'], error['range']['start']['column']), (str(main), 1, 2))
+        self.assertEqual((Path(error['file']), error['range']['start']['line'], error['range']['start']['column']), (main, 1, 2))
         self.assertIn('fn wrong', error['generated']['source'])
         (self.src / '.macros/make.ly').write_text('extern fn forbidden(): Int;\nfn make(target: String, argument: String): String { "" }')
         self.diagnostic('LYM0002', 'extern')

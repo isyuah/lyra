@@ -5,6 +5,8 @@ import sys
 import tempfile
 import unittest
 
+from platform_cli import executable
+
 
 COMPILER = Path(sys.argv.pop(1)).resolve()
 
@@ -27,7 +29,7 @@ fn forward<U>(work: Task<Task<U>>): Task<Task<U>> {
 async fn main(): Unit { print((await flatten(forward(nested()))).value) }
 ''')
             for flags in ([], ['--release']):
-                exe = root / 'app'
+                exe = executable(root / 'app')
                 result = subprocess.run([COMPILER, 'build', root, '-o', exe, *flags], capture_output=True, text=True, timeout=30)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(subprocess.check_output([exe], timeout=10), b'17\n')

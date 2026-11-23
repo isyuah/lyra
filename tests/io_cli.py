@@ -5,6 +5,8 @@ import sys
 import tempfile
 import unittest
 
+from platform_cli import assert_linkage, c_archive, executable
+
 
 COMPILER = Path(sys.argv.pop(1)).resolve()
 
@@ -22,7 +24,7 @@ class IO(unittest.TestCase):
         self.source.write_text(source, encoding="utf-8")
         for flags in ([], ["--release"]):
             with self.subTest(release=bool(flags)):
-                output = self.package / "app"
+                output = executable(self.package / "app")
                 built = subprocess.run([COMPILER, "build", self.package, "-o", output, *flags], capture_output=True, timeout=30)
                 self.assertEqual(built.returncode, 0, built.stderr.decode())
                 invoke(output)
@@ -59,9 +61,7 @@ fn main(): Unit {
             result = subprocess.run([app, destination, "参数"], input="\r\n正文\r\nlast".encode(), capture_output=True, timeout=5)
             self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "参数\0尾\n正文\n".encode(), "诊断\n".encode()))
             self.assertEqual(destination.read_bytes(), "参数\0尾".encode())
-            dynamic = subprocess.check_output(["readelf", "-dW", app], text=True)
-            self.assertNotIn("libstdc++", dynamic)
-            self.assertNotIn("libsqlite3", dynamic)
+            assert_linkage(self, app)
         self.example(source, invoke)
 
     def test_invalid_utf8_empty_file_and_missing_file(self):
@@ -91,6 +91,13 @@ fn main(): Unit {
 }
 ''', invoke)
 
+    def test_run_preserves_forwarded_argument_boundaries(self):
+        self.source.write_text('import std.io.arg\nimport std.io.argCount\n'
+                               'fn main(): Unit { print(argCount()); print(arg(0).value); print(arg(1).value) }')
+        value = '中文 "quoted" \\'
+        result = subprocess.run([COMPILER, 'run', self.package, '--', '', value], capture_output=True, timeout=30)
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, ('2\n\n' + value + '\n').encode(), b''))
+
     def test_foreign_scalar_and_assertion_failure(self):
         def invoke(app):
             result = subprocess.run([app], capture_output=True, timeout=5)
@@ -108,15 +115,12 @@ fn main(): Unit {
 
     def test_link_a_user_selected_c_archive(self):
         native = self.package / 'native helper.c'
-        target = self.package / 'helper.o'
-        archive = self.package / 'lib helper.a'
         native.write_text('#include <stdint.h>\nint64_t fixtureScale(int64_t value) { return value * 3; }\n')
-        subprocess.run(['clang-18', '-c', native, '-o', target], check=True)
-        subprocess.run(['ar', 'rcs', archive, target], check=True)
+        archive = c_archive(native, self.package / '原生 helper')
         self.source.write_text('extern fn fixtureScale(value: Int): Int;\nfn main(): Unit { print(fixtureScale(7)) }')
         run = subprocess.run([COMPILER, 'run', self.package, '--link', archive], capture_output=True, timeout=30)
         self.assertEqual((run.returncode, run.stdout, run.stderr), (0, b'21\n', b''))
-        app = self.package / 'build/debug/app'
+        app = executable(self.package / 'build/debug/app')
         previously = app.read_bytes()
         missing = subprocess.run([COMPILER, 'build', self.package], capture_output=True, timeout=30)
         self.assertNotEqual(missing.returncode, 0)

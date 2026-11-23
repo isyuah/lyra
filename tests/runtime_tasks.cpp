@@ -1,12 +1,12 @@
 #include "managed.h"
+#include "net.h"
 #include "strings.h"
 #include "tasks.h"
 
-#include <pthread.h>
+#include <condition_variable>
+#include <mutex>
 #include <stdio.h>
 #include <stdlib.h>
-#include <sys/socket.h>
-#include <unistd.h>
 
 namespace {
 
@@ -133,8 +133,8 @@ void park(LyraTask *self, void *storage) {
 }
 
 struct NativeGate {
-    pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
-    pthread_cond_t changed = PTHREAD_COND_INITIALIZER;
+    std::mutex mutex;
+    std::condition_variable changed;
     bool entered = false;
     bool mayReturn = false;
     bool returned = false;
@@ -143,13 +143,12 @@ struct NativeGate {
 
 void nativeCall(void *storage) {
     auto *gate = static_cast<NativeGate *>(storage);
-    pthread_mutex_lock(&gate->lock);
+    std::unique_lock lock(gate->mutex);
     gate->entered = true;
-    pthread_cond_signal(&gate->changed);
-    while (!gate->mayReturn) pthread_cond_wait(&gate->changed, &gate->lock);
+    gate->changed.notify_one();
+    gate->changed.wait(lock, [&] { return gate->mayReturn; });
     check(!gate->closed, "cancel freed a handle still in use by a worker");
     gate->returned = true;
-    pthread_mutex_unlock(&gate->lock);
 }
 
 struct BlockingFrame {
@@ -178,20 +177,21 @@ struct CancellationFrame {
 void cancelDuringCall(LyraTask *self, void *storage) {
     auto *frame = static_cast<CancellationFrame *>(storage);
     auto *gate = frame->gate;
-    pthread_mutex_lock(&gate->lock);
-    while (!gate->entered) pthread_cond_wait(&gate->changed, &gate->lock);
+    std::unique_lock lock(gate->mutex);
+    gate->changed.wait(lock, [&] { return gate->entered; });
     lyraTaskRequestCancel(frame->target);
     lyraTaskWake(frame->target);
     check(lyraTaskState(frame->target) == LYRA_TASK_SUSPENDED && !gate->closed, "native request woke before completion");
     lyraGcCollect();
     gate->mayReturn = true;
-    pthread_cond_signal(&gate->changed);
-    pthread_mutex_unlock(&gate->lock);
+    gate->changed.notify_one();
+    lock.unlock();
     lyraTaskComplete(self, nullptr);
 }
 
 struct DisconnectCase {
-    int sockets[2];
+    lyraRuntime::net::Socket sockets[2];
+    uintptr_t monitor{};
     NativeGate gate;
     LyraTask *handler{}, *blocked{};
     LyraCleanup *cleanups{};
@@ -200,8 +200,8 @@ struct DisconnectCase {
 
 void *queuedClosure(void *storage, const LyraException **) {
     auto *test = static_cast<DisconnectCase *>(storage);
-    check(!lyraTaskWatchDisconnect(test->sockets[0]), "worker shared the caller's current task");
-    close(test->sockets[1]);
+    check(!lyraTaskWatchDisconnect(test->monitor), "worker shared the caller's current task");
+    lyraRuntime::net::close(test->sockets[1]);
     nativeCall(&test->gate);
     lyraGcCollect();
     return lyraGcAlloc(sizeof(Counter));
@@ -214,14 +214,14 @@ void observeDisconnect(LyraTask *self, void *storage) {
         lyraTaskWake(self);
         return;
     }
-    pthread_mutex_lock(&test->gate.lock);
+    std::unique_lock lock(test->gate.mutex);
     check(!test->closed && lyraTaskCancelRequested(test->blocked), "disconnect did not cancel the worker's owner tree");
     check(lyraTaskState(test->handler) == LYRA_TASK_SUSPENDED && lyraTaskState(test->blocked) == LYRA_TASK_SUSPENDED,
           "pending C operation or its parent resumed before the worker returned");
     test->observed = true;
     test->gate.mayReturn = true;
-    pthread_cond_signal(&test->gate.changed);
-    pthread_mutex_unlock(&test->gate.lock);
+    test->gate.changed.notify_one();
+    lock.unlock();
     lyraTaskComplete(self, nullptr);
 }
 
@@ -231,11 +231,12 @@ void watchedHandler(LyraTask *self, void *storage) {
         lyraCleanupPush(&test->cleanups, [](void *environment) -> const LyraException * {
             auto *closing = static_cast<DisconnectCase *>(environment);
             check(closing->gate.returned && closing->observed && !closing->closed, "defer closed a resource before opaque native work ended");
-            close(closing->sockets[0]);
+            lyraRuntime::net::close(closing->sockets[0]);
+            lyraRuntime::net::closeMonitor(closing->monitor);
             closing->closed = true;
             return nullptr;
         }, test);
-        check(lyraTaskWatchDisconnect(test->sockets[0]), "owner could not watch a socket");
+        check(lyraTaskWatchDisconnect(test->monitor), "owner could not watch a socket");
         test->blocked = lyraTaskBlocking(queuedClosure, test);
         check(!lyraTaskAwait(self, test->blocked), "cold blocking closure was already done");
         return;
@@ -283,7 +284,6 @@ void failGroup(LyraTask *self, void *storage) {
 }
 
 int main() {
-    alarm(20);
     auto *origin = lyraDomainCreate();
     auto *other = lyraDomainCreate();
     unsigned executions = 0;
@@ -361,19 +361,16 @@ int main() {
     lyraTaskStart(origin, lyraTaskCreate(cancelDuringCall, &cancellation));
     lyraDomainRun(origin);
     check(gate.closed && lyraTaskState(call) == LYRA_TASK_CANCELLED, "native cleanup did not complete cancellation");
-    pthread_cond_destroy(&gate.changed);
-    pthread_mutex_destroy(&gate.lock);
-
     DisconnectCase disconnected{};
-    check(socketpair(AF_UNIX, SOCK_STREAM, 0, disconnected.sockets) == 0, "cannot create test sockets");
+    check(uv_socketpair(SOCK_STREAM, 0, disconnected.sockets, UV_NONBLOCK_PIPE, UV_NONBLOCK_PIPE) == 0, "cannot create test sockets");
+    disconnected.monitor = lyraRuntime::net::disconnectMonitor(disconnected.sockets[0]);
+    check(disconnected.monitor != 0, "cannot create disconnect monitor");
     disconnected.handler = lyraTaskCreate(watchedHandler, &disconnected);
     lyraTaskKeepCleanups(disconnected.handler, &disconnected.cleanups);
     lyraTaskStart(origin, disconnected.handler);
     lyraTaskStart(origin, lyraTaskCreate(observeDisconnect, &disconnected));
     lyraDomainRun(origin);
     check(disconnected.closed && lyraTaskState(disconnected.handler) == LYRA_TASK_CANCELLED, "request never finished cleanup");
-    pthread_cond_destroy(&disconnected.gate.changed);
-    pthread_mutex_destroy(&disconnected.gate.lock);
 
     GroupCase group{};
     group.causes[0] = lyraExceptionCreate(lyraStringFromBytes("first", 5));

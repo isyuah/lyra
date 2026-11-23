@@ -5,6 +5,8 @@ import sys
 import tempfile
 import unittest
 
+from platform_cli import executable
+
 
 COMPILER = Path(sys.argv.pop(1)).resolve()
 
@@ -22,7 +24,7 @@ class Sums(unittest.TestCase):
         self.main.write_text(source, encoding="utf-8")
         for profile, options in (("debug", []), ("release", ["--release"])):
             with self.subTest(profile=profile):
-                app = self.package / profile
+                app = executable(self.package / profile)
                 build = subprocess.run([COMPILER, "build", self.package, *options, "-o", app], capture_output=True, timeout=30)
                 self.assertEqual(build.returncode, 0, build.stderr.decode())
                 run = subprocess.run([app], capture_output=True, timeout=10)

@@ -3,11 +3,11 @@
 #include "strings.h"
 #include "tasks.h"
 
-#include <pthread.h>
+#include <condition_variable>
+#include <mutex>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 
 namespace {
 
@@ -106,8 +106,8 @@ void queryAndCleanup() {
 }
 
 struct Gate {
-    pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
-    pthread_cond_t changed = PTHREAD_COND_INITIALIZER;
+    std::mutex mutex;
+    std::condition_variable changed;
     bool atQuery = false;
     bool released = false;
 };
@@ -126,11 +126,12 @@ void nativeQuery(void *storage) {
     job->connection = openMemory();
     job->statement = prepare(job->connection, "SELECT 'Ada'");
     auto *gate = job->gate;
-    pthread_mutex_lock(&gate->lock);
-    gate->atQuery = true;
-    pthread_cond_signal(&gate->changed);
-    while (!gate->released) pthread_cond_wait(&gate->changed, &gate->lock);
-    pthread_mutex_unlock(&gate->lock);
+    {
+        std::unique_lock lock(gate->mutex);
+        gate->atQuery = true;
+        gate->changed.notify_one();
+        gate->changed.wait(lock, [&] { return gate->released; });
+    }
 
     LyraSqliteError error;
     check(lyraSqliteNext(job->statement, &error) == LYRA_SQLITE_ROW, "cancel closed statement before native step");
@@ -156,23 +157,23 @@ struct Disconnect { Job *job; LyraTask *query; };
 void disconnectTask(LyraTask *task, void *storage) {
     auto *event = static_cast<Disconnect *>(storage);
     auto *gate = event->job->gate;
-    pthread_mutex_lock(&gate->lock);
-    while (!gate->atQuery) pthread_cond_wait(&gate->changed, &gate->lock);
-    lyraTaskRequestCancel(event->query);
-    check(lyraTaskState(event->query) == LYRA_TASK_SUSPENDED && !event->job->closed, "cancellation released active native resources");
-    LyraSqliteError error;
-    check(lyraSqliteClose(event->job->connection, &error) == LYRA_SQLITE_BUSY, "close should report active statement");
-    lyraGcCollect();
-    gate->released = true;
-    pthread_cond_signal(&gate->changed);
-    pthread_mutex_unlock(&gate->lock);
+    {
+        std::unique_lock lock(gate->mutex);
+        gate->changed.wait(lock, [&] { return gate->atQuery; });
+        lyraTaskRequestCancel(event->query);
+        check(lyraTaskState(event->query) == LYRA_TASK_SUSPENDED && !event->job->closed, "cancellation released active native resources");
+        LyraSqliteError error;
+        check(lyraSqliteClose(event->job->connection, &error) == LYRA_SQLITE_BUSY, "close should report active statement");
+        lyraGcCollect();
+        gate->released = true;
+        gate->changed.notify_one();
+    }
     lyraTaskComplete(task, nullptr);
 }
 
 }
 
 int main() {
-    alarm(20);
     queryAndCleanup();
     auto *domain = lyraDomainCreate();
     Gate gate;
@@ -187,6 +188,4 @@ int main() {
     lyraGcCollect();
     matches(job->name, "Ada", 3);
     lyraDomainDestroy(domain);
-    pthread_cond_destroy(&gate.changed);
-    pthread_mutex_destroy(&gate.lock);
 }

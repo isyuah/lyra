@@ -5,6 +5,8 @@ import sys
 import tempfile
 import unittest
 
+from platform_cli import executable
+
 
 COMPILER = Path(sys.argv.pop(1)).resolve()
 
@@ -23,14 +25,14 @@ class Closures(unittest.TestCase):
         self.main.write_text(source, encoding='utf-8')
         for mode in ([], ['--release']):
             with self.subTest(mode=mode):
-                app = self.package / 'app'
+                app = executable(self.package / 'app')
                 built = subprocess.run([COMPILER, 'build', self.package, *mode, '-o', app], text=True, capture_output=True, timeout=30)
                 self.assertEqual(built.returncode, 0, built.stderr)
                 ran = subprocess.run([app], text=True, capture_output=True, timeout=15)
                 self.assertEqual((ran.returncode != 0, ran.stdout.splitlines()), (bool(frames), lines), ran.stderr)
                 if frames:
                     observed = [frame.strip().rsplit(':', 1)[0] for frame in ran.stderr.splitlines() if ' at ' in frame]
-                    self.assertEqual(observed, [f'{role} at {self.main}:{line}' for role, line in frames], ran.stderr)
+                    self.assertEqual(observed, [f'{role} at {self.main.as_posix()}:{line}' for role, line in frames], ran.stderr)
                 else:
                     self.assertEqual(ran.stderr, '')
 
@@ -150,7 +152,7 @@ fn main(): Unit { print(probe(false)); print(probe(true)); print(returner()(2)(5
         for declaration, body, code, bad in cases:
             with self.subTest(body=body):
                 program = declaration + '\nfn main(): Unit { ' + body + ' }'
-                self.main.write_text(program, encoding='utf-8')
+                self.main.write_bytes(program.encode())
                 checked = subprocess.run([COMPILER, 'check', self.package, '--diagnostics=json'], text=True, capture_output=True, timeout=10)
                 self.assertNotEqual(checked.returncode, 0)
                 error, = json.loads(checked.stderr)

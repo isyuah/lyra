@@ -1,23 +1,20 @@
 #include "managed.h"
+#include "net.h"
 #include "strings.h"
 
-#include <arpa/inet.h>
+#include <algorithm>
 #include <cerrno>
 #include <climits>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <llhttp.h>
-#include <netinet/in.h>
-#include <poll.h>
-#include <sys/socket.h>
-#include <time.h>
-#include <unistd.h>
 
 namespace {
 
-struct Endpoint { int descriptor; int port; int status; };
-struct Request { int descriptor; int status; const void* method; const void* target; const void* body; };
+namespace net = lyraRuntime::net;
+struct Endpoint { net::Socket descriptor; int port; int status; };
+struct Request { net::Socket descriptor; uintptr_t monitor; int status; const void* method; const void* target; const void* body; };
 constexpr std::size_t maxWire = 256 * 1024;
 constexpr std::size_t maxBody = 128 * 1024;
 constexpr std::size_t maxTarget = 8192;
@@ -30,31 +27,29 @@ struct Parsed {
     bool complete{};
 };
 
-int64_t now() {
-    struct timespec clock{};
-    clock_gettime(CLOCK_MONOTONIC, &clock);
-    return clock.tv_sec * INT64_C(1000) + clock.tv_nsec / 1000000;
-}
+int64_t now() { return static_cast<int64_t>(uv_hrtime() / UINT64_C(1000000)); }
 
-int waitFor(int descriptor, short event, int64_t deadline) {
-    pollfd slot{descriptor, event, 0};
+int waitFor(net::Socket descriptor, short event, int64_t deadline) {
+    net::PollSlot slot{descriptor, event, 0};
     for (;;) {
         auto remaining = deadline - now();
         if (remaining < 0) return ETIMEDOUT;
-        auto result = ::poll(&slot, 1, static_cast<int>(remaining));
+        auto result = net::poll(slot, static_cast<int>(remaining));
         if (result > 0) return 0;
         if (result == 0) return ETIMEDOUT;
-        if (errno != EINTR) return errno;
+        auto status = net::error();
+        if (status != EINTR) return status;
     }
 }
 
-int sendAll(int descriptor, const char* data, std::size_t size, int64_t deadline) {
+int sendAll(net::Socket descriptor, const char* data, std::size_t size, int64_t deadline) {
     while (size) {
-        auto sent = ::send(descriptor, data, size, MSG_NOSIGNAL);
+        auto sent = net::send(descriptor, data, static_cast<int>(std::min<std::size_t>(size, INT_MAX)));
         if (sent > 0) { data += sent; size -= sent; continue; }
         if (sent == 0) return EPIPE;
-        if (errno == EINTR) continue;
-        if (errno != EWOULDBLOCK && errno != EAGAIN) return errno;
+        auto status = net::error();
+        if (status == EINTR) continue;
+        if (!net::retry(status)) return status;
         if (auto error = waitFor(descriptor, POLLOUT, deadline)) return error;
     }
     return 0;
@@ -72,8 +67,14 @@ int append(llhttp_t* parser, const char* data, std::size_t size, bool target) {
     return 0;
 }
 
-void stop(int& descriptor) {
-    if (descriptor >= 0) { ::close(descriptor); descriptor = -1; }
+void stop(net::Socket& descriptor) {
+    if (descriptor != net::invalidSocket) { net::close(descriptor); descriptor = net::invalidSocket; }
+}
+
+void stop(Request* request) {
+    stop(request->descriptor);
+    net::closeMonitor(request->monitor);
+    request->monitor = 0;
 }
 
 int parse(Request* request, int64_t deadline) {
@@ -90,9 +91,9 @@ int parse(Request* request, int64_t deadline) {
     while (!parsed.complete) {
         if (auto error = waitFor(request->descriptor, POLLIN, deadline)) return error;
         char buffer[8192];
-        auto size = ::recv(request->descriptor, buffer, sizeof(buffer), 0);
+        auto size = net::receive(request->descriptor, buffer, sizeof(buffer));
         if (size == 0) return ECONNRESET;
-        if (size < 0) { if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue; return errno; }
+        if (size < 0) { auto status = net::error(); if (net::retry(status)) continue; return status; }
         total += static_cast<std::size_t>(size);
         if (total > maxWire) return EMSGSIZE;
         auto code = llhttp_execute(&parser, buffer, static_cast<std::size_t>(size));
@@ -119,17 +120,17 @@ const char* reason(int64_t status) {
 
 extern "C" Endpoint* lyraHttpListen(int64_t port) {
     auto listener = static_cast<Endpoint*>(lyraGcAlloc(sizeof(Endpoint)));
-    *listener = {-1, 0, EINVAL};
+    *listener = {net::invalidSocket, 0, EINVAL};
     if (port < 0 || port > UINT16_MAX) return listener;
-    auto fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
-    if (fd < 0) { listener->status = errno; return listener; }
+    auto fd = net::open();
+    if (fd == net::invalidSocket) { listener->status = net::error(); return listener; }
     sockaddr_in address{};
     address.sin_family = AF_INET;
     address.sin_port = htons(static_cast<uint16_t>(port));
     address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    socklen_t length = sizeof(address);
+    net::AddressLength length = sizeof(address);
     if (::bind(fd, reinterpret_cast<const sockaddr*>(&address), length) || ::listen(fd, 64) || ::getsockname(fd, reinterpret_cast<sockaddr*>(&address), &length)) {
-        listener->status = errno; ::close(fd); return listener;
+        listener->status = net::error(); net::close(fd); return listener;
     }
     *listener = {fd, ntohs(address.sin_port), 0};
     return listener;
@@ -142,22 +143,25 @@ extern "C" void lyraHttpStop(Endpoint* server) { stop(server->descriptor); }
 extern "C" Request* lyraHttpAccept(const Endpoint* server, int64_t timeoutMs) {
     auto request = static_cast<Request*>(lyraGcAlloc(sizeof(Request)));
     auto empty = lyraStringFromBytes(nullptr, 0);
-    *request = {-1, 0, empty, empty, empty};
-    if (server->descriptor < 0 || timeoutMs < 0 || timeoutMs > INT_MAX) { request->status = EINVAL; return request; }
+    *request = {net::invalidSocket, 0, 0, empty, empty, empty};
+    if (server->descriptor == net::invalidSocket || timeoutMs < 0 || timeoutMs > INT_MAX) { request->status = EINVAL; return request; }
     auto deadline = now() + timeoutMs;
     for (;;) {
         if (auto error = waitFor(server->descriptor, POLLIN, deadline)) { request->status = error; return request; }
-        request->descriptor = ::accept4(server->descriptor, nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
-        if (request->descriptor >= 0) break;
-        if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) { request->status = errno; return request; }
+        request->descriptor = net::accept(server->descriptor);
+        if (request->descriptor != net::invalidSocket) break;
+        auto status = net::error();
+        if (!net::retry(status)) { request->status = status; return request; }
     }
+    request->monitor = net::disconnectMonitor(request->descriptor);
+    if (!request->monitor) { request->status = net::error(); stop(request); return request; }
     request->status = parse(request, deadline);
     if (request->status) {
         if (request->status == EPROTO || request->status == EILSEQ || request->status == EMSGSIZE) {
             const char* response = request->status == EMSGSIZE ? "HTTP/1.1 413 Content Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n" : "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
             sendAll(request->descriptor, response, std::strlen(response), deadline);
         }
-        stop(request->descriptor);
+        stop(request);
     }
     return request;
 }
@@ -166,33 +170,21 @@ extern "C" int64_t lyraHttpRequestStatus(const Request* req) { return req->statu
 extern "C" const void* lyraHttpMethod(const Request* req) { return req->method; }
 extern "C" const void* lyraHttpTarget(const Request* req) { return req->target; }
 extern "C" const void* lyraHttpBody(const Request* req) { return req->body; }
-extern "C" int lyraHttpDescriptor(const void* request) { return static_cast<const Request*>(request)->descriptor; }
-extern "C" void lyraHttpDrop(Request* req) { stop(req->descriptor); }
+extern "C" uintptr_t lyraHttpDisconnectMonitor(const void* request) { return static_cast<const Request*>(request)->monitor; }
+extern "C" void lyraHttpDrop(Request* req) { stop(req); }
 
 extern "C" uint8_t lyraHttpDisconnected(const Request* req) {
-    if (req->descriptor < 0) return true;
-    char next;
-    ssize_t count;
-    do { count = ::recv(req->descriptor, &next, 1, MSG_PEEK | MSG_DONTWAIT); } while (count < 0 && errno == EINTR);
-    return count == 0 || (count < 0 && errno != EAGAIN && errno != EWOULDBLOCK);
+    return !req->monitor || net::disconnected(req->descriptor);
 }
 
 extern "C" uint8_t lyraHttpWaitDisconnect(const Request* req, int64_t timeoutMs) {
-    if (req->descriptor < 0) return true;
+    if (!req->monitor) return true;
     if (timeoutMs < 0 || timeoutMs > INT_MAX) return false;
-    auto deadline = now() + timeoutMs;
-    pollfd slot{req->descriptor, POLLRDHUP, 0};
-    for (;;) {
-        auto remaining = deadline - now();
-        if (remaining < 0) return false;
-        auto result = ::poll(&slot, 1, static_cast<int>(remaining));
-        if (result < 0 && errno == EINTR) continue;
-        return result > 0 && (slot.revents & (POLLRDHUP | POLLHUP | POLLERR | POLLNVAL));
-    }
+    return net::waitDisconnect(req->monitor, static_cast<int>(timeoutMs));
 }
 
 extern "C" int64_t lyraHttpRespond(Request* req, int64_t status, const void* mediaType, const void* body) {
-    if (req->descriptor < 0) return EBADF;
+    if (req->descriptor == net::invalidSocket) return EBADF;
     auto type = lyraStringBytes(mediaType);
     auto size = lyraStringLength(mediaType);
     auto length = lyraStringLength(body);
@@ -205,7 +197,7 @@ extern "C" int64_t lyraHttpRespond(Request* req, int64_t status, const void* med
     auto error = sendAll(req->descriptor, header, static_cast<std::size_t>(count), deadline);
     bool head = lyraStringLength(req->method) == 4 && std::memcmp(lyraStringBytes(req->method), "HEAD", 4) == 0;
     if (!error && !head) error = sendAll(req->descriptor, lyraStringBytes(body), length, deadline);
-    stop(req->descriptor);
+    stop(req);
     return error;
 }
 

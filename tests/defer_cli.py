@@ -5,6 +5,8 @@ import sys
 import tempfile
 import unittest
 
+from platform_cli import executable
+
 
 COMPILER = Path(sys.argv.pop(1)).resolve()
 
@@ -22,7 +24,7 @@ class Defers(unittest.TestCase):
         self.source.write_text(program, encoding="utf-8")
         for flags in ([], ["--release"]):
             with self.subTest(flags=flags):
-                app = self.package / "app"
+                app = executable(self.package / "app")
                 build = subprocess.run([COMPILER, "build", self.package, *flags, "-o", app], capture_output=True, timeout=30)
                 self.assertEqual(build.returncode, 0, build.stderr.decode())
                 run = subprocess.run([app], capture_output=True, timeout=10)

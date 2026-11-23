@@ -4,6 +4,8 @@ import sys
 import tempfile
 import unittest
 
+from platform_cli import assert_linkage, executable
+
 
 COMPILER = Path(sys.argv.pop(1)).resolve()
 
@@ -50,14 +52,12 @@ fn main(): Unit {
 ''', encoding="utf-8")
             for flags in ([], ["--release"]):
                 with self.subTest(release=bool(flags)):
-                    app = package / "query"
+                    app = executable(package / "query")
                     built = subprocess.run([COMPILER, "build", package, "-o", app, *flags], capture_output=True, timeout=30)
                     self.assertEqual(built.returncode, 0, built.stderr.decode())
                     result = subprocess.run([app], cwd=package, capture_output=True, timeout=10)
                     self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "李\0Ada\n".encode(), b""))
-                    dynamic = subprocess.check_output(["readelf", "-dW", app], text=True)
-                    dependencies = {line.split("[")[1].split("]")[0] for line in dynamic.splitlines() if "(NEEDED)" in line}
-                    self.assertEqual(dependencies, {"libc.so.6", "libsqlite3.so.0"})
+                    assert_linkage(self, app, 'libsqlite3.so.0')
 
 
 if __name__ == "__main__":

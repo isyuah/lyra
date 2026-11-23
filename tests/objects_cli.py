@@ -5,6 +5,8 @@ import sys
 import tempfile
 import unittest
 
+from platform_cli import assert_linkage, executable
+
 
 COMPILER = Path(sys.argv.pop(1)).resolve()
 GC_FIXTURE = Path(__file__).parent / "fixtures" / "objects" / "src" / "main.ly"
@@ -23,15 +25,13 @@ class Objects(unittest.TestCase):
         self.main.write_text(source, encoding="utf-8")
         for profile, options in (("debug", []), ("release", ["--release"])):
             with self.subTest(profile=profile):
-                app = self.package / profile
+                app = executable(self.package / profile)
                 built = subprocess.run([COMPILER, "build", self.package, *options, "-o", app],
                                        capture_output=True, timeout=30)
                 self.assertEqual(built.returncode, 0, built.stderr.decode())
                 result = subprocess.run([app], capture_output=True, timeout=20)
                 self.assertEqual((result.returncode, result.stdout, result.stderr), (0, expected, b""))
-                dynamic = subprocess.check_output(["readelf", "-dW", app], text=True)
-                needed = [line.split("[")[1].split("]")[0] for line in dynamic.splitlines() if "(NEEDED)" in line]
-                self.assertEqual(needed, ["libc.so.6"])
+                assert_linkage(self, app)
 
     def test_copy_fields_method_and_identity(self):
         (self.src / "models.ly").write_text("""

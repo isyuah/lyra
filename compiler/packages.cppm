@@ -4,7 +4,6 @@ module;
 #include <charconv>
 #include <compare>
 #include <cstdint>
-#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -17,7 +16,6 @@ module;
 #include <variant>
 #include <vector>
 #include <llvm/ADT/StringExtras.h>
-#include <llvm/Support/FileSystem.h>
 #include <llvm/Support/FormatVariadic.h>
 #include <llvm/Support/JSON.h>
 #include <llvm/Support/Program.h>
@@ -25,6 +23,7 @@ module;
 #include <llvm/Support/raw_ostream.h>
 
 export module lyra.packages;
+import lyra.platform;
 
 export namespace lyra {
 
@@ -85,19 +84,27 @@ void packageName(const string& name) {
     if (name.size() > 192 || !std::all_of(parts.begin(), parts.end(), [](const string& part) { return simpleName(part, true); })) invalid("无效的包名：" + name);
 }
 bool safeRelative(string_view name) {
-    if (name.empty() || name.size() > 2048 || name.find_first_of("\\:") != string_view::npos || !json::isUTF8(name)) return false;
+    if (name.empty() || name.size() > 2048 || name.find_first_of("\\:<>\"|?*") != string_view::npos || !json::isUTF8(name)) return false;
     for (char ch : name) if (static_cast<unsigned char>(ch) < 32 || ch == 127) return false;
     auto parts = split(name, '/');
-    return std::none_of(parts.begin(), parts.end(), [](const string& part) { return part.empty() || part == "." || part == ".."; });
+    return std::none_of(parts.begin(), parts.end(), [](const string& part) {
+        if (part.empty() || part.back() == '.' || part.back() == ' ') return true;
+        auto stem = llvm::StringRef(part).split('.').first.rtrim(' ');
+        auto device = stem.upper();
+        if (device == "CON" || device == "PRN" || device == "AUX" || device == "NUL" || device == "CONIN$" || device == "CONOUT$") return true;
+        if (!device.starts_with("COM") && !device.starts_with("LPT")) return false;
+        auto suffix = string_view(device).substr(3);
+        return (suffix.size() == 1 && suffix.front() >= '1' && suffix.front() <= '9') || suffix == "¹" || suffix == "²" || suffix == "³";
+    });
 }
 
 string readFile(const fs::path& path) {
-    if (!fs::is_regular_file(path)) io("找不到文件：" + path.string());
+    if (!fs::is_regular_file(path)) io("找不到文件：" + pathText(path));
     auto size = fs::file_size(path);
-    if (size > maxBytes) io("文件过大：" + path.string());
+    if (size > maxBytes) io("文件过大：" + pathText(path));
     std::ifstream input(path, std::ios::binary);
     string bytes(size, '\0');
-    if (!input || !input.read(bytes.data(), bytes.size()) || input.peek() != std::char_traits<char>::eof() || input.bad()) io("无法完整读取文件：" + path.string());
+    if (!input || !input.read(bytes.data(), bytes.size()) || input.peek() != std::char_traits<char>::eof() || input.bad()) io("无法完整读取文件：" + pathText(path));
     return bytes;
 }
 
@@ -106,25 +113,11 @@ void writeFile(const fs::path& path, string_view bytes) {
     std::ofstream output(path, std::ios::binary | std::ios::trunc);
     output.write(bytes.data(), bytes.size());
     output.close();
-    if (!output) io("写入失败：" + path.string());
+    if (!output) io("写入失败：" + pathText(path));
 }
 
-struct Scratch {
-    fs::path path;
-    explicit Scratch(const fs::path& parent) {
-        fs::create_directories(parent);
-        llvm::SmallString<128> temporary;
-        auto error = llvm::sys::fs::createUniqueDirectory((parent / ".lyra-tmp").string(), temporary);
-        if (error) io("创建临时目录失败：" + error.message());
-        path = temporary.str().str();
-    }
-    ~Scratch() { std::error_code error; fs::remove_all(path, error); }
-    Scratch(const Scratch&) = delete;
-    Scratch& operator=(const Scratch&) = delete;
-};
-
 void replaceFile(const fs::path& path, string_view bytes) {
-    Scratch scratch(path.parent_path());
+    StagingDirectory scratch(path.parent_path());
     auto temp = scratch.path / "contents";
     writeFile(temp, bytes);
     fs::rename(temp, path);
@@ -307,7 +300,7 @@ Manifest manifestFrom(string_view bytes, const string& where) {
             if (dep.get("path")) {
                 auto path = required(dep, "path", location);
                 if (path.empty() || path.find('\0') != string::npos) invalid(location + "：无效本地路径");
-                dependency.path = path;
+                dependency.path = fromUtf8(path);
             }
             if (dep.get("registry")) {
                 dependency.registry = required(dep, "registry", location);
@@ -332,7 +325,7 @@ Manifest manifestFrom(string_view bytes, const string& where) {
             for (const auto& [key, file] : asObject(inputs, where + ": macroInputs." + name.str())) {
                 auto path = file.getAsString();
                 if (!path || !safeRelative(path->str())) invalid(where + "：宏输入必须是包内相对文件路径");
-                granted.emplace(key.str(), path->str());
+                granted.emplace(key.str(), fromUtf8(path->str()));
             }
         }
     }
@@ -343,23 +336,24 @@ Files collect(const fs::path& root) {
     Files files;
     std::size_t size = 0;
     auto include = [&](const fs::path& path) {
-        auto name = path.lexically_relative(root).generic_string();
+        auto name = pathText(path.lexically_relative(root));
         if (files.contains(name)) return;
-        if (fs::is_symlink(path) || !safeRelative(name) || !fs::is_regular_file(path)) invalid("源码包包含非普通文件或无效路径：" + path.string());
-        if (fs::file_size(path) + size > maxBytes || files.size() >= maxFiles) invalid("源码包超过大小或文件数限制：" + root.string());
+        if (fs::is_symlink(path) || !safeRelative(name) || !fs::is_regular_file(path)) invalid("源码包包含非普通文件或无效路径：" + pathText(path));
+        if (fs::file_size(path) + size > maxBytes || files.size() >= maxFiles) invalid("源码包超过大小或文件数限制：" + pathText(root));
         auto bytes = readFile(path);
         size += bytes.size();
         files.emplace(std::move(name), std::move(bytes));
     };
     include(root / manifestFile);
-    if (!fs::is_directory(root / "src") || fs::is_symlink(root / "src")) invalid("缺少普通 src 目录：" + root.string());
+    if (!fs::is_directory(root / "src") || fs::is_symlink(root / "src")) invalid("缺少普通 src 目录：" + pathText(root));
     for (const auto& entry : fs::recursive_directory_iterator(root / "src")) {
         if (entry.is_symlink() || !entry.is_directory()) include(entry.path());
     }
-    auto manifest = manifestFrom(files.at(manifestFile), (root / manifestFile).string());
+    auto manifest = manifestFrom(files.at(manifestFile), pathText(root / manifestFile));
     for (const auto& [macro, inputs] : manifest.macroInputs) for (const auto& [key, path] : inputs) {
-        if (!path.generic_string().starts_with("src/") && !path.generic_string().starts_with("inputs/")) invalid("可发布的宏输入须放在 src/ 或 inputs/：" + path.string());
-        for (auto parent = path.parent_path(); !parent.empty(); parent = parent.parent_path()) if (fs::is_symlink(root / parent)) invalid("宏输入目录不能是符号链接：" + parent.string());
+        auto name = pathText(path);
+        if (!name.starts_with("src/") && !name.starts_with("inputs/")) invalid("可发布的宏输入须放在 src/ 或 inputs/：" + name);
+        for (auto parent = path.parent_path(); !parent.empty(); parent = parent.parent_path()) if (fs::is_symlink(root / parent)) invalid("宏输入目录不能是符号链接：" + pathText(parent));
         include(root / path);
     }
     return files;
@@ -395,12 +389,13 @@ Files unpack(string_view bytes, const string& where) {
     auto manifest = manifestFrom(files.at(manifestFile), where);
     std::set<string> grants;
     for (const auto& [macro, inputs] : manifest.macroInputs) for (const auto& [key, path] : inputs) {
-        if (!files.contains(path.generic_string())) invalid(where + "：归档缺少声明的宏输入：" + path.string());
-        grants.insert(path.generic_string());
+        auto name = pathText(path);
+        if (!files.contains(name)) invalid(where + "：归档缺少声明的宏输入：" + name);
+        grants.insert(std::move(name));
     }
     for (const auto& [name, body] : files) {
         if (name.starts_with("inputs/") && !grants.contains(name)) invalid(where + "：归档包含未声明的宏输入：" + name);
-        for (auto prefix = fs::path(name).parent_path(); !prefix.empty(); prefix = prefix.parent_path()) if (files.contains(prefix.generic_string())) invalid(where + "：文件与目录重名：" + prefix.string());
+        for (auto prefix = fromUtf8(name).parent_path(); !prefix.empty(); prefix = prefix.parent_path()) if (files.contains(pathText(prefix))) invalid(where + "：文件与目录重名：" + pathText(prefix));
     }
     return files;
 }
@@ -415,10 +410,14 @@ string sourceOf(string source, const fs::path& directory, const fs::path& worksp
         return source;
     }
     if (source.empty() || source.find("://") != string::npos || source.find('\0') != string::npos) invalid("不支持的注册中心：" + source);
-    auto path = fs::weakly_canonical(directory / source);
-    return "registry:" + path.lexically_relative(workspace).generic_string();
+    auto path = fs::weakly_canonical(directory / fromUtf8(source));
+    auto relative = path.lexically_relative(workspace);
+    return "registry:" + pathText(relative.empty() ? path : relative);
 }
-string localSource(const fs::path& root, const fs::path& workspace) { return "path:" + root.lexically_relative(workspace).generic_string(); }
+string localSource(const fs::path& root, const fs::path& workspace) {
+    auto relative = root.lexically_relative(workspace);
+    return "path:" + pathText(relative.empty() ? root : relative);
+}
 string identity(const string& source, const string& name) { return source + "|" + name; }
 
 struct Record { Version version; string hash; bool yanked; };
@@ -454,15 +453,18 @@ struct Store {
     LockedNodes locks;
 
     string getRemote(const string& url, const string& label) {
-        Scratch scratch(cache); auto target = (scratch.path / "download").string();
+        StagingDirectory scratch(cache);
+        auto file = scratch.path / "download";
+        auto target = pathText(file);
         auto curl = llvm::sys::findProgramByName("curl");
         if (!curl) io("下载 " + label + " 需要 curl");
-        llvm::SmallVector<llvm::StringRef> args{*curl, "-q", "--silent", "--fail", "--proto", "=http,https", "--max-time", "30", "--max-filesize", "67108864", "--output", target, "--", url};
-        if (llvm::sys::ExecuteAndWait(*curl, args, std::nullopt, {}, 35) != 0) io("从只读注册中心下载失败：" + label + " (" + url + ")");
-        return readFile(target);
+        llvm::SmallVector<llvm::StringRef> args{*curl, "-q", "--silent", "--fail", "--proto", "=http,https", "--max-time", "30", "--max-filesize", "67108864", "--", url};
+        std::optional<llvm::StringRef> redirects[] = {std::nullopt, llvm::StringRef(target), std::nullopt};
+        if (llvm::sys::ExecuteAndWait(*curl, args, std::nullopt, redirects, 35) != 0) io("从只读注册中心下载失败：" + label + " (" + url + ")");
+        return readFile(file);
     }
 
-    fs::path registryPath(const string& source) const { return workspace / source.substr(string_view("registry:").size()); }
+    fs::path registryPath(const string& source) const { return workspace / fromUtf8(string_view(source).substr(string_view("registry:").size())); }
 
     const std::vector<Record>& index(const Request& request) {
         auto id = identity(request.source, request.name);
@@ -482,10 +484,10 @@ struct Store {
     }
 
     const Node& local(const fs::path& directory) {
-        auto root = fs::canonical(directory); auto key = "local:" + root.string();
+        auto root = fs::canonical(directory); auto key = "local:" + pathText(root);
         if (auto found = nodes.find(key); found != nodes.end()) return found->second;
         auto contents = readFile(root / manifestFile);
-        return nodes.emplace(key, Node{manifestFrom(contents, (root / manifestFile).string()), localSource(root, workspace), hashOf(contents), root}).first->second;
+        return nodes.emplace(key, Node{manifestFrom(contents, pathText(root / manifestFile)), localSource(root, workspace), hashOf(contents), root}).first->second;
     }
 
     const Node& released(const Request& request, const Record& record) {
@@ -509,21 +511,22 @@ struct Store {
         if (!fs::is_regular_file(cached)) replaceFile(cached, bytes);
         auto root = cache / "sources" / record.hash;
         if (!fs::exists(root)) {
-            Scratch scratch(root.parent_path());
+            StagingDirectory scratch(root.parent_path());
             auto staged = scratch.path / "srcpkg";
             fs::create_directories(staged / "src");
-            for (const auto& [file, body] : files) writeFile(staged / file, body);
+            for (const auto& [file, body] : files) writeFile(staged / fromUtf8(file), body);
+            if constexpr (windows) if (collect(staged) != files) invalid(label + "：源码包路径在 Windows 上重名");
             std::error_code error; fs::rename(staged, root, error);
             if (error && !fs::is_directory(root)) io("安装源码包失败：" + error.message());
         }
-        if (fs::is_symlink(root) || collect(root) != files) fail("LYK0005", label + " 的展开源码缓存被修改：" + root.string());
+        if (fs::is_symlink(root) || collect(root) != files) fail("LYK0005", label + " 的展开源码缓存被修改：" + pathText(root));
         return nodes.emplace(key, Node{std::move(manifest), request.source, record.hash, std::move(root), record.yanked}).first->second;
     }
 
     Request dependency(const Node& owner, const Dependency& dependency) {
         if (!dependency.path.empty()) {
             auto root = fs::weakly_canonical(owner.root / dependency.path);
-            if (!fs::is_regular_file(root / manifestFile)) io("本地依赖 " + dependency.name + " 缺少清单：" + (root / manifestFile).string());
+            if (!fs::is_regular_file(root / manifestFile)) io("本地依赖 " + dependency.name + " 缺少清单：" + pathText(root / manifestFile));
             return {localSource(root, workspace), dependency.name, dependency.range, root};
         }
         string source;
@@ -611,15 +614,15 @@ LockedNodes readLock(const json::Object& obj, const string& where) {
 
 struct Layout { fs::path root, entry; std::vector<fs::path> members; };
 std::optional<std::vector<fs::path>> membersOf(const fs::path& root) {
-    auto obj = objectFrom(readFile(root / manifestFile), (root / manifestFile).string(), true);
+    auto obj = objectFrom(readFile(root / manifestFile), pathText(root / manifestFile), true);
     auto field = obj.get("workspace"); if (!field) return std::nullopt;
-    const auto& ws = asObject(*field, root.string());
+    const auto& ws = asObject(*field, pathText(root));
     std::vector<fs::path> members;
     if (obj.get("name")) members.push_back(root);
-    for (const auto& member : stringList(ws, "members", root.string())) {
+    for (const auto& member : stringList(ws, "members", pathText(root))) {
         if (!safeRelative(member)) invalid("workspace 成员须为内部目录：" + member);
-        auto resolved = fs::weakly_canonical(root / member);
-        if (!safeRelative(resolved.lexically_relative(root).generic_string())) invalid("workspace 成员指向外部目录：" + member);
+        auto resolved = fs::weakly_canonical(root / fromUtf8(member));
+        if (!safeRelative(pathText(resolved.lexically_relative(root)))) invalid("workspace 成员指向外部目录：" + member);
         if (std::find(members.begin(), members.end(), resolved) != members.end()) invalid("重复 workspace 成员：" + member);
         if (!fs::is_regular_file(resolved / manifestFile)) invalid("workspace 成员缺少清单：" + member);
         members.push_back(std::move(resolved));
@@ -630,7 +633,7 @@ std::optional<std::vector<fs::path>> membersOf(const fs::path& root) {
 }
 Layout layout(const fs::path& directory) {
     auto dir = fs::canonical(directory);
-    if (!fs::is_regular_file(dir / manifestFile)) invalid("找不到包清单：" + (dir / manifestFile).string());
+    if (!fs::is_regular_file(dir / manifestFile)) invalid("找不到包清单：" + pathText(dir / manifestFile));
     for (auto candidate = dir; ; candidate = candidate.parent_path()) {
         if (fs::is_regular_file(candidate / manifestFile)) {
             auto members = membersOf(candidate);
@@ -663,13 +666,13 @@ PackageGraph resolvePackages(const fs::path& directory, PackageOptions options) 
     if (options.update && options.locked) fail("LYK0001", "--update 与 --locked 不能并用");
     auto ws = layout(directory); auto lockPath = ws.root / "lyra.lock";
     fs::path cache = ws.root / ".lyra" / "cache";
-    if (auto env = std::getenv("LYRA_CACHE"); env && *env) cache = fs::absolute(env);
-    if (options.locked && !fs::is_regular_file(lockPath)) fail("LYK0003", "锁定构建缺少 " + lockPath.string());
+    if (auto override = cacheOverride(); !override.empty()) cache = fs::absolute(override);
+    if (options.locked && !fs::is_regular_file(lockPath)) fail("LYK0003", "锁定构建缺少 " + pathText(lockPath));
     std::optional<json::Object> old;
     Store store{ws.root, cache, options, {}, {}, {}};
     if (fs::exists(lockPath)) {
-        old = objectFrom(readFile(lockPath), lockPath.string());
-        store.locks = readLock(*old, lockPath.string());
+        old = objectFrom(readFile(lockPath), pathText(lockPath));
+        store.locks = readLock(*old, pathText(lockPath));
     }
     PackageGraph graph{ws.root, {}, {}, {}, {}, {}};
     std::vector<Need> pending;
@@ -707,10 +710,10 @@ PackageGraph resolvePackages(const fs::path& directory, PackageOptions options) 
     std::set<string> done; Strings visiting;
     for (const auto& [id, package] : packages) visitGraph(id, packages, done, visiting);
     json::Array members;
-    for (const auto& member : ws.members) members.emplace_back(member.lexically_relative(ws.root).generic_string());
+    for (const auto& member : ws.members) members.emplace_back(pathText(member.lexically_relative(ws.root)));
     json::Object lock{{"format", 1}, {"members", std::move(members)}, {"packages", std::move(entries)}};
     if (!old || *old != lock) {
-        if (options.locked) fail("LYK0003", "清单与锁文件不符：" + lockPath.string());
+        if (options.locked) fail("LYK0003", "清单与锁文件不符：" + pathText(lockPath));
         replaceFile(lockPath, render(json::Value(std::move(lock))));
     }
     for (auto& [id, package] : packages) graph.packages.push_back(std::move(package));
@@ -721,8 +724,8 @@ namespace {
 void newPackage(const fs::path& directory, const string& name, bool library) {
     packageName(name);
     auto root = fs::absolute(directory).lexically_normal();
-    if (fs::exists(root)) invalid("目标目录已存在：" + root.string());
-    Scratch scratch(root.parent_path()); auto stage = scratch.path / "new";
+    if (fs::exists(root)) invalid("目标目录已存在：" + pathText(root));
+    StagingDirectory scratch(root.parent_path()); auto stage = scratch.path / "new";
     writeFile(stage / manifestFile, render(json::Object{{"name", name}, {"version", "0.1.0"}, {"kind", library ? "lib" : "app"}, {"dependencies", json::Object{}}}));
     string source = "pub fn answer(): Int { 42 }\n";
     if (!library) source += "\nfn main(): Unit { print(answer()) }\n";
@@ -730,39 +733,39 @@ void newPackage(const fs::path& directory, const string& name, bool library) {
     writeFile(stage / "tests" / "answer.ly", "import self.answer\nimport std.io.assert\n\n"
               "fn main(): Unit {\n    assert(answer() == 42, \"expected 42\")\n}\n");
     fs::rename(stage, root);
-    std::cout << root.string() << '\n';
+    std::cout << pathText(root) << '\n';
 }
 
 struct PublishLock {
     fs::path path;
     explicit PublishLock(const fs::path& registry) : path(registry / ".publish-lock") {
         fs::create_directories(registry);
-        if (!fs::create_directory(path)) io("注册中心正在发布或有未清理的 .publish-lock：" + registry.string());
+        if (!fs::create_directory(path)) io("注册中心正在发布或有未清理的 .publish-lock：" + pathText(registry));
     }
     ~PublishLock() { std::error_code error; fs::remove(path, error); }
 };
 
 void packPackage(const fs::path& directory, const fs::path& output, const fs::path& registry) {
     auto root = fs::canonical(directory);
-    auto files = collect(root); auto manifest = manifestFrom(files.at(manifestFile), (root / manifestFile).string());
+    auto files = collect(root); auto manifest = manifestFrom(files.at(manifestFile), pathText(root / manifestFile));
     for (const auto& [alias, dep] : manifest.dependencies) if (!dep.path.empty() || (dep.registry != "self" && !isWeb(dep.registry))) invalid("发布包不能包含本地依赖：" + alias + " (" + dep.name + ")");
     auto archive = archiveOf(files); auto hash = hashOf(archive);
     if (registry.empty()) {
         auto basename = split(manifest.name, '/').back() + "-" + manifest.version + ".lypkg";
         auto target = fs::absolute(output.empty() ? root / "dist" / basename : output);
-        if (fs::exists(target) && (!fs::is_regular_file(target) || readFile(target) != archive)) invalid("拒绝覆盖已有且内容不同的文件：" + target.string());
+        if (fs::exists(target) && (!fs::is_regular_file(target) || readFile(target) != archive)) invalid("拒绝覆盖已有且内容不同的文件：" + pathText(target));
         if (!fs::exists(target)) replaceFile(target, archive);
-        std::cout << target.string() << " sha256=" << hash << '\n';
+        std::cout << pathText(target) << " sha256=" << hash << '\n';
         return;
     }
     auto center = fs::absolute(registry); PublishLock guard(center);
     auto index = center / "index" / (manifest.name + ".json");
     json::Object object{{"name", manifest.name}, {"versions", json::Array{}}};
-    if (fs::exists(index)) object = objectFrom(readFile(index), index.string());
-    auto published = recordsFrom(object, index.string(), manifest.name);
+    if (fs::exists(index)) object = objectFrom(readFile(index), pathText(index));
+    auto published = recordsFrom(object, pathText(index), manifest.name);
     if (std::any_of(published.begin(), published.end(), [&](const Record& item) { return item.version.text == manifest.version; })) fail("LYK0004", "不能覆盖已发布版本：" + manifest.name + "@" + manifest.version);
     auto artifact = center / "artifacts" / (hash + ".lypkg");
-    if (fs::exists(artifact)) { if (hashOf(readFile(artifact)) != hash) fail("LYK0005", "注册中心现有制品 SHA-256 不匹配：" + artifact.string()); }
+    if (fs::exists(artifact)) { if (hashOf(readFile(artifact)) != hash) fail("LYK0005", "注册中心现有制品 SHA-256 不匹配：" + pathText(artifact)); }
     else replaceFile(artifact, archive);
     object.getArray("versions")->emplace_back(json::Object{{"version", manifest.version}, {"sha256", hash}, {"yanked", false}});
     replaceFile(index, render(json::Value(std::move(object))));
@@ -782,21 +785,21 @@ int packageCommand(const std::vector<std::string_view>& args) {
         auto value = [&] { if (index + 1 >= args.size() || args[index + 1].empty() || args[index + 1].starts_with('-')) invalid(packageUsage); return string(args[++index]); };
         if (command == "new" && arg == "--lib" && !library) library = true;
         else if (command == "new" && arg == "--name" && name.empty()) name = value();
-        else if (command == "pack" && arg == "-o" && output.empty() && registry.empty()) output = value();
-        else if (command == "pack" && arg == "--registry" && output.empty() && registry.empty()) { auto dir = value(); if (dir.find("://") != string::npos) invalid("HTTP(S) 注册中心只读，--registry 需要本地目录"); registry = dir; }
+        else if (command == "pack" && arg == "-o" && output.empty() && registry.empty()) output = fromUtf8(value());
+        else if (command == "pack" && arg == "--registry" && output.empty() && registry.empty()) { auto dir = value(); if (dir.find("://") != string::npos) invalid("HTTP(S) 注册中心只读，--registry 需要本地目录"); registry = fromUtf8(dir); }
         else if ((command == "lock" || command == "fetch") && arg == "--locked" && !options.locked) options.locked = true;
         else if ((command == "lock" || command == "fetch") && arg == "--offline" && !options.offline) options.offline = true;
         else if (command == "lock" && arg == "--update" && !options.update) options.update = true;
-        else if (directory.empty() && !arg.empty() && arg.front() != '-') directory = arg;
+        else if (directory.empty() && !arg.empty() && arg.front() != '-') directory = fromUtf8(arg);
         else invalid(packageUsage);
     }
     if (directory.empty()) invalid(packageUsage);
-    if (command == "new") newPackage(directory, name.empty() ? directory.lexically_normal().filename().string() : name, library);
+    if (command == "new") newPackage(directory, name.empty() ? pathText(directory.lexically_normal().filename()) : name, library);
     else if (command == "pack") packPackage(directory, output, registry);
     else if (command == "fetch" || command == "lock") {
         auto graph = resolvePackages(directory, options);
         for (const auto& message : graph.warnings) std::cout << "warning: " << message << '\n';
-        std::cout << (graph.workspace / "lyra.lock").string() << " (" << graph.packages.size() << ")\n";
+        std::cout << pathText(graph.workspace / "lyra.lock") << " (" << graph.packages.size() << ")\n";
     } else invalid(packageUsage);
     return 0;
 }

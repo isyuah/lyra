@@ -13,7 +13,7 @@
 | 错误与资源 | [errors-and-resources.md](errors-and-resources.md) | `Result`、`?` 复用普通 `implicit`、异常与取消、资源别名、关闭后的错误和同步 `defer` |
 | 异步执行 | [async-execution.md](async-execution.md) | 冷 Task 重复等待、任务组收尾、同域串行、显式跨域共享、竞争与内存安全 |
 | 模块、包与构建 | [modules-packages.md](modules-packages.md) | 文件与模块映射、可见性、re-export、包身份、锁文件、源码发布与显式脚本授权 |
-| 原生工具链与 FFI | [native-toolchain.md](native-toolchain.md) | WSL/LLVM 开发环境与自检、AOT 交付、GC 演进路线、SQLite 句柄与取消验收 |
+| 原生工具链与 FFI | [native-toolchain.md](native-toolchain.md) | Windows 与 Linux 原生构建和 AOT 交付、GC 演进路线、SQLite 句柄与取消验收 |
 | 编译器与运行时验收 | [compiler-acceptance.md](compiler-acceptance.md) | H 委托设计：先交付源码诊断与最小 AOT 正反例，再验证 GC、异步、FFI 与服务 |
 | 元编程与数据交换 | [metaprogramming-data.md](metaprogramming-data.md) | `[标记]`、`@装饰器`、`#宏` 分写；声明宏与表达式宏、只读输入、独立授权的外部工具和 JSON/TOML 显式派生 |
 

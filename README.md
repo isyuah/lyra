@@ -1,8 +1,8 @@
 # Lyra
 
-Lyra 是一门使用 LLVM AOT 的编译型语言。编译器把通过静态检查的源码编译成 Linux 可执行文件，不需要在部署机安装 LLVM。语言设计和验收契约见 [RFC 索引](rfc/README.md)，当前可以运行的语法见下文。
+Lyra 是一门使用 LLVM AOT 的编译型语言。编译器把通过静态检查的源码编译成 Windows x64 的 PE 或 Linux x86-64 的 ELF 可执行文件，部署应用不需要 Lyra 或 LLVM。语言设计和验收契约见 [RFC 索引](rfc/README.md)，当前可以运行的语法见下文。
 
-**0.1 Alpha 的使用范围：** x86-64 Linux 上的单机 CLI、可发布的源码库，以及使用 SQLite 的小型 HTTP 服务。可以从下面的项目开始；语言和包格式仍处于开发期。
+**0.1 Alpha 的使用范围：** Windows x64 和 Linux x86-64 上的单机 CLI、可发布的源码库，以及使用 SQLite 的小型 HTTP 服务。语言和包格式仍处于开发期。
 
 ## 用预编译 SDK 新建项目
 
@@ -21,7 +21,20 @@ lyra run hello --release --locked --offline
 
 ## 从源码构建
 
-在 **x86-64 Linux** 的仓库根目录执行；Windows 开发机先进入 WSL 2 的 Ubuntu 24.04。编译器使用 C++23 命名模块，需要 Clang/LLVM 18.1、配套的 `clang-scan-deps-18`、CMake 3.28+、Ninja 1.11+ 和 Python 3（测试）。安装步骤见[原生工具链 RFC](rfc/native-toolchain.md)。
+**Windows x64：** 按[Windows 开发机配置](rfc/native-toolchain.md#开发机准备windows-x64)准备 Clang、LLVM 18.1 开发包、Visual Studio C++ Build Tools 和 Windows SDK。在 x64 Developer PowerShell 中配置并构建 `windows-dev` 或 `windows-release`，无需 WSL。构建完成后可以直接运行：
+
+```powershell
+$lyra = Resolve-Path 'build/windows-release/bin/lyra.exe'
+& $lyra new '中文 项目' --name hello
+& $lyra check '中文 项目' --offline
+& $lyra test '中文 项目' --locked --offline
+& $lyra build '中文 项目' --release --locked --offline
+& './中文 项目/build/release/app.exe'
+```
+
+最后一条命令输出 `42`。安装 SDK 用 `cmake --install build/windows-release --prefix build/sdk-windows`，搬迁时整体复制 SDK 目录。用 SDK **编译**程序仍需本机 Clang、LLD 和 VS/Windows SDK 的链接环境；**运行**该示例只需复制 `app.exe`。
+
+**Linux x86-64：** 在 Linux 的仓库根目录执行；在 Windows 上给 Linux 服务器构建应用时使用 WSL 2。编译器使用 C++23 命名模块，需要 Clang/LLVM 18.1、配套的 `clang-scan-deps-18`、CMake 3.28+、Ninja 1.11+ 和 Python 3（测试）。
 
 ```sh
 cmake --preset dev
@@ -72,11 +85,11 @@ lyra pack <目录> [-o <源码包>|--registry <本地目录>]
 - 在源或目标类型的定义模块写 `implicit (user: User): Response { ... }`，即可在需要 `Response` 时直接传入或返回 `User`。不同具体错误之间的 `?` 也用同一种直接转换；不额外声明 trait、不串接转换，两端各有一条可见转换时在使用处报歧义。
 - `async fn` 调用返回冷 `Task<T>`；`await` 在需要时启动，重复等待复用结果，`spawn` 在同一串行域调度。`await blocking { ... }` 把同步工作交给有界线程池，不占住当前域；跨挂起点存活的局部值由 GC 扫描。`async fn main(): Result<Unit,String>` 的 `Err` 打印到 stderr 并以非零状态退出。见[异步实现说明](runtime/managed-tasks.md)。
 - 普通异常写 `throw Exception("reason")`，用 `try { ... } catch e: Exception { ... }` 或 `catch { ... }` 捕获。`defer` 在退出当前块时倒序清理；取消独立于异常。使用 [std.task](std/task/README.md) 给一棵任务树设置 trace 或 deadline，不需要逐层传 `context`。
-- `extern fn` 通过 C ABI 调用原生函数。编译自己的 C 适配器时，从工具链 `include/` 引入 `<lyra/string.h>` 即可按字节读取 `String`，部署应用不用带头文件。随工具链安装的 [std.io](std/io/README.md) 可读参数、标准流和文件；[std.sqlite](std/sqlite/README.md) 可用预编译语句查询系统 SQLite。只有使用 SQLite 的应用才需要目标机提供 `libsqlite3.so.0`。
+- `extern fn` 通过 C ABI 调用原生函数。可用 `--link` 指定 Linux 的 `.o`、`.a`、`.so`，或 Windows MSVC ABI 的 `.obj`、静态库或导入库 `.lib`。从工具链 `include/` 引入 `<lyra/string.h>` 可按字节读取 `String`。随工具链安装的 [std.io](std/io/README.md) 可读参数、标准流和文件；[std.sqlite](std/sqlite/README.md) 提供预编译语句。Linux 使用 SQLite 的应用需要 `libsqlite3.so.0`，Windows 由 SDK 静态链接 SQLite。
 - [std.json](std/json/README.md) 支持显式 `#derive(Json)`，派生器本身是 [Lyra 宏](std/meta/README.md)。用 [std.http](std/http/README.md) 可以运行[真实 HTTP/SQLite 查询服务](examples/http-sqlite/README.md)，无需 VM 或外部 Web 服务器。
 - 形参和字段可带 `[path]`、`[query("tag")]` 等编译期标记；声明宏据此生成包装函数。表达式宏 `#name(...)` 可以校验显式授予的快照，再把调用者实参拼进普通的类型检查；无需运行时反射或联网。
 - [JSON Lines 统计 CLI](examples/jsonlines/README.md) 是可直接运行的双包项目：公开库解码，命令行逐行统计，错误带行号。验收会实际发布库、移走源码和中心，再从锁和缓存重新原生编译。
-- `check` 不调用 Clang、不创建产物。`build` 默认输出 `<包目录>/build/debug/app`（`-O0`），`--release` 输出 `build/release/app`（`-O2`），`-o` 指定其他路径。类型错误或链接失败都不会覆盖已有产物。
+- `check` 不调用 Clang、不创建产物。`build` 默认输出 `<包目录>/build/debug/app`（`-O0`），`--release` 输出 `build/release/app`（`-O2`），Windows 的程序名为 `app.exe`。`-o` 指定完整目标路径，Windows 上给可执行文件显式写 `.exe`。类型错误或链接失败都不会覆盖已有产物。
 - 诊断写到标准错误；`--diagnostics=json` 输出诊断数组，成功为 `[]`。带源码位置时，`range.start/end` 是左闭右开区间：`offset` 为从 0 开始的原文件 UTF-8 字节偏移，`line/column` 从 1 开始，列按 Unicode 码点计，CRLF 和 LF 均算一次换行。
 
 ## 验证 Ubuntu 22.04 部署

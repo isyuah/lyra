@@ -4,6 +4,7 @@ module;
 #include <vector>
 
 export module lyra.closures;
+import lyra.platform;
 import lyra.source;
 
 export namespace lyra {
@@ -41,7 +42,7 @@ struct NativeClosures {
     }
     Value location(const Source& source, Span site) const {
         auto position = source.origin ? source.origin->start : source.position(site.begin);
-        auto* file = builder.CreateGlobalStringPtr(source.origin ? source.origin->file : source.path.string());
+        auto* file = builder.CreateGlobalStringPtr(source.origin ? source.origin->file : pathText(source.path));
         auto* point = llvm::ConstantStruct::getAnon({file, builder.getInt64(position.line), builder.getInt64(position.column)});
         return new llvm::GlobalVariable(module(), point->getType(), true, llvm::GlobalValue::PrivateLinkage, point, "closure.site");
     }

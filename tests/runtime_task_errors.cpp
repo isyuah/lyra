@@ -5,7 +5,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <unistd.h>
 
 namespace {
 
@@ -152,7 +151,6 @@ void failingPeer(LyraTask *self, void *storage) {
 }
 
 int main() {
-    alarm(15);
     auto *origin = lyraDomainCreate(), *other = lyraDomainCreate();
     ownership(origin, other, false, false);
     ownership(origin, other, true, false);

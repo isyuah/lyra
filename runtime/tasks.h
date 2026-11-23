@@ -30,7 +30,7 @@ void lyraTaskCreatedAt(LyraTask *task, const char *file, uint64_t line, uint64_t
 void lyraTaskKeepCleanups(LyraTask *task, LyraCleanup **stack);
 LyraTask *lyraTaskBlocking(LyraBlockingBody body, void *environment);
 void lyraTaskSharedCopy(void *destination, const void *source, size_t bytes);
-int lyraTaskWatchDisconnect(int socketFd);
+int lyraTaskWatchDisconnect(uintptr_t monitor);
 void lyraTaskStart(LyraDomain *domain, LyraTask *task);
 int lyraTaskAwait(LyraTask *waiter, LyraTask *target);
 LyraAwaitStatus lyraTaskAwaitValue(LyraTask *waiter, LyraTask *target);

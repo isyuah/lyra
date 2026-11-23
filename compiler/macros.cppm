@@ -14,6 +14,7 @@ module;
 
 export module lyra.macros;
 import lyra.check;
+import lyra.platform;
 
 export namespace lyra {
 using MacroFiles = std::map<std::string, std::map<std::string, std::filesystem::path>>;
@@ -219,7 +220,7 @@ std::string expand(const Source& source, const Expansion& prefix, const MacroPac
     if (fs::is_regular_file(path)) {
         auto relative = fs::weakly_canonical(path).lexically_relative(fs::canonical(package.root));
         if (relative.empty() || *relative.begin() == "..") throw at(source, prefix.name.span, "LYM0002", "宏实现必须位于声明包内");
-    } else path = fs::canonical("/proc/self/exe").parent_path().parent_path() / "share/lyra/std/meta" / directory / file;
+    } else path = sdkRoot() / "share/lyra/std/meta" / directory / file;
     if (!fs::is_regular_file(path)) throw at(source, prefix.name.span, "LYM0001", "找不到" + std::string(expression ? "表达式宏 #" : prefix.decorator ? "装饰器 @" : "声明宏 #") + prefix.name.text);
     if (fs::file_size(path) > byteLimit) throw at(source, prefix.name.span, "LYM0002", "宏实现超过大小限制");
     files.push_back(path);
@@ -269,7 +270,7 @@ void parsePackageFile(Module& syntax, Source& source, std::size_t file, const Ma
             copy({read, call.span.begin});
             auto argument = call.argumentsSpan;
             Expansion prefix{file, call.name, Identifier{std::string(original.substr(argument.begin, argument.end - argument.begin)), argument}, false, false, 0};
-            auto output = sourceText(source.path.string() + "(#" + call.name.text + ")", expand(source, prefix, package, "", {}, "expression", "", inputs, &call), source.moduleId);
+            auto output = sourceText(fromUtf8(pathText(source.path) + "(#" + call.name.text + ")"), expand(source, prefix, package, "", {}, "expression", "", inputs, &call), source.moduleId);
             output.origin = source.site(site);
             auto splices = macroSplices(output, call.arguments.size());
             auto mark = output.origin->start.offset + 1;
@@ -318,7 +319,7 @@ void expandMacros(Module& syntax, std::vector<Source>& sources, const std::map<s
         auto generated = expand(source, prefix, packages.at(source.moduleId), name.text, fields, prefix.record ? (syntax.aggregates[prefix.target].reference ? "class" : "struct") : "fn", bodyText, inputs);
         auto label = prefix.decorator ? "@" : "#";
         if (prefix.decorator) generated = "fn hook(): Unit {\n" + generated + "\n}";
-        auto output = sourceText(source.path.string() + "(" + label + prefix.name.text + ")", std::move(generated), source.moduleId);
+        auto output = sourceText(fromUtf8(pathText(source.path) + "(" + label + prefix.name.text + ")"), std::move(generated), source.moduleId);
         output.origin = source.site(prefix.name.span);
         sources.push_back(std::move(output));
         auto start = syntax.functions.size(), records = syntax.aggregates.size(), imports = syntax.imports.size(), traits = syntax.traits.size();

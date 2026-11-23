@@ -5,6 +5,8 @@ import sys
 import tempfile
 import unittest
 
+from platform_cli import executable
+
 
 COMPILER = Path(sys.argv.pop(1)).resolve()
 
@@ -22,10 +24,10 @@ class Collections(unittest.TestCase):
         self.main.write_text(source, encoding="utf-8")
         for flags in ([], ["--release"]):
             with self.subTest(flags=flags):
-                executable = self.package / "program"
-                build = subprocess.run([COMPILER, "build", self.package, *flags, "-o", executable], capture_output=True, timeout=30)
+                app = executable(self.package / "program")
+                build = subprocess.run([COMPILER, "build", self.package, *flags, "-o", app], capture_output=True, timeout=30)
                 self.assertEqual(build.returncode, 0, build.stderr.decode())
-                run = subprocess.run([executable], capture_output=True, timeout=10)
+                run = subprocess.run([app], capture_output=True, timeout=10)
                 self.assertEqual(run.stdout, expected)
                 if error is None:
                     self.assertEqual((run.returncode, run.stderr), (0, b""))

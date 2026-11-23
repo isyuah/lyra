@@ -6,7 +6,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <unistd.h>
 
 namespace {
 
@@ -90,7 +89,6 @@ void expires(LyraTask *self, void *storage) {
 }
 
 int main() {
-    alarm(10);
     check(!lyraContextCurrent() && !lyraContextEnter(nullptr), "sync caller has an active task");
     auto *domain = lyraDomainCreate();
     ScopeCase scopes{};

@@ -36,7 +36,7 @@ llvm::Type* cType(Type type, llvm::IRBuilder<>& builder) {
 
 void validateForeign(const CheckedFunction& fn, const Source& source) {
     const auto& symbol = *fn.syntax.foreignSymbol;
-    if (symbol.text == "main" || symbol.text.starts_with("llvm.")) throw at(source, symbol.span, "LYF0001", "不能绑定此保留 C 符号：" + symbol.text);
+    if (symbol.text == "main" || symbol.text == "wmain" || symbol.text.starts_with("llvm.")) throw at(source, symbol.span, "LYF0001", "不能绑定此保留 C 符号：" + symbol.text);
     for (std::size_t slot = 0; slot < fn.syntax.parameters.size(); ++slot) {
         if (!abiType(fn.locals[slot].type)) throw at(source, fn.syntax.parameters[slot].type.span, "LYF0001", "extern 形参只支持 Int、Bool、String 句柄或 CPtr");
     }

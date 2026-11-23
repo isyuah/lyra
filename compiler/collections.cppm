@@ -9,6 +9,7 @@ module;
 #include <vector>
 
 export module lyra.collections;
+import lyra.platform;
 import lyra.source;
 
 export namespace lyra {
@@ -105,7 +106,7 @@ struct NativeLists {
         auto pointer = builder.getPtrTy(); auto integer = builder.getInt64Ty();
         auto position = source.position(site.begin);
         auto access = module().getOrInsertFunction("lyraListGet", pointer, pointer, integer, pointer, integer, integer);
-        return builder.CreateCall(access, {list, index, builder.CreateGlobalStringPtr(source.path.string()), builder.getInt64(position.line), builder.getInt64(position.column)});
+        return builder.CreateCall(access, {list, index, builder.CreateGlobalStringPtr(pathText(source.path)), builder.getInt64(position.line), builder.getInt64(position.column)});
     }
 
     void set(llvm::Value* list, llvm::Value* index, llvm::Value* value) const {

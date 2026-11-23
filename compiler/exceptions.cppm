@@ -4,6 +4,7 @@ module;
 
 export module lyra.exceptions;
 import lyra.source;
+import lyra.platform;
 
 export namespace lyra {
 
@@ -39,7 +40,7 @@ struct NativeExceptions {
         auto pointer = builder.getPtrTy();
         auto integer = builder.getInt64Ty();
         auto position = source.origin ? source.origin->start : source.position(site.begin);
-        auto file = builder.CreateGlobalStringPtr(source.origin ? source.origin->file : source.path.string());
+        auto file = builder.CreateGlobalStringPtr(source.origin ? source.origin->file : pathText(source.path));
         auto line = builder.getInt64(position.line), column = builder.getInt64(position.column);
         if (!role) return builder.CreateCall(module().getOrInsertFunction("lyraExceptionRaise", pointer, pointer, pointer, integer, integer), {error, file, line, column});
         return builder.CreateCall(module().getOrInsertFunction("lyraExceptionFrame", pointer, pointer, pointer, pointer, integer, integer), {error, builder.CreateGlobalStringPtr(role), file, line, column});
@@ -52,7 +53,7 @@ struct NativeExceptions {
     llvm::Value* created(llvm::Value* task, const Source& source, Span site) const {
         auto pointer = builder.getPtrTy(); auto integer = builder.getInt64Ty();
         auto position = source.origin ? source.origin->start : source.position(site.begin);
-        auto file = builder.CreateGlobalStringPtr(source.origin ? source.origin->file : source.path.string());
+        auto file = builder.CreateGlobalStringPtr(source.origin ? source.origin->file : pathText(source.path));
         auto note = module().getOrInsertFunction("lyraTaskCreatedAt", builder.getVoidTy(), pointer, pointer, integer, integer);
         builder.CreateCall(note, {task, file, builder.getInt64(position.line), builder.getInt64(position.column)});
         return task;

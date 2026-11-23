@@ -6,6 +6,8 @@ import tempfile
 import textwrap
 import unittest
 
+from platform_cli import executable
+
 
 COMPILER = Path(sys.argv.pop(1)).resolve()
 
@@ -27,7 +29,7 @@ class Generics(unittest.TestCase):
     def run_native(self, expected):
         for flags in ([], ['--release']):
             with self.subTest(flags=flags):
-                output = self.package / 'program'
+                output = executable(self.package / 'program')
                 result = self.cli('build', *flags, '-o', output)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 run = subprocess.run([output], capture_output=True, text=True, timeout=5)

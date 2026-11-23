@@ -63,15 +63,15 @@ async fn main(): Unit {
 }
 ```
 
-源码验收还用同一域的写任务放行 FIFO 中阻塞的读任务。在 `UV_THREADPOOL_SIZE=1` 时也能推进；另从真实 SQLite 查询读取文本，确定性关闭后触发 GC，最后在原域读取结果。
+源码验收确认域在 Worker 阻塞读标准输入时仍能推进：测试进程收到同域任务的通知后才写入管道。在 `UV_THREADPOOL_SIZE=1` 时也能推进；另从真实 SQLite 查询读取文本，确定性关闭后触发 GC，最后在原域读取结果。
 
 ### 原生阻塞工作
 
 `lyraTaskBlock(self, work, nativeData)` 将同步 C 回调交给 libuv 进程级有界线程池，当前任务挂起，同域仍能执行其他步骤。存有 GC 引用的工作载荷须用 `lyraGcAlloc` 分配；运行时在操作期间保活载荷并注册 Worker，允许原生封装分配对象、复制结果（如 [SQLite 文本](sqlite.md)）。普通 `malloc` 载荷内部仍不扫描。工作线程不调用 Task API；不要同时无同步地修改同一个 C/C++ 字段。被接纳的工作运行中收到取消时，仍等 C 返回才在所属域恢复清理；提交前已经取消则不发起工作。可以用 `UV_THREADPOOL_SIZE=1` 重跑测试，验证不需要额外 Worker 解围。
 
-`lyraTaskWatchDisconnect(fd)` 从当前域内的任务注册连接断开通知，不读取或关闭调用者的 fd；Linux 后端使用自持的重复 fd。断连时在所属域请求取消当前任务及其激活的孩子；只有 C 工作已返回后才允许父任务执行取消清理。未捕获的原生任务失败取消仍在运行的兄弟，多个失败用 `lyraTaskFailureCount/At` 按登记顺序遍历。实际 socketpair 断开、取消安全与逆序发生的两个失败由[原生任务用例](../tests/runtime_tasks.cpp)验证。
+`lyraTaskWatchDisconnect(monitor)` 从当前任务注册连接断开通知，不读写或关闭请求套接字。Linux 用重复的 fd 加 libuv poll；Windows 给连接登记 Winsock `FD_CLOSE`，用独立的事件句柄和 libuv 通知所属域。断连时取消当前任务及其激活的孩子；C 工作返回后父任务才执行取消清理。未捕获的原生任务失败会取消仍在运行的兄弟，多个失败按登记顺序遍历。[原生任务用例](../tests/runtime_tasks.cpp)验证实际 socket 对断开、取消安全与逆序发生的两个失败。
 
-**任务上下文：**[std.task](../std/task/README.md) 用普通泛型函数提供隐式 trace 和 deadline。冷 Task 创建时没有快照，首次启动时从所有者继承；重复等待不重设。阻塞请求在提交时保留不可变快照，Worker 仅在调用期间可读，不能登记超时或 socket watch。每个更严格的作用域在所属事件循环安装单调时钟定时器；继承同一期限的子任务由上层传播取消，无需另建定时器。只有已经激活的所有者承担收尾责任。[源码用例](../tests/context_cli.py)用单 Worker 和 FIFO 固定等待顺序；[原生用例](../tests/runtime_context.cpp)验证任务局部的 GC 保活、提前结束时撤掉定时器及已挂起任务到期后被唤醒。
+**任务上下文：**[std.task](../std/task/README.md) 用普通泛型函数提供隐式 trace 和 deadline。冷 Task 创建时没有快照，首次启动时从所有者继承；重复等待不重设。阻塞请求在提交时保留不可变快照，Worker 仅在调用期间可读，不能登记超时或 socket watch。每个更严格的作用域在所属事件循环安装单调时钟定时器；继承同一期限的子任务由上层传播取消，无需另建定时器。只有已经激活的所有者承担收尾责任。[源码用例](../tests/context_cli.py)用单 Worker 和受测试进程控制的标准输入固定等待顺序；[原生用例](../tests/runtime_context.cpp)验证任务局部的 GC 保活、提前结束时撤掉定时器及已挂起任务到期后被唤醒。
 
 **当前边界：**多个串行域由同一主线程驱动，原生测试验证跨域等待与恢复归属。显式 CPU 并行域仍需端到端验收。
 

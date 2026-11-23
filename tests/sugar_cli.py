@@ -5,6 +5,8 @@ import sys
 import tempfile
 import unittest
 
+from platform_cli import executable
+
 
 COMPILER = Path(sys.argv.pop(1)).resolve()
 
@@ -74,9 +76,10 @@ fn main(): Unit {
 ''', encoding='utf-8')
         for flags in ([], ['--release']):
             with self.subTest(flags=flags):
-                built = subprocess.run([COMPILER, 'build', self.package, *flags, '-o', self.package / 'app'], capture_output=True, timeout=30)
+                app = executable(self.package / 'app')
+                built = subprocess.run([COMPILER, 'build', self.package, *flags, '-o', app], capture_output=True, timeout=30)
                 self.assertEqual(built.returncode, 0, built.stderr.decode())
-                ran = subprocess.run([self.package / 'app'], capture_output=True, timeout=5)
+                ran = subprocess.run([app], capture_output=True, timeout=5)
                 self.assertEqual((ran.returncode, ran.stdout, ran.stderr), (0, b'7\n7\n3\n8\n6\n5\n11\n1\n3\n8\n7\ntext\n7\n1\n42\n', b''))
 
     def test_wrong_operands_report_source_sites(self):

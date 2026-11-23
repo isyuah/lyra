@@ -5,6 +5,8 @@ import sys
 import tempfile
 import unittest
 
+from platform_cli import executable, running
+
 
 COMPILER = Path(sys.argv.pop(1)).resolve()
 
@@ -17,8 +19,7 @@ class TaskContext(unittest.TestCase):
             (root / 'lyra.json5').write_text("{name:'test/context',version:'1.0.0'}")
             (root / 'src/main.ly').write_text('''
 import std.io.assert
-import std.io.readFile
-import std.io.writeFile
+import std.io.readLine
 import std.task.trace
 import std.task.remainingMs
 import std.task.withTrace
@@ -41,23 +42,27 @@ async fn main(): Unit {
     assert(await withTrace("B", cold) == "B", "context at activation")
     assert(trace() == "" && await withTrace("C", cold) == "B", "waiter changed terminal result")
     val live = spawn withTrace("owner", blocking {
-        val signal = readFile("gate")
+        val signal = readLine()
         assert(signal.ok(), "read gate")
         trace()
     })
     await deadlineGroup(live)
-    assert(writeFile("gate", "release") == 0, "release gate")
+    print("deadline joined")
     assert(await live == "owner", "waiter changed ownership")
     print("done")
 }
 ''')
-            os.mkfifo(root / 'gate')
             for mode in ([], ['--release']):
                 with self.subTest(mode=mode):
-                    built = subprocess.run([COMPILER, 'build', root, *mode, '-o', root / 'app'], capture_output=True, timeout=30)
+                    app = executable(root / 'app')
+                    built = subprocess.run([COMPILER, 'build', root, *mode, '-o', app], capture_output=True, timeout=30)
                     self.assertEqual(built.returncode, 0, built.stderr.decode())
-                    ran = subprocess.run([root / 'app'], cwd=root, env={**os.environ, 'UV_THREADPOOL_SIZE': '1'}, capture_output=True, timeout=10)
-                    self.assertEqual((ran.returncode, ran.stdout, ran.stderr), (0, b'done\n', b''))
+                    with running([app], cwd=root, env={**os.environ, 'UV_THREADPOOL_SIZE': '1'}) as (process, output):
+                        self.assertEqual(output.line(), b'deadline joined\n')
+                        process.stdin.write(b'release\n')
+                        process.stdin.flush()
+                        self.assertEqual(process.wait(timeout=10), 0)
+                        self.assertEqual((output.remaining(), process.stderr.read()), (b'done\n', b''))
 
 
 if __name__ == '__main__':

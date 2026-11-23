@@ -2,13 +2,18 @@
 #define LYRA_RUNTIME_IO_H
 
 #include <stdint.h>
+#include <stddef.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 typedef struct LyraIoText LyraIoText;
+#ifdef _WIN32
+void lyraIoSetArgs(int argc, wchar_t** argv);
+#else
 void lyraIoSetArgs(int argc, char** argv);
+#endif
 int64_t lyraIoArgCount(void);
 LyraIoText* lyraIoArgument(int64_t index);
 LyraIoText* lyraIoReadLine(void);

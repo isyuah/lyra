@@ -16,6 +16,7 @@ import lyra.foreign;
 import lyra.collections;
 import lyra.closures;
 import lyra.exceptions;
+import lyra.platform;
 
 namespace lyra {
 namespace {
@@ -494,7 +495,7 @@ struct Emitter {
         auto integer = builder.getInt64Ty();
         auto error = module.getOrInsertFunction("lyraArithmeticError", builder.getVoidTy(), pointer, integer, integer, pointer);
         auto position = source.position(site.begin);
-        builder.CreateCall(error, {builder.CreateGlobalStringPtr(source.path.string()), builder.getInt64(position.line),
+        builder.CreateCall(error, {builder.CreateGlobalStringPtr(pathText(source.path)), builder.getInt64(position.line),
                                    builder.getInt64(position.column), builder.CreateGlobalStringPtr(message)});
         builder.CreateUnreachable();
         builder.SetInsertPoint(next);
@@ -694,7 +695,7 @@ struct Emitter {
 
 std::unique_ptr<llvm::Module> lower(const CheckedModule& program, const std::vector<Source>& sources, llvm::LLVMContext& context) {
     auto module = std::make_unique<llvm::Module>("lyra", context);
-    module->setTargetTriple("x86_64-pc-linux-gnu");
+    module->setTargetTriple(nativeTriple);
     Builder builder(context);
     Layouts layouts(program, builder);
     std::vector<llvm::Function*> functions;
@@ -717,10 +718,10 @@ std::unique_ptr<llvm::Module> lower(const CheckedModule& program, const std::vec
         emitter.run();
         if (fn.syntax.isAsync) lowerAsync(*factory, *body, emitter.cleanupHead);
     }
-    bool commandLine = module->getFunction("lyraIoArgCount") || module->getFunction("lyraIoArgument");
+    bool commandLine = windows || module->getFunction("lyraIoArgCount") || module->getFunction("lyraIoArgument");
     auto signature = commandLine ? llvm::FunctionType::get(builder.getInt32Ty(), {builder.getInt32Ty(), builder.getPtrTy()}, false)
                                  : llvm::FunctionType::get(builder.getInt32Ty(), false);
-    auto main = llvm::Function::Create(signature, llvm::Function::ExternalLinkage, "main", *module);
+    auto main = llvm::Function::Create(signature, llvm::Function::ExternalLinkage, nativeEntry, *module);
     builder.SetInsertPoint(llvm::BasicBlock::Create(context, "entry", main));
     if (commandLine) builder.CreateCall(module->getOrInsertFunction("lyraIoSetArgs", builder.getVoidTy(), builder.getInt32Ty(), builder.getPtrTy()), {main->getArg(0), main->getArg(1)});
     auto entry = program.entry.value();

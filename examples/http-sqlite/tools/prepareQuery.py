@@ -8,7 +8,7 @@ root = Path(__file__).resolve().parents[1]
 
 
 def snapshot():
-    schema = (root / 'inputs/schema.sql').read_text(encoding='utf-8')
+    schema = (root / 'inputs/schema.sql').read_bytes().decode('utf-8')
     query = (root / 'tools/userById.sql').read_text(encoding='utf-8').strip()
     db = sqlite3.connect(':memory:')
     try:

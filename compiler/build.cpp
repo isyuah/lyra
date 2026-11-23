@@ -1,6 +1,4 @@
 module;
-#include <cerrno>
-#include <cstdlib>
 #include <filesystem>
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/Module.h>
@@ -14,26 +12,11 @@ module;
 module lyra.build;
 import lyra.check;
 import lyra.lowering;
+import lyra.platform;
 
 namespace lyra {
 namespace fs = std::filesystem;
 namespace {
-
-class StagingDirectory {
-public:
-    explicit StagingDirectory(const fs::path& parent) {
-        auto pattern = (parent / ".lyra-XXXXXX").string();
-        if (!::mkdtemp(pattern.data())) throw fs::filesystem_error("mkdtemp", parent, std::error_code(errno, std::generic_category()));
-        path = pattern;
-    }
-    StagingDirectory(const StagingDirectory&) = delete;
-    StagingDirectory& operator=(const StagingDirectory&) = delete;
-    ~StagingDirectory() {
-        std::error_code ignored;
-        fs::remove_all(path, ignored);
-    }
-    fs::path path;
-};
 
 void runClang(const std::string& driver, const std::vector<std::string>& options, const std::string& log) {
     std::vector<llvm::StringRef> args{driver};
@@ -44,40 +27,49 @@ void runClang(const std::string& driver, const std::vector<std::string>& options
     if (status != 0) {
         auto captured = llvm::MemoryBuffer::getFile(log);
         if (captured) reason += (*captured)->getBuffer().str();
-        throw Diagnostic{"LYB0002", "clang-18 失败（退出码 " + std::to_string(status) + "）：" + reason};
+        throw Diagnostic{"LYB0002", std::string(nativeDriver) + " 失败（退出码 " + std::to_string(status) + "）：" + reason};
     }
 }
 
 void emitExecutable(const llvm::Module& module, const fs::path& output, bool release, const std::vector<fs::path>& libraries) {
-    auto driver = llvm::sys::findProgramByName("clang-18");
-    if (!driver) throw Diagnostic{"LYB0002", "找不到 clang-18；请在构建机安装并加入 PATH"};
-    auto runtime = fs::canonical("/proc/self/exe").parent_path().parent_path() / "lib" / "liblyraRuntime.a";
-    if (!fs::is_regular_file(runtime)) throw Diagnostic{"LYB0002", "找不到 Lyra 运行时：" + runtime.string()};
-    fs::create_directories(output.parent_path());
+    auto driver = llvm::sys::findProgramByName(nativeDriver);
+    if (!driver) throw Diagnostic{"LYB0002", std::string("找不到 ") + nativeDriver + "；请在构建机安装并加入 PATH"};
+    auto lib = sdkRoot() / "lib";
+    auto runtime = lib / (windows ? "lyraRuntime.lib" : "liblyraRuntime.a");
+    if (!fs::is_regular_file(runtime)) throw Diagnostic{"LYB0002", "找不到 Lyra 运行时：" + pathText(runtime)};
     StagingDirectory staging(output.parent_path());
-    auto ir = (staging.path / "module.ll").string();
-    auto object = (staging.path / "module.o").string();
-    auto executable = staging.path / "app";
-    auto log = (staging.path / "clang.log").string();
+    auto irFile = staging.path / "module.ll";
+    auto ir = pathText(irFile);
+    auto object = pathText(staging.path / (windows ? "module.obj" : "module.o"));
+    auto executable = executablePath(staging.path / "app");
+    auto log = pathText(staging.path / "clang.log");
     std::error_code error;
     llvm::raw_fd_ostream stream(ir, error, llvm::sys::fs::OF_None);
-    if (error) throw fs::filesystem_error("open", ir, error);
+    if (error) throw fs::filesystem_error("open", irFile, error);
     module.print(stream, nullptr);
     stream.close();
     if (stream.has_error()) {
         auto writeError = stream.error();
         stream.clear_error();
-        throw fs::filesystem_error("write", ir, writeError);
+        throw fs::filesystem_error("write", irFile, writeError);
     }
     auto target = "--target=" + module.getTargetTriple();
     runClang(*driver, {target, release ? "-O2" : "-O0", "-c", "-x", "ir", ir, "-o", object}, log);
-    auto lib = runtime.parent_path();
-    std::vector<std::string> link{target, object, "-Wl,--as-needed"};
-    for (const auto& library : libraries) link.push_back(library.string());
-    link.insert(link.end(), {runtime.string(), (lib / "libgc.a").string(), (lib / "libuv.a").string(), (lib / "libllhttp.a").string(),
-                            (lib / "libjansson.a").string(), "-pthread", "-ldl", "-lrt", "-lsqlite3", "-o", executable.string()});
+    std::vector<std::string> link{target, object};
+    if constexpr (windows) link.insert(link.end(), {"-fuse-ld=lld", "-fms-runtime-lib=static"});
+    else link.push_back("-Wl,--as-needed");
+    for (const auto& library : libraries) link.push_back(pathText(library));
+    link.push_back(pathText(runtime));
+    if constexpr (windows) {
+        for (auto name : {"gc.lib", "libuv.lib", "llhttp.lib", "jansson.lib", "sqlite3.lib"}) link.push_back(pathText(lib / name));
+        link.insert(link.end(), {"-lws2_32", "-liphlpapi", "-luserenv", "-lpsapi", "-ladvapi32", "-luser32", "-ldbghelp", "-lole32", "-lshell32"});
+    } else {
+        for (auto name : {"libgc.a", "libuv.a", "libllhttp.a", "libjansson.a"}) link.push_back(pathText(lib / name));
+        link.insert(link.end(), {"-pthread", "-ldl", "-lrt", "-lsqlite3"});
+    }
+    link.insert(link.end(), {"-o", pathText(executable)});
     runClang(*driver, link, log);
-    fs::rename(executable, output);
+    publishExecutable(executable, output);
 }
 
 }
@@ -85,9 +77,9 @@ void emitExecutable(const llvm::Module& module, const fs::path& output, bool rel
 void build(const CheckedModule& functions, const std::vector<Source>& sources, const fs::path& output, bool release, const std::vector<fs::path>& libraries) {
     if (fs::exists(output)) {
         for (const auto& source : sources) {
-            if (!source.origin && fs::equivalent(source.path, output)) throw Diagnostic{"LYI0001", "输出路径不能覆盖输入源码：" + output.string()};
+            if (!source.origin && fs::equivalent(source.path, output)) throw Diagnostic{"LYI0001", "输出路径不能覆盖输入源码：" + pathText(output)};
         }
-        for (const auto& library : libraries) if (fs::equivalent(library, output)) throw Diagnostic{"LYI0001", "输出路径不能覆盖原生链接输入：" + output.string()};
+        for (const auto& library : libraries) if (fs::equivalent(library, output)) throw Diagnostic{"LYI0001", "输出路径不能覆盖原生链接输入：" + pathText(output)};
     }
     llvm::LLVMContext context;
     auto module = lower(functions, sources, context);
@@ -95,7 +87,7 @@ void build(const CheckedModule& functions, const std::vector<Source>& sources, c
 }
 
 int execute(const fs::path& executable, const std::vector<std::string_view>& arguments) {
-    auto path = fs::absolute(executable).string();
+    auto path = pathText(fs::absolute(executable));
     std::vector<llvm::StringRef> args{path};
     for (auto arg : arguments) args.emplace_back(arg);
     std::string reason;

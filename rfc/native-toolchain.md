@@ -1,6 +1,6 @@
 # Lyra RFC：原生工具链、GC 与 C ABI
 
-**状态：LLVM AOT、Linux x86-64/glibc 和系统 SQLite 已通过原型验收；原型使用 BDWGC，精确根追踪与内部对象布局仍可演进。**
+**状态：LLVM AOT 支持 Windows x64 与 Linux x86-64/glibc 原生构建；原型使用 BDWGC，精确根追踪与内部对象布局仍可演进。**
 
 **范围：** 原生编译与运行、发布目标、现成 GC 方向、SQLite C ABI 首个用例及错误诊断目标。
 
@@ -8,8 +8,9 @@
 
 - 编译模型为 LLVM 后端的 AOT 原生编译。
 - 用户程序不得依赖 JVM、CLR 或 Lyra 托管虚拟机；程序可以携带语言 Runtime。应用与 Runtime 的代码被本机 linker 链接。
-- 首期工作流以 Windows 开发机通过 WSL/Linux 环境构建并部署到 Linux 服务器为目标。允许依赖系统动态库；Lyra、LLVM 和语言 VM 不需要安装在目标机。
+- Windows 开发机可直接构建 Windows x64 程序。给 Linux 服务器构建时仍用 Linux 或 WSL；当前不做跨目标链接和 sysroot 管理。
 - 首个验收目标是 Linux x86-64/glibc，以 Ubuntu 22.04 x86-64 为最低测试镜像，用相应目标库链接。[部署验收](../tests/jammy-smoke.sh)检查 ELF 的动态依赖：整数、对象、标准 I/O 和 JSONL 样例只需系统 libc；SQLite 与 HTTP/SQLite 样例另需 `libsqlite3.so.0`。
+- Windows 目标为 x64 MSVC ABI。GC、libuv、Jansson、llhttp、SQLite 和 C Runtime 静态链接进使用它们的应用。Windows 测试检查 PE 只导入系统 DLL，并从搬迁后的 SDK 离线编译，在无构建工具 `PATH` 的进程中运行独立产物。通过外部导入库引入的 DLL 由应用另行部署。
 - 类 Go `scratch` 的零基础镜像/全静态交付是后续优化目标，不是首期门槛。不得以支持 scratch 为由让第一版构建链无法运行。
 
 程序包大小与常驻内存分别看待。目标是内置 Runtime/GC 但不用虚拟机、单程序易分发且能够在服务器上多进程运行；目前不设与 Go 对比的硬 MB 上限。建立可执行服务后，再以等价负载与 Go 对照报告多进程总内存、二进制大小、启动时间、吞吐和尾延迟。
@@ -46,11 +47,29 @@ for pid in "${pids[@]}"; do cat "/proc/$pid/smaps_rollup"; done |
 
 ### 首个编译器的实现选择
 
-编译器和运行时使用 **C++23、Clang 18、CMake 3.28+ 与 Ninja 1.11+**。源码诊断、语法、类型检查、LLVM lowering 和构建驱动通过 C++ 命名模块暴露接口，CMake `FILE_SET CXX_MODULES` 与 `clang-scan-deps-18` 跟踪依赖。标准库及 LLVM 头在全局模块片段引入；不要求工具链提供 `import std`。`check` 和 `build` 共用前端，前端不调用 Clang。后端用 LLVM 18 的 `IRBuilder` 构造模块，验证后写临时 IR，由 `clang-18` 生成目标文件并链接具有 C ABI 的静态运行时。发布的程序不包含编译器或 LLVM；整数切片只动态依赖系统 libc。
+编译器和运行时使用 **C++23、Clang、CMake 与 Ninja 1.11+**。源码诊断、语法、类型检查、LLVM lowering 和构建驱动通过 C++ 命名模块暴露接口，CMake `FILE_SET CXX_MODULES` 与宿主 Clang 配套的 `clang-scan-deps` 跟踪依赖，不要求工具链提供 `import std`。`check` 和 `build` 共用前端，前端不调用 Clang。后端用 LLVM 18.1 的 `IRBuilder` 构造模块，验证后用 Clang 将临时 IR 编译为本机目标文件，再链接具有 C ABI 的静态运行时。Linux 使用 `clang-18`；Windows 用 `PATH` 中的 `clang.exe` 和 `lld-link.exe`。
+
+### 开发机准备：Windows x64
+
+1. 准备 CMake、Ninja、Python 3（测试）、Git 和 Visual Studio Build Tools 的 C++ 桌面开发组件。打开 **x64 Developer PowerShell**，确保 `LIB` 中有 x64 CRT 和 Windows SDK 的 `um`、`ucrt` 库目录。原生构建已使用 CMake 4.5、Ninja 1.13、Clang 23 和 VS 2026 的 MSVC 工具集；较新的 MSVC STL 需要与它兼容的 Clang，宿主 Clang 不必与嵌入的 LLVM 库同版本。
+2. 下载 LLVM 官方 [18.1.8 Windows x64 MSVC 完整归档](https://github.com/llvm/llvm-project/releases/tag/llvmorg-18.1.8)中的 `clang+llvm-18.1.8-x86_64-pc-windows-msvc.tar.xz`，解压到独立目录。`LLVM_DIR` 指向其中的 `lib/cmake/llvm`，仅有 Clang 的安装包不含编译 Lyra 所需的开发库。官方归档链接的 DIA 库从当前 Visual Studio 查找；自定义布置可传 `-DLYRA_DIA_GUIDS=<完整路径>`。
+3. 用 vcpkg 从仓库的 `vcpkg.json` 安装固定版本的原生库，再从同一个 PowerShell 配置与验收。下面假设 `vcpkg`、用于宿主编译的 `clang++`、配套的 `clang-scan-deps` 和 `lld-link` 在 `PATH` 中；将 `$llvm` 改为实际解压目录：
+
+   ```powershell
+   $llvm = 'E:/tools/clang+llvm-18.1.8-x86_64-pc-windows-msvc'
+   $ports = Join-Path $PWD 'build/windows-ports'
+   vcpkg install --triplet x64-windows-static "--x-install-root=$ports"
+   cmake --preset windows-release "-DLLVM_DIR=$llvm/lib/cmake/llvm" "-DCMAKE_PREFIX_PATH=$ports/x64-windows-static"
+   cmake --build --preset windows-release
+   ctest --preset windows-release
+   cmake --install build/windows-release --prefix build/sdk-windows
+   ```
+
+   调试版改用 `windows-dev`。安装树包含标准库和静态库，不附 Clang；运行编译器仍需要 Visual C++ Redistributable，该环境通常由 VS Build Tools 提供。构建和运行源码的命令示例见[仓库说明](../README.md)。外部 C 静态库若也希望随应用单文件交付，使用 x64 MSVC ABI 和静态 CRT（`/MT`）。
 
 ### 开发机准备：WSL 2 + Ubuntu 24.04
 
-写规范、设计一致性用例不需要安装 LLVM。要构建当前编译器，只在 WSL/Linux 安装 LLVM 18.1 开发包和 Clang 18 即可，不用在 Windows 再配 SDK，也不用从源码编译 LLVM。正式验收另用 22.04 目标环境或对应 sysroot 构建，并在最低镜像上执行，不能拿 24.04 本机链接、运行成功代替。
+只构建 Linux 版本时，在 WSL/Linux 中安装 LLVM 18.1 开发包和 Clang 18 即可，不需要另准备 Windows SDK。最低版本验收在 22.04 目标环境构建，再放入只装运行依赖的 22.04 镜像执行。
 
 1. 在 PowerShell 运行 `wsl -l -v`。已有 `Ubuntu-24.04`（版本 2）就直接 `wsl -d Ubuntu-24.04`；新开发机没有该发行版时才运行 `wsl --install -d Ubuntu-24.04`，按系统提示完成首次启动。
 2. 进入 **Ubuntu 终端**后，先运行 `clang-18 --version`、`llvm-config-18 --version --host-target --cmakedir` 和 `cmake --version`。头文件、库和 `LLVMConfig.cmake` 来自开发包，不能只验证 `clang`。缺包时才安装：
@@ -126,7 +145,7 @@ int64_t writeText(const LyraString *text) {
 
 ## 已接受验收行为
 
-- 指定 Linux 目标生成原生可执行文件，不要求安装 Lyra VM/LLVM Runtime；动态库依赖明确可查。
+- 原生编译生成本平台 ELF 或 PE，不要求安装 Lyra VM 或 LLVM Runtime；动态库依赖明确可查。
 - WSL/Linux 构建的产物在声明的目标 Linux 环境中执行。
 - 同步 SQLite 调用不阻塞串行异步执行域 Worker；SQLite 的外部资源可确定性关闭。
 - 任务暂停期间仅由异步状态帧持有的对象仍能通过 GC 压力测试。

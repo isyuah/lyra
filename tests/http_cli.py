@@ -3,7 +3,6 @@ import http.client
 import json
 import os
 from pathlib import Path
-import select
 import shutil
 import socket
 import sqlite3
@@ -13,6 +12,8 @@ import sys
 import tempfile
 import unittest
 
+from platform_cli import WINDOWS, assert_linkage, executable, running
+
 
 COMPILER = Path(sys.argv.pop(1)).resolve()
 SERVICE = Path(__file__).resolve().parents[1] / "examples/http-sqlite"
@@ -20,21 +21,13 @@ CANCELLATION = Path(__file__).resolve().parent / "fixtures/http-cancel"
 
 
 @contextlib.contextmanager
-def server(executable, *arguments):
-    process = subprocess.Popen(["stdbuf", "-oL", executable, *arguments], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                               env={**os.environ, "UV_THREADPOOL_SIZE": "1"})
-    try:
-        if not select.select([process.stdout], [], [], 8)[0]:
-            raise TimeoutError("listener did not report its bound port")
-        yield int(process.stdout.readline()), process
-    finally:
-        if process.poll() is None:
-            process.terminate()
-        try:
-            process.communicate(timeout=5)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.communicate()
+def server(app, *arguments):
+    with running([app, *arguments], env={**os.environ, "UV_THREADPOOL_SIZE": "1"}) as (process, output):
+        yield int(output.line()), process, output
+
+
+def reset_on_close(connection):
+    connection.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack('HH' if WINDOWS else 'ii', 1, 0))
 
 
 def exchange(port, method, target, body=None):
@@ -51,11 +44,12 @@ class HTTP(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
-        self.root = Path(temporary.name)
+        self.root = Path(temporary.name) / "HTTP 服务"
+        self.root.mkdir()
 
     def profiles(self, package):
         for profile, flags in (("debug", []), ("release", ["--release"])):
-            output = self.root / profile
+            output = executable(self.root / profile)
             built = subprocess.run([COMPILER, "build", package, "-o", output, *flags], capture_output=True, timeout=45)
             self.assertEqual(built.returncode, 0, built.stderr.decode())
             yield profile, output
@@ -68,18 +62,18 @@ class HTTP(unittest.TestCase):
             with self.subTest(profile=profile):
                 database = self.root / (profile + ".db")
                 name = '李"\\\n\0Ada'
-                with sqlite3.connect(database) as connection:
+                with contextlib.closing(sqlite3.connect(database)) as connection, connection:
                     connection.execute("CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT)")
                     connection.execute("INSERT INTO users VALUES(7,?)", (name,))
                     connection.execute("INSERT INTO users VALUES(9,?)", ("x" * (2 * 1024 * 1024),))
-                with server(app, database) as (port, process):
+                with server(app, database) as (port, process, _):
                     with socket.socket() as drop:
                         drop.settimeout(5)
                         drop.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
                         drop.connect(("127.0.0.1", port))
                         drop.sendall(b"GET /users/9 HTTP/1.1\r\nHost: localhost\r\n\r\n")
                         self.assertEqual(drop.recv(1), b"H")
-                        drop.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+                        reset_on_close(drop)
                     status, mime, body = exchange(port, "GET", "/users/7?view=one")
                     self.assertEqual((status, mime, json.loads(body)), (200, "application/json", {"id": 7, "name": name}))
                     self.assertEqual(exchange(port, "GET", "/users/8")[0], 404)
@@ -88,9 +82,7 @@ class HTTP(unittest.TestCase):
                     database.unlink()
                     self.assertEqual(exchange(port, "GET", "/users/7")[0], 500)
                     self.assertIsNone(process.poll())
-                dynamic = subprocess.check_output(["readelf", "-dW", app], text=True)
-                needed = {line.split("[")[1].split("]")[0] for line in dynamic.splitlines() if "(NEEDED)" in line}
-                self.assertEqual(needed, {"libc.so.6", "libsqlite3.so.0"})
+                assert_linkage(self, app, 'libsqlite3.so.0')
 
     def test_query_snapshot_is_checked_without_running_a_prepare_step(self):
         package = self.root / 'service'
@@ -98,14 +90,15 @@ class HTTP(unittest.TestCase):
         prepare = [sys.executable, package / 'tools/prepareQuery.py']
         subprocess.run([*prepare, '--check'], check=True, capture_output=True)
         schema = package / 'inputs/schema.sql'
-        schema.write_text(schema.read_text() + 'CREATE TABLE events(id INTEGER PRIMARY KEY);\n')
+        schema.write_bytes(schema.read_bytes().replace(b'\n', b'\r\n') + b'CREATE TABLE events(id INTEGER PRIMARY KEY);\r\n')
         def check():
             return subprocess.run([COMPILER, 'check', package, '--diagnostics=json'], capture_output=True, timeout=20)
         mismatch = check()
         self.assertNotEqual(mismatch.returncode, 0)
         self.assertEqual(json.loads(mismatch.stderr)[0]['code'], 'LYM0002')
         subprocess.run(prepare, check=True, capture_output=True)
-        self.assertEqual(check().returncode, 0)
+        refreshed = check()
+        self.assertEqual(refreshed.returncode, 0, refreshed.stderr.decode())
         saved = (package / 'inputs/userById.snapshot').read_bytes()
         (package / 'tools/userById.sql').write_text('SELECT typo FROM users WHERE id=?1')
         failed = subprocess.run(prepare, capture_output=True)
@@ -139,12 +132,11 @@ fn main(): Unit {
 }
 ''')
         for profile, app in self.profiles(package):
-            with self.subTest(profile=profile), server(app) as (port, process):
+            with self.subTest(profile=profile), server(app) as (port, process, output):
                 with socket.create_connection(("127.0.0.1", port), 5) as drop:
                     drop.sendall(b"GET /hold HTTP/1.1\r\nHost: localhost\r\n\r\n")
-                    self.assertTrue(select.select([process.stdout], [], [], 5)[0])
-                    self.assertEqual(process.stdout.readline(), b"GET\n")
-                    drop.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+                    self.assertEqual(output.line(), b"GET\n")
+                    reset_on_close(drop)
                 process.stdin.write(b"continue\n")
                 process.stdin.flush()
                 with socket.create_connection(("127.0.0.1", port), 5) as echo:
@@ -169,14 +161,12 @@ fn main(): Unit {
                 database = self.root / (profile + ".db")
                 with contextlib.closing(sqlite3.connect(database, timeout=0)) as observer:
                     observer.executescript("CREATE TABLE rows(id INTEGER PRIMARY KEY); INSERT INTO rows VALUES(7),(8);")
-                    with server(app, database) as (port, process):
+                    with server(app, database) as (port, process, output):
                         with socket.create_connection(("127.0.0.1", port), timeout=5) as drop:
                             drop.sendall(b"GET /hold HTTP/1.1\r\nHost: localhost\r\n\r\n")
-                            self.assertTrue(select.select([process.stdout], [], [], 5)[0])
-                            self.assertEqual(process.stdout.readline(), b"cursor open\n")
-                            drop.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
-                        self.assertTrue(select.select([process.stdout], [], [], 5)[0])
-                        self.assertEqual(process.stdout.readline(), b"cancellation observed\n")
+                            self.assertEqual(output.line(), b"cursor open\n")
+                            reset_on_close(drop)
+                        self.assertEqual(output.line(), b"cancellation observed\n")
                         self.assertIsNone(process.poll())
                         with self.assertRaisesRegex(sqlite3.OperationalError, "database is locked"):
                             observer.execute("BEGIN EXCLUSIVE")
@@ -184,7 +174,7 @@ fn main(): Unit {
                         process.stdin.flush()
                         self.assertEqual(exchange(port, "GET", "/next"), (200, "text/plain", b"ready"))
                         self.assertEqual(process.wait(timeout=5), 0)
-                        self.assertEqual(process.stdout.read(), b"cursor closed\ndatabase closed\nrequest closed\nrequest group closed\n")
+                        self.assertEqual(output.remaining(), b"cursor closed\ndatabase closed\nrequest closed\nrequest group closed\n")
                         self.assertEqual(process.stderr.read(), b"")
                     observer.execute("BEGIN EXCLUSIVE")
                     observer.rollback()

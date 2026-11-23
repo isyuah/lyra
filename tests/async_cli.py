@@ -6,6 +6,8 @@ import sys
 import tempfile
 import unittest
 
+from platform_cli import executable, running
+
 
 COMPILER = Path(sys.argv.pop(1)).resolve()
 
@@ -23,7 +25,7 @@ class Async(unittest.TestCase):
         self.main.write_text(source, encoding="utf-8")
         for mode in ([], ["--release"]):
             with self.subTest(mode=mode):
-                app = self.package / "app"
+                app = executable(self.package / "app")
                 built = subprocess.run([COMPILER, "build", self.package, *mode, "-o", app], capture_output=True, timeout=30)
                 self.assertEqual(built.returncode, 0, built.stderr.decode())
                 run = subprocess.run([app], capture_output=True, timeout=15)
@@ -134,7 +136,7 @@ async fn main(): Unit {
                                  'async fn main(): Result<Unit,String> { spawn child(); ' + outcome + ' }', encoding="utf-8")
             for mode in ([], ["--release"]):
                 with self.subTest(outcome=outcome, mode=mode):
-                    app = self.package / "app"
+                    app = executable(self.package / "app")
                     built = subprocess.run([COMPILER, "build", self.package, *mode, "-o", app], capture_output=True, timeout=30)
                     self.assertEqual(built.returncode, 0, built.stderr.decode())
                     run = subprocess.run([app], capture_output=True, timeout=10)
@@ -144,12 +146,11 @@ async fn main(): Unit {
         (self.package / "lyra.json5").write_text("{name:'test/blocking',version:'1.0.0'}")
         self.main.write_text('''
 import std.io.assert
-import std.io.readFile
-import std.io.writeFile
+import std.io.readLine
 import std.sqlite.open
-async fn release(): Unit { assert(writeFile("gate", "ready") == 0, "open FIFO writer") }
+async fn release(): Unit { print("domain still running") }
 async fn main(): Unit {
-    val reading = spawn blocking { readFile("gate").value }
+    val reading = spawn blocking { readLine().value }
     spawn release();
     print(await reading)
     val result = await blocking {
@@ -165,14 +166,17 @@ async fn main(): Unit {
     print(result)
 }
 ''', encoding="utf-8")
-        os.mkfifo(self.package / "gate")
         for flags in ([], ["--release"]):
             with self.subTest(flags=flags):
-                app = self.package / "app"
+                app = executable(self.package / "app")
                 built = subprocess.run([COMPILER, "build", self.package, "-o", app, *flags], capture_output=True, timeout=30)
                 self.assertEqual(built.returncode, 0, built.stderr.decode())
-                ran = subprocess.run([app], cwd=self.package, env={**os.environ, "UV_THREADPOOL_SIZE": "1"}, capture_output=True, timeout=10)
-                self.assertEqual((ran.returncode, ran.stdout, ran.stderr), (0, b"ready\nafter close\n", b""))
+                with running([app], cwd=self.package, env={**os.environ, "UV_THREADPOOL_SIZE": "1"}) as (process, output):
+                    self.assertEqual(output.line(), b"domain still running\n")
+                    process.stdin.write(b"ready\n")
+                    process.stdin.flush()
+                    self.assertEqual(process.wait(timeout=10), 0)
+                    self.assertEqual((output.remaining(), process.stderr.read()), (b"ready\nafter close\n", b""))
 
     def test_invalid_task_operations(self):
         for source, marked in (("fn main(): Unit { val bad = await work() } async fn work(): Unit {}", "await"),

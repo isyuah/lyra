@@ -7,6 +7,8 @@ import sys
 import tempfile
 import unittest
 
+from platform_cli import assert_linkage, executable
+
 
 COMPILER = Path(sys.argv.pop(1)).resolve()
 EXAMPLE = Path(__file__).resolve().parents[1] / "examples/jsonlines"
@@ -50,7 +52,7 @@ class ExternalJsonLines(unittest.TestCase):
                     + b'{"station":"tail","delta":1}')
             for profile, flags in (("debug", []), ("release", ["--release"])):
                 with self.subTest(profile=profile):
-                    app = root / profile
+                    app = executable(root / profile)
                     cli("build", consumer, "--locked", "--offline", "-o", app, *flags)
                     for text, expected in ((data, {"rows": 3, "total": 9007199254740992, "rejected": 3}),
                                            (b"", {"rows": 0, "total": 0, "rejected": 0})):
@@ -59,17 +61,16 @@ class ExternalJsonLines(unittest.TestCase):
                         self.assertEqual(json.loads(done.stdout), expected)
                         errors = done.stderr.decode().splitlines()
                         self.assertEqual([line.split(":", 1)[0] for line in errors], ["line 3", "line 4", "line 5"] if text else [])
-                    bad_input = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+                    reader, writer = os.pipe()
                     try:
-                        done = subprocess.run([app], stdin=bad_input, cwd=root, capture_output=True, timeout=5)
+                        done = subprocess.run([app], stdin=writer, cwd=root, capture_output=True, timeout=5)
                     finally:
-                        os.close(bad_input)
+                        os.close(writer)
+                        os.close(reader)
                     self.assertNotEqual(done.returncode, 0)
                     self.assertEqual(done.stdout, b"")
                     self.assertIn(b"cannot read stdin", done.stderr)
-                    dynamic = subprocess.check_output(["readelf", "-dW", app], text=True)
-                    needed = [line.split("[")[1].split("]")[0] for line in dynamic.splitlines() if "(NEEDED)" in line]
-                    self.assertEqual(needed, ["libc.so.6"])
+                    assert_linkage(self, app)
             self.assertEqual((consumer / "lyra.lock").read_bytes(), lock)
 
 

@@ -5,6 +5,8 @@ import sys
 import tempfile
 import unittest
 
+from platform_cli import executable
+
 
 COMPILER = Path(sys.argv.pop(1)).resolve()
 
@@ -22,7 +24,7 @@ class Exceptions(unittest.TestCase):
         self.source.write_text(source, encoding='utf-8')
         for mode in ([], ['--release']):
             with self.subTest(mode=mode):
-                app = self.package / 'app'
+                app = executable(self.package / 'app')
                 build = subprocess.run([COMPILER, 'build', self.package, *mode, '-o', app], capture_output=True, text=True, timeout=30)
                 self.assertEqual(build.returncode, 0, build.stderr)
                 result = subprocess.run([app], capture_output=True, text=True, timeout=15)

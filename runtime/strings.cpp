@@ -74,6 +74,7 @@ std::uint8_t lyraStringEqual(const void* left, const void* right) {
 void lyraPrintString(const void* value) {
     std::fwrite(lyraStringBytes(value), 1, lyraStringLength(value), stdout);
     std::putchar('\n');
+    std::fflush(stdout);
 }
 
 int lyraReportStringError(const void* value) {

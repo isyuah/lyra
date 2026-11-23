@@ -7,7 +7,7 @@
 | RFC 编号 | RFC-0001 |
 | 版本 | 0.2 Draft |
 | 状态 | 本轮已接受设计方向，部分细节开放 |
-| 目标平台 | 首个验收目标为 Linux x86-64/glibc，最低测试镜像 Ubuntu 22.04 x86-64 |
+| 目标平台 | Windows x64/MSVC 与 Linux x86-64/glibc 原生构建；Linux 最低测试镜像 Ubuntu 22.04 x86-64 |
 | 编译模型 | AOT Native Compilation |
 | 运行时模型 | Managed Native Runtime |
 | 核心优先级 | DX → 表达能力 → 工程可维护性 → 性能 |
@@ -71,7 +71,7 @@
 | 并发 | 普通 `spawn` 同域串行；`parallel { ... }` 跨域启动并归当前组，可共享普通对象、直接 `await` 后回到等待者域。安全代码中的竞争不得破坏内存安全。 |
 | 宏与数据交换 | `[标记]`、`@装饰器`、`#宏` 分写。声明宏和表达式宏使用传入的语法与显式只读输入展开；外部准备工具另行授权。JSON/TOML 由 `#derive(Json, Toml)` 显式生成实现；默认只映射公开字段、拒绝未知键。 |
 | 整数 | 普通有符号整数算术在 Debug 和 Release 下都检查溢出；需回绕时使用明确的回绕操作。 |
-| 包与部署 | 目录组成模块；源码包及 workspace 锁文件作为默认分发模型。首期使用 Windows + WSL 构建 Linux 原生程序，允许明确声明动态库依赖。 |
+| 包与部署 | 目录组成模块；源码包及 workspace 锁文件作为默认分发模型。Windows 用原生 PowerShell 工作流，Linux 用本机或 WSL；允许显式使用动态库。 |
 | 互操作与库 | 首个 C ABI 集成样例为阻塞式 SQLite API，不包含来自 C 线程的反向回调。异步、HTTP、JSON/TOML 等作为工具链维护的语言与标准库能力，不因此成为全部必须的语法关键字。 |
 
 可观察行为见[语言核心](rfc/language-core.md)。[RFC-0002](rfc/0002-syntax.md) 已确认：变长形参写 `values: Int...`，函数体得到本次调用独立的可变 `List<Int>`；调用处的 `...ids` 首版只展开列表，按顺序传入元素，不共用来源列表。固定列表形参写 `values: List<Int>`，直接传 `ids` 时两边访问同一个列表。`identity<Int>(7)` 按显式泛型调用解析，省略类型实参时可从实参和明确的目标类型推断；`await findUser(id)?` 先等待、再传播。跨行、完整运算符分组和求值顺序见同篇 §3–4。HTTP 参数绑定是库设计，不是另一种函数调用。
@@ -1051,7 +1051,7 @@ Runtime 调度器在迁移 Task 时不得改变其上下文语义。
 
 ### 8.11 LLVM + Native Deployment
 
-首期以 Windows/WSL 开发，面向 Linux x86-64/glibc 的 Ubuntu 22.04 最低测试镜像，SQLite 为列明的系统动态库；静态 scratch 发布留给后续。LLVM AOT 不依赖 VM，GC 优先复用现成实现，具体收集器由原型确定。见[原生工具链 RFC](rfc/native-toolchain.md)。
+当前编译器支持 Windows x64 PE 与 Linux x86-64 ELF 的本机 LLVM AOT 编译，不要求 VM。应用链接 BDWGC 和其他使用到的运行时库；Windows 静态链接 CRT 和 SQLite，Linux 的最低测试镜像为 Ubuntu 22.04，SQLite 为声明的系统动态库。跨目标编译与 Linux 全静态交付后置。见[原生工具链 RFC](rfc/native-toolchain.md)。
 
 ---
 
@@ -1222,7 +1222,7 @@ RFC-0001 确立主要语言与工具链方向，但尚不足以成为完整语�
 9. 默认非空；`T?` 与可嵌套 `Option<T>` 等价；整数普通运算检查溢出。
 10. 目录组成模块、公开 re-export 与别名可保留原身份；导入无副作用；包按单版本解析并使用锁文件和源码分发。
 11. 第三方构建脚本默认不执行，需单独列示并由用户显式授权。
-12. LLVM AOT 原生编译，不依赖 VM；首期通过 Windows + WSL 面向 Linux，允许声明动态库；首个 C ABI 集成样例使用同步 SQLite。
+12. LLVM AOT 原生编译，不依赖 VM；支持 Windows/MSVC 与 Linux/glibc 本机交付，允许声明动态库；首个 C ABI 集成样例使用同步 SQLite。
 13. 首期标准库包含内置异步能力及工具链维护的 HTTP、JSON/TOML 等常用库；异步错误提供用户源码级调用链诊断。
 
 已选定的语法与尚未冻结的细节分别列在[语言核心](rfc/language-core.md)；[专题索引](rfc/README.md)说明本轮复核如何取代原问卷中的推荐项。

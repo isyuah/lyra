@@ -19,8 +19,13 @@ const LyraException* raised(const char* message, std::uint64_t line) {
 }
 
 std::string report(const LyraException* failure) {
+#ifdef _WIN32
+    FILE* file;
+    check(tmpfile_s(&file) == 0, "cannot create report stream");
+#else
     FILE* file = std::tmpfile();
     check(file != nullptr, "cannot create report stream");
+#endif
     lyraExceptionWrite(failure, file);
     std::rewind(file);
     std::string result;

@@ -6,10 +6,17 @@
 #include <string_view>
 #include <vector>
 
+#ifdef _WIN32
+#include <fcntl.h>
+#include <io.h>
+#include <llvm/Support/ConvertUTF.h>
+#endif
+
 import lyra.build;
 import lyra.check;
 import lyra.modules;
 import lyra.packages;
+import lyra.platform;
 
 namespace fs = std::filesystem;
 using namespace lyra;
@@ -42,17 +49,22 @@ Options options(const std::vector<std::string_view>& args, const std::vector<std
         if (arg == "--locked" && !result.packages.locked) result.packages.locked = true;
         else if (arg == "--offline" && !result.packages.offline) result.packages.offline = true;
         else if (arg == "--release" && command != "check" && !result.release) result.release = true;
-        else if (arg == "-o" && command == "build" && !result.output && index + 1 < args.size() && !args[index + 1].starts_with('-')) result.output = args[++index];
+        else if (arg == "-o" && command == "build" && !result.output && index + 1 < args.size() && !args[index + 1].starts_with('-')) result.output = fromUtf8(args[++index]);
         else if (arg == "--link" && command != "check" && index + 1 < args.size() && !args[index + 1].starts_with('-')) {
-            auto path = fs::absolute(args[++index]);
-            if (!fs::is_regular_file(path)) throw Diagnostic{"LYI0001", "找不到原生链接输入：" + path.string()};
-            auto name = path.filename().string();
-            auto version = name.rfind(".so.");
-            bool soname = version != name.npos && version + 4 < name.size() && name.find_first_not_of("0123456789.", version + 4) == name.npos;
-            if (!soname && path.extension() != ".a" && path.extension() != ".o" && path.extension() != ".so") throw Diagnostic{"LYC0001", "--link 只接受目标文件、静态库或共享库：" + name};
+            auto path = fs::absolute(fromUtf8(args[++index]));
+            if (!fs::is_regular_file(path)) throw Diagnostic{"LYI0001", "找不到原生链接输入：" + pathText(path)};
+            auto name = pathText(path.filename());
+            auto extension = pathText(path.extension());
+            if constexpr (windows) {
+                if (extension != ".obj" && extension != ".lib") throw Diagnostic{"LYC0001", "--link 只接受 .obj、静态库或导入库 .lib：" + name};
+            } else {
+                auto version = name.rfind(".so.");
+                bool soname = version != name.npos && version + 4 < name.size() && name.find_first_not_of("0123456789.", version + 4) == name.npos;
+                if (!soname && extension != ".a" && extension != ".o" && extension != ".so") throw Diagnostic{"LYC0001", "--link 只接受目标文件、静态库或共享库：" + name};
+            }
             result.libraries.push_back(std::move(path));
         }
-        else if (!arg.empty() && !arg.starts_with('-') && result.directory.empty()) result.directory = arg;
+        else if (!arg.empty() && !arg.starts_with('-') && result.directory.empty()) result.directory = fromUtf8(arg);
         else throw Diagnostic{"LYC0001", usage};
     }
     if (result.directory.empty()) throw Diagnostic{"LYC0001", usage};
@@ -64,14 +76,14 @@ int compile(const Options& opts, Compilation program, bool library, fs::path out
     if (opts.command == "check") return 0;
     if (library) throw Diagnostic{"LYC0002", "库没有可执行入口；使用 lyra check 或 lyra test 检查库"};
     if (fs::exists(output)) for (const auto& input : program.macroInputs) {
-        if (fs::equivalent(input, output)) throw Diagnostic{"LYI0001", "输出路径不能覆盖宏或其只读输入：" + output.string()};
+        if (fs::equivalent(input, output)) throw Diagnostic{"LYI0001", "输出路径不能覆盖宏或其只读输入：" + pathText(output)};
     }
     build(module, program.sources, output, opts.release, opts.libraries);
     return opts.command == "build" ? 0 : execute(output, opts.arguments);
 }
 
 int project(const Options& opts, bool json) {
-    auto binary = [&](const fs::path& root) { return opts.output.value_or(root / "build" / (opts.release ? "release" : "debug") / "app"); };
+    auto binary = [&](const fs::path& root) { return opts.output.value_or(executablePath(root / "build" / (opts.release ? "release" : "debug") / "app")); };
     if (!fs::exists(opts.directory / "lyra.json5")) {
         if (opts.packages.locked || opts.packages.offline || opts.command == "test") throw Diagnostic{"LYK0001", "此操作需要包清单 lyra.json5"};
         auto sources = loadSources(opts.directory);
@@ -104,20 +116,20 @@ int project(const Options& opts, bool json) {
         std::sort(cases.begin(), cases.end());
         for (const auto& path : cases) {
             auto program = loadProgram(graph, id, path);
-            auto output = package.root / "build" / "test" / (opts.release ? "release" : "debug") / path.stem();
+            auto name = path.stem();
+            if constexpr (windows) name += ".exe";
+            auto output = package.root / "build" / "test" / (opts.release ? "release" : "debug") / name;
             int status = compile(opts, std::move(program), false, output);
-            if (status) throw Diagnostic{"LYC0003", path.string() + " 测试退出码：" + std::to_string(status)};
+            if (status) throw Diagnostic{"LYC0003", pathText(path) + " 测试退出码：" + std::to_string(status)};
             ++tests;
-            std::cout << "ok " << package.name << '/' << path.filename().string() << '\n';
+            std::cout << "ok " << package.name << '/' << pathText(path.filename()) << '\n';
         }
     }
     if (opts.command == "test" && !tests) throw Diagnostic{"LYC0003", "没有找到 tests/*.ly 测试入口"};
     return 0;
 }
-}
 
-int main(int argc, char** argv) {
-    std::vector<std::string_view> args(argv + 1, argv + argc);
+int run(std::vector<std::string_view> args) {
     auto separator = std::ranges::find(args, "--");
     bool forwards = separator != args.end();
     std::vector<std::string_view> arguments;
@@ -139,3 +151,21 @@ int main(int argc, char** argv) {
     catch (const fs::filesystem_error& error) { report({"LYI0001", error.what()}, json); }
     return 1;
 }
+}
+
+#ifdef _WIN32
+int wmain(int argc, wchar_t** argv) {
+    _setmode(_fileno(stdout), _O_BINARY);
+    _setmode(_fileno(stderr), _O_BINARY);
+    std::vector<std::string> words(argc - 1);
+    for (int index = 1; index < argc; ++index) {
+        if (!llvm::convertWideToUTF8(argv[index], words[index - 1])) {
+            report({"LYC0001", "命令行包含无效的 UTF-16"}, false);
+            return 1;
+        }
+    }
+    return run({words.begin(), words.end()});
+}
+#else
+int main(int argc, char** argv) { return run({argv + 1, argv + argc}); }
+#endif

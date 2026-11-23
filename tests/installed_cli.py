@@ -11,6 +11,8 @@ import tempfile
 import threading
 import unittest
 
+from platform_cli import assert_linkage, c_archive, executable
+
 
 CMAKE = Path(sys.argv.pop(1)).resolve()
 BUILD = Path(sys.argv.pop(1)).resolve()
@@ -30,8 +32,8 @@ class Installed(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix='lyra-relocation-') as temporary:
             root = Path(temporary)
             staged = root / 'staging'
-            prefix = root / 'relocated toolchain'
-            cache = root / 'private cache'
+            prefix = root / '搬迁工具链 relocated'
+            cache = root / '独立缓存 private'
             environment = {**os.environ, 'LYRA_CACHE': str(cache), 'NO_PROXY': '127.0.0.1', 'no_proxy': '127.0.0.1'}
 
             def run(*args, good=True):
@@ -50,9 +52,9 @@ class Installed(unittest.TestCase):
             run(CMAKE, '--install', BUILD, '--prefix', staged)
             shutil.copytree(staged, prefix)
             shutil.rmtree(staged)
-            compiler = prefix / 'bin/lyra'
+            compiler = executable(prefix / 'bin/lyra')
             write(prefix / 'share/lyra/std/installprobe/src/identity.ly', 'pub fn identity(): String { "relocated" }')
-            app = root / 'consumer app'
+            app = root / '使用方 consumer app'
             library = root / 'source producer'
             run(compiler, 'new', app, '--name', 'release/consumer')
             run(compiler, 'new', library, '--name', 'release/catalog', '--lib')
@@ -78,24 +80,24 @@ class Installed(unittest.TestCase):
             run(compiler, 'pack', library, '--registry', registry)
 
             handler = functools.partial(StaticRegistry, directory=registry)
-            with http.server.ThreadingHTTPServer(('127.0.0.1', 0), handler) as server:
-                server.requests = []
-                thread = threading.Thread(target=server.serve_forever)
-                thread.start()
-                try:
-                    origin = f'http://127.0.0.1:{server.server_port}'
-                    manifest(app, dependencies={'catalog': {'name': 'release/catalog', 'version': '^0.1.0', 'registry': origin}})
-                    run(compiler, 'lock', app)
-                finally:
-                    server.shutdown()
-                    thread.join()
+            server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), handler)
+            server.requests = []
+            thread = threading.Thread(target=server.serve_forever)
+            thread.start()
+            self.addCleanup(server.server_close)
+            self.addCleanup(thread.join)
+            self.addCleanup(server.shutdown)
+            origin = f'http://127.0.0.1:{server.server_port}'
+            manifest(app, dependencies={'catalog': {'name': 'release/catalog', 'version': '^0.1.0', 'registry': origin}})
+            run(compiler, 'lock', app)
 
             lock = app / 'lyra.lock'
             frozen = lock.read_bytes()
             package = next(item for item in json.loads(frozen)['packages'] if item['name'] == 'release/catalog')
             digest = package['sha256']
             self.assertEqual((package['version'], package['source']), ('0.1.0', origin))
-            self.assertEqual(server.requests, ['/index/release/catalog.json', f'/artifacts/{digest}.lypkg'])
+            online_requests = ['/index/release/catalog.json', f'/artifacts/{digest}.lypkg']
+            self.assertEqual(server.requests, online_requests)
             self.assertEqual(hashlib.sha256((cache / 'artifacts' / f'{digest}.lypkg').read_bytes()).hexdigest(), digest)
             source = cache / 'sources' / digest
             for relative, content in files.items():
@@ -107,11 +109,27 @@ class Installed(unittest.TestCase):
             native = root / 'native fixture'
             write(native / 'read.c', '''#define _XOPEN_SOURCE 700
 #include <lyra/string.h>
-#include <pthread.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef _WIN32
+#define _WIN32_WINNT 0x0A00
+#include <windows.h>
+static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
+static SYNCHRONIZATION_BARRIER gate;
+static BOOL CALLBACK initGate(PINIT_ONCE state, PVOID param, PVOID *context) {
+    (void)state;
+    (void)param;
+    (void)context;
+    return InitializeSynchronizationBarrier(&gate, 2, -1);
+}
+void distributionMeet(void) {
+    if (!InitOnceExecuteOnce(&once, initGate, NULL, NULL)) abort();
+    EnterSynchronizationBarrier(&gate, SYNCHRONIZATION_BARRIER_FLAGS_NO_DELETE);
+}
+#else
+#include <pthread.h>
 static pthread_once_t once = PTHREAD_ONCE_INIT;
 static pthread_barrier_t gate;
 static void initGate(void) { if (pthread_barrier_init(&gate, NULL, 2)) abort(); }
@@ -120,6 +138,7 @@ void distributionMeet(void) {
     int status = pthread_barrier_wait(&gate);
     if (status != 0 && status != PTHREAD_BARRIER_SERIAL_THREAD) abort();
 }
+#endif
 
 int64_t distributionRead(const LyraString *value, const LyraString *empty, int64_t number) {
     static const unsigned char expected[] = {0xe4, 0xb8, 0xad, 0, 'x', 0};
@@ -135,10 +154,7 @@ int64_t distributionRead(const LyraString *value, const LyraString *empty, int64
     return number * 7;
 }
 ''')
-            obj = native / 'read.o'
-            archive = native / 'lib fixture.a'
-            run('clang-18', '-std=c11', '-O2', '-pthread', '-Wall', '-Wextra', '-Werror', '-I', prefix / 'include', '-c', native / 'read.c', '-o', obj)
-            run('ar', 'rcs', archive, obj)
+            archive = c_archive(native / 'read.c', native / 'lib fixture', '-O2', '-Wall', '-Wextra', '-Werror', '-I', prefix / 'include')
             write(app / 'src/main.ly', '''import catalog.banner
 import std.installprobe.identity
 extern fn distributionRead(value: String, empty: String, number: Int): Int;
@@ -159,23 +175,27 @@ import self.score
 import std.io.assert
 async fn main(): Unit { assert(label() == "relocated: 打包时的标题:v1", "wrong installed input"); assert(await score() == 42, "wrong C ABI result") }
 ''')
-            blocked = root / 'offline guard' / 'curl'
-            write(blocked, '#!/bin/sh\n: > "$LYRA_NETWORK_CALLED"\nexit 97\n')
-            blocked.chmod(0o755)
-            attempted = root / 'network was requested'
-            environment.update(PATH=str(blocked.parent) + os.pathsep + environment['PATH'], LYRA_NETWORK_CALLED=str(attempted), UV_THREADPOOL_SIZE='2')
+            environment['UV_THREADPOOL_SIZE'] = '2'
             run(compiler, 'fetch', app, *frozen_args)
             for mode in ([], ['--release']):
                 args = (*frozen_args, *mode, '--link', archive)
                 self.assertIn('ok release/consumer/contract.ly', run(compiler, 'test', app, *args).stdout)
                 result = run(compiler, 'run', app, *args)
                 self.assertEqual((result.stdout.splitlines(), result.stderr), (['trace: banner', 'relocated: 打包时的标题:v1', '42'], ''))
+                program = executable(app / 'build' / ('release' if mode else 'debug') / 'app')
+                assert_linkage(self, program)
+                standalone = executable(root / '独立 standalone')
+                shutil.copy2(program, standalone)
+                isolated = subprocess.run([standalone], cwd=root, capture_output=True, text=True, timeout=10,
+                                          env={**environment, 'PATH': '', 'LIB': '', 'INCLUDE': ''})
+                self.assertEqual((isolated.returncode, isolated.stdout.splitlines(), isolated.stderr),
+                                 (0, ['trace: banner', 'relocated: 打包时的标题:v1', '42'], ''))
             self.assertEqual(lock.read_bytes(), frozen)
             shutil.rmtree(cache)
             error = run(compiler, 'fetch', app, *frozen_args, good=False)
             self.assertIn(digest, error.stderr)
             self.assertEqual(lock.read_bytes(), frozen)
-            self.assertFalse(attempted.exists(), 'an offline command invoked the network transport')
+            self.assertEqual(server.requests, online_requests, 'an offline command invoked the network transport')
 
 
 if __name__ == '__main__':

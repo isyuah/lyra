@@ -10,6 +10,7 @@ module;
 #include <vector>
 
 module lyra.source;
+import lyra.platform;
 
 namespace lyra {
 
@@ -31,7 +32,7 @@ static Site rawSite(const Source& source, Span span) {
     auto start = rawPosition(source, span.begin);
     auto lineStart = source.lineStarts[start.line - 1];
     auto lineEnd = source.text.find_first_of("\r\n", lineStart);
-    return {source.path.string(), start, rawPosition(source, span.end), source.text.substr(lineStart, lineEnd - lineStart), lineStart};
+    return {pathText(source.path), start, rawPosition(source, span.end), source.text.substr(lineStart, lineEnd - lineStart), lineStart};
 }
 
 static const SourcePiece& pieceAt(const Source& source, std::size_t offset) {
@@ -112,12 +113,12 @@ void report(const Diagnostic& error, bool json) {
 
 std::vector<Source> loadSources(const fs::path& package) {
     auto directory = package / "src";
-    if (!fs::is_directory(directory)) throw Diagnostic{"LYI0001", "找不到源码目录：" + directory.string()};
+    if (!fs::is_directory(directory)) throw Diagnostic{"LYI0001", "找不到源码目录：" + pathText(directory)};
     std::vector<fs::path> paths;
     for (const auto& entry : fs::directory_iterator(directory)) {
         if (entry.path().extension() == ".ly" && entry.is_regular_file()) paths.push_back(entry.path());
     }
-    if (paths.empty()) throw Diagnostic{"LYI0001", "源码目录里没有 .ly 文件：" + directory.string()};
+    if (paths.empty()) throw Diagnostic{"LYI0001", "源码目录里没有 .ly 文件：" + pathText(directory)};
     std::sort(paths.begin(), paths.end());
     std::vector<Source> sources;
     for (const auto& path : paths) sources.push_back(loadSource(path, {}));
@@ -126,11 +127,11 @@ std::vector<Source> loadSources(const fs::path& package) {
 
 Source loadSource(const fs::path& path, std::string moduleId) {
     std::ifstream input(path, std::ios::binary);
-    if (!input) throw Diagnostic{"LYI0001", "无法打开源码：" + path.string()};
+    if (!input) throw Diagnostic{"LYI0001", "无法打开源码：" + pathText(path)};
     std::string text;
     char buffer[8192];
     while (input.read(buffer, sizeof buffer) || input.gcount() > 0) text.append(buffer, input.gcount());
-    if (!input.eof() || input.bad()) throw Diagnostic{"LYI0001", "读取源码失败：" + path.string()};
+    if (!input.eof() || input.bad()) throw Diagnostic{"LYI0001", "读取源码失败：" + pathText(path)};
     return sourceText(path, std::move(text), std::move(moduleId));
 }
 

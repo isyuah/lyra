@@ -12,6 +12,7 @@ export module lyra.modules;
 import lyra.generics;
 import lyra.packages;
 import lyra.macros;
+import lyra.platform;
 import lyra.syntax;
 
 export namespace lyra {
@@ -174,15 +175,15 @@ Compilation loadProgram(const PackageGraph& graph, const std::string& entry, con
         auto directory = package->root / "src";
         std::vector<fs::path> paths;
         for (auto item = fs::recursive_directory_iterator(directory); item != fs::recursive_directory_iterator{}; ++item) {
-            if (item->is_directory() && item->path().filename().string().starts_with('.')) { item.disable_recursion_pending(); continue; }
-            if (item->is_symlink()) throw Diagnostic{"LYI0001", "源码不允许符号链接：" + item->path().string()};
+            if (item->is_directory() && pathText(item->path().filename()).starts_with('.')) { item.disable_recursion_pending(); continue; }
+            if (item->is_symlink()) throw Diagnostic{"LYI0001", "源码不允许符号链接：" + pathText(item->path())};
             if (item->is_regular_file() && item->path().extension() == ".ly") paths.push_back(item->path());
         }
         std::sort(paths.begin(), paths.end());
         for (const auto& path : paths) {
             auto module = prefixes.at(id);
             auto relative = path.parent_path().lexically_relative(directory);
-            if (relative != ".") module += '/' + relative.generic_string();
+            if (relative != ".") module += '/' + pathText(relative);
             spaces.try_emplace(module, Space{package});
             program.sources.push_back(loadSource(path, module));
         }
@@ -201,7 +202,7 @@ Compilation loadProgram(const PackageGraph& graph, const std::string& entry, con
     }
     expandMacros(program.syntax, program.sources, macroPackages, program.macroInputs);
     std::map<std::string, ResolvedPackage> bundled;
-    auto standard = fs::canonical("/proc/self/exe").parent_path().parent_path() / "share" / "lyra" / "std";
+    auto standard = sdkRoot() / "share" / "lyra" / "std";
     for (std::size_t index = 0; index < program.syntax.imports.size(); ++index) {
         const auto& use = program.syntax.imports[index];
         if (use.path.size() < 3 || use.path[0].text != "std") continue;

@@ -11,7 +11,7 @@ fn main(): Unit {
 }
 ```
 
-`listen(0)` 绑定 `127.0.0.1` 的临时端口，`port()` 读取实际值。`accept(timeoutMs)` 是同步操作，超时覆盖等待连接及读完整请求。`status()` 为零表示可用，失败为 Linux `errno`。`target()` 保留请求目标和查询串；`pathInt(prefix, fallback)` 解析指定前缀后一个非负十进制参数，自动忽略查询串。`body()` 是经过 UTF-8 验证的文本，可含 NUL，支持分块传输。
+`listen(0)` 绑定 `127.0.0.1` 的临时端口，`port()` 读取实际值。`accept(timeoutMs)` 是同步操作，超时覆盖等待连接及读完整请求。`status()` 为零表示可用，失败带本平台的网络或 I/O 错误码。`target()` 保留请求目标和查询串；`pathInt(prefix, fallback)` 解析指定前缀后一个非负十进制参数，自动忽略查询串。`body()` 是经过 UTF-8 验证的文本，可含 NUL，支持分块传输。
 
 一条 TCP 连接一个 HTTP 请求。请求线、头部和传输体总计最多 256 KiB，目标最多 8 KiB，解码后正文最多 128 KiB；超限回 `413`，格式或文本非法回 `400`。`respond()` 发送状态、Content-Type、Content-Length 和正文后关闭连接，返回零或 `errno`；`close()` 可显式放弃或释放。同一 `Listener` 或 `Request` 的同步操作应串行调用。没有 TLS、HTTP/2 或长连接。
 

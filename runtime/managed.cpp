@@ -3,9 +3,9 @@
 #define GC_THREADS
 #include <gc/gc.h>
 #include <new>
-#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <uv.h>
 
 struct LyraGcRoot {
     void *value;
@@ -19,7 +19,7 @@ struct LyraCleanup {
 
 namespace {
 
-pthread_once_t initialization = PTHREAD_ONCE_INIT;
+uv_once_t initialization = UV_ONCE_INIT;
 
 void initialize() {
     GC_INIT();
@@ -37,22 +37,22 @@ void *requireMemory(void *memory) {
 }
 
 void *lyraGcAlloc(size_t bytes) {
-    pthread_once(&initialization, initialize);
+    uv_once(&initialization, initialize);
     return requireMemory(GC_MALLOC(bytes ? bytes : 1));
 }
 
 void *lyraGcAllocAtomic(size_t bytes) {
-    pthread_once(&initialization, initialize);
+    uv_once(&initialization, initialize);
     return requireMemory(GC_MALLOC_ATOMIC(bytes ? bytes : 1));
 }
 
 void lyraGcCollect() {
-    pthread_once(&initialization, initialize);
+    uv_once(&initialization, initialize);
     GC_gcollect();
 }
 
 LyraGcRoot *lyraGcRootCreate(void *value) {
-    pthread_once(&initialization, initialize);
+    uv_once(&initialization, initialize);
     return ::new (requireMemory(GC_MALLOC_UNCOLLECTABLE(sizeof(LyraGcRoot)))) LyraGcRoot{value};
 }
 

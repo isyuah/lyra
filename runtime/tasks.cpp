@@ -1,15 +1,18 @@
 #include "tasks.h"
 #include "context.h"
+#include "locks.h"
 #include "managed.h"
 
-#include <fcntl.h>
 #include <new>
-#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 #include <uv.h>
+
+#ifndef _WIN32
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 
 struct LyraDomain {
     uv_loop_t loop;
@@ -57,10 +60,15 @@ struct LyraTask {
 };
 
 struct DisconnectWatch {
+#ifdef _WIN32
+    uv_async_t ready;
+    HANDLE event, waiter;
+#else
     uv_poll_t poll;
+    int fd;
+#endif
     LyraTask *task;
     DisconnectWatch *next;
-    int fd;
 };
 
 struct DeadlineWatch { uv_timer_t timer; LyraTask *task; };
@@ -69,7 +77,8 @@ namespace {
 
 thread_local LyraTask *currentTask;
 thread_local const LyraContext *workerContext;
-pthread_mutex_t sharedAccess = PTHREAD_MUTEX_INITIALIZER;
+uv_mutex_t sharedAccess;
+uv_once_t sharedInitialized = UV_ONCE_INIT;
 
 void require(bool condition, const char *error) {
     if (!condition) {
@@ -174,12 +183,18 @@ void addFailure(Failure *&head, size_t ordinal, const LyraException *cause) {
 }
 
 void closeWatch(DisconnectWatch *watch) {
+#ifdef _WIN32
+    if (watch->waiter) require(UnregisterWaitEx(watch->waiter, INVALID_HANDLE_VALUE) != 0, "cannot stop disconnect wait");
+    CloseHandle(watch->event);
+    uv_close(reinterpret_cast<uv_handle_t *>(&watch->ready), [](uv_handle_t *handle) { free(handle->data); });
+#else
     uv_poll_stop(&watch->poll);
     uv_close(reinterpret_cast<uv_handle_t *>(&watch->poll), [](uv_handle_t *handle) {
         auto *closing = static_cast<DisconnectWatch *>(handle->data);
         close(closing->fd);
         free(closing);
     });
+#endif
 }
 
 void stopDeadline(LyraTask *task) {
@@ -359,20 +374,32 @@ LyraTask *lyraTaskBlocking(LyraBlockingBody body, void *environment) {
 }
 
 void lyraTaskSharedCopy(void *destination, const void *source, size_t bytes) {
-    pthread_mutex_lock(&sharedAccess);
+    uv_once(&sharedInitialized, [] { lyraRuntime::initMutex(sharedAccess); });
+    lyraRuntime::Lock lock(sharedAccess);
     memcpy(destination, source, bytes);
-    pthread_mutex_unlock(&sharedAccess);
 }
 
-int lyraTaskWatchDisconnect(int socketFd) {
-    if (!currentTask) return 0;
-    auto fd = fcntl(socketFd, F_DUPFD_CLOEXEC, 0);
-    if (fd < 0) return 0;
+int lyraTaskWatchDisconnect(uintptr_t monitor) {
+    if (!currentTask || !monitor) return 0;
     auto *watch = static_cast<DisconnectWatch *>(calloc(1, sizeof(DisconnectWatch)));
     require(watch != nullptr, "cannot allocate disconnect watch");
-    watch->fd = fd;
     watch->task = currentTask;
-    if (uv_poll_init(&currentTask->domain->loop, &watch->poll, fd)) { close(fd); free(watch); return 0; }
+    auto *loop = &currentTask->domain->loop;
+#ifdef _WIN32
+    auto *process = GetCurrentProcess();
+    if (!DuplicateHandle(process, reinterpret_cast<HANDLE>(monitor), process, &watch->event, 0, FALSE, DUPLICATE_SAME_ACCESS)) { free(watch); return 0; }
+    if (uv_async_init(loop, &watch->ready, [](uv_async_t *handle) {
+        uv_unref(reinterpret_cast<uv_handle_t *>(handle));
+        lyraTaskRequestCancel(static_cast<DisconnectWatch *>(handle->data)->task);
+    })) { CloseHandle(watch->event); free(watch); return 0; }
+    watch->ready.data = watch;
+    if (!RegisterWaitForSingleObject(&watch->waiter, watch->event, [](void *data, BOOLEAN) {
+        uv_async_send(&static_cast<DisconnectWatch *>(data)->ready);
+    }, watch, INFINITE, WT_EXECUTEONLYONCE)) { closeWatch(watch); return 0; }
+#else
+    watch->fd = fcntl(static_cast<int>(monitor - 1), F_DUPFD_CLOEXEC, 0);
+    if (watch->fd < 0) { free(watch); return 0; }
+    if (uv_poll_init_socket(loop, &watch->poll, watch->fd)) { close(watch->fd); free(watch); return 0; }
     watch->poll.data = watch;
     int status = uv_poll_start(&watch->poll, UV_DISCONNECT, [](uv_poll_t *poll, int status, int events) {
         auto *watch = static_cast<DisconnectWatch *>(poll->data);
@@ -382,6 +409,7 @@ int lyraTaskWatchDisconnect(int socketFd) {
         }
     });
     if (status) { closeWatch(watch); return 0; }
+#endif
     watch->next = currentTask->watches;
     currentTask->watches = watch;
     return 1;

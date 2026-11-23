@@ -5,6 +5,7 @@ module;
 #include <vector>
 
 export module lyra.conversions;
+import lyra.platform;
 import lyra.check;
 
 export namespace lyra {
@@ -12,7 +13,7 @@ struct DirectConversion { Type source, target; std::size_t function; };
 
 std::string conversionSite(const CheckedFunction& declaration, const std::vector<Source>& sources) {
     const auto& file = sources[declaration.syntax.file];
-    return file.path.string() + ":" + std::to_string(file.position(declaration.syntax.name.span.begin).line);
+    return pathText(file.path) + ":" + std::to_string(file.position(declaration.syntax.name.span.begin).line);
 }
 
 void registerConversion(std::vector<DirectConversion>& table, const CheckedModule& module, const std::vector<Source>& sources, std::size_t index) {
