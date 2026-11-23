@@ -21,6 +21,8 @@ pub class Listener(val handle: CPtr) {
     pub fn close(self): Unit { lyraHttpStop(self.handle) }
 }
 
+pub struct Response(pub val code: Int, pub val contentType: String, pub val body: String)
+
 pub class Request(val handle: CPtr) {
     pub fn status(self): Int { lyraHttpRequestStatus(self.handle) }
     pub fn method(self): String { lyraHttpMethod(self.handle) }

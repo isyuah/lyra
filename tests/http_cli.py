@@ -161,7 +161,7 @@ fn main(): Unit {
                         process.stdin.flush()
                         self.assertEqual(exchange(port, "GET", "/next"), (200, "text/plain", b"ready"))
                         self.assertEqual(process.wait(timeout=5), 0)
-                        self.assertEqual(process.stdout.read(), b"cursor closed\nrequest group closed\n")
+                        self.assertEqual(process.stdout.read(), b"cursor closed\ndatabase closed\nrequest closed\nrequest group closed\n")
                         self.assertEqual(process.stderr.read(), b"")
                     observer.execute("BEGIN EXCLUSIVE")
                     observer.rollback()

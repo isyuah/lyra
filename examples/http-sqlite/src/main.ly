@@ -1,5 +1,6 @@
 import std.http.listen
 import std.http.Request
+import std.http.Response
 import std.io.arg
 import std.io.assert
 import std.io.writeError
@@ -10,7 +11,7 @@ import std.sqlite.openReadOnly
 #derive(Json)
 struct User(pub val id: Int, pub val name: String)
 
-struct Response(val code: Int, val contentType: String, val body: String)
+implicit (user: User): Response { Response(200, "application/json", encodeUser(user)) }
 
 fn text(code: Int, body: String): Response { Response(code, "text/plain", body) }
 fn cause(status: DbStatus): String { status.operation() + ": " + status.message() }
@@ -49,13 +50,14 @@ async fn route(request: Request, path: String): Response {
     if id < 0 { return text(400, "invalid id") }
     val result = await blocking { lookup(path, id) }
     match result {
-        Ok(Some(user)) => Response(200, "application/json", encodeUser(user)),
+        Ok(Some(user)) => user,
         Ok(None) => text(404, "not found"),
         Err(message) => { writeError("GET " + request.target() + ": " + message + "\n"); text(500, "database error") },
     }
 }
 
 async fn handle(request: Request, path: String): Unit {
+    defer request.close()
     val response = if request.watchDisconnect() { await route(request, path) } else { text(500, "disconnect watch unavailable") }
     if !request.disconnected() {
         await blocking { request.respond(response.code, response.contentType, response.body); };
@@ -74,7 +76,6 @@ async fn main(): Unit {
         val request = await blocking { server.accept(30000) }
         if request.status() == 0 {
             await requestGroup(request, path.value)
-            request.close()
         }
     }
 }

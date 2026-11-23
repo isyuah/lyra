@@ -15,8 +15,8 @@ lyra build examples/http-sqlite -o "$work/users-app"
 
 1. `main` 用 `await blocking { server.accept(...) }` 接收请求，在自己的 `requestGroup` 中启动 handler。示例一次处理一条请求，让单线程阻塞池也能取得进展。
 2. `handle` 在请求任务内登记 `watchDisconnect()`。查询工作在线程池中打开连接、绑定参数、复制结果并关闭 statement 和连接，只把 `Result<User?,String>` 传回执行域。
-3. `route` 分别处理查到、未找到和错误三种结果。`#derive(Json)` 生成的 `encodeUser` 负责整数和文本编码，HTTP 层没有单独的 JSON 转义器。
-4. 客户端断开时，请求任务被取消；正在运行的阻塞工作保留句柄直到安全返回。取消不作为数据库错误，也不发送补救响应。`requestGroup` 等子任务结束再交还控制权，监听循环继续接受连接。
+3. `route` 分别处理查到、未找到和错误三种结果。成功分支直接返回 `user`：该分支需要 `std.http.Response`，因此调用 `User` 所在模块的普通 `implicit` 转换；转换体用 `#derive(Json)` 生成的 `encodeUser` 编码。HTTP 层没有单独的 JSON 转义器。
+4. 客户端断开时，请求任务被取消；正在运行的阻塞工作保留句柄直到安全返回。handler 注册的 `defer request.close()` 在子任务收尾后释放请求，取消不作为数据库错误，也不发送补救响应。`requestGroup` 等子任务结束再交还控制权，监听循环继续接受连接。
 
 [端到端测试](../../tests/http_cli.py)在一个阻塞线程、真实 loopback 和临时 SQLite 下运行 Debug、Release；既测试大响应中途断线后同一实例还能处理请求，也覆盖中文、引号、换行和 NUL 的往返。
 

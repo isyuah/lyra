@@ -9,6 +9,7 @@ async fn observe(target: Task<Unit>): Unit { await target }
 async fn group(child: Task<Unit>): Unit { spawn child; }
 
 async fn handle(request: Request, work: Task<Unit>, probe: Task<Unit>): Unit {
+    defer { request.close(); print("request closed") }
     assert(request.watchDisconnect(), "watch owner disconnect")
     spawn work;
     spawn probe;
@@ -26,20 +27,19 @@ async fn main(): Unit {
     val path = arg(0).value
     val work = blocking {
         val db = openReadOnly(path)
+        defer { assert(db.close().ok(), "close database"); print("database closed") }
         val query = db.prepare("SELECT id FROM rows ORDER BY id")
+        defer { assert(query.close().ok(), "close cursor"); print("cursor closed") }
         assert(query.next().row() && query.readInt(0).value == 7, "first row")
         print("cursor open")
         assert(readLine().value == "continue", "release worker")
         assert(query.next().row() && query.readInt(0).value == 8 && query.next().done(), "cursor still usable")
-        assert(query.close().ok() && db.close().ok(), "close cursor and database")
-        print("cursor closed")
     }
     val probe = observe(work)
     val serving = spawn group(handle(request, work, probe))
     await group(observe(probe))
     print("cancellation observed")
     await serving
-    request.close()
     print("request group closed")
 
     val next = await blocking { server.accept(5000) }
