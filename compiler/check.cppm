@@ -12,20 +12,22 @@ export import lyra.syntax;
 
 export namespace lyra {
 struct Type {
-    enum Kind { Unit, Int, UInt, Real, Bool, String, Char, Bytes, Never, Record, Enum, Variable, Task, CPtr, Option, Result, List, Exception, Closure, Any, Dyn, Error, TaskLocal };
+    enum Kind { Unit, Int, UInt, Real, Bool, String, Char, Bytes, Never, Record, Enum, Variable, Task, CPtr, Option, Result, List, Exception, Closure, Any, Dyn, Error, TaskLocal, Projection };
     Kind kind;
     std::size_t id{};
     constexpr Type(Kind kind = Unit, std::size_t id = 0) : kind(kind), id(id) {}
     auto operator<=>(const Type&) const = default;
 };
-struct Local { Type type; bool writable; std::optional<ExprId> worker{}; bool captured{}; std::optional<Span> declaration{}; };
-enum class Callee { Function, Constructor, Variant, Print, Collect, Sum, ListAdd, TaskCancel, Exception, Indirect, ToReal, ToIntegerChecked, ToString, ToBytes, DecodeUtf8, Dynamic, BusinessError, ErrorSuppress, FailureInfo, LocalKey, LocalGet, WithLocal };
+struct Local { Type type; bool writable; std::optional<ExprId> worker{}; bool captured{}; std::optional<Span> declaration{}; std::string name{}; };
+enum class Callee { Function, Constructor, Variant, Print, Collect, Sum, ListAdd, TaskCancel, Exception, Indirect, ToReal, ToIntegerChecked, ToString, ToBytes, DecodeUtf8, Dynamic, BusinessError, ErrorSuppress, FailureInfo, LocalKey, LocalGet, WithLocal, ExtensionProperty, ReflectTypeName, ReflectFieldCount, ReflectFieldName, ReflectField };
 struct PatternSlot { std::size_t local; };
 struct PatternProduct { bool operator==(const PatternProduct&) const = default; };
+struct CheckedAlternatives {};
+struct CheckedIntegerRange { std::uint64_t lower, upper; bool inclusive, signedValues; };
 struct VariantTag { std::size_t owner; unsigned index; bool operator==(const VariantTag&) const = default; };
 using PatternConstructor = std::variant<SumTag, bool, PatternProduct, VariantTag>;
 struct CheckedPattern {
-    std::variant<std::monostate, PatternSlot, PatternConstructor, std::uint64_t, StringLiteral> node{};
+    std::variant<std::monostate, PatternSlot, PatternConstructor, std::uint64_t, CheckedIntegerRange, CheckedAlternatives, StringLiteral> node{};
     std::vector<CheckedPattern> parts{};
 };
 struct IteratorPlan { std::size_t open, next; };
@@ -48,7 +50,12 @@ struct CheckedEnum { Enumeration syntax; std::vector<std::vector<Type>> payloads
 struct SumTypes { Type success, failure; bool operator==(const SumTypes&) const = default; };
 struct FunctionShape { std::vector<Type> parameters; Type result; bool operator==(const FunctionShape&) const = default; };
 using ConstScalar = std::variant<std::monostate, bool, std::uint64_t, double, std::string>;
-struct CheckedModule { std::deque<CheckedFunction> functions; std::optional<std::size_t> entry; std::deque<CheckedAggregate> aggregates; std::vector<std::string> variableNames; std::vector<Type> taskResults; std::vector<SumTypes> sumTypes; std::vector<Type> listElements; std::deque<FunctionShape> signatures{}; std::deque<CheckedEnum> enums{}; std::vector<NameReference> references{}; std::vector<Trait> traits{}; std::vector<ExceptionType> exceptions{}; std::vector<Type> taskLocalValues{}; std::vector<std::optional<ConstScalar>> constants{}; };
+struct ConstRef { std::size_t index; bool operator==(const ConstRef&) const = default; };
+using ConstValue = std::variant<ConstScalar, ConstRef>;
+using ConstTag = std::variant<std::monostate, SumTag, VariantTag>;
+struct ConstComposite { Type type; ConstTag tag; std::vector<ConstValue> fields; unsigned height{}; };
+struct TypeProjection { Type owner; std::string member; bool operator==(const TypeProjection&) const = default; };
+struct CheckedModule { std::deque<CheckedFunction> functions; std::optional<std::size_t> entry; std::deque<CheckedAggregate> aggregates; std::vector<std::string> variableNames; std::vector<Type> taskResults; std::vector<SumTypes> sumTypes; std::vector<Type> listElements; std::deque<FunctionShape> signatures{}; std::deque<CheckedEnum> enums{}; std::vector<NameReference> references{}; std::vector<Trait> traits{}; std::vector<ExceptionType> exceptions{}; std::vector<Type> taskLocalValues{}; std::vector<std::optional<ConstValue>> constants{}; std::vector<TypeProjection> projections{}; std::deque<ConstComposite> constantComposites{}; };
 std::optional<Type> hiddenType(const CheckedModule& module, Type type);
 CheckedModule check(Module module, const std::vector<Source>& sources, bool requireEntry = true);
 }

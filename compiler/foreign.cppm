@@ -20,7 +20,7 @@ namespace lyra {
 namespace {
 
 bool abiType(Type type) {
-    return numericType(type) || type == Type::Bool || type == Type::String || type == Type::CPtr;
+    return numericType(type) || type == Type::Bool || type == Type::String || type == Type::Bytes || type == Type::CPtr;
 }
 
 llvm::Type* cType(Type type, llvm::IRBuilder<>& builder) {
@@ -29,7 +29,7 @@ llvm::Type* cType(Type type, llvm::IRBuilder<>& builder) {
         case Type::Real: return numberWidth(type) == 32 ? builder.getFloatTy() : builder.getDoubleTy();
         case Type::Bool: return builder.getInt8Ty();
         case Type::Unit: return builder.getVoidTy();
-        case Type::CPtr: case Type::String: return builder.getPtrTy();
+        case Type::CPtr: case Type::String: case Type::Bytes: return builder.getPtrTy();
         default: llvm_unreachable("unsupported foreign ABI type");
     }
 }
@@ -46,7 +46,7 @@ void validateForeign(const CheckedFunction& fn, const Source& source) {
     const auto& symbol = *fn.syntax.foreignSymbol;
     if (symbol.text == "main" || symbol.text == "wmain" || symbol.text.starts_with("llvm.")) throw at(source, symbol.span, "LYF0001", "不能绑定此保留 C 符号：" + symbol.text);
     for (std::size_t slot = 0; slot < fn.syntax.parameters.size(); ++slot) {
-        if (!abiType(fn.locals[slot].type)) throw at(source, fn.syntax.parameters[slot].type.span, "LYF0001", "extern 形参只支持数值、Bool、String 句柄或 CPtr");
+        if (!abiType(fn.locals[slot].type)) throw at(source, fn.syntax.parameters[slot].type.span, "LYF0001", "extern 形参只支持数值、Bool、String 或 Bytes 句柄，以及 CPtr");
     }
     if (fn.result != Type::Unit && !abiType(fn.result)) throw at(source, fn.syntax.result.span, "LYF0001", "此返回类型没有可用的 C ABI");
 }
@@ -70,16 +70,16 @@ void emitForeign(const CheckedFunction& fn, const Source& source, llvm::Function
     builder.SetInsertPoint(llvm::BasicBlock::Create(module.getContext(), "ffi", &wrapper));
     std::vector<llvm::Type*> parameters;
     std::vector<llvm::Value*> values;
-    std::vector<llvm::AllocaInst*> stringRoots;
+    std::vector<llvm::AllocaInst*> borrowedRoots;
     for (auto& argument : wrapper.args()) {
         auto type = fn.locals[argument.getArgNo()].type;
         auto raw = cType(type, builder);
         parameters.push_back(raw);
         values.push_back(type == Type::Bool ? builder.CreateZExt(&argument, raw) : &argument);
-        if (type == Type::String) {
-            auto root = builder.CreateAlloca(raw, nullptr, "borrowed.string");
+        if (type == Type::String || type == Type::Bytes) {
+            auto root = builder.CreateAlloca(raw, nullptr, "borrowed.buffer");
             builder.CreateStore(&argument, root, true);
-            stringRoots.push_back(root);
+            borrowedRoots.push_back(root);
         }
     }
     const auto& symbol = *fn.syntax.foreignSymbol;
@@ -92,7 +92,7 @@ void emitForeign(const CheckedFunction& fn, const Source& source, llvm::Function
         result->addParamAttr(slot, attr);
     }
     if (auto attr = extension(fn.result); attr != llvm::Attribute::None) { foreign->addRetAttr(attr); result->addRetAttr(attr); }
-    for (auto root : stringRoots) builder.CreateLoad(builder.getPtrTy(), root, true);
+    for (auto root : borrowedRoots) builder.CreateLoad(builder.getPtrTy(), root, true);
     if (fn.result == Type::Unit) builder.CreateRet(builder.getInt8(0));
     else if (fn.result == Type::Bool) builder.CreateRet(builder.CreateIsNotNull(result));
     else builder.CreateRet(result);

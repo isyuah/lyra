@@ -6,7 +6,18 @@ Lyra 是一门使用 LLVM AOT 的编译型语言。编译器把通过静态检�
 
 ## 用预编译 SDK 新建项目
 
-在 Ubuntu 22.04 x86-64 的构建机上准备 Clang/LLVM 18.1、系统 C 链接环境和 `libsqlite3-dev`（当前链接命令使用 `-lsqlite3`）。这个 SDK 链接 Jammy 的 `libLLVM-18.so.18.1`；Ubuntu 24.04 使用下节的源码构建，应用的部署不受编译器动态库名称影响。拿到 SDK 后，在压缩包所在目录执行：
+**Windows x64：** 准备 x64 Visual C++ Redistributable、Clang、LLD 和 Visual Studio C++ Build Tools（含 Windows SDK）。只使用预编译 SDK 时不需要 LLVM 开发头和 CMake。打开 x64 Developer PowerShell，进入压缩包所在目录：
+
+```powershell
+Expand-Archive lyra-0.1.0-alpha.1-windows-x64.zip -DestinationPath .
+$lyra = Resolve-Path 'lyra-0.1.0-alpha.1-windows-x64/bin/lyra.exe'
+& $lyra new hello
+& $lyra lock hello --offline
+& $lyra test hello --locked --offline
+& $lyra run hello --release --locked --offline
+```
+
+**Ubuntu 22.04 x86-64：** 构建机需有 Clang/LLVM 18.1、系统 C 链接环境和 `libsqlite3-dev`。SDK 使用 Jammy 的 `libLLVM-18.so.18.1`；Ubuntu 24.04 使用下节的源码构建。进入压缩包所在目录：
 
 ```sh
 tar -xzf lyra-0.1.0-alpha.1-ubuntu22.04-x86_64.tar.gz
@@ -17,7 +28,7 @@ lyra test hello --locked --offline
 lyra run hello --release --locked --offline
 ```
 
-测试运行项目自带的 `tests/answer.ly`，最后一条命令打印 `42`。编译好的 `hello/build/release/app` 可以单独复制到兼容的 Linux 服务器运行。用 `lyra new mylib --lib` 创建的库同样带一条可运行的测试。
+测试运行项目自带的 `tests/answer.ly`，最后一条命令打印 `42`。部署时只需分发 `hello/build/release/app.exe`（Windows）或 `hello/build/release/app`（Linux）。用 `lyra new mylib --lib` 创建的库同样带一条可运行的测试。[原生工具链 RFC](rfc/native-toolchain.md#打包与复验-sdk)提供 SDK 打包和验收命令。
 
 ## 从源码构建
 
@@ -26,7 +37,7 @@ lyra run hello --release --locked --offline
 ```powershell
 $lyra = Resolve-Path 'build/windows-release/bin/lyra.exe'
 & $lyra new '中文 项目' --name hello
-& $lyra check '中文 项目' --offline
+& $lyra lock '中文 项目' --offline
 & $lyra test '中文 项目' --locked --offline
 & $lyra build '中文 项目' --release --locked --offline
 & './中文 项目/build/release/app.exe'
@@ -45,7 +56,7 @@ build/dev/bin/lyra build examples/compiler-smoke/pass --release
 examples/compiler-smoke/pass/build/release/app
 ```
 
-`check .../fail` 预期非零退出，在 `;` 处报告 `LYT0001`；最后一条命令应打印 `3` 并正常退出。要构建优化版编译器，把三个 preset 命令中的 `dev` 换成 `release`。用 `cmake --install build/dev --prefix <目录>` 安装工具链，搬迁时整体复制前缀，包含 `bin/`、`lib/`、`share/` 和给 C 适配器使用的 `include/`。首次构建需要构建机上的 GC、libuv、SQLite、Jansson 开发包；CMake 下载并校验固定版本的 llhttp，已有源码时可设 `-DLYRA_LLHTTP_SOURCE_DIR=...` 离线配置。部署**编译好的应用**只需复制产物到约定的 Linux 环境，不用带工具链。
+`check .../fail` 预期非零退出，在 `;` 处报告 `LYT0001`；最后一条命令应打印 `3` 并正常退出。要构建优化版编译器，把三个 preset 命令中的 `dev` 换成 `release`。用 `cmake --install build/dev --prefix <目录>` 安装工具链，搬迁时整体复制前缀，包含 `bin/`、`lib/`、`share/` 和给 C 适配器使用的 `include/`。首次构建需要构建机上的 GC、libuv、SQLite、Jansson 开发包；CMake 下载并校验固定版本的 llhttp 与 tomlc17。离线配置可分别传 `-DLYRA_LLHTTP_SOURCE_DIR=...` 和 `-DFETCHCONTENT_SOURCE_DIR_LYRA_TOMLC17=...` 指定已准备的源码。部署**编译好的应用**只需复制产物到约定的 Linux 环境，不用带工具链。
 
 ### 试跑一个完整项目
 
@@ -65,10 +76,12 @@ printf '%s\n' '{"station":"东区","delta":7}' '{"station":"西区","delta":-2}'
 lyra --version
 lyra new <目录> [--name <包名>] [--lib]
 lyra check|build|run|test <包目录> [--locked] [--offline] [--diagnostics=json]
-lyra build <包目录> [-o <产物>] [--release]
+lyra build <包目录> [-o <产物>] [--release] [--debug-info]
 lyra run <包目录> [--release] [-- <程序参数>...]
 lyra lock|fetch <目录> [--locked] [--offline]
 lyra pack <目录> [-o <源码包>|--registry <本地目录>]
+lyra lsp --stdio
+lyra fmt [--check] <文件.ly>...
 ```
 
 - `lyra.json5` 包中一个目录组成一个模块。`import self.net.port` 从本包导入，`import cfg.defaultPort as port` 从清单中简称为 `cfg` 的库导入。默认私有，`pub import` 可重导出。无清单的单模块冒烟样例只读取 `src` 直属文件。库包可独立 `check`，无需 `main`。
@@ -80,20 +93,26 @@ lyra pack <目录> [-o <源码包>|--registry <本地目录>]
 - [实例方法](rfc/language-core.md#实例方法与静态方法)不用声明接收者：`fn label(): String { name }` 可直接读字段，同名参数遮蔽时写 `this.name`。类函数声明为 `static fn`，用 `User.make(...)` 调用，无需对象实例。
 - 字段可以写 `pub val name: String? = "guest"`。省略构造实参或解码缺少该键的 JSON 对象时都会求同一个默认值。显式传入 `None` 或解码 JSON 的 `null` 都会保留空值。
 - 泛型函数 `fn identity<T>(value: T): T { value }` 可写 `identity(42)` 或 `identity<String>("Ada")`。Struct、Class 和方法也可带类型形参，例如 `class Cell<Item>(var value: Item)` 与 `Cell("Ada")`。未调用的泛型也检查函数体，具体类型组合各自生成原生实现。
-- `fn draw<T: Render>(item: T)` 可调用 `trait Render` 要求的方法。业务类型有可见、签名匹配的方法即可，不用声明 `implements`。结构检查发生在编译时，见[泛型与接口](rfc/generics-and-interfaces.md)。
+- `fn draw<T: Render & Identifiable>(item: T)` 可调用两个 trait 要求的方法。业务类型有可见、签名匹配的方法即可，不用声明 `implements`。trait 可声明 `type Item`，实现类型提供 `pub type Item = String`，泛型中用 `T.Item` 引用。见[泛型与接口](rfc/generics-and-interfaces.md)。
 - [函数值与闭包](compiler/closures.md)可以返回、传参或存入集合。`apply(4) { it * 2 }` 把尾块传给末尾的固定函数形参；闭包共享被捕获的绑定，跨 `await`、GC 后仍可调用，`return` 和 `?` 只退出最近的 lambda。
 - [列表和变长参数](compiler/collections.md)支持 `[1, 2]`、按下标读写、`.size`、`.add(value)`、参数默认值、`fn sum(values: Int...)`。`sum(...ids)` 展开元素；函数收到本次调用自己的列表，更改槽位不影响调用方。如果元素是对象引用，引用的仍是同一个对象。
-- `Option<T>`（简写 `T?`）和 `Result<T,E>` 支持嵌套和 `?` 提前返回。可用 [`enum`](rfc/language-core.md#封闭枚举与匹配) 定义带位置或命名载荷的分支。`match` 要求穷尽，支持嵌套分支、字面量、按名解构 Struct，以及 `Some(x) if x > 0 => x` 形式的守卫。
+- `Option<T>`（简写 `T?`）和 `Result<T,E>` 支持嵌套和 `?` 提前返回。可用 [`enum`](rfc/language-core.md#封闭枚举与匹配) 定义带位置或命名载荷的分支。`match` 要求穷尽，支持嵌套解构、`A(x) | B(x)`、整数范围和 `Some(x) if x > 0 => x` 形式的守卫。
 - `for value in values` 遍历列表，或通过可见的同步 `iterator()`、`next(): Option<T>` 遍历自定义集合。整数循环可写 `for i in 0..<count`（不包含 `count`）或 `for i in 1..count`（包含 `count`）。`user?.name ?? "unknown"` 只在接收者有值时访问成员，只在结果为空时计算兜底表达式。
-- [std.collections](std/collections/README.md) 提供普通泛型函数 `map`、`filter` 和 `fold`，例如 `map(values) { it * 2 }`。`HashMap` 和 `HashSet` 可直接用 `for` 遍历进入循环时的快照。
+- [std.collections](std/collections/README.md) 提供 `map`、`filter`、`fold`、`any` 和 `find`；导入扩展组 `ListOps` 后可链式调用。`HashMap` 和 `HashSet` 可直接用 `for` 遍历进入循环时的快照。
 - 在源或目标类型的定义模块写 `implicit (user: User): Response { ... }`，即可在需要 `Response` 时直接传入或返回 `User`。不同具体错误之间的 `?` 也用同一种直接转换；不额外声明 trait、不串接转换，两端各有一条可见转换时在使用处报歧义。
 - `async fn` 调用返回冷 `Task<T>`；`await` 在需要时启动，重复等待复用结果，`spawn` 在同一串行域调度。`await blocking { ... }` 把同步工作交给有界线程池，不占住当前域；跨挂起点存活的局部值由 GC 扫描。`async fn main(): Result<Unit,String>` 的 `Err` 打印到 stderr 并以非零状态退出。见[异步实现说明](runtime/managed-tasks.md)。
+- `taskGroup` 等待孩子收尾；`parallel` 和 [`parallelFor`](std/collections/README.md#有界并行遍历) 可在多个 OS 线程上同时执行。用 `LYRA_PARALLEL_WORKERS` 调整 CPU Worker 数，复合共享更新可用 [std.sync](std/sync/README.md) 的锁和原子操作。
 - 普通异常写 `throw Exception("reason")`，用 `try { ... } catch e: Exception { ... }` 或 `catch { ... }` 捕获。`defer` 在退出当前块时倒序清理；取消独立于异常。使用 [std.task](std/task/README.md) 给一棵任务树设置 trace 或 deadline，不需要逐层传 `context`。
 - `extern fn` 通过 C ABI 调用原生函数。可用 `--link` 指定 Linux 的 `.o`、`.a`、`.so`，或 Windows MSVC ABI 的 `.obj`、静态库或导入库 `.lib`。从工具链 `include/` 引入 `<lyra/string.h>` 可按字节读取 `String`。随工具链安装的 [std.io](std/io/README.md) 可读参数、标准流和文件；[std.sqlite](std/sqlite/README.md) 提供预编译语句。Linux 使用 SQLite 的应用需要 `libsqlite3.so.0`，Windows 由 SDK 静态链接 SQLite。
 - [std.json](std/json/README.md) 支持显式 `#derive(Json)`，派生器本身是 [Lyra 宏](std/meta/README.md)。用 [std.http](std/http/README.md) 可以运行[真实 HTTP/SQLite 查询服务](examples/http-sqlite/README.md)，无需 VM 或外部 Web 服务器。
+- [std.toml](std/toml/README.md) 同样用显式 `#derive(Toml)` 生成 TOML 编解码器，严格拒绝未知字段，可用显式入口放宽；别名、默认值、嵌套表和数组表均有端到端验收。日期时间目前解析为 TOML 专用值，业务类型需要手写映射。
+- `const` 可调用纯同步函数并预计算复合值，`pub const` 可跨包导入。编译期求值范围与预算见[元编程 RFC](rfc/metaprogramming-data.md#编译期常量)。[std.reflect](std/reflect/README.md) 可显式读取 `Any` 的类型名及公开 Struct/Class 字段；它与静态 JSON/TOML 派生相互独立。
 - 形参和字段可带 `[path]`、`[query("tag")]` 等编译期标记；声明宏据此生成包装函数。表达式宏 `#name(...)` 可以校验显式授予的快照，再把调用者实参拼进普通的类型检查；无需运行时反射或联网。
 - [JSON Lines 统计 CLI](examples/jsonlines/README.md) 是可直接运行的双包项目：公开库解码，命令行逐行统计，错误带行号。验收会实际发布库、移走源码和中心，再从锁和缓存重新原生编译。
-- `check` 不调用 Clang、不创建产物。`build` 默认输出 `<包目录>/build/debug/app`（`-O0`），`--release` 输出 `build/release/app`（`-O2`），Windows 的程序名为 `app.exe`。`-o` 指定完整目标路径，Windows 上给可执行文件显式写 `.exe`。类型错误或链接失败都不会覆盖已有产物。
+- `check` 不调用 Clang、不生成原生产物。`build` 默认输出 `<包目录>/build/debug/app`（`-O0`，含源码级调试信息），`--release` 输出 `build/release/app`（`-O2`），`--release --debug-info` 保留优化版符号。Windows 的程序名为 `app.exe`，有符号时另生成同名 `.pdb`。构建按 LLVM IR、目标、Clang 版本和编译选项缓存原生目标文件；每次仍进行类型检查与链接。缓存默认位于输出目录下的 `.lyra-cache/objects`，`LYRA_CACHE` 可指定共享缓存根；缺失、损坏或不可用时照常编译。`-o` 指定完整目标路径；类型错误或链接失败不会覆盖已有产物。
+- 设置 `LYRA_NATIVE_BACKTRACE=1` 会在未捕获异常的 Lyra 源码链后显示原生帧。见[调试原生程序](rfc/native-toolchain.md#调试原生程序)。
+- `lyra lsp --stdio` 提供基于同一 parser/checker 的 VS Code 语言服务，支持未保存缓冲区诊断、补全、悬停、定义、引用、重命名及格式化。扩展在 `editors/vscode/`，通过 `lyra.serverPath` 或 `PATH` 找到 SDK；服务端只读解析已有依赖，不下载包或执行准备脚本。LSP 行列使用 UTF-16，编译器诊断仍保留 UTF-8 字节范围。
+- `lyra fmt` 整理显式传入的 `.ly` 文件，`--check` 只检查不写入。首版整理缩进和 token 之外的行尾空白，不重排语句或改动字面量、注释内容和原有换行；无需解析包或展开宏。
 - 诊断写到标准错误；`--diagnostics=json` 输出诊断数组，成功为 `[]`。带源码位置时，`range.start/end` 是左闭右开区间：`offset` 为从 0 开始的原文件 UTF-8 字节偏移，`line/column` 从 1 开始，列按 Unicode 码点计，CRLF 和 LF 均算一次换行。
 
 ## 验证 Ubuntu 22.04 部署

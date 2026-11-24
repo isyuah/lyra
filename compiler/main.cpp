@@ -1,7 +1,9 @@
 #include <algorithm>
+#include <cstdio>
 #include <filesystem>
 #include <iostream>
 #include <optional>
+#include <ranges>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -14,6 +16,8 @@
 
 import lyra.build;
 import lyra.check;
+import lyra.format;
+import lyra.lsp;
 import lyra.modules;
 import lyra.packages;
 import lyra.platform;
@@ -23,9 +27,11 @@ using namespace lyra;
 
 namespace {
 constexpr auto usage = "lyra --help | --version\n"
+                       "lyra lsp --stdio\n"
+                       "lyra fmt [--check] <文件.ly>...\n"
                        "lyra new <目录> [--name <包名>] [--lib]\n"
                        "lyra check|build|run|test <包目录> [--locked] [--offline] [--diagnostics=json]\n"
-                       "lyra build <包目录> [-o <产物>] [--release] [--link <C库>] | run <包目录> [--release] [--link <C库>] [-- <程序实参>...]\n"
+                       "lyra build <包目录> [-o <产物>] [--release] [--debug-info] [--link <C库>] | run <包目录> [--release] [--debug-info] [--link <C库>] [-- <程序实参>...]\n"
                        "lyra lock|fetch <目录> [--locked] [--offline] | lock <目录> --update\n"
                        "lyra pack <目录> [-o <源码包>|--registry <本地目录>]";
 
@@ -34,7 +40,7 @@ struct Options {
     fs::path directory;
     std::optional<fs::path> output;
     PackageOptions packages{};
-    bool release{};
+    NativeBuildOptions native{};
     std::vector<std::string_view> arguments{};
     std::vector<fs::path> libraries{};
 };
@@ -43,12 +49,13 @@ Options options(const std::vector<std::string_view>& args, const std::vector<std
     auto command = args.front();
     if (command != "check" && command != "build" && command != "run" && command != "test") throw Diagnostic{"LYC0001", usage};
     if (separator && command != "run") throw Diagnostic{"LYC0001", usage};
-    Options result{command, {}, {}, {}, false, arguments};
+    Options result{command, {}, {}, {}, {}, arguments};
     for (std::size_t index = 1; index < args.size(); ++index) {
         auto arg = args[index];
         if (arg == "--locked" && !result.packages.locked) result.packages.locked = true;
         else if (arg == "--offline" && !result.packages.offline) result.packages.offline = true;
-        else if (arg == "--release" && command != "check" && !result.release) result.release = true;
+        else if (arg == "--release" && command != "check" && !result.native.release) result.native.release = true;
+        else if (arg == "--debug-info" && command != "check" && !result.native.debugInfo) result.native.debugInfo = true;
         else if (arg == "-o" && command == "build" && !result.output && index + 1 < args.size() && !args[index + 1].starts_with('-')) result.output = fromUtf8(args[++index]);
         else if (arg == "--link" && command != "check" && index + 1 < args.size() && !args[index + 1].starts_with('-')) {
             auto path = fs::absolute(fromUtf8(args[++index]));
@@ -78,12 +85,12 @@ int compile(const Options& opts, Compilation program, bool library, fs::path out
     if (fs::exists(output)) for (const auto& input : program.macroInputs) {
         if (fs::equivalent(input, output)) throw Diagnostic{"LYI0001", "输出路径不能覆盖宏或其只读输入：" + pathText(output)};
     }
-    build(module, program.sources, output, opts.release, opts.libraries);
+    build(module, program.sources, output, opts.native, opts.libraries);
     return opts.command == "build" ? 0 : execute(output, opts.arguments);
 }
 
 int project(const Options& opts, bool json) {
-    auto binary = [&](const fs::path& root) { return opts.output.value_or(executablePath(root / "build" / (opts.release ? "release" : "debug") / "app")); };
+    auto binary = [&](const fs::path& root) { return opts.output.value_or(executablePath(root / "build" / (opts.native.release ? "release" : "debug") / "app")); };
     if (!fs::exists(opts.directory / "lyra.json5")) {
         if (opts.packages.locked || opts.packages.offline || opts.command == "test") throw Diagnostic{"LYK0001", "此操作需要包清单 lyra.json5"};
         auto sources = loadSources(opts.directory);
@@ -118,7 +125,7 @@ int project(const Options& opts, bool json) {
             auto program = loadProgram(graph, id, path);
             auto name = path.stem();
             if constexpr (windows) name += ".exe";
-            auto output = package.root / "build" / "test" / (opts.release ? "release" : "debug") / name;
+            auto output = package.root / "build" / "test" / (opts.native.release ? "release" : "debug") / name;
             int status = compile(opts, std::move(program), false, output);
             if (status) throw Diagnostic{"LYC0003", pathText(path) + " 测试退出码：" + std::to_string(status)};
             ++tests;
@@ -126,6 +133,19 @@ int project(const Options& opts, bool json) {
         }
     }
     if (opts.command == "test" && !tests) throw Diagnostic{"LYC0003", "没有找到 tests/*.ly 测试入口"};
+    return 0;
+}
+
+int format(const std::vector<std::string_view>& args) {
+    std::vector<fs::path> files;
+    bool checkOnly = false;
+    for (auto arg : std::views::drop(args, 1)) {
+        if (arg == "--check" && !checkOnly) checkOnly = true;
+        else if (!arg.empty() && !arg.starts_with('-')) files.push_back(fs::absolute(fromUtf8(arg)));
+        else throw Diagnostic{"LYC0001", usage};
+    }
+    if (files.empty()) throw Diagnostic{"LYC0001", usage};
+    for (const auto& file : files) formatFile(file, checkOnly);
     return 0;
 }
 
@@ -139,8 +159,12 @@ int run(std::vector<std::string_view> args) {
         if (args.size() == 1 && args[0] == "--version" && !forwards) { std::cout << "lyra " LYRA_TOOLCHAIN_VERSION "\n"; return 0; }
         if (args.size() == 1 && args[0] == "--help") { std::cout << usage << '\n'; return 0; }
         if (args.empty()) throw Diagnostic{"LYC0001", usage};
+        if (args.size() == 2 && args[0] == "lsp" && args[1] == "--stdio" && !forwards && !json) return languageServer();
         int code;
-        if (args[0] == "new" || args[0] == "lock" || args[0] == "fetch" || args[0] == "pack") {
+        if (args[0] == "fmt") {
+            if (forwards) throw Diagnostic{"LYC0001", usage};
+            code = format(args);
+        } else if (args[0] == "new" || args[0] == "lock" || args[0] == "fetch" || args[0] == "pack") {
             if (forwards) throw Diagnostic{"LYC0001", usage};
             code = packageCommand(args);
         } else code = project(options(args, arguments, forwards), json);

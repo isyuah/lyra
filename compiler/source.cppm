@@ -1,6 +1,7 @@
 module;
 #include <cstddef>
 #include <filesystem>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -22,7 +23,7 @@ struct SourceAnchor {
     bool operator==(const SourceAnchor&) const = default;
 };
 
-struct NameReference { SourceAnchor use, declaration; };
+struct NameReference { SourceAnchor use, declaration; std::optional<SourceAnchor> renameTarget{}; };
 
 struct Position {
     std::size_t offset, line, column;
@@ -35,7 +36,9 @@ struct Site {
     std::size_t lineStartOffset;
 };
 
+
 struct SourcePiece { Span output, input; bool copied; std::size_t hygiene; };
+using SourceOverlay = std::map<std::filesystem::path, std::string>;
 
 struct Source {
     std::filesystem::path path;
@@ -63,7 +66,7 @@ struct Diagnostic {
 Diagnostic at(const Source& source, Span span, std::string code, std::string message);
 void report(const Diagnostic& error, bool json);
 std::vector<Source> loadSources(const std::filesystem::path& package);
-Source loadSource(const std::filesystem::path& path, std::string moduleId);
+Source loadSource(const std::filesystem::path& path, std::string moduleId, const SourceOverlay* overlay = nullptr);
 Source sourceText(const std::filesystem::path& path, std::string text, std::string moduleId);
 
 }

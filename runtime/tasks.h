@@ -22,6 +22,7 @@ typedef enum LyraTaskState {
 typedef enum LyraAwaitStatus { LYRA_AWAIT_PENDING, LYRA_AWAIT_VALUE, LYRA_AWAIT_EXCEPTION } LyraAwaitStatus;
 
 LyraDomain *lyraDomainCreate(void);
+int64_t lyraTaskParallelism(void);
 size_t lyraDomainRun(LyraDomain *domain);
 void lyraDomainDestroy(LyraDomain *domain);
 

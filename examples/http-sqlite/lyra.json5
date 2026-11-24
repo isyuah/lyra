@@ -1,4 +1,5 @@
 {
-  name: 'example/http-sqlite', version: '0.1.0',
-  macroInputs: { userQuery: { schema: 'inputs/schema.sql', snapshot: 'inputs/userById.snapshot' } },
+  name: 'example/http-sqlite', version: '0.1.0', kind: 'app',
+  workspace: { members: ['users'] },
+  dependencies: { users: { name: 'example/users', version: '^0.1.0', path: 'users' } },
 }

@@ -103,6 +103,171 @@ pub fn relay<T: Render>(value: T): String { draw(value) }''')
         self.program(header + 'struct Wrong {}\nfn main(): Unit { val callback: (Wrong) -> String = draw }')
         self.rejects('LYG0005', 'render', 'draw')
 
+    def test_multiple_structural_bounds_merge_forward_and_reject_conflicts(self):
+        self.program('''
+            trait Readable { fn read(): String }
+            trait Labelled { fn label(): String }
+            trait Renderable { fn render(): String }
+            trait Printable { fn render(): String }
+            struct Entry(val text: String) {
+                fn read(): String { text }
+                fn label(): String { "entry" }
+                fn render(): String { text }
+            }
+            fn render<T: Readable & Labelled & Renderable & Printable>(value: T): String {
+                value.label() + ":" + value.read() + ":" + value.render()
+            }
+            fn relay<T: Readable & Labelled & Renderable & Printable>(value: T): String { render(value) }
+            fn main(): Unit { print(relay(Entry("Ada"))) }
+        ''')
+        self.run_native('entry:Ada:Ada\n')
+
+        self.program('''
+            trait AsText { fn render(): String }
+            trait AsNumber { fn render(): Int }
+            fn ambiguous<T: AsText & AsNumber>(value: T): String { value.render() }
+            fn main(): Unit {}
+        ''')
+        self.rejects('LYG0006', '冲突', 'render')
+
+        self.program('''
+            trait Readable { fn read(): String }
+            trait Labelled { fn label(): String }
+            fn render<T: Readable & Labelled>(value: T): String { value.label() + value.read() }
+            struct Incomplete { fn read(): String { "read" } }
+            fn main(): Unit { print(render(Incomplete())) }
+        ''')
+        self.rejects('LYG0005', 'Labelled', 'render')
+
+    def test_associated_types_specialize_across_modules(self):
+        (self.package / 'lyra.json5').write_text('{name:"demo",version:"0.1.0"}')
+        library = self.package / 'src/data'
+        library.mkdir()
+        (library / 'reader.ly').write_text('''
+pub trait Reader { type Item; fn read(): Item }
+pub struct TextReader(pub val text: String) {
+    pub type Item = String
+    pub fn read(): String { text }
+}
+pub struct NumberReader(pub val value: Int) {
+    pub type Item = Int
+    pub fn read(): Int { value }
+}
+pub fn readValue<T: Reader>(reader: T): T.Item { reader.read() }
+pub fn pair<T: Reader>(reader: T, other: T.Item): List<T.Item> { [reader.read(), other] }
+''')
+        self.program('''
+            import self.data.Reader as Readable
+            import self.data.TextReader
+            import self.data.NumberReader
+            import self.data.readValue
+            import self.data.pair
+            class Box<Value>(pub val item: Value) {
+                pub type Item = Value
+                pub fn read(): Value { item }
+            }
+            fn readAlias<T: Readable>(reader: T) { readValue(reader) }
+            fn main(): Unit {
+                val text: String = readValue(TextReader("Ada"))
+                val alias: String = readAlias(Box("Grace"))
+                val names: List<String> = pair(TextReader("Ada"), "Lovelace")
+                val numbers: List<Int> = pair(NumberReader(7), 8)
+                print(text + ":" + alias + ":" + names[0] + ":" + names[1])
+                print(numbers[0] + numbers[1])
+            }
+        ''')
+        self.run_native('Ada:Grace:Ada:Lovelace\n15\n')
+
+    def test_generic_extension_properties_across_modules(self):
+        (self.package / 'lyra.json5').write_text('{name:"demo",version:"0.1.0"}')
+        library = self.package / 'src/data'
+        library.mkdir()
+        (library / 'views.ly').write_text('''
+pub extension ListView<T> for List<T> {
+    val first: T get() { this[0] }
+}
+''')
+        self.program('''
+            import self.data.ListView
+            struct Entry(val value: Int)
+            extension EntryView for Entry {
+                val value: Int get() { 999 }
+            }
+            fn make(): List<Int> { print("make"); [7, 8] }
+            fn main(): Unit {
+                print(make().first)
+                print(Entry(3).value)
+            }
+        ''')
+        self.run_native('make\n7\n3\n')
+
+    def test_extension_property_rejects_write_and_ambiguous_groups(self):
+        self.program('''
+            struct Entry(val value: Int)
+            extension EntryView for Entry { val doubled: Int get() { value * 2 } }
+            fn main(): Unit { Entry(2).doubled = 4 }
+        ''')
+        self.rejects('LYT0004', '不能给此位置赋值', 'Entry(2).doubled')
+
+        self.program('''
+            struct Entry(val value: Int)
+            extension FirstView for Entry { val label: String get() { "first" } }
+            extension SecondView for Entry { val label: String get() { "second" } }
+            fn main(): Unit { print(Entry(2).label) }
+        ''')
+        self.rejects('LYT0019', '扩展属性存在歧义', 'label')
+
+        (self.package / 'lyra.json5').write_text('{name:"demo",version:"0.1.0"}')
+        library = self.package / 'src/data'
+        library.mkdir()
+        (library / 'model.ly').write_text('''
+pub struct Entry(val secret: Int)
+pub extension EntryView for Entry { val secret: Int get() { 999 } }
+pub fn makeEntry(): Entry { Entry(2) }
+''')
+        self.program('''
+            import self.data.Entry
+            import self.data.EntryView
+            import self.data.makeEntry
+            fn main(): Unit { print(makeEntry().secret) }
+        ''')
+        self.rejects('LYN0003', '模块私有', 'secret')
+
+    def test_associated_types_reject_missing_private_cyclic_and_dynamic_implementations(self):
+        (self.package / 'lyra.json5').write_text('{name:"demo",version:"0.1.0"}')
+        library = self.package / 'src/data'
+        library.mkdir(parents=True)
+        (library / 'reader.ly').write_text('''pub trait Reader { type Item; fn read(): Item }
+pub fn readValue<T: Reader>(reader: T): T.Item { reader.read() }''')
+        self.program('''
+            import self.data.readValue
+            struct Missing { pub fn read(): String { "missing" } }
+            fn main(): Unit { print(readValue(Missing())) }
+        ''')
+        self.rejects('LYG0005', 'Item', 'readValue')
+        self.program('''
+            import self.data.readValue
+            struct Hidden { type Item = String; pub fn read(): String { "hidden" } }
+            fn main(): Unit { print(readValue(Hidden())) }
+        ''')
+        self.rejects('LYG0005', 'Item', 'readValue')
+        self.program('''
+            import self.data.readValue
+            struct Wrong { pub type Item = String; pub fn read(): Int { 0 } }
+            fn main(): Unit { print(readValue(Wrong())) }
+        ''')
+        self.rejects('LYG0005', 'Int', 'readValue')
+        self.program('''
+            struct Loop { pub type Item = Loop.Item }
+            fn main(): Unit {}
+        ''')
+        self.rejects('LYG0007', '循环', 'Loop.Item')
+        self.program('''
+            trait Reader { type Item; fn read(): Item }
+            fn main(): Unit { val reader: dyn Reader = None }
+        ''')
+        self.rejects('LYG0007', '静态约束', 'dyn Reader')
+
     def test_async_structural_method_preserves_cold_task(self):
         self.program('''trait Fetch { async fn read(): Int }
             struct Store { async fn read(): Int { print("started"); 7 } }

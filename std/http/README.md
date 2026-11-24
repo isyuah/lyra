@@ -2,16 +2,25 @@
 
 ```text
 import std.http.listen
-fn main(): Unit {
+import std.http.Router
+import std.http.Request
+import std.http.Response
+async fn hello(request: Request): Response {
+    val name = request.path("name") ?? ""
+    Response.text(200, "你好 " + name)
+}
+async fn main(): Unit {
     val server = listen(8080)
     if server.status() != 0 { return }
-    val request = server.accept(5000)
-    if request.status() == 0 { request.respond(200, "text/plain; charset=utf-8", "你好"); }
-    server.close()
+    val router = Router()
+    router.get("/hello/{name}", (request: Request) => { hello(request) })
+    await router.serve(server, 4)
 }
 ```
 
-`listen(0)` 绑定 `127.0.0.1` 的临时端口，`port()` 读取实际值。`accept(timeoutMs)` 是同步操作，超时覆盖等待连接及读完整请求。`status()` 为零表示可用，失败带本平台的网络或 I/O 错误码。`target()` 保留请求目标和查询串；`pathInt(prefix, fallback)` 解析指定前缀后一个非负十进制参数，自动忽略查询串。`body()` 是经过 UTF-8 验证的文本，可含 NUL，支持分块传输。
+`listen(0)` 绑定 `127.0.0.1` 的临时端口，`port()` 读取实际值。`accept(timeoutMs)` 是同步操作，超时覆盖等待连接及读完整请求；`Router.serve(listener, capacity)` 则用固定接收槽并发处理路由，capacity 必须在 1..64。`status()` 为零表示可用，失败带本平台的网络或 I/O 错误码。`target()` 保留请求目标和查询串；`path(name)` 读取路由模板中的解码字符串，`pathInt(name)` 返回 `Result<Int?, String>`，可区分未绑定与非整数或越界。旧的 `pathInt(prefix, fallback)` 只供无路由旧式处理器。`body()` 是经过 UTF-8 验证的文本，可含 NUL，支持分块传输。
+
+`Router.get/post(pattern, handler)` 走同一注册、路径匹配和分派 API。固定形参 handler 的 path/query/body 适配可由 `#post("/teams/{id}")` 生成，并显式调用生成的 `<function>Route(router)` 挂载；请求字段以 `[path]`、`[query("tag")]` 和 `[body]` 声明。路径支持 `Int`/`String`，单值 query 要求恰好一次，`List<String>` query 保留重复项及出现顺序；body 要求同模块可见的 `jsonCodec<Type>()`，或 `[body("codecFactory")]` 指定的零参数工厂。不满足参数契约或解码失败回 400，不调用业务函数。
 
 一条 TCP 连接一个 HTTP 请求。请求线、头部和传输体总计最多 256 KiB，目标最多 8 KiB，解码后正文最多 128 KiB；超限回 `413`，格式或文本非法回 `400`。`respond()` 发送状态、Content-Type、Content-Length 和正文后关闭连接，返回零或 `errno`；`close()` 可显式放弃或释放。同一 `Listener` 或 `Request` 的同步操作应串行调用。没有 TLS、HTTP/2 或长连接。
 

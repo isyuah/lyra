@@ -16,7 +16,7 @@ function(lyra_windows_runtime runtime)
         install(FILES "${dependencies}/share/${port}/copyright" DESTINATION "share/lyra/licenses/${port}")
     endforeach()
     target_compile_definitions(${runtime} PRIVATE GC_NOT_DLL)
-    target_link_libraries(${runtime} PUBLIC BDWgc::gc libuv::uv_a jansson::jansson unofficial::sqlite3::sqlite3)
+    target_link_libraries(${runtime} PUBLIC BDWgc::gc libuv::uv_a jansson::jansson unofficial::sqlite3::sqlite3 dbghelp)
 endfunction()
 
 function(lyra_relocate_llvm_dia)

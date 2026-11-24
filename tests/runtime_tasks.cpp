@@ -4,10 +4,12 @@
 #include "strings.h"
 #include "tasks.h"
 
+#include <chrono>
 #include <condition_variable>
 #include <mutex>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <thread>
 
 namespace {
@@ -363,24 +365,71 @@ void parallelRendezvous(LyraTask *self, void *storage) {
 }
 
 struct NestedDomain {
-    std::thread::id caller;
     unsigned depth;
     LyraTask *child;
 };
 
 void nestedDomain(LyraTask *self, void *storage) {
     auto& frame = *static_cast<NestedDomain *>(storage);
-    auto thread = std::this_thread::get_id();
-    check(thread != frame.caller, "nested parallel reentered its immediate caller's executor");
     if (frame.depth) {
         if (!frame.child) {
             auto *child = static_cast<NestedDomain *>(lyraGcAlloc(sizeof(NestedDomain)));
-            *child = {thread, frame.depth - 1, nullptr};
+            *child = {frame.depth - 1, nullptr};
             frame.child = lyraTaskParallel(self, lyraTaskCreate(nestedDomain, child));
         }
         if (lyraTaskAwaitValue(self, frame.child) == LYRA_AWAIT_PENDING) return;
         check(lyraTaskState(frame.child) == LYRA_TASK_COMPLETED, "nested domain failed while sharing the worker pool");
     }
+    lyraTaskComplete(self, nullptr);
+}
+
+struct StealCase {
+    std::mutex mutex;
+    std::condition_variable changed;
+    std::thread::id occupiedWorker;
+    unsigned completed{};
+};
+
+void occupyWorker(LyraTask *self, void *storage) {
+    auto& test = *static_cast<StealCase *>(storage);
+    lyraTaskSpawn(self, lyraTaskCreate([](LyraTask *child, void *storage) {
+        auto& test = *static_cast<StealCase *>(storage);
+        std::lock_guard lock(test.mutex);
+        check(test.completed == 2, "the same execution domain ran while its parent step was still active");
+        lyraTaskComplete(child, nullptr);
+    }, storage));
+    {
+        std::unique_lock lock(test.mutex);
+        test.occupiedWorker = std::this_thread::get_id();
+        test.changed.notify_all();
+        check(test.changed.wait_for(lock, std::chrono::seconds(10), [&] { return test.completed == 2; }),
+              "runnable domains did not make progress while another Worker was occupied");
+    }
+    lyraTaskComplete(self, nullptr);
+}
+
+void scheduleSteal(LyraTask *self, void *storage) {
+    auto& test = *static_cast<StealCase *>(storage);
+    lyraTaskParallel(self, lyraTaskCreate(occupyWorker, storage));
+    {
+        std::unique_lock lock(test.mutex);
+        check(test.changed.wait_for(lock, std::chrono::seconds(10), [&] { return test.occupiedWorker != std::thread::id{}; }),
+              "parallel Worker did not reach its gate");
+    }
+    for (unsigned index = 0; index < 2; ++index) lyraTaskParallel(self, lyraTaskCreate([](LyraTask *child, void *storage) {
+        auto& test = *static_cast<StealCase *>(storage);
+        auto *value = static_cast<Counter *>(lyraGcAlloc(sizeof(Counter)));
+        value->count = 73;
+        collectUnderPressure();
+        check(value->count == 73, "a managed value was lost on a Worker during stealing");
+        {
+            std::lock_guard lock(test.mutex);
+            check(std::this_thread::get_id() != test.occupiedWorker, "independent runnable work remained on the occupied Worker");
+            ++test.completed;
+            test.changed.notify_all();
+        }
+        lyraTaskComplete(child, nullptr);
+    }, storage));
     lyraTaskComplete(self, nullptr);
 }
 
@@ -468,13 +517,19 @@ void checkParallel(LyraDomain *origin) {
 
     auto *deep = lyraTaskCreate([](LyraTask *self, void *) {
         auto *frame = static_cast<NestedDomain *>(lyraGcAlloc(sizeof(NestedDomain)));
-        *frame = {std::this_thread::get_id(), 8, nullptr};
+        *frame = {8, nullptr};
         lyraTaskParallel(self, lyraTaskCreate(nestedDomain, frame));
         lyraTaskComplete(self, nullptr);
     }, nullptr);
     lyraTaskStart(origin, deep);
     lyraDomainRun(origin);
     check(lyraTaskState(deep) == LYRA_TASK_COMPLETED, "nested awaits consumed all available workers");
+
+    StealCase steal;
+    auto *balanced = lyraTaskCreate(scheduleSteal, &steal);
+    lyraTaskStart(origin, balanced);
+    lyraDomainRun(origin);
+    check(lyraTaskState(balanced) == LYRA_TASK_COMPLETED && steal.completed == 2, "stealing lost a ready domain");
 
     ParallelNative native;
     native.owner = lyraTaskCreate(joinNative, &native);
@@ -496,9 +551,34 @@ void checkParallel(LyraDomain *origin) {
           "parallel failures were reported in completion order");
 }
 
+void checkSingleWorker() {
+    check(uv_os_setenv("LYRA_PARALLEL_WORKERS", "1") == 0, "cannot set parallel Worker limit");
+    auto caller = std::this_thread::get_id();
+    auto *root = lyraTaskCreate([](LyraTask *self, void *storage) {
+        auto *worker = lyraTaskCreate([](LyraTask *self, void *storage) {
+            auto& caller = *static_cast<std::thread::id *>(storage);
+            check(std::this_thread::get_id() != caller, "configured Worker ran on the root executor");
+            auto *frame = static_cast<NestedDomain *>(lyraGcAlloc(sizeof(NestedDomain)));
+            *frame = {8, nullptr};
+            lyraTaskParallel(self, lyraTaskCreate(nestedDomain, frame));
+            lyraTaskComplete(self, nullptr);
+        }, storage);
+        lyraTaskParallel(self, worker);
+        lyraTaskComplete(self, nullptr);
+    }, &caller);
+    check(lyraTaskRunRoot(root) == 0, "nested parallel work deadlocked with one Worker");
 }
 
-int main() {
+}
+
+int main(int argc, char **argv) {
+    if (argc == 2 && strcmp(argv[1], "--single-worker") == 0) {
+        check(lyraTaskParallelism() == 1, "parallelism API ignored the one-Worker configuration");
+        checkSingleWorker();
+        return EXIT_SUCCESS;
+    }
+    check(uv_os_setenv("LYRA_PARALLEL_WORKERS", "2") == 0, "cannot configure parallel tests");
+    check(lyraTaskParallelism() == 2, "parallelism API reported the wrong Worker capacity");
     auto *origin = lyraDomainCreate();
     auto *other = lyraDomainCreate();
     unsigned executions = 0;

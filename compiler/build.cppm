@@ -7,6 +7,8 @@ export module lyra.build;
 import lyra.check;
 
 export namespace lyra {
-void build(const CheckedModule& functions, const std::vector<Source>& sources, const std::filesystem::path& output, bool release, const std::vector<std::filesystem::path>& libraries);
+struct NativeBuildOptions { bool release{}, debugInfo{}; };
+void build(const CheckedModule& functions, const std::vector<Source>& sources, const std::filesystem::path& output,
+    NativeBuildOptions options, const std::vector<std::filesystem::path>& libraries);
 int execute(const std::filesystem::path& executable, const std::vector<std::string_view>& arguments);
 }

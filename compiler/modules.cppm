@@ -6,6 +6,7 @@ module;
 #include <set>
 #include <span>
 #include <string>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -17,15 +18,23 @@ import lyra.platform;
 import lyra.syntax;
 
 export namespace lyra {
-struct Compilation { std::vector<Source> sources; Module syntax; std::vector<std::filesystem::path> macroInputs{}; };
-Compilation loadProgram(const PackageGraph& graph, const std::string& entry, const std::optional<std::filesystem::path>& testFile = {});
+struct Compilation { std::vector<Source> sources; Module syntax; std::vector<std::filesystem::path> macroInputs{}; std::vector<NameReference> references{}; };
+struct ParsedFileSyntax { std::string text; Module syntax; };
+struct ParseCache { std::map<std::string, ParsedFileSyntax> files; };
+Compilation loadProgram(const PackageGraph& graph, const std::string& entry, const std::optional<std::filesystem::path>& testFile = {}, const SourceOverlay* overlays = nullptr, ParseCache* parseCache = nullptr);
 }
 
 namespace lyra {
 namespace fs = std::filesystem;
 namespace {
 
-struct Symbol { std::string name; bool visible; bool callable; bool imported{}; bool extension{}; };
+struct LinkedDeclaration { SourceAnchor anchor; bool visible; };
+struct Symbol {
+    std::string name;
+    bool visible, callable, imported{}, extension{};
+    std::vector<LinkedDeclaration> targets{};
+    std::optional<SourceAnchor> renameTarget{};
+};
 struct Space {
     const ResolvedPackage* package;
     std::map<std::string, Symbol> definitions{};
@@ -37,6 +46,8 @@ struct Linker {
     std::map<std::string, Space>& spaces;
     const std::map<std::string, std::string>& prefixes;
     std::string entry;
+    std::vector<NameReference>& references;
+    bool indexing;
 
     void declare(std::size_t file, Identifier& id, bool visible, bool callable, bool extension = false) {
         auto scope = sources[file].moduleId;
@@ -47,6 +58,8 @@ struct Linker {
             if (!callable || !symbol->second.callable || name == "main") throw at(sources[file], id.span, "LYN0002", "名称已声明：" + id.text);
             symbol->second.visible |= visible;
         }
+        if (indexing) symbol->second.targets.push_back({{file, id.span}, visible});
+        if (indexing) references.push_back({{file, id.span}, {file, id.span}, {}});
         id.text = std::move(name);
     }
 
@@ -72,12 +85,35 @@ struct Linker {
         auto found = spaces.find(target);
         if (found == spaces.end()) throw at(source, name.span, "LYN0003", "导入的源码模块不存在");
         auto& space = found->second;
-        if (auto hit = space.definitions.find(name.text); hit != space.definitions.end() && hit->second.visible) return {hit->second.name, use.isPublic, hit->second.callable, true, hit->second.extension};
+        if (auto hit = space.definitions.find(name.text); hit != space.definitions.end() && hit->second.visible && !hit->second.imported) {
+            auto result = hit->second;
+            result.visible = use.isPublic;
+            result.imported = true;
+            std::erase_if(result.targets, [](const auto& target) { return !target.visible; });
+            return result;
+        }
         if (auto alias = space.imports.find(name.text); alias != space.imports.end() && alias->second->isPublic) {
             auto symbol = resolve(*alias->second, active);
-            return {std::move(symbol.name), use.isPublic, symbol.callable, true};
+            symbol.visible = use.isPublic;
+            if (indexing && alias->second->alias.span != alias->second->path.back().span)
+                symbol.renameTarget = SourceAnchor{alias->second->file, alias->second->alias.span};
+            return symbol;
         }
         throw at(source, name.span, "LYN0003", "目标模块没有公开声明：" + name.text);
+    }
+
+    Symbol import(const Import& use) {
+        std::set<const Import*> active;
+        auto result = resolve(use, active);
+        if (indexing && result.targets.size() == 1) {
+            auto target = result.targets.front().anchor;
+            references.push_back({{use.file, use.path.back().span}, target, result.renameTarget});
+            if (use.alias.span != use.path.back().span) {
+                result.renameTarget = SourceAnchor{use.file, use.alias.span};
+                references.push_back({*result.renameTarget, target, result.renameTarget});
+            }
+        }
+        return result;
     }
 
     void rewrite(Module& syntax) {
@@ -101,14 +137,13 @@ struct Linker {
         }
         for (auto& [moduleId, space] : spaces) {
             for (const auto& [name, use] : space.imports) {
-                std::set<const Import*> active;
-                space.definitions.emplace(name, resolve(*use, active));
+                space.definitions.emplace(name, import(*use));
             }
         }
         std::map<std::size_t, std::map<std::string, Symbol>> generatedScopes;
         for (const auto& [file, imports] : generatedImports) {
             auto& scope = generatedScopes[file] = spaces.at(sources[file].moduleId).definitions;
-            for (const auto& [name, use] : imports) { std::set<const Import*> active; scope[name] = resolve(*use, active); }
+            for (const auto& [name, use] : imports) scope[name] = import(*use);
         }
         auto scopeOf = [&](std::size_t file) -> const auto& {
             auto generated = generatedScopes.find(file);
@@ -116,6 +151,21 @@ struct Linker {
         };
         auto renameTypeIn = [&](std::size_t file, Identifier& type, std::span<const Identifier> parameters = {}) {
             const auto& scope = scopeOf(file);
+            if (indexing && type.span.end > type.span.begin) {
+                const auto& source = sources[file];
+                auto text = source.text.substr(type.span.begin, type.span.end - type.span.begin);
+                auto fragment = sourceText(source.path, text, {});
+                bool projection = false;
+                for (const auto& token : syntaxTokens(fragment, false, true)) {
+                    auto name = std::string_view(text).substr(token.span.begin, token.span.end - token.span.begin);
+                    if (name == ".") { projection = true; continue; }
+                    if (std::exchange(projection, false) || token.kind != "name") continue;
+                    if (name.starts_with('`')) name = name.substr(1, name.size() - 2);
+                    if (std::ranges::any_of(parameters, [&](const auto& parameter) { return parameter.text == name; })) continue;
+                    if (auto found = scope.find(std::string(name)); found != scope.end() && !found->second.callable && found->second.targets.size() == 1)
+                        references.push_back({{file, {type.span.begin + token.span.begin, type.span.begin + token.span.end}}, found->second.targets.front().anchor, found->second.renameTarget});
+                }
+            }
             type.text = mapTypeNames(typeForm(type.text), [&](const std::string& name) {
                 if (std::ranges::any_of(parameters, [&](const auto& parameter) { return parameter.text == name; })) return name;
                 auto found = scope.find(name); return found == scope.end() ? name : found->second.name;
@@ -134,14 +184,15 @@ struct Linker {
         for (auto& record : syntax.aggregates) {
             for (auto& bound : record.bounds) renameTypeIn(record.file, bound.trait);
             for (auto& field : record.fields) renameTypeIn(record.file, field.type, record.typeParameters);
+            for (auto& member : record.associated) renameTypeIn(record.file, member.type, record.typeParameters);
         }
         for (auto& item : syntax.enums) {
             for (auto& bound : item.bounds) renameTypeIn(item.file, bound.trait);
             for (auto& entry : item.cases) for (auto& field : entry.fields) renameTypeIn(item.file, field.type, item.typeParameters);
         }
         for (auto& trait : syntax.traits) for (auto& method : trait.methods) {
-            renameTypeIn(trait.file, method.result);
-            for (auto& parameter : method.parameters) renameTypeIn(trait.file, parameter.type);
+            renameTypeIn(trait.file, method.result, trait.associated);
+            for (auto& parameter : method.parameters) renameTypeIn(trait.file, parameter.type, trait.associated);
         }
         for (auto& fn : syntax.functions) {
             const auto& scope = scopeOf(fn.file);
@@ -149,10 +200,7 @@ struct Linker {
                 if (auto found = scope.find(name.text); found != scope.end()) name.text = found->second.name;
             };
             auto renameType = [&](Identifier& name) {
-                name.text = mapTypeNames(typeForm(name.text), [&](const std::string& part) {
-                    if (genericParameter(fn, part)) return part;
-                    auto found = scope.find(part); return found == scope.end() ? part : found->second.name;
-                });
+                renameTypeIn(fn.file, name, fn.typeParameters);
             };
             if (fn.owner) rename(*fn.owner);
             if (fn.extensionGroup) rename(*fn.extensionGroup);
@@ -163,6 +211,7 @@ struct Linker {
                 if (auto found = scope.find(name.text); found != scope.end()) {
                     name.linked = found->second.name;
                     name.exportedOnly = found->second.imported;
+                    name.renameTarget = found->second.renameTarget;
                 }
                 else if (name.text == "main") name.linked = sources[fn.file].moduleId + "::main";
             };
@@ -198,9 +247,66 @@ struct Linker {
     }
 };
 
+std::string parsedFileKey(const fs::path& path) {
+    std::error_code error;
+    auto canonical = fs::weakly_canonical(path, error);
+    return pathText(error ? fs::absolute(path).lexically_normal() : canonical);
 }
 
-Compilation loadProgram(const PackageGraph& graph, const std::string& entry, const std::optional<fs::path>& testFile) {
+const Module& cachedFileSyntax(const Source& source, ParseCache& cache) {
+    auto key = parsedFileKey(source.path);
+    auto found = cache.files.find(key);
+    if (found != cache.files.end() && found->second.text == source.text) return found->second.syntax;
+    if (cache.files.size() >= 4096) cache.files.clear();
+    Module syntax;
+    parseFile(syntax, source, 0);
+    auto [entry, inserted] = cache.files.insert_or_assign(std::move(key), ParsedFileSyntax{source.text, std::move(syntax)});
+    return entry->second.syntax;
+}
+
+void appendCachedSyntax(Module& target, const Module& cached, std::size_t file) {
+    const auto functionOffset = target.functions.size();
+    const auto aggregateOffset = target.aggregates.size();
+    for (auto function : cached.functions) {
+        function.file = file;
+        target.functions.push_back(std::move(function));
+    }
+    for (auto aggregate : cached.aggregates) {
+        aggregate.file = file;
+        for (auto& field : aggregate.fields) if (field.defaultValue) field.defaultValue->function += functionOffset;
+        target.aggregates.push_back(std::move(aggregate));
+    }
+    for (auto import : cached.imports) {
+        import.file = file;
+        target.imports.push_back(std::move(import));
+    }
+    for (auto expansion : cached.expansions) {
+        expansion.file = file;
+        expansion.target += expansion.record ? aggregateOffset : functionOffset;
+        target.expansions.push_back(std::move(expansion));
+    }
+    for (auto trait : cached.traits) {
+        trait.file = file;
+        target.traits.push_back(std::move(trait));
+    }
+    for (auto item : cached.enums) {
+        item.file = file;
+        target.enums.push_back(std::move(item));
+    }
+    for (auto extension : cached.extensions) {
+        extension.file = file;
+        for (auto& property : extension.properties) property.getter += functionOffset;
+        target.extensions.push_back(std::move(extension));
+    }
+    for (auto exception : cached.exceptions) {
+        exception.file = file;
+        target.exceptions.push_back(std::move(exception));
+    }
+}
+
+}
+
+Compilation loadProgram(const PackageGraph& graph, const std::string& entry, const std::optional<fs::path>& testFile, const SourceOverlay* overlays, ParseCache* parseCache) {
     std::map<std::string, const ResolvedPackage*> packages;
     std::map<std::string, std::string> prefixes;
     for (const auto& package : graph.packages) {
@@ -219,10 +325,17 @@ Compilation loadProgram(const PackageGraph& graph, const std::string& entry, con
         auto package = packages.at(id);
         auto directory = package->root / "src";
         std::vector<fs::path> paths;
-        for (auto item = fs::recursive_directory_iterator(directory); item != fs::recursive_directory_iterator{}; ++item) {
+        auto first = fs::is_directory(directory) ? fs::recursive_directory_iterator(directory) : fs::recursive_directory_iterator{};
+        for (auto item = std::move(first); item != fs::recursive_directory_iterator{}; ++item) {
             if (item->is_directory() && pathText(item->path().filename()).starts_with('.')) { item.disable_recursion_pending(); continue; }
             if (item->is_symlink()) throw Diagnostic{"LYI0001", "源码不允许符号链接：" + pathText(item->path())};
             if (item->is_regular_file() && item->path().extension() == ".ly") paths.push_back(item->path());
+        }
+        if (overlays) for (const auto& [path, text] : *overlays) {
+            auto relative = path.lexically_relative(directory);
+            if (relative.empty() || relative == "." || *relative.begin() == ".." || path.extension() != ".ly") continue;
+            if (std::ranges::any_of(relative, [](const auto& part) { return pathText(part).starts_with('.'); })) continue;
+            if (std::ranges::find(paths, path) == paths.end()) paths.push_back(path);
         }
         std::sort(paths.begin(), paths.end());
         for (const auto& path : paths) {
@@ -230,20 +343,26 @@ Compilation loadProgram(const PackageGraph& graph, const std::string& entry, con
             auto relative = path.parent_path().lexically_relative(directory);
             if (relative != ".") module += '/' + pathText(relative);
             spaces.try_emplace(module, Space{package});
-            program.sources.push_back(loadSource(path, module));
+            program.sources.push_back(loadSource(path, module, overlays));
         }
     }
     auto root = prefixes.at(entry);
     if (testFile) {
         root += "#test";
         spaces.emplace(root, Space{packages.at(entry)});
-        program.sources.push_back(loadSource(*testFile, root));
+        program.sources.push_back(loadSource(*testFile, root, overlays));
     }
     std::map<std::string, MacroPackage> macroPackages;
-    for (const auto& [module, space] : spaces) macroPackages.emplace(module, MacroPackage{space.package->root, space.package->macroInputs});
+    auto macroCache = overlays ? fs::path{} : cacheOverride();
+    if (!overlays) macroCache = (macroCache.empty() ? graph.workspace / ".lyra" / "cache" : macroCache) / "compiler" / "macros";
+    for (const auto& [module, space] : spaces) macroPackages.emplace(module, MacroPackage{space.package->root, space.package->macroInputs, overlays, macroCache});
     for (std::size_t file = 0; file < program.sources.size(); ++file) {
         auto& source = program.sources[file];
-        parsePackageFile(program.syntax, source, file, macroPackages.at(source.moduleId), program.macroInputs);
+        if (source.text.find_first_of("#@") == std::string::npos) {
+            if (parseCache) appendCachedSyntax(program.syntax, cachedFileSyntax(source, *parseCache), file);
+            else parseFile(program.syntax, source, file);
+        }
+        else parsePackageFile(program.syntax, source, file, macroPackages.at(source.moduleId), program.macroInputs);
     }
     expandMacros(program.syntax, program.sources, macroPackages, program.macroInputs);
     std::map<std::string, ResolvedPackage> bundled;
@@ -262,11 +381,17 @@ Compilation loadProgram(const PackageGraph& graph, const std::string& entry, con
         auto loaded = loadSources(packageRoot);
         for (auto& source : loaded) {
             source.moduleId = key;
+            if (overlays) if (auto found = overlays->find(source.path); found != overlays->end())
+                source = sourceText(source.path, found->second, key);
             program.sources.push_back(std::move(source));
-            parseFile(program.syntax, program.sources.back(), program.sources.size() - 1);
+            auto file = program.sources.size() - 1;
+            if (program.sources.back().text.find_first_of("#@") == std::string::npos) {
+                if (parseCache) appendCachedSyntax(program.syntax, cachedFileSyntax(program.sources.back(), *parseCache), file);
+                else parseFile(program.syntax, program.sources.back(), file);
+            } else parseFile(program.syntax, program.sources.back(), file);
         }
     }
-    Linker{program.sources, spaces, prefixes, root}.rewrite(program.syntax);
+    Linker{program.sources, spaces, prefixes, root, program.references, overlays != nullptr}.rewrite(program.syntax);
     return program;
 }
 

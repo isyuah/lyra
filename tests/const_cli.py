@@ -97,9 +97,19 @@ fn main(): Unit {
 
     def test_purity_checks_unused_branches_and_constant_bindings_are_immutable(self):
         cases = [
-            ('fn io(): Int { 2 }\nconst fn decide(): Int { if true { 1 } else { io() } }', 'LYCT0001', 'io'),
+            ('fn io(): Int { print(2); 2 }\nconst fn decide(): Int { if true { 1 } else { io() } }', 'LYCT0001', 'print'),
             ('const fn bad(): Unit { print(1) }', 'LYCT0001', 'print'),
-            ('const fn bad(): List<Int> { [1] }', 'LYCT0001', '标量'),
+            ('const bad: List<Int> = [1]', 'LYCT0001', 'List 只能'),
+            ('struct Bag(val items: List<Int>)\nconst bad: Option<Bag> = Some(Bag([1]))', 'LYCT0001', 'List 只能'),
+            ('class Item(val count: Int)\nconst bad: Item = Item(1)', 'LYCT0001', 'Class'),
+            ('class Item(val count: Int)\nstruct Bag(val item: Item)\nconst bad: Option<Bag> = None', 'LYCT0001', 'Class'),
+            ('class Item { init() { if false { print(1) } } }\nconst bad: Unit = { Item(); }', 'LYCT0001', 'print'),
+            ('const bad: () -> Int = () => { 1 }', 'LYCT0001', '函数值'),
+            ('struct Bag(val action: () -> Int)\nconst bad: Option<Bag> = None', 'LYCT0001', '函数值'),
+            ('fn noisy(): Int { print(1); 1 }\nconst fn bad(): Int { val call = noisy; if false { call() } else { 2 } }', 'LYCT0001', 'print'),
+            ('const fn bad(): Int { val call = () => { print(1); 1 }; 2 }', 'LYCT0001', 'print'),
+            ('async fn pause(): Int { 1 }\nconst fn bad(): Int { val call = pause; 2 }', 'LYCT0001', '编译期'),
+            ('extern fn foreign(value: Int): Int;\nconst fn bad(): Int { val call = foreign; 2 }', 'LYCT0001', '外部'),
             ('const value: Int = 1\nfn attempt(): Unit { value = 2 }', 'LYT0004', '赋值'),
             ('const value: Int = 1\nfn attempt(): Int { value() }', 'LYCT0001', '不是函数'),
         ]
@@ -120,6 +130,251 @@ fn main(): Unit {
             with self.subTest(source=source):
                 self.write('app/src/main.ly', source + '\nfn main(): Unit {}')
                 self.diagnose(self.app, code, message)
+
+    def test_const_functions_validate_transitive_calls_and_evaluate_match(self):
+        self.write('app/lyra.json5', '{name:"app",version:"0.1.0"}')
+        self.write('app/src/main.ly', '''
+const fn classify(value: Int): Int {
+    match value {
+        -2..<0 => 11,
+        0 | 2 => 22,
+        _ => 33
+    }
+}
+const result: Int = classify(-1) + classify(2) + classify(8)
+fn main(): Unit { print(result) }
+''')
+        result = self.cli('run', self.app)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines(), ['66'])
+
+        self.write('app/src/main.ly', '''
+fn twice(value: Int): Int { value * 2 }
+const result: Int = twice(12)
+fn main(): Unit { print(result) }
+''')
+        result = self.cli('run', self.app)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines(), ['24'])
+
+        self.write('app/src/main.ly', '''
+fn printLater(): Int { print("not constant"); 0 }
+const fn hiddenEffect(): Int { if true { 7 } else { printLater() } }
+const fn caller(): Int { hiddenEffect() }
+const result: Int = caller()
+fn main(): Unit {}
+''')
+        self.diagnose(self.app, 'LYCT0001', 'print')
+
+    def test_const_functions_support_generic_instances_and_default_arguments(self):
+        self.write('app/lyra.json5', '{name:"app",version:"0.1.0"}')
+        self.write('app/src/main.ly', '''
+const fn identity<Item>(value: Item): Item { value }
+const fn add(value: Int, increment: Int = 3): Int { value + increment }
+const result: Int = identity<Int>(5) + add(6)
+fn main(): Unit { print(result) }
+''')
+        result = self.cli('run', self.app)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines(), ['14'])
+
+    def test_const_functions_evaluate_struct_enum_and_sum_values(self):
+        self.write('app/lyra.json5', '{name:"app",version:"0.1.0"}')
+        self.write('app/src/main.ly', '''
+struct Point(val x: Int, val y: Int)
+enum Choice { Count(Int), Alias(Int), Empty }
+extension PointMetrics for Point {
+    val total: Int get() { this.x + this.y }
+}
+const fn shifted(point: Point): Point { Point(point.x + 1, point.y + 2) }
+const fn classify(choice: Choice): Int {
+    match choice {
+        Choice.Count(value) | Choice.Alias(value) if value > 0 => value,
+        Choice.Count(_) | Choice.Alias(_) => 0,
+        Choice.Empty => -1
+    }
+}
+const fn maybe(value: Int): Int? {
+    if value > 0 { Some(value) } else { None }
+}
+const fn lifted(): Int? { 7 }
+const fn read(): Result<Int,String> { Ok(8) }
+const fn readAndAdd(): Result<Int,String> { Ok(read()? + 1) }
+const fn pointScore(): Int { val point = shifted(Point(2, 3)); point.total }
+const fn unicodeChar(): Char { "a🙂"[1] }
+const result: Int = pointScore() + classify(Choice.Alias(5)) + classify(Choice.Count(-1)) + classify(Choice.Empty) + (maybe(7) ?? 0) + (lifted() ?? 0) + (match readAndAdd() { Ok(value) => value, Err(_) => 0 })
+fn main(): Unit { print(result) }
+''')
+        result = self.cli('run', self.app)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines(), ['35'])
+
+        self.write('app/src/main.ly', '''
+const fn unicodeChar(): Char { "a🙂"[1] }
+fn main(): Unit { print(unicodeChar()) }
+''')
+        result = self.cli('run', self.app)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines(), ['🙂'])
+
+    def test_const_index_out_of_bounds_is_a_build_time_diagnostic(self):
+        cases = [
+            ('const fn bad(): Char { "a"[1] }\nconst value: Char = bad()', 'LYCT0003', '索引越界'),
+            ('const fn bad(): Char { "a"[-1] }\nconst value: Char = bad()', 'LYCT0003', '索引越界'),
+            ('const fn bad(): UInt8 { b"a"[1] }\nconst value: UInt8 = bad()', 'LYCT0003', '索引越界'),
+            ('const fn bad(): UInt8 { b"a"[-1] }\nconst value: UInt8 = bad()', 'LYCT0003', '索引越界'),
+            ('fn bad(): Int { val numbers = [1]; numbers[1] }\nconst value: Int = bad()', 'LYCT0003', '索引越界'),
+            ('fn bad(): Unit { val numbers = [1]; numbers[-1] = 2 }\nconst value: Unit = bad()', 'LYCT0003', '索引越界'),
+        ]
+        for source, code, message in cases:
+            with self.subTest(source=source):
+                self.write('app/src/main.ly', source + '\nfn main(): Unit {}')
+                self.diagnose(self.app, code, message)
+
+    def test_pure_list_algorithm_exports_a_composite_constant(self):
+        self.write('app/lyra.json5', '{name:"app",version:"0.1.0",dependencies:{cfg:{name:"cfg",version:"^0.1.0",path:"../cfg"}}}')
+        self.write('cfg/lyra.json5', '{name:"cfg",version:"0.1.0",kind:"lib"}')
+        self.write('cfg/src/data.ly', '''pub struct Item(pub var amount: Int, pub val tag: String)
+pub enum Summary { Found(Item), Missing }
+fn change(values: List<Item>): Int {
+    values[0] = Item(10, "updated")
+    2
+}
+pub fn compute(): Result<Summary,String> {
+    val values = [Item(1, "first"), Item(3, "second")]
+    val alias = values
+    if alias != values || values == [Item(1, "first"), Item(3, "second")] { return Err("identity") }
+    var copy = values[0]
+    copy.amount += 20
+    if values[0].amount != 1 { return Err("copy") }
+    alias[0].amount += change(values)
+    var total = 0
+    for item in alias {
+        total += item.amount
+        alias.add(Item(100, "extra"))
+    }
+    for char in "a🙂" { total += 1 }
+    for byte in b"xy" { total += 1 }
+    val count: Int? = Some(alias.size)
+    if count == None { return Err("empty") }
+    Ok(Summary.Found(Item(total + count, values[0].tag)))
+}
+pub const summary: Result<Summary,String> = compute()
+''')
+        self.write('app/src/main.ly', '''import cfg.Item
+import cfg.Summary
+import cfg.compute
+import cfg.summary
+const saved: Result<Summary,String> = summary
+fn show(result: Result<Summary,String>): Unit {
+    match result {
+        Ok(Summary.Found(item)) => { print(item.amount); print(item.tag) },
+        Ok(Summary.Missing) => { print("missing") },
+        Err(error) => { print(error) }
+    }
+}
+fn main(): Unit { show(saved); show(compute()) }
+''')
+        for mode in ([], ['--release']):
+            with self.subTest(mode=mode):
+                result = self.cli('run', self.app, *mode)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.splitlines(), ['14', 'updated', '14', 'updated'])
+
+    def test_temporary_classes_preserve_identity_through_init_and_nested_assignments(self):
+        self.write('app/src/main.ly', '''
+class Counter(var value: Int = 2, var next: Counter? = None) {
+    fn bump(by: Int = value): Int { value += by; value }
+}
+struct Point(var amount: Int)
+class Box {
+    val counter: Counter = Counter()
+    var point: Point = Point(3)
+    val name: String
+    init(name: String, early: Bool = false) {
+        this.name = name
+        if early { return }
+        point.amount += counter.bump()
+    }
+}
+struct View(val box: Box)
+fn get(boxes: List<Box>, calls: Counter): Box { calls.bump(1); boxes[0] }
+fn reassign(boxes: List<Box>, second: Box): Int {
+    boxes[0] = second
+    second.point.amount = 40
+    2
+}
+fn compute(): String {
+    val first = Box("first")
+    val second = Box("second", true)
+    val view = View(first)
+    val boxes = [first]
+    val calls = Counter(0)
+    get(boxes, calls).point.amount += reassign(boxes, second)
+    view.box.counter.next = Some(first.counter)
+    val cycle = match first.counter.next { Some(link) => link == first.counter, None => false }
+    var copy = first.point
+    copy.amount += 100
+    "${first.name}:${first.point.amount}:${second.name}:${second.point.amount}:${calls.value}:${view.box == first}:${boxes[0] == first}:${first.counter != second.counter}:${cycle}:${copy.amount}"
+}
+const saved: String = compute()
+fn main(): Unit { print(saved); print(compute()) }
+''')
+        expected = 'first:9:second:40:1:true:false:true:true:109'
+        for mode in ([], ['--release']):
+            with self.subTest(mode=mode):
+                result = self.cli('run', self.app, *mode)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.splitlines(), [expected, expected])
+
+    def test_temporary_closures_share_captures_and_get_fresh_loop_bindings(self):
+        self.write('app/src/main.ly', '''
+class Operations(val bump: (Int) -> Int, val read: () -> Int)
+enum NumberPair { Values(Int, Int) }
+fn make(start: Int): Operations {
+    var count = start
+    val bump = (amount: Int) => { count += amount; count }
+    Operations(bump, () => { count })
+}
+fn apply<Item>(value: Item, action: (Item) -> Item): Item { action(value) }
+fn identity<Item>(value: Item): Item { value }
+fn optionalCall(action: (() -> Int)?): Int {
+    if action == None { return 0 }
+    action()
+}
+fn decline(saved: List<() -> Int>, action: () -> Int): Bool { saved.add(action); false }
+fn failed(): Result<Int,String> { Err("bad") }
+fn compute(): String {
+    val operations = make(1)
+    val first = operations.bump(2)
+    val second = operations.bump(5)
+    val callbacks: List<() -> Int> = []
+    for number in [2, 4] {
+        var current = number
+        callbacks.add { current += number; current }
+    }
+    for number in [7, 9] {
+        match NumberPair.Values(number, 0) {
+            NumberPair.Values(0, bound) | NumberPair.Values(bound, 0) if decline(callbacks, () => { bound }) => {},
+            _ => {}
+        }
+    }
+    val generic: (Int) -> Int = identity
+    val finish = (number: Int) => { () => { number + operations.read() } }
+    val report = (): Result<Int,String> => { Ok(failed()?) }
+    val result = match report() { Ok(number) => number, Err(_) => 42 }
+    val counts = "${first}:${second}:${operations.read()}:${callbacks[0]()}-${callbacks[0]()}-${callbacks[1]()}-${callbacks[2]()}-${callbacks[3]()}"
+    "${counts}:${apply(6, generic)}:${apply(4) { it + 1 }}:${finish(3)()}:${optionalCall(Some(() => { 10 }))}:${result}"
+}
+const saved: String = compute()
+fn main(): Unit { print(saved); print(compute()) }
+''')
+        expected = '3:8:8:4-6-8-7-9:6:5:11:10:42'
+        for mode in ([], ['--release']):
+            with self.subTest(mode=mode):
+                result = self.cli('run', self.app, *mode)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.splitlines(), [expected, expected])
 
 
 if __name__ == '__main__':

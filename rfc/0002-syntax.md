@@ -124,10 +124,11 @@ val name: String? = absent()
 - `for i in start..<end` 遍历半开区间，`for i in start..end` 包含终点。两个 `Int` 端点从左到右各求值一次，步长为 `1`；起点大于终点时遍历为空，闭区间到达 `Int` 最大值后直接结束。区间写法目前只在 `for` 的头部使用。
 - `for character in text` 遍历 `String` 的 Unicode 标量（`Char`）；`for byte in bytes` 遍历 `Bytes` 的 `UInt8`。其他类型通过可见的同步方法 `iterator(): I` 和 `I.next(): Option<T>` 参与遍历，两个方法除接收者外不接收参数，也不声明类型形参。进入循环时调用一次 `iterator()`，每轮调用一次 `next()`；只有最外层的 `None` 才结束，`Some(None)` 仍是一个元素。协议按静态类型检查；有状态的游标可以用 Class 保存可变位置。`...` 的展开仍只接受 `List<T>`。
 - 标准库的 [`HashMap` 和 `HashSet`](../std/collections/README.md#字典与集合) 通过这个协议遍历进入循环时的浅快照，分别产出键值项和集合元素，不承诺顺序。
-- `match` 必须穷尽。被匹配值只求一次，按源码顺序选第一个模式和守卫都通过的分支。内置和类型和[封闭枚举](language-core.md#封闭枚举与匹配)可嵌套匹配，也可以匹配 `Bool`、整数、`Char` 和 `String` 字面量；仅列字面量时，除 `Bool` 外需兜底。`_` 忽略该位置，普通标识符创建只读绑定。用 `=>` 隔开模式和值，分支之间用逗号，允许末尾逗号。
+- `match` 必须穷尽。被匹配值只求一次，按源码顺序选第一个模式和守卫都通过的分支。内置和类型和[封闭枚举](language-core.md#封闭枚举与匹配)可嵌套匹配，也可以匹配 `Bool`、整数、`Char` 和 `String` 字面量；整数范围参与穷尽性分析。`_` 忽略该位置，普通标识符创建只读绑定。用 `=>` 隔开模式和值，分支之间用逗号，允许末尾逗号。
+- 模式支持 `|` 表示 OR，例如 `Text(value) | Failure(value)`；可嵌套在载荷和 Struct 字段内。每个备选分支必须绑定完全相同名称且类型一致的只读值。整数模式支持整数字面量端点的 `lower..upper`（含上界）和 `lower..<upper`（不含上界）；倒序或空区间不匹配任何值。浮点范围不属于模式，需用守卫表达。
 - `match value { Point(x: 0, y: distance) => distance, _ => 0 }` 按字段名解构 Struct，不调用构造器；可以省去不关心的字段，显式解构的字段遵守访问权限。`Some(x) if x > 0 => x` 只在模式命中后求值 `Bool` 守卫，守卫为假就尝试下一分支；绑定仅在同一分支的守卫和结果中可见。有守卫的分支不计入穷尽检查。
 - **已定：** 后缀 `?` 由操作数静态类型区分 `Err` 与 `None`，要求最近的函数或 lambda 返回兼容类型；对 `async fn` 检查其声明的完成值。不会把 `None` 自动变成 `Err` 或 HTTP 状态。[同步 `defer`](errors-and-resources.md) 在离开登记的块时倒序执行一次，包括 `return`、`?`、异常与协作式取消；`defer` 自身不可 `await`。
 
 ## 评审边界
 
-[调用与解析正反例](0002-syntax-cases.md)列出首版验收用例。循环标签暂缓。HTTP 的 path/query/body 怎样解码和怎么省掉 `request` 样板，单独在[同一请求的手写版和短写提案](../examples/user-service/README.md)比较，不占用新的函数调用规则。
+[调用与解析正反例](0002-syntax-cases.md)列出首版验收用例。循环标签暂缓。HTTP 的 path/query/body 通过 [`std.http`](../std/http/README.md) 的 `Request` API 读取；可选 `#post` 宏生成同一 Router API 使用的 handler 适配器，不占用新的函数调用规则。

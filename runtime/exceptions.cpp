@@ -1,4 +1,5 @@
 #include "exceptions.h"
+#include "backtrace.h"
 #include "managed.h"
 #include "strings.h"
 
@@ -23,14 +24,14 @@ void location(FILE* stream, Location point) {
 
 }
 
-struct LyraException { const void* message; const void* type; const char* name; Location origin; const Frame* trace; const Suppressed* suppressed; const LyraException* identity; };
+struct LyraException { const void* message; const void* type; const char* name; Location origin; const Frame* trace; const Suppressed* suppressed; const LyraException* identity; const lyraRuntime::Backtrace* native; };
 
 const LyraException* lyraExceptionCreate(const void* message) {
     return lyraExceptionCreateTyped(message, nullptr, "Exception");
 }
 
 const LyraException* lyraExceptionCreateTyped(const void* message, const void* type, const char* name) {
-    auto error = managed<LyraException>(message, type, name, Location{}, nullptr, nullptr, nullptr);
+    auto error = managed<LyraException>(message, type, name, Location{}, nullptr, nullptr, nullptr, nullptr);
     error->identity = error;
     return error;
 }
@@ -43,6 +44,7 @@ const LyraException* lyraExceptionRaise(const LyraException* error, const char* 
     if (error->origin.file) return error;
     auto located = managed<LyraException>(*error);
     located->origin = {file, line, column};
+    located->native = lyraRuntime::captureBacktrace();
     return located;
 }
 
@@ -78,6 +80,7 @@ void lyraExceptionWrite(const LyraException* error, FILE* stream) {
         for (; trace; trace = trace->next) {
             std::fprintf(stream, "  %s at ", trace->frame->role); location(stream, trace->frame->location); std::fputc('\n', stream);
         }
+        if (item->native) lyraRuntime::writeBacktrace(*item->native, stream);
         for (auto extra = item->suppressed; extra; extra = extra->previous) pending = managed<Pending>(extra->error, pending);
     }
 }

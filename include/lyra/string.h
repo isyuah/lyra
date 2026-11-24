@@ -16,6 +16,15 @@ typedef struct LyraStringView {
 
 LyraStringView lyraStringView(const LyraString *value);
 
+typedef struct LyraBytes LyraBytes;
+
+typedef struct LyraBytesView {
+    const unsigned char *data;
+    size_t size;
+} LyraBytesView;
+
+LyraBytesView lyraBytesView(const LyraBytes *value);
+
 #ifdef __cplusplus
 }
 #endif

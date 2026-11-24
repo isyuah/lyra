@@ -1,0 +1,65 @@
+{
+  "name": "lyra-language",
+  "displayName": "Lyra Language",
+  "description": "Editor support for Lyra with the native Lyra SDK.",
+  "version": "0.1.0",
+  "publisher": "lyra-lang",
+  "engines": {
+    "vscode": "^1.100.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "extensionKind": [
+    "workspace"
+  ],
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": false,
+      "description": "Lyra analyzes project manifests, dependencies, and declared macro inputs in the workspace."
+    },
+    "virtualWorkspaces": false
+  },
+  "main": "./extension.cjs",
+  "scripts": {
+    "check": "node --check extension.cjs"
+  },
+  "contributes": {
+    "configuration": {
+      "title": "Lyra",
+      "properties": {
+        "lyra.serverPath": {
+          "type": "string",
+          "default": "lyra",
+          "scope": "machine",
+          "description": "Lyra SDK executable (absolute path or a name on PATH). Reload the window after changing it."
+        }
+      }
+    },
+    "languages": [
+      {
+        "id": "lyra",
+        "aliases": [
+          "Lyra"
+        ],
+        "extensions": [
+          ".ly"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "lyra",
+        "scopeName": "source.lyra",
+        "path": "./syntaxes/lyra.tmLanguage.json",
+        "embeddedLanguages": {
+          "meta.embedded.expression.lyra": "lyra"
+        }
+      }
+    ]
+  },
+  "dependencies": {
+    "vscode-languageclient": "9.0.1"
+  }
+}

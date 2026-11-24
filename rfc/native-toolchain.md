@@ -10,7 +10,7 @@
 - 用户程序不得依赖 JVM、CLR 或 Lyra 托管虚拟机；程序可以携带语言 Runtime。应用与 Runtime 的代码被本机 linker 链接。
 - Windows 开发机可直接构建 Windows x64 程序。给 Linux 服务器构建时仍用 Linux 或 WSL；当前不做跨目标链接和 sysroot 管理。
 - 首个验收目标是 Linux x86-64/glibc，以 Ubuntu 22.04 x86-64 为最低测试镜像，用相应目标库链接。[部署验收](../tests/jammy-smoke.sh)检查 ELF 的动态依赖：整数、对象、标准 I/O 和 JSONL 样例只需系统 libc；SQLite 与 HTTP/SQLite 样例另需 `libsqlite3.so.0`。
-- Windows 目标为 x64 MSVC ABI。GC、libuv、Jansson、llhttp、SQLite 和 C Runtime 静态链接进使用它们的应用。Windows 测试检查 PE 只导入系统 DLL，并从搬迁后的 SDK 离线编译，在无构建工具 `PATH` 的进程中运行独立产物。通过外部导入库引入的 DLL 由应用另行部署。
+- Windows 目标为 x64 MSVC ABI。GC、libuv、Jansson、llhttp、tomlc17、SQLite 和 C Runtime 静态链接进使用它们的应用。Windows 测试检查 PE 只导入系统 DLL，并从搬迁后的 SDK 离线编译，在无构建工具 `PATH`、`LIB`、`INCLUDE` 的进程中运行独立产物。通过外部导入库引入的 DLL 由应用另行部署。
 - 类 Go `scratch` 的零基础镜像/全静态交付是后续优化目标，不是首期门槛。不得以支持 scratch 为由让第一版构建链无法运行。
 
 程序包大小与常驻内存分别看待。目标是内置 Runtime/GC 但不用虚拟机、单程序易分发且能够在服务器上多进程运行；目前不设与 Go 对比的硬 MB 上限。建立可执行服务后，再以等价负载与 Go 对照报告多进程总内存、二进制大小、启动时间、吞吐和尾延迟。
@@ -49,6 +49,12 @@ for pid in "${pids[@]}"; do cat "/proc/$pid/smaps_rollup"; done |
 
 编译器和运行时使用 **C++23、Clang、CMake 与 Ninja 1.11+**。源码诊断、语法、类型检查、LLVM lowering 和构建驱动通过 C++ 命名模块暴露接口，CMake `FILE_SET CXX_MODULES` 与宿主 Clang 配套的 `clang-scan-deps` 跟踪依赖，不要求工具链提供 `import std`。`check` 和 `build` 共用前端，前端不调用 Clang。后端用 LLVM 18.1 的 `IRBuilder` 构造模块，验证后用 Clang 将临时 IR 编译为本机目标文件，再链接具有 C ABI 的静态运行时。Linux 使用 `clang-18`；Windows 用 `PATH` 中的 `clang.exe` 和 `lld-link.exe`。
 
+### 调试原生程序
+
+默认 Debug 产物内含 DWARF（Linux）或配套的 CodeView/PDB（Windows）。函数、参数、局部变量、源码行和复合类型字段按 LLVM 目标布局记录；Windows 部署调试产物时将同名 `.pdb` 放在 `.exe` 旁。`lyra build <包目录> --release --debug-info` 可保留优化版符号；优化器删除或合并的局部值仍可能无法查看。
+
+`LYRA_NATIVE_BACKTRACE=1` 在异常首次抛出时捕获至多 32 帧。未捕获异常先打印 Lyra 的源码、任务与原因链，再输出原生帧；原样重抛不会用新的回溯覆盖抛点。Windows 运行时从本机 PDB 查符号，Linux 打印模块名和相对偏移，例如可用 `llvm-symbolizer-18 --obj ./app 0x1234` 查具体位置。合成宏代码的语义诊断仍指回手写调用处。原生调试信息、回溯和可搬迁符号由[命令行用例](../tests/debug_info_cli.py)验证。
+
 ### 开发机准备：Windows x64
 
 1. 准备 CMake、Ninja、Python 3（测试）、Git 和 Visual Studio Build Tools 的 C++ 桌面开发组件。打开 **x64 Developer PowerShell**，确保 `LIB` 中有 x64 CRT 和 Windows SDK 的 `um`、`ucrt` 库目录。原生构建已使用 CMake 4.5、Ninja 1.13、Clang 23 和 VS 2026 的 MSVC 工具集；较新的 MSVC STL 需要与它兼容的 Clang，宿主 Clang 不必与嵌入的 LLVM 库同版本。
@@ -66,6 +72,28 @@ for pid in "${pids[@]}"; do cat "/proc/$pid/smaps_rollup"; done |
    ```
 
    调试版改用 `windows-dev`。安装树包含标准库和静态库，不附 Clang；运行编译器仍需要 Visual C++ Redistributable，该环境通常由 VS Build Tools 提供。构建和运行源码的命令示例见[仓库说明](../README.md)。外部 C 静态库若也希望随应用单文件交付，使用 x64 MSVC ABI 和静态 CRT（`/MT`）。
+
+### 打包与复验 SDK
+
+在 Windows x64 构建机上用已通过测试的 `windows-release` 安装树打包：
+
+```powershell
+$name = 'lyra-0.1.0-alpha.1-windows-x64'
+cmake --install build/windows-release --prefix "build/dist/staging/$name"
+tar -a -cf "build/dist/$name.zip" -C build/dist/staging $name
+```
+
+在 Ubuntu 22.04 x86-64 构建机上用 `release` 安装树打包：
+
+```sh
+name=lyra-0.1.0-alpha.1-ubuntu22.04-x86_64
+cmake --install build/release --prefix "build/dist/staging/$name"
+tar -czf "build/dist/$name.tar.gz" -C build/dist/staging "$name"
+```
+
+解包后在对应平台从仓库根目录运行 `python tests/installed_cli.py --sdk <解包后的SDK目录>`。测试会搬迁安装树，在仓库外检查锁定源码包和 C ABI，并从解包的 SDK 构建、运行双包 JSONL 与 HTTP/SQLite 应用。Windows 需在 x64 Developer PowerShell 中执行，Linux 可用 `python3`。部署环境只运行生成的应用；Jammy 的独立运行验收见[部署验收脚本](../tests/jammy-smoke.sh)。VSIX 打包和桌面联调见[扩展说明](../editors/vscode/README.md#真实编辑器验收)。
+
+Windows 的解包验收可加 `--deployment-bundle build/dist/windows-apps`，将两种构建的应用、测试数据库和验证脚本放进新目录。把该目录放到部署机，在目录里运行 `powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\verify.ps1`。脚本只用系统 PowerShell，检查 JSONL 正常行与坏行的结果，以及 SQLite 服务的 `200` 和 `404` 响应。
 
 ### 开发机准备：WSL 2 + Ubuntu 24.04
 
@@ -110,7 +138,7 @@ LLVM 是代码生成后端，不是语言运行时或 GC。Lyra Runtime 实现�
 
 数值类型按位宽与符号对应 C 的 `intN_t` / `uintN_t`，`Float32` 对应 `float`，`Float64` 对应 `double`。Linux 上使用浮点 `%` 的程序可能另依赖系统 `libm.so.6`；整数和不用该运算的程序无需引入它。
 
-项目自己的 C 库可在 `lyra build`、`run`、`test` 上重复传 `--link /path/to/libexample.a`（也可传目标文件或共享库）。输入按命令行顺序交给 Clang，不执行包内脚本。`check` 只检查签名；链接阶段验证符号能否解析。`Int` 对应 `int64_t`，`Bool` 对应 `uint8_t`，`CPtr` 对应不透明指针；Lyra `String` 是带长度的运行时句柄，不是 `char*`。使用共享库时要在目标机提供相同 ABI；`lyra.lock` 锁定 Lyra 源码包，不代为分发原生库。
+项目自己的 C 库可在 `lyra build`、`run`、`test` 上重复传 `--link /path/to/libexample.a`（也可传目标文件或共享库）。输入按命令行顺序交给 Clang，不执行包内脚本。`check` 只检查签名；链接阶段验证符号能否解析。`Int` 对应 `int64_t`，`Bool` 对应 `uint8_t`，`CPtr` 对应不透明指针；Lyra `String` 和 `Bytes` 都是带长度的运行时句柄，不是裸字节指针。使用共享库时要在目标机提供相同 ABI；`lyra.lock` 锁定 Lyra 源码包，不代为分发原生库。
 
 用安装树的 `include/` 编译 C 适配器即可读取 `String`。例如，Lyra 声明 `extern fn writeText(text: String): Int;`，C 实现如下：
 
@@ -127,13 +155,15 @@ int64_t writeText(const LyraString *text) {
 
 `LyraString` 是不透明句柄。视图的 `data` 指向只读 UTF-8 字节；`size` 是字节数，包含内容中所有 NUL（即便 NUL 是最后一个字节），不计任何额外的结束符。不要读取 `data[size]` 或调用 `strlen`。空字符串返回非空 `data` 与零长度；普通 Lyra `String` 实参不会是空指针，C 显式调用 `lyraStringView(NULL)` 得到 `{NULL, 0}`。
 
-编译器在同步 C 调用返回前保活所有传入的 `String`，包括阻塞期间另一线程触发 GC 的情况。句柄和视图只在这次调用内借用，不能保存到全局变量或交给另一个线程；需要跨调用使用时，在返回前复制 `size` 个字节到 C 自己的存储。[安装验收](../tests/installed_cli.py)用搬迁后的头文件和独立的 C11 编译单元验证这些边界。其余运行时头文件不作为公共 C API 分发。
+`Bytes` 对应同一头文件里的不透明 `LyraBytes`。`lyraBytesView` 返回 `LyraBytesView`，其 `data` 是 `const unsigned char*`，不保证 UTF-8 或 NUL 结尾。C 返回 `String` 或 `Bytes` 时须返回相应的有效 Lyra 句柄（例如原样返回本次参数），不能返回视图、C 数组或 `NULL`。
+
+编译器在同步 C 调用返回前保活所有传入的 `String` 和 `Bytes`，包括阻塞期间另一线程触发 GC 的情况。句柄和视图只在这次调用内借用，不能保存到全局变量或交给另一个线程；需要跨调用使用时，在返回前复制 `size` 个字节到 C 自己的存储。[安装验收](../tests/installed_cli.py)用搬迁后的头文件和独立的 C11 编译单元验证文本边界；[集合和文件验收](../tests/stdlib_daily_cli.py)验证字节句柄。其余运行时头文件不作为公共 C API 分发。
 
 在异步任务中，可能阻塞的 SQLite 操作必须通过隔离的执行入口进行。首例可以在一次隔离的同步操作里打开数据库、执行查询并清理，再把数据值返回执行域。这样 `defer` 仍是同步的，也不会在调度线程上执行可能阻塞的关闭操作。
 
 **已通过的端到端验收**：[原生句柄测试](../tests/runtime_sqlite.cpp)在系统 SQLite 的内存库中建表、写入 `7 / Ada` 并参数化查询；缺表时保留 `prepare` 的操作名、错误码和消息，关闭 statement、连接并触发 GC 后，拷出的文本仍有效。[Lyra 源码测试](../tests/sqlite_cli.py)还区分 SQL `NULL` 与空串，保留文本中的 NUL，并检查 `close()` 抛出 `Busy` 后可以继续用游标，释放游标后再经连接别名成功关闭。[真实 HTTP 服务](../tests/http_cli.py)在隔离线程执行查询，命中、无行、缺文件或缺表分别返回 200、404、500，并测到请求取消后的安全收尾。
 
-**公开 API**：[std.sqlite](../std/sqlite/README.md) 的数据库操作直接返回 `Result<T, DbError>`。`next()` 的 `Ok(false)` 表示游标正常结束；列读取用 `Ok(None)` 表示 SQL `NULL`。`DbError` 保留 `kind`、`operation`、`code` 和 `message()`；[服务代码](../examples/http-sqlite/src/main.ly)用 `?` 传播为 `Result<User?, DbError>`，不再翻译原生状态。同步 `close()` 的 `Busy` 等清理失败走异常通道。
+**公开 API**：[std.sqlite](../std/sqlite/README.md) 的数据库操作直接返回 `Result<T, DbError>`。`next()` 的 `Ok(false)` 表示游标正常结束；列读取用 `Ok(None)` 表示 SQL `NULL`。`DbError` 保留 `kind`、`operation`、`code` 和 `message()`；[服务的查询库](../examples/http-sqlite/users/src/users.ly)用 `?` 传播为 `Result<User?, DbError>`，不再翻译原生状态。同步 `close()` 的 `Busy` 等清理失败走异常通道。
 
 取消路径单独验收：用可控的测试门闩停住隔离操作，同域另一 Task 应仍能推进。取消拥有该操作的作用域时，**不能在原生操作还可能使用句柄时释放它**；放行并等它安全返回，清理后任务组才可退出。不要求不支持中断的 C 调用立即停止。这两条用例不用定时睡眠来猜调度顺序。
 

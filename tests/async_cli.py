@@ -21,14 +21,15 @@ class Async(unittest.TestCase):
         directory.mkdir()
         self.main = directory / "main.ly"
 
-    def run_source(self, source, expected):
+    def run_source(self, source, expected, env=None):
         self.main.write_text(source, encoding="utf-8")
         for mode in ([], ["--release"]):
             with self.subTest(mode=mode):
-                app = executable(self.package / "app")
+                output = Path(tempfile.mkdtemp(dir=self.package, prefix="app-"))
+                app = executable(output / "app")
                 built = subprocess.run([COMPILER, "build", self.package, *mode, "-o", app], capture_output=True, timeout=30)
                 self.assertEqual(built.returncode, 0, built.stderr.decode())
-                run = subprocess.run([app], capture_output=True, timeout=15)
+                run = subprocess.run([app], capture_output=True, timeout=15, env=env)
                 self.assertEqual((run.returncode, run.stdout.decode(), run.stderr), (0, expected, b""))
 
     def test_cold_arguments_repeated_await_and_spawn(self):
@@ -189,6 +190,124 @@ async fn main(): Unit {
     print(gate.load())
 }
 ''', 'caught\n42\n42\n2\n42\ntrue\n4\n')
+
+    def test_parallel_for_respects_runtime_worker_capacity(self):
+        (self.package / "lyra.json5").write_text("{name:'test/parallel-for',version:'1.0.0'}")
+        source = '''
+import std.collections.parallelFor
+import std.sync.AtomicInt
+import std.task.parallelism
+
+class Totals(val active: AtomicInt, val maximum: AtomicInt, val sum: AtomicInt)
+async fn add(totals: Totals, value: Int, expectedWorkers: Int): Unit {
+    val active = totals.active.fetchAdd(1) + 1
+    var previous = totals.maximum.load()
+    while active > previous && !totals.maximum.compareExchange(previous, active) { previous = totals.maximum.load() }
+    if value <= expectedWorkers {
+        while totals.maximum.load() < expectedWorkers {}
+    }
+    totals.sum.fetchAdd(value)
+    totals.active.fetchAdd(-1);
+}
+async fn main(): Unit {
+    val totals = Totals(AtomicInt(), AtomicInt(), AtomicInt())
+    val capacity = parallelism()
+    val expectedWorkers = if capacity < 2 { capacity } else { 2 }
+    await parallelFor([1, 2, 3, 4, 5], maxConcurrency: 2) { add(totals, it, expectedWorkers) }
+    print(totals.sum.load())
+    print(totals.maximum.load())
+    print(totals.active.load())
+    print(capacity)
+}
+'''
+        self.run_source(source, '15\n2\n0\n3\n', env={**os.environ, "LYRA_PARALLEL_WORKERS": "3"})
+        self.run_source(source, '15\n1\n0\n1\n', env={**os.environ, "LYRA_PARALLEL_WORKERS": "1"})
+
+    def test_parallel_for_empty_input_and_read_only_input_contract(self):
+        (self.package / "lyra.json5").write_text("{name:'test/parallel-for-input',version:'1.0.0'}")
+        self.run_source('''
+import std.collections.parallelFor
+import std.sync.AtomicInt
+
+class Totals(val count: AtomicInt, val sum: AtomicInt)
+async fn record(totals: Totals, value: Int): Unit {
+    totals.count.fetchAdd(1)
+    totals.sum.fetchAdd(value);
+}
+async fn main(): Unit {
+    val totals = Totals(AtomicInt(), AtomicInt())
+    val empty: List<Int> = []
+    await parallelFor(empty, maxConcurrency: 2) { record(totals, it) }
+    print(totals.count.load())
+
+    val input = [3, 5, 7, 11]
+    await parallelFor(input, maxConcurrency: 2) { record(totals, it) }
+    print(totals.count.load())
+    print(totals.sum.load())
+    print(input.size)
+    print(input[0] + input[1] + input[2] + input[3])
+
+    try { await parallelFor(empty, maxConcurrency: 0) { record(totals, it) } }
+    catch error: Exception { print(error.message) }
+    print(totals.count.load())
+}
+''', '0\n4\n26\n4\n26\nparallelFor maxConcurrency must be positive\n4\n',
+                       env={**os.environ, "LYRA_PARALLEL_WORKERS": "2"})
+
+    def test_parallel_for_failure_propagates_and_runs_cleanup(self):
+        (self.package / "lyra.json5").write_text("{name:'test/parallel-for-failure',version:'1.0.0'}")
+        self.run_source('''
+import std.collections.parallelFor
+import std.sync.AtomicInt
+
+exception ItemFailed
+class State(val cleaned: AtomicInt, val completed: AtomicInt)
+async fn action(state: State, item: Int): Unit {
+    defer state.cleaned.fetchAdd(1)
+    if item == 1 { throw ItemFailed("item 1 failed") }
+    state.completed.fetchAdd(1);
+}
+async fn main(): Unit {
+    val state = State(AtomicInt(), AtomicInt())
+    try { await parallelFor([1], maxConcurrency: 1) { action(state, it) } }
+    catch error: ItemFailed { print(error.message) }
+    print(state.cleaned.load())
+    print(state.completed.load())
+}
+''', 'item 1 failed\n1\n0\n', env={**os.environ, "LYRA_PARALLEL_WORKERS": "2"})
+
+    def test_parallel_for_cancellation_waits_for_worker_cleanup(self):
+        (self.package / "lyra.json5").write_text("{name:'test/parallel-for-cancel',version:'1.0.0'}")
+        source = '''
+import std.collections.parallelFor
+import std.sync.AtomicInt
+
+class State(val started: AtomicInt, val release: AtomicInt, val cleaned: AtomicInt, val completed: AtomicInt)
+async fn action(state: State, item: Int): Unit {
+    state.started.fetchAdd(1)
+    defer state.cleaned.fetchAdd(1)
+    await blocking { while state.release.load() == 0 {} }
+    state.completed.fetchAdd(1);
+}
+async fn cancelAfterStart(job: Task<Unit>, state: State): Unit {
+    await blocking {
+        while state.started.load() < 2 {}
+    }
+    job.cancel()
+    state.release.store(1)
+}
+async fn main(): Unit {
+    val state = State(AtomicInt(), AtomicInt(), AtomicInt(), AtomicInt())
+    taskGroup {
+        val job = spawn parallelFor([1, 2, 3, 4], maxConcurrency: 2) { action(state, it) }
+        spawn cancelAfterStart(job, state)
+    }
+    print(state.started.load())
+    print(state.cleaned.load())
+    print(state.completed.load())
+}
+'''
+        self.run_source(source, '2\n2\n0\n', env={**os.environ, "LYRA_PARALLEL_WORKERS": "2", "UV_THREADPOOL_SIZE": "3"})
 
     def test_typed_task_local_keeps_unset_and_stored_none_distinct(self):
         self.run_source('''

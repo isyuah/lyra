@@ -3,6 +3,7 @@
 #include "managed.h"
 #include "strings.h"
 
+#include <atomic>
 #include <cerrno>
 #include <climits>
 #include <cstddef>
@@ -10,6 +11,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <new>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -20,7 +22,39 @@ struct LyraIoText {
     const void* value;
 };
 
+struct LyraIoBytes {
+    int status;
+    const void* value;
+};
+
+struct LyraIoFile {
+    std::atomic_flag busy{};
+    std::FILE* stream;
+    bool writing;
+};
+
+struct LyraIoFileOpen {
+    int status;
+    LyraIoFile* file;
+};
+
 namespace {
+
+enum FileStatus : int { fileEof = -1, fileClosed = -2, fileBusy = -3, fileInvalid = -4 };
+
+struct FileLease {
+    explicit FileLease(LyraIoFile& file) : file(file), held(!file.busy.test_and_set(std::memory_order_acquire)) {}
+    ~FileLease() { if (held) file.busy.clear(std::memory_order_release); }
+    int access(bool writing) const {
+        if (!held) return fileBusy;
+        if (!file.stream) return fileClosed;
+        return file.writing == writing ? 0 : fileInvalid;
+    }
+    LyraIoFile& file;
+    bool held;
+};
+
+int systemStatus() { return errno ? errno : EIO; }
 
 void* memory(void* value) {
     if (!value) { std::fputs("Lyra runtime: I/O buffer allocation failed\n", stderr); std::abort(); }
@@ -45,6 +79,7 @@ std::FILE* openFile(const void* path, bool writing) {
     auto name = static_cast<char*>(memory(std::malloc(length + 1)));
     std::memcpy(name, data, length);
     name[length] = '\0';
+    errno = 0;
     auto file = std::fopen(name, writing ? "wb" : "rb");
     auto error = errno;
 #endif
@@ -55,7 +90,13 @@ std::FILE* openFile(const void* path, bool writing) {
 
 int write(std::FILE* file, const void* content) {
     auto length = lyraStringLength(content);
-    return std::fwrite(lyraStringBytes(content), 1, length, file) == length ? 0 : (errno ? errno : EIO);
+    errno = 0;
+    return std::fwrite(lyraStringBytes(content), 1, length, file) == length ? 0 : systemStatus();
+}
+
+int closeFile(std::FILE* file) {
+    errno = 0;
+    return std::fclose(file) ? systemStatus() : 0;
 }
 
 struct ByteBuffer {
@@ -79,6 +120,36 @@ struct ByteBuffer {
     }
 };
 
+int readAll(const void* path, ByteBuffer& data) {
+    auto file = openFile(path, false);
+    if (!file) return systemStatus();
+    char buffer[8192];
+    int status = 0;
+    errno = 0;
+    while (auto count = std::fread(buffer, 1, sizeof(buffer), file)) {
+        if (!data.append(buffer, count)) { status = EOVERFLOW; break; }
+        if (std::ferror(file)) break;
+        errno = 0;
+    }
+    if (!status && std::ferror(file)) status = systemStatus();
+    auto closed = closeFile(file);
+    return status ? status : closed;
+}
+
+int writeAll(const void* path, const void* content) {
+    auto file = openFile(path, true);
+    if (!file) return systemStatus();
+    auto status = write(file, content);
+    auto closed = closeFile(file);
+    return status ? status : closed;
+}
+
+LyraIoBytes* bytes(const char* data, std::size_t size, int status) {
+    auto out = static_cast<LyraIoBytes*>(lyraGcAlloc(sizeof(LyraIoBytes)));
+    *out = {status, status ? nullptr : lyraStringFromBytes(data, size)};
+    return out;
+}
+
 }
 
 LyraIoText* lyraIoDecode(const char* data, std::size_t size, int status) {
@@ -101,9 +172,10 @@ LyraIoText* lyraIoReadLine() {
     lyraRuntime::Lock lock(input);
     ByteBuffer line;
     for (;;) {
+        errno = 0;
         auto next = std::fgetc(stdin);
         if (next == EOF) {
-            auto status = std::ferror(stdin) ? (errno ? errno : EIO) : line.length ? 0 : -1;
+            auto status = std::ferror(stdin) ? systemStatus() : line.length ? 0 : fileEof;
             return lyraIoDecode(line.data, line.length, status);
         }
         if (next == '\n') {
@@ -116,25 +188,65 @@ LyraIoText* lyraIoReadLine() {
 }
 
 LyraIoText* lyraIoReadFile(const void* path) {
-    auto file = openFile(path, false);
-    if (!file) return lyraIoDecode(nullptr, 0, errno);
-    char buffer[8192];
     ByteBuffer data;
-    int status = 0;
-    while (auto count = std::fread(buffer, 1, sizeof(buffer), file)) {
-        if (!data.append(buffer, count)) { status = EOVERFLOW; break; }
-    }
-    if (!status && std::ferror(file)) status = errno ? errno : EIO;
-    if (std::fclose(file) && !status) status = errno;
+    auto status = readAll(path, data);
     return lyraIoDecode(data.data, data.length, status);
 }
 
-int64_t lyraIoWriteFile(const void* path, const void* content) {
-    auto file = openFile(path, true);
-    if (!file) return errno;
-    auto status = write(file, content);
-    if (std::fclose(file) && !status) status = errno;
-    return status;
+int64_t lyraIoWriteFile(const void* path, const void* content) { return writeAll(path, content); }
+int64_t lyraIoWriteBytes(const void* path, const void* content) { return writeAll(path, content); }
+
+LyraIoBytes* lyraIoReadBytes(const void* path) {
+    ByteBuffer data;
+    auto status = readAll(path, data);
+    return bytes(data.data, data.length, status);
+}
+
+int64_t lyraIoBytesStatus(const LyraIoBytes* result) { return result->status; }
+const void* lyraIoBytesValue(const LyraIoBytes* result) { return result->value; }
+
+LyraIoFileOpen* lyraIoFileOpen(const void* path, uint8_t writing) {
+    auto stream = openFile(path, writing);
+    auto status = stream ? 0 : systemStatus();
+    auto result = static_cast<LyraIoFileOpen*>(lyraGcAlloc(sizeof(LyraIoFileOpen)));
+    *result = {status, stream ? ::new (lyraGcAlloc(sizeof(LyraIoFile))) LyraIoFile{{}, stream, writing != 0} : nullptr};
+    return result;
+}
+
+int64_t lyraIoFileOpenStatus(const LyraIoFileOpen* result) { return result->status; }
+LyraIoFile* lyraIoFileOpened(const LyraIoFileOpen* result) { return result->file; }
+
+LyraIoBytes* lyraIoFileRead(LyraIoFile* file, int64_t maximum) {
+    FileLease lease(*file);
+    if (auto status = lease.access(false)) return bytes(nullptr, 0, status);
+    if (maximum <= 0) return bytes(nullptr, 0, fileInvalid);
+    char buffer[65536];
+    auto limit = maximum < static_cast<int64_t>(sizeof(buffer)) ? static_cast<std::size_t>(maximum) : sizeof(buffer);
+    errno = 0;
+    auto count = std::fread(buffer, 1, limit, file->stream);
+    if (std::ferror(file->stream)) return bytes(nullptr, 0, systemStatus());
+    return bytes(buffer, count, count ? 0 : fileEof);
+}
+
+int64_t lyraIoFileWrite(LyraIoFile* file, const void* content) {
+    FileLease lease(*file);
+    auto status = lease.access(true);
+    return status ? status : write(file->stream, content);
+}
+
+int64_t lyraIoFileFlush(LyraIoFile* file) {
+    FileLease lease(*file);
+    if (auto status = lease.access(true)) return status;
+    errno = 0;
+    return std::fflush(file->stream) ? systemStatus() : 0;
+}
+
+int64_t lyraIoFileClose(LyraIoFile* file) {
+    FileLease lease(*file);
+    if (!lease.held) return fileBusy;
+    auto stream = file->stream;
+    file->stream = nullptr;
+    return stream ? closeFile(stream) : 0;
 }
 
 int64_t lyraIoWriteError(const void* content) {

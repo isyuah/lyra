@@ -225,6 +225,40 @@ async fn main(): Unit {
 }
 ''', b"2\nrooted\n")
 
+    def test_or_patterns_and_integer_ranges(self):
+        self.native('''
+enum Message { Text(String), Failure(String), Done }
+enum Wrapped { Value(Int) }
+fn text(message: Message): String {
+    match message {
+        Text(value) | Failure(value) => value,
+        Done => "done",
+    }
+}
+fn classify(value: Int): Int {
+    match value {
+        -10..<0 => 1,
+        0..2 => 2,
+        _ => 3,
+    }
+}
+fn byteClass(value: Int8): Int {
+    match value {
+        -128..-1 => 4,
+        0..127 => 5,
+    }
+}
+fn main(): Unit {
+    print(text(Message.Text("body")))
+    print(text(Message.Failure("error")))
+    print(text(Message.Done))
+    print(match Wrapped.Value(2) { Wrapped.Value(1 | 2) => 6, _ => 0 })
+    print(classify(-10)); print(classify(-1)); print(classify(0)); print(classify(2)); print(classify(3))
+    print(byteClass(-128)); print(byteClass(-1)); print(byteClass(0)); print(byteClass(127))
+    print(match true { true | false => 7 })
+}
+''', b"body\nerror\ndone\n6\n1\n1\n2\n2\n3\n4\n4\n5\n5\n7\n")
+
     def test_static_rejections(self):
         for body, code, fragment in (
             ("fn f(v: Option<Int?>): Int { match v { None => 0, Some(Some(x)) => x } }", "LYT0012", "Some(None)"),
@@ -236,9 +270,15 @@ async fn main(): Unit {
             ("async fn read(): Result<Int,String> { Ok(2) }\nasync fn bad(): Result<Int,String> { Ok(await (read()?)) }", "LYT0013", "Task"),
             ("fn f(v: Result<Int,String>): Bool { v == v }", "LYT0006", "Eq"),
             ("fn f(v: Bool): Int { match v { true if true => 1, false => 0 } }", "LYT0012", "true"),
-            ("fn f(v: Int): Int { match v { 1 => 1 } }", "LYT0012", "_"),
+            ("fn f(v: Int): Int { match v { 1 => 1 } }", "LYT0012", "-9223372036854775808"),
             ("fn f(v: Bool): Int { match v { value if 1 => 1, _ => 0 } }", "LYT0001", "Bool"),
             ("fn f(v: Bool): Int { match v { 1 => 1, _ => 0 } }", "LYT0011", "Bool"),
+            ("fn f(v: Bool): Int { match v { true | 1 => 1, _ => 0 } }", "LYT0011", "整数字面量"),
+            ("fn f(v: Int8): Int { match v { -128..0 => 1 } }", "LYT0012", "1"),
+            ("fn f(v: Bool): Int { match v { 1..2 => 1, _ => 0 } }", "LYT0011", "整数区间"),
+            ("enum Choice { Left(Int), Right(String) }\nfn f(v: Choice): Int { match v { Left(item) | Right(item) => 1 } }", "LYT0011", "相同名称和类型"),
+            ("enum Choice { Left(Int), Right(Int) }\nfn f(v: Choice): Int { match v { Left(item) | Right(other) => 1 } }", "LYT0011", "相同名称和类型"),
+            ("fn f(v: Int8): Int { match v { 1..<1 => 0 } }", "LYT0012", "-128"),
             ("struct Flags(val first: Bool, val second: Bool)\nfn f(v: Flags): Int { match v { Flags(first: true) => 1, Flags(second: true) => 2 } }", "LYT0012", "Flags(first: false, second: false)"),
             ("struct Flags(val first: Bool, val second: Bool)\nfn f(v: Flags): Int { match v { Flags(first: name, second: name) => 1 } }", "LYN0002", "name"),
             ("struct Flags(val first: Bool)\nfn f(v: Flags): Int { match v { Flags(first: true, first: false) => 1 } }", "LYN0002", "first"),

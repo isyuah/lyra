@@ -1,11 +1,17 @@
 module;
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
+#include <llvm/IR/DIBuilder.h>
+#include <llvm/IR/DebugInfoMetadata.h>
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/Intrinsics.h>
 #include <llvm/IR/Module.h>
 #include <llvm/IR/Verifier.h>
+#include <llvm/Support/MathExtras.h>
 #include <map>
+#include <optional>
+#include <set>
 #include <span>
 #include <string_view>
 #include <utility>
@@ -33,7 +39,8 @@ struct Layouts {
     const CheckedModule& program;
     std::vector<llvm::StructType*> objects;
     std::vector<std::vector<llvm::StructType*>> payloads;
-    mutable std::map<Type, llvm::Constant*> typeTokens{};
+    mutable std::map<Type, llvm::GlobalVariable*> typeTokens{};
+    mutable std::set<Type> initializedTypeTokens{};
     mutable std::map<std::vector<std::size_t>, llvm::Constant*> interfaceTables{};
     bool workers{};
 
@@ -63,10 +70,130 @@ struct Layouts {
 
     bool reference(Type type) const { return program.aggregates[type.id].syntax.reference; }
 
+    std::string typeName(Type type) const {
+        auto nested = [&](Type item) { return typeName(item); };
+        switch (type.kind) {
+            case Type::Unit: return "Unit";
+            case Type::Int: case Type::UInt: case Type::Real: return numberName(type);
+            case Type::Bool: return "Bool";
+            case Type::String: return "String";
+            case Type::Char: return "Char";
+            case Type::Bytes: return "Bytes";
+            case Type::Never: return "Never";
+            case Type::CPtr: return "CPtr";
+            case Type::Any: return "Any";
+            case Type::Error: return "Error";
+            case Type::Exception: return type.id ? program.exceptions[type.id - 1].name.text : "Exception";
+            case Type::Record: case Type::Enum: {
+                auto full = type.kind == Type::Record ? program.aggregates[type.id].syntax.name.text : program.enums[type.id].syntax.name.text;
+                auto separator = full.rfind("::");
+                std::string name = separator == full.npos ? full : full.substr(separator + 2);
+                const auto& arguments = type.kind == Type::Record ? program.aggregates[type.id].arguments : program.enums[type.id].arguments;
+                if (arguments.empty()) return name;
+                name += '<';
+                for (std::size_t index = 0; index < arguments.size(); ++index) {
+                    if (index) name += ", ";
+                    name += nested(arguments[index]);
+                }
+                return name + '>';
+            }
+            case Type::Task: return "Task<" + nested(program.taskResults[type.id]) + ">";
+            case Type::TaskLocal: return "TaskLocal<" + nested(program.taskLocalValues[type.id]) + ">";
+            case Type::List: return "List<" + nested(program.listElements[type.id]) + ">";
+            case Type::Option: return "Option<" + nested(program.sumTypes[type.id].success) + ">";
+            case Type::Result: return "Result<" + nested(program.sumTypes[type.id].success) + ", " + nested(program.sumTypes[type.id].failure) + ">";
+            case Type::Dyn: return "dyn " + program.traits[type.id].name.text;
+            case Type::Closure: {
+                const auto& shape = program.signatures[type.id];
+                std::string name = "(";
+                for (std::size_t index = 0; index < shape.parameters.size(); ++index) {
+                    if (index) name += ", ";
+                    name += nested(shape.parameters[index]);
+                }
+                return name + ") -> " + nested(shape.result);
+            }
+            case Type::Variable: case Type::Projection: llvm_unreachable("abstract type cannot be reflected at runtime");
+        }
+        llvm_unreachable("invalid type name");
+    }
+
+    llvm::Constant* cString(Builder& builder, llvm::StringRef value) const {
+        auto* content = llvm::ConstantDataArray::getString(builder.getContext(), value, true);
+        auto* global = new llvm::GlobalVariable(*builder.GetInsertBlock()->getModule(), content->getType(), true,
+            llvm::GlobalValue::PrivateLinkage, content, "lyra.reflect.text");
+        llvm::Constant* indices[] = {builder.getInt32(0), builder.getInt32(0)};
+        return llvm::ConstantExpr::getInBoundsGetElementPtr(content->getType(), global,
+            indices);
+    }
+
+    llvm::Function* fieldGetter(Builder& builder, Type owner, std::size_t slot, Type fieldType) const {
+        auto& module = *builder.GetInsertBlock()->getModule();
+        auto* pointer = builder.getPtrTy();
+        auto* signature = llvm::FunctionType::get(builder.getVoidTy(), {pointer, pointer}, false);
+        auto* getter = llvm::Function::Create(signature, llvm::Function::InternalLinkage,
+            "lyra.reflect.get." + std::to_string(owner.id) + "." + std::to_string(slot), module);
+        Builder emit(llvm::BasicBlock::Create(builder.getContext(), "entry", getter));
+        llvm::Value* object = getter->getArg(0);
+        if (reference(owner)) object = emit.CreateLoad(pointer, object);
+        auto* address = emit.CreateStructGEP(objects[owner.id], object, static_cast<unsigned>(slot));
+        auto* fieldNative = native(emit, fieldType);
+        auto* value = workers ? sharedRead(emit, fieldNative, address) : emit.CreateLoad(fieldNative, address);
+        auto* anyType = llvm::StructType::get(emit.getContext(), {pointer, pointer});
+        llvm::Value* any;
+        if (fieldType == Type::Any) {
+            any = value;
+        } else {
+            auto allocate = module.getOrInsertFunction("lyraGcAlloc", pointer, emit.getInt64Ty());
+            auto* boxed = emit.CreateCall(allocate, {llvm::ConstantExpr::getSizeOf(fieldNative)});
+            emit.CreateStore(value, boxed);
+            any = llvm::UndefValue::get(anyType);
+            any = emit.CreateInsertValue(any, typeToken(emit, fieldType), 0);
+            any = emit.CreateInsertValue(any, boxed, 1);
+        }
+        emit.CreateStore(any, getter->getArg(1));
+        emit.CreateRetVoid();
+        return getter;
+    }
+
     llvm::Constant* typeToken(Builder& builder, Type type) const {
+        auto& module = *builder.GetInsertBlock()->getModule();
+        auto* pointer = builder.getPtrTy();
+        auto* descriptor = llvm::StructType::get(builder.getContext(), {builder.getInt32Ty(), builder.getInt32Ty(), pointer, builder.getInt64Ty(), pointer});
         auto [entry, inserted] = typeTokens.try_emplace(type);
-        if (inserted) entry->second = new llvm::GlobalVariable(*builder.GetInsertBlock()->getModule(), builder.getInt8Ty(), true,
-            llvm::GlobalValue::PrivateLinkage, builder.getInt8(0), "lyra.type.identity");
+        if (inserted) entry->second = new llvm::GlobalVariable(module, descriptor, true,
+            llvm::GlobalValue::PrivateLinkage, llvm::Constant::getNullValue(descriptor), "lyra.type.identity");
+        if (!initializedTypeTokens.contains(type)) {
+            initializedTypeTokens.insert(type);
+            std::vector<llvm::Constant*> fields;
+            if (type.kind == Type::Record && !program.aggregates[type.id].abstract) {
+                const auto& aggregate = program.aggregates[type.id];
+                auto* fieldDescriptor = llvm::StructType::get(builder.getContext(), {pointer, pointer, pointer});
+                for (std::size_t slot = 0; slot < aggregate.syntax.fields.size(); ++slot) {
+                    const auto& field = aggregate.syntax.fields[slot];
+                    if (!field.isPublic) continue;
+                    auto* getter = fieldGetter(builder, type, slot, aggregate.fields[slot]);
+                    fields.push_back(llvm::ConstantStruct::get(fieldDescriptor, {
+                        cString(builder, field.name.text), typeToken(builder, aggregate.fields[slot]), getter
+                    }));
+                }
+            }
+            llvm::Constant* fieldArray = llvm::ConstantPointerNull::get(pointer);
+            if (!fields.empty()) {
+                auto* fieldDescriptor = llvm::StructType::get(builder.getContext(), {pointer, pointer, pointer});
+                auto* array = llvm::ArrayType::get(fieldDescriptor, fields.size());
+                auto* global = new llvm::GlobalVariable(module, array, true, llvm::GlobalValue::PrivateLinkage,
+                    llvm::ConstantArray::get(array, fields), "lyra.reflect.fields");
+                llvm::Constant* indices[] = {builder.getInt32(0), builder.getInt32(0)};
+                fieldArray = llvm::ConstantExpr::getInBoundsGetElementPtr(array, global,
+                    indices);
+            }
+            unsigned kind = type.kind == Type::Record ? (reference(type) ? 2u : 1u) : type.kind == Type::Enum ? 3u : 0u;
+            auto initializer = llvm::ConstantStruct::get(descriptor, {
+                builder.getInt32(1), builder.getInt32(kind), cString(builder, typeName(type)),
+                builder.getInt64(fields.size()), fieldArray
+            });
+            entry->second->setInitializer(initializer);
+        }
         return entry->second;
     }
 
@@ -103,7 +230,7 @@ struct Layouts {
         case Type::Char: return builder.getInt32Ty();
         case Type::Unit: case Type::Never: return builder.getInt8Ty();
         case Type::String: case Type::Bytes: case Type::Task: case Type::CPtr: case Type::List: case Type::Exception: case Type::Closure: case Type::Error: case Type::TaskLocal: return builder.getPtrTy();
-        case Type::Variable: llvm_unreachable("abstract type reached LLVM lowering");
+        case Type::Variable: case Type::Projection: llvm_unreachable("abstract type reached LLVM lowering");
         case Type::Any: case Type::Dyn: return llvm::StructType::get(builder.getContext(), {builder.getPtrTy(), builder.getPtrTy()});
         case Type::Record: return reference(type) ? static_cast<llvm::Type*>(builder.getPtrTy()) : objects[type.id];
         case Type::Enum: return llvm::StructType::get(builder.getContext(), {builder.getInt32Ty(), builder.getPtrTy()});
@@ -114,6 +241,178 @@ struct Layouts {
     }
 };
 
+struct DebugInfo {
+    llvm::DIBuilder builder;
+    llvm::DICompileUnit* unit;
+    const llvm::DataLayout& abi;
+    const Layouts& layouts;
+    std::span<const Source> sources;
+    Builder& ir;
+    std::map<std::string, llvm::DIFile*> files{};
+    std::map<Type, llvm::DIType*> types{};
+    bool optimized;
+
+    DebugInfo(llvm::Module& module, const Layouts& layouts, std::span<const Source> sources, Builder& ir, bool optimized)
+        : builder(module), abi(module.getDataLayout()), layouts(layouts), sources(sources), ir(ir), optimized(optimized) {
+        module.addModuleFlag(llvm::Module::Warning, "Debug Info Version", llvm::DEBUG_METADATA_VERSION);
+        if constexpr (windows) module.addModuleFlag(llvm::Module::Warning, "CodeView", 1);
+        else module.addModuleFlag(llvm::Module::Warning, "Dwarf Version", 4);
+        unit = builder.createCompileUnit(llvm::dwarf::DW_LANG_C_plus_plus_14, file(pathText(sources.front().path)),
+            "Lyra compiler", optimized, "", 0);
+    }
+
+    llvm::DIFile* file(const std::string& path) {
+        auto [entry, inserted] = files.try_emplace(path);
+        if (inserted) {
+            auto source = fromUtf8(path);
+            entry->second = builder.createFile(pathText(source.filename()), pathText(source.parent_path()));
+        }
+        return entry->second;
+    }
+
+    llvm::DIType* pointer(llvm::DIType* target) {
+        return builder.createPointerType(target, abi.getPointerSizeInBits(), abi.getPointerABIAlignment(0).value() * 8);
+    }
+
+    unsigned alignment(llvm::Type* native) const { return abi.getABITypeAlign(native).value() * 8; }
+
+    llvm::DICompositeType* product(llvm::StringRef name, llvm::DIFile* source, unsigned line,
+                                  llvm::StructType* storage, unsigned tag = llvm::dwarf::DW_TAG_structure_type) {
+        auto forward = builder.createReplaceableCompositeType(tag, name, source, source, line, 0,
+            abi.getTypeAllocSizeInBits(storage), alignment(storage), llvm::DINode::FlagZero);
+        return llvm::MDNode::replaceWithDistinct(llvm::TempDICompositeType(forward));
+    }
+
+    llvm::DIDerivedType* member(llvm::DICompositeType* owner, llvm::StructType* storage, unsigned slot,
+                                llvm::StringRef name, llvm::DIType* field, unsigned line,
+                                llvm::DINode::DIFlags flags = llvm::DINode::FlagPublic) {
+        auto* native = storage->getElementType(slot);
+        return builder.createMemberType(owner, name, owner->getFile(), line, abi.getTypeStoreSizeInBits(native), alignment(native),
+            abi.getStructLayout(storage)->getElementOffsetInBits(slot), flags, field);
+    }
+
+    llvm::DIType* record(Type value, llvm::DIType*& cached) {
+        const auto& declaration = layouts.program.aggregates[value.id].syntax;
+        const auto& source = sources[declaration.file];
+        const auto site = source.userSite(declaration.name.span);
+        auto* storage = layouts.objects[value.id];
+        auto* compound = product(layouts.typeName(value), file(site.file), static_cast<unsigned>(site.start.line), storage,
+            declaration.reference ? llvm::dwarf::DW_TAG_class_type : llvm::dwarf::DW_TAG_structure_type);
+        cached = declaration.reference ? pointer(compound) : compound;
+        std::vector<llvm::Metadata*> members;
+        for (unsigned slot = 0; slot < declaration.fields.size(); ++slot) {
+            const auto& field = declaration.fields[slot];
+            auto line = static_cast<unsigned>(source.userSite(field.name.span).start.line);
+            auto flags = field.isPublic ? llvm::DINode::FlagPublic : llvm::DINode::FlagPrivate;
+            members.push_back(member(compound, storage, slot, field.name.text, type(layouts.program.aggregates[value.id].fields[slot]), line, flags));
+        }
+        builder.replaceArrays(compound, builder.getOrCreateArray(members));
+        return cached;
+    }
+
+    llvm::DIType* sum(Type value, llvm::DIType*& cached) {
+        auto* storage = llvm::cast<llvm::StructType>(layouts.native(ir, value));
+        auto* compound = product(layouts.typeName(value), unit->getFile(), 0, storage);
+        cached = compound;
+        const auto& shape = layouts.program.sumTypes[value.id];
+        const bool option = value.kind == Type::Option;
+        std::vector<llvm::Metadata*> members{
+            member(compound, storage, 0, option ? "hasValue" : "isOk", type(Type::Bool), 0),
+            member(compound, storage, 1, "value", type(shape.success), 0),
+        };
+        if (!option) {
+            members.push_back(member(compound, storage, 2, "error", type(shape.failure), 0));
+            members.push_back(member(compound, storage, 3, "cause", type(Type::Error), 0));
+        }
+        builder.replaceArrays(compound, builder.getOrCreateArray(members));
+        return cached;
+    }
+
+    llvm::DIType* enumeration(Type value, llvm::DIType*& cached) {
+        const auto& item = layouts.program.enums[value.id];
+        const auto& source = sources[item.syntax.file];
+        const auto site = source.userSite(item.syntax.name.span);
+        auto line = static_cast<unsigned>(site.start.line);
+        auto* location = file(site.file);
+        auto* storage = llvm::cast<llvm::StructType>(layouts.native(ir, value));
+        auto name = layouts.typeName(value);
+        auto* compound = product(name, location, line, storage);
+        cached = compound;
+        std::vector<llvm::Metadata*> enumerators;
+        std::vector<llvm::Metadata*> payloads;
+        std::uint64_t size = 0;
+        unsigned align = 0;
+        for (unsigned index = 0; index < item.syntax.cases.size(); ++index) {
+            const auto& variant = item.syntax.cases[index];
+            enumerators.push_back(builder.createEnumerator(variant.name.text, index, true));
+            if (variant.fields.empty()) continue;
+            auto* payload = layouts.payloads[value.id][index];
+            size = std::max(size, abi.getTypeAllocSizeInBits(payload).getFixedValue());
+            align = std::max(align, alignment(payload));
+            auto caseLine = static_cast<unsigned>(source.userSite(variant.name.span).start.line);
+            auto* fields = product(name + "::" + variant.name.text, location, caseLine, payload);
+            std::vector<llvm::Metadata*> members;
+            for (unsigned slot = 0; slot < variant.fields.size(); ++slot) {
+                const auto& field = variant.fields[slot];
+                auto fieldName = field.name ? field.name->text : "item" + std::to_string(slot);
+                members.push_back(member(fields, payload, slot, fieldName, type(item.payloads[index][slot]), caseLine));
+            }
+            builder.replaceArrays(fields, builder.getOrCreateArray(members));
+            payloads.push_back(builder.createMemberType(location, variant.name.text, location, caseLine,
+                abi.getTypeAllocSizeInBits(payload), alignment(payload), 0, llvm::DINode::FlagPublic, fields));
+        }
+        auto* tagType = builder.createEnumerationType(location, name + "::Tag", location, line, 32, 32,
+            builder.getOrCreateArray(enumerators), type(Type{Type::UInt, 32}));
+        auto* payloadType = payloads.empty() ? nullptr : builder.createUnionType(location, name + "::Payload", location, line,
+            llvm::alignTo(size, align), align, llvm::DINode::FlagZero, builder.getOrCreateArray(payloads));
+        llvm::Metadata* members[] = {member(compound, storage, 0, "tag", tagType, line),
+            member(compound, storage, 1, "payload", pointer(payloadType), line)};
+        builder.replaceArrays(compound, builder.getOrCreateArray(members));
+        return cached;
+    }
+
+    llvm::DIType* type(Type value) {
+        auto [entry, inserted] = types.try_emplace(value);
+        auto& cached = entry->second;
+        if (!inserted) return cached;
+        switch (value.kind) {
+            case Type::Record: return record(value, cached);
+            case Type::Enum: return enumeration(value, cached);
+            case Type::Option: case Type::Result: return sum(value, cached);
+            default: break;
+        }
+        auto name = layouts.typeName(value);
+        auto basic = [&](unsigned bits, unsigned encoding) { return builder.createBasicType(name, bits, encoding); };
+        switch (value.kind) {
+            case Type::Int: cached = basic(numberWidth(value), llvm::dwarf::DW_ATE_signed); break;
+            case Type::UInt: cached = basic(numberWidth(value), llvm::dwarf::DW_ATE_unsigned); break;
+            case Type::Real: cached = basic(numberWidth(value), llvm::dwarf::DW_ATE_float); break;
+            case Type::Bool: cached = basic(8, llvm::dwarf::DW_ATE_boolean); break;
+            case Type::Char: cached = basic(32, llvm::dwarf::DW_ATE_unsigned_char); break;
+            case Type::Unit: cached = basic(8, llvm::dwarf::DW_ATE_unsigned); break;
+            case Type::CPtr: cached = pointer(nullptr); break;
+            case Type::String: case Type::Bytes: case Type::Task: case Type::List: case Type::Exception:
+            case Type::Closure: case Type::Error: case Type::TaskLocal:
+                cached = pointer(builder.createForwardDecl(llvm::dwarf::DW_TAG_structure_type, name, unit->getFile(), unit->getFile(), 0));
+                break;
+            default: cached = builder.createUnspecifiedType(name); break;
+        }
+        return cached;
+    }
+
+    llvm::DISubprogram* function(llvm::Function& native, const Site& site, llvm::ArrayRef<llvm::Metadata*> signature,
+                                llvm::DINode::DIFlags flags = llvm::DINode::FlagZero) {
+        auto* shape = builder.createSubroutineType(builder.getOrCreateTypeArray(signature));
+        auto name = native.getName();
+        auto line = static_cast<unsigned>(site.start.line);
+        auto properties = llvm::DISubprogram::SPFlagDefinition;
+        if (optimized) properties |= llvm::DISubprogram::SPFlagOptimized;
+        auto* scope = builder.createFunction(unit, name, name, file(site.file), line, shape, line, flags, properties);
+        native.setSubprogram(scope);
+        return scope;
+    }
+};
+
 struct Emitter {
     const CheckedFunction& fn;
     const Source& source;
@@ -121,7 +420,9 @@ struct Emitter {
     llvm::Function* native;
     const std::vector<llvm::Function*>& functions;
     const Layouts& layouts;
+    DebugInfo* debug;
     Builder builder{module.getContext()};
+    llvm::DISubprogram* debugScope{};
     std::vector<Value> locals{};
     struct Loop { Label test, done; Value cleanups; std::size_t handlers; };
     std::vector<Loop> loops{};
@@ -235,12 +536,27 @@ struct Emitter {
     void run(std::optional<ExprId> workerId = {}) {
         worker = workerId;
         builder.SetInsertPoint(label("entry"));
+        if (debug) {
+            const auto declaration = worker ? fn.syntax.expressions[*worker].span : fn.syntax.name.span;
+            const auto site = source.userSite(declaration);
+            std::vector<llvm::Metadata*> signature{debug->type(completionType())};
+            if (!worker) {
+                for (std::size_t slot = 0; slot < fn.syntax.parameters.size(); ++slot) signature.push_back(debug->type(fn.locals[slot].type));
+            } else if (lambda()) {
+                for (auto slot : fn.expressions[*worker].argumentSlots) signature.push_back(debug->type(fn.locals[slot].type));
+            }
+            debugScope = debug->function(*native, site, signature);
+            debugLocation(site);
+        }
         errorSlot = NativeExceptions{builder}.slot();
         if (std::ranges::find(fn.cleanupOwners, worker) != fn.cleanupOwners.end()) cleanupHead = cleanupStack(builder);
         locals.resize(fn.locals.size());
         for (std::size_t slot = 0; slot < fn.locals.size(); ++slot) {
             const auto& local = fn.locals[slot];
-            if (local.worker == worker) locals[slot] = builder.CreateAlloca(local.captured ? builder.getPtrTy() : layouts.native(builder, local.type));
+            if (local.worker == worker) {
+                locals[slot] = builder.CreateAlloca(local.captured ? builder.getPtrTy() : layouts.native(builder, local.type));
+                if (debug && local.declaration && !local.name.empty()) declareDebugLocal(slot, local);
+            }
         }
         if (lambda()) {
             const auto& literal = fn.expressions[*worker];
@@ -263,6 +579,32 @@ struct Emitter {
         if (live()) leave(initializer() ? read(fn.syntax.parameters.size()) : deferred() ? unit() : tail);
     }
 
+    llvm::DILocation* location(const Site& site) {
+        auto* file = debug->file(site.file);
+        llvm::DILocalScope* scope = debugScope;
+        if (file != debugScope->getFile()) scope = debug->builder.createLexicalBlockFile(debugScope, file);
+        return llvm::DILocation::get(module.getContext(), static_cast<unsigned>(site.start.line), static_cast<unsigned>(site.start.column), scope);
+    }
+
+    void debugLocation(const Site& site) { builder.SetCurrentDebugLocation(location(site)); }
+
+    void declareDebugLocal(std::size_t slot, const Local& local) {
+        const auto site = source.userSite(*local.declaration);
+        auto* file = debug->file(site.file);
+        auto* type = debug->type(local.type);
+        auto line = static_cast<unsigned>(site.start.line);
+        unsigned argument = 0;
+        if (!worker && slot < fn.syntax.parameters.size()) argument = static_cast<unsigned>(slot + 1);
+        if (lambda()) {
+            const auto& slots = fn.expressions[*worker].argumentSlots;
+            if (auto found = std::ranges::find(slots, slot); found != slots.end()) argument = static_cast<unsigned>(found - slots.begin() + 1);
+        }
+        auto* variable = argument ? debug->builder.createParameterVariable(debugScope, local.name, argument, file, line, type, true)
+            : debug->builder.createAutoVariable(debugScope, local.name, file, line, type, true);
+        auto* expression = local.captured ? debug->builder.createExpression({llvm::dwarf::DW_OP_deref}) : debug->builder.createExpression();
+        debug->builder.insertDeclare(locals[slot], variable, expression, location(site), builder.GetInsertBlock());
+    }
+
     bool initializer() const { return !worker && fn.syntax.initializer; }
 
     Type rawType(ExprId id) const { const auto& info = fn.expressions[id]; return info.sourceType.value_or(info.type); }
@@ -274,9 +616,7 @@ struct Emitter {
         return payload ? builder.CreateInsertValue(value, payload, payloadSlot(tag)) : value;
     }
 
-    Value makeVariant(ExprId id, llvm::ArrayRef<Value> values = {}) {
-        auto type = rawType(id);
-        auto index = fn.expressions[id].target;
+    Value makeVariant(Type type, std::size_t index, llvm::ArrayRef<Value> values) {
         auto tag = builder.getInt32(static_cast<unsigned>(index));
         Value result = builder.CreateInsertValue(llvm::Constant::getNullValue(layouts.native(builder, type)), tag, 0);
         if (values.empty()) return result;
@@ -284,6 +624,10 @@ struct Emitter {
         auto payload = asyncCell(builder, storage);
         for (unsigned slot = 0; slot < values.size(); ++slot) builder.CreateStore(values[slot], builder.CreateStructGEP(storage, payload, slot));
         return builder.CreateInsertValue(result, payload, 1);
+    }
+
+    Value makeVariant(ExprId id, llvm::ArrayRef<Value> values = {}) {
+        return makeVariant(rawType(id), fn.expressions[id].target, values);
     }
 
     Value castNumber(Value value, Type from, Type to) {
@@ -334,6 +678,7 @@ struct Emitter {
     }
 
     Value emit(ExprId id) {
+        if (debug) debugLocation(source.userSite(fn.syntax.expressions[id].span));
         auto value = std::visit([&](const auto& node) { return emitNode(id, node); }, fn.syntax.expressions[id].node);
         const auto& info = fn.expressions[id];
         if (!live() || !info.sourceType) return value;
@@ -427,16 +772,43 @@ struct Emitter {
         return result;
     }
 
+    Value emitConstant(const ConstValue& constant, Type type, std::map<std::size_t, Value>& emitted) {
+        auto* representation = layouts.native(builder, type);
+        if (auto scalar = std::get_if<ConstScalar>(&constant)) {
+            if (auto value = std::get_if<std::uint64_t>(scalar)) return llvm::ConstantInt::get(representation, *value);
+            if (auto value = std::get_if<double>(scalar)) return llvm::ConstantFP::get(representation, *value);
+            if (auto value = std::get_if<bool>(scalar)) return builder.getInt1(*value);
+            if (auto value = std::get_if<std::string>(scalar)) return stringConstant(*value);
+            return unit();
+        }
+        auto index = std::get<ConstRef>(constant).index;
+        if (auto prior = emitted.find(index); prior != emitted.end()) return prior->second;
+        const auto& stored = layouts.program.constantComposites[index];
+        Value result;
+        if (auto sum = std::get_if<SumTag>(&stored.tag)) {
+            const auto& shape = layouts.program.sumTypes[type.id];
+            auto payloadType = successTag(*sum) ? shape.success : shape.failure;
+            result = makeSum(type, *sum, stored.fields.empty() ? nullptr : emitConstant(stored.fields.front(), payloadType, emitted));
+        } else if (auto variant = std::get_if<VariantTag>(&stored.tag)) {
+            std::vector<Value> fields;
+            const auto& types = layouts.program.enums[type.id].payloads[variant->index];
+            for (std::size_t slot = 0; slot < stored.fields.size(); ++slot) fields.push_back(emitConstant(stored.fields[slot], types[slot], emitted));
+            result = makeVariant(type, variant->index, fields);
+        } else {
+            result = llvm::Constant::getNullValue(representation);
+            const auto& types = layouts.program.aggregates[type.id].fields;
+            for (unsigned slot = 0; slot < stored.fields.size(); ++slot)
+                result = builder.CreateInsertValue(result, emitConstant(stored.fields[slot], types[slot], emitted), slot);
+        }
+        emitted.emplace(index, result);
+        return result;
+    }
+
     Value emitNode(ExprId id, const Identifier&) {
         const auto& info = fn.expressions[id];
         if (info.constantRef) {
-            const auto& constant = *layouts.program.constants[*info.constantRef];
-            auto* type = layouts.native(builder, rawType(id));
-            if (auto value = std::get_if<std::uint64_t>(&constant)) return llvm::ConstantInt::get(type, *value);
-            if (auto value = std::get_if<double>(&constant)) return llvm::ConstantFP::get(type, *value);
-            if (auto value = std::get_if<bool>(&constant)) return builder.getInt1(*value);
-            if (auto value = std::get_if<std::string>(&constant)) return stringConstant(*value);
-            return unit();
+            std::map<std::size_t, Value> emitted;
+            return emitConstant(*layouts.program.constants[*info.constantRef], rawType(id), emitted);
         }
         if (info.functionRef) {
             const auto& syntax = layouts.program.functions[*info.functionRef].syntax;
@@ -452,7 +824,7 @@ struct Emitter {
     Value emitNode(ExprId id, const Lambda&) {
         NativeClosures closures{builder};
         auto* code = closures.function(signature(layouts.program.signatures[rawType(id).id]), native->getName() + ".lambda");
-        Emitter{fn, source, module, code, functions, layouts}.run(id);
+        Emitter{fn, source, module, code, functions, layouts, debug}.run(id);
         std::vector<Value> cells;
         for (auto slot : fn.expressions[id].captures) cells.push_back(cell(slot));
         return closures.close(code, cells);
@@ -474,7 +846,7 @@ struct Emitter {
     std::pair<BlockingCode, std::vector<Value>> closure(ExprId id, Type result, llvm::StringRef suffix) {
         const auto& captures = fn.expressions[id].captures;
         auto code = blockingCode(*native, layouts.native(builder, result), captures.size(), suffix);
-        Emitter{fn, source, module, code.body, functions, layouts}.run(id);
+        Emitter{fn, source, module, code.body, functions, layouts, debug}.run(id);
         std::vector<Value> cells;
         for (auto slot : captures) cells.push_back(cell(slot));
         return {code, std::move(cells)};
@@ -494,7 +866,7 @@ struct Emitter {
         auto signature = llvm::FunctionType::get(pointer, std::vector<llvm::Type*>(captures.size(), pointer), false);
         auto* factory = llvm::Function::Create(signature, llvm::Function::InternalLinkage, native->getName() + (parallel ? ".parallel" : ".group"), module);
         auto* body = lyra::asyncBody(*factory, layouts.native(builder, type));
-        Emitter child{fn, source, module, body, functions, layouts};
+        Emitter child{fn, source, module, body, functions, layouts, debug};
         child.run(id);
         lowerAsync(*factory, *body, child.cleanupHead);
         std::vector<Value> cells;
@@ -580,6 +952,39 @@ struct Emitter {
         if (auto* slot = std::get_if<PatternSlot>(&pattern.node)) bindings.emplace_back(slot->local, subject);
         else if (auto* number = std::get_if<std::uint64_t>(&pattern.node))
             matchTest(builder.CreateICmpEQ(subject, llvm::ConstantInt::get(subject->getType(), *number)), miss);
+        else if (auto* range = std::get_if<CheckedIntegerRange>(&pattern.node)) {
+            auto lower = llvm::ConstantInt::get(subject->getType(), range->lower);
+            auto upper = llvm::ConstantInt::get(subject->getType(), range->upper);
+            auto aboveLower = range->signedValues ? builder.CreateICmpSGE(subject, lower) : builder.CreateICmpUGE(subject, lower);
+            auto belowUpper = range->inclusive
+                ? (range->signedValues ? builder.CreateICmpSLE(subject, upper) : builder.CreateICmpULE(subject, upper))
+                : (range->signedValues ? builder.CreateICmpSLT(subject, upper) : builder.CreateICmpULT(subject, upper));
+            matchTest(builder.CreateAnd(aboveLower, belowUpper), miss);
+        } else if (std::holds_alternative<CheckedAlternatives>(pattern.node)) {
+            auto matched = label("match.pattern.alternative");
+            std::vector<std::pair<Label, std::vector<std::pair<std::size_t, Value>>>> incoming;
+            for (std::size_t index = 0; index < pattern.parts.size(); ++index) {
+                auto failed = index + 1 == pattern.parts.size() ? miss : label("match.pattern.next-alternative");
+                std::vector<std::pair<std::size_t, Value>> alternativeBindings;
+                emitPattern(pattern.parts[index], subject, failed, alternativeBindings);
+                auto predecessor = builder.GetInsertBlock();
+                builder.CreateBr(matched);
+                incoming.emplace_back(predecessor, std::move(alternativeBindings));
+                if (index + 1 < pattern.parts.size()) builder.SetInsertPoint(failed);
+            }
+            builder.SetInsertPoint(matched);
+            std::map<std::size_t, std::vector<std::pair<Value, Label>>> values;
+            for (const auto& [block, alternativeBindings] : incoming)
+                for (const auto& [slot, value] : alternativeBindings) values[slot].emplace_back(value, block);
+            for (const auto& [slot, alternatives] : values) {
+                if (alternatives.size() == 1) bindings.emplace_back(slot, alternatives.front().first);
+                else {
+                    auto phi = builder.CreatePHI(layouts.native(builder, fn.locals[slot].type), alternatives.size());
+                    for (const auto& [value, block] : alternatives) phi->addIncoming(value, block);
+                    bindings.emplace_back(slot, phi);
+                }
+            }
+        }
         else if (auto* text = std::get_if<StringLiteral>(&pattern.node)) matchTest(stringEqual(subject, stringConstant(text->bytes)), miss);
         else if (auto* constructor = std::get_if<PatternConstructor>(&pattern.node)) {
             if (auto* tag = std::get_if<SumTag>(constructor)) {
@@ -668,6 +1073,8 @@ struct Emitter {
         if (fn.expressions[id].callee == Callee::Variant) return makeVariant(id);
         auto object = emit(member.receiver);
         if (!live()) return unit();
+        if (fn.expressions[id].callee == Callee::ExtensionProperty)
+            return callFunction(fn.expressions[id].target, {object}, member.name.span);
         auto owner = fn.expressions[member.receiver].type;
         if (owner.kind == Type::List) return NativeLists{builder}.size(object);
         if (owner == Type::Char) return object;
@@ -833,6 +1240,35 @@ struct Emitter {
                 guard(builder.CreateLoad(pointer, errorSlot), handlers.size(), call.name.span, "call");
                 return value;
             }
+            case Callee::ReflectTypeName: return pointerCall("lyraReflectTypeName", {builder.CreateExtractValue(receiver, 0)});
+            case Callee::ReflectFieldCount: {
+                auto pointer = builder.getPtrTy();
+                return builder.CreateCall(module.getOrInsertFunction("lyraReflectFieldCount", builder.getInt64Ty(), pointer),
+                    {builder.CreateExtractValue(receiver, 0)});
+            }
+            case Callee::ReflectFieldName: return pointerCall("lyraReflectFieldNames", {builder.CreateExtractValue(receiver, 0)});
+            case Callee::ReflectField: {
+                auto pointer = builder.getPtrTy();
+                auto anyType = layouts.native(builder, Type::Any);
+                auto* input = builder.CreateAlloca(anyType);
+                auto* output = builder.CreateAlloca(anyType);
+                builder.CreateStore(receiver, input);
+                builder.CreateStore(llvm::Constant::getNullValue(anyType), output);
+                auto found = builder.CreateCall(module.getOrInsertFunction("lyraReflectFieldValue", builder.getInt8Ty(), pointer, pointer, pointer),
+                    {input, args[1], output});
+                auto missing = builder.GetInsertBlock(), present = label("reflect.field.present"), done = label("reflect.field.end");
+                builder.CreateCondBr(builder.CreateICmpNE(found, builder.getInt8(0)), present, done);
+                builder.SetInsertPoint(present);
+                auto value = builder.CreateLoad(anyType, output);
+                auto some = makeSum(rawType(id), SumTag::Some, value);
+                auto presentEnd = builder.GetInsertBlock();
+                builder.CreateBr(done);
+                builder.SetInsertPoint(done);
+                auto result = builder.CreatePHI(layouts.native(builder, rawType(id)), 2);
+                result->addIncoming(makeSum(rawType(id), SumTag::None), missing);
+                result->addIncoming(some, presentEnd);
+                return result;
+            }
             case Callee::Exception: {
                 auto type = rawType(id);
                 if (!type.id) return NativeExceptions{builder}.create(args.front());
@@ -877,6 +1313,7 @@ struct Emitter {
             case Callee::Collect:
                 builder.CreateCall(module.getOrInsertFunction("lyraGcCollect", builder.getVoidTy()));
                 return unit();
+            case Callee::ExtensionProperty: llvm_unreachable("extension property getter is not a Call expression");
             case Callee::Constructor: {
                 auto storage = layouts.objects[info.target];
                 if (layouts.program.aggregates[info.target].syntax.reference) {
@@ -1275,11 +1712,15 @@ struct Emitter {
 
 }
 
-std::unique_ptr<llvm::Module> lower(const CheckedModule& program, const std::vector<Source>& sources, llvm::LLVMContext& context) {
+std::unique_ptr<llvm::Module> lower(const CheckedModule& program, const std::vector<Source>& sources,
+        llvm::LLVMContext& context, bool optimized, bool symbols) {
     auto module = std::make_unique<llvm::Module>("lyra", context);
     module->setTargetTriple(nativeTriple);
+    module->setDataLayout(nativeDataLayout);
     Builder builder(context);
     Layouts layouts(program, builder);
+    std::optional<DebugInfo> debug;
+    if (symbols) debug.emplace(*module, layouts, sources, builder, optimized);
     std::vector<llvm::Function*> functions;
     for (const auto& fn : program.functions) {
         if (fn.syntax.constant == ConstKind::Value) { functions.push_back(nullptr); continue; }
@@ -1298,7 +1739,7 @@ std::unique_ptr<llvm::Module> lower(const CheckedModule& program, const std::vec
             continue;
         }
         auto* body = fn.syntax.isAsync ? asyncBody(*factory, layouts.native(builder, fn.result)) : factory;
-        Emitter emitter{fn, sources[fn.syntax.file], *module, body, functions, layouts};
+        Emitter emitter{fn, sources[fn.syntax.file], *module, body, functions, layouts, debug ? &*debug : nullptr};
         emitter.run();
         if (fn.syntax.isAsync) lowerAsync(*factory, *body, emitter.cleanupHead);
     }
@@ -1307,9 +1748,15 @@ std::unique_ptr<llvm::Module> lower(const CheckedModule& program, const std::vec
                                  : llvm::FunctionType::get(builder.getInt32Ty(), false);
     auto main = llvm::Function::Create(signature, llvm::Function::ExternalLinkage, nativeEntry, *module);
     builder.SetInsertPoint(llvm::BasicBlock::Create(context, "entry", main));
-    if (commandLine) builder.CreateCall(module->getOrInsertFunction("lyraIoSetArgs", builder.getVoidTy(), builder.getInt32Ty(), builder.getPtrTy()), {main->getArg(0), main->getArg(1)});
     auto entry = program.entry.value();
     const auto& root = program.functions[entry];
+    if (debug) {
+        auto site = sources[root.syntax.file].userSite(root.syntax.name.span);
+        llvm::Metadata* type[] = {debug->type(Type{Type::Int, 32})};
+        auto* scope = debug->function(*main, site, type, llvm::DINode::FlagArtificial);
+        builder.SetCurrentDebugLocation(llvm::DILocation::get(context, site.start.line, site.start.column, scope));
+    }
+    if (commandLine) builder.CreateCall(module->getOrInsertFunction("lyraIoSetArgs", builder.getVoidTy(), builder.getInt32Ty(), builder.getPtrTy()), {main->getArg(0), main->getArg(1)});
     if (root.syntax.isAsync) {
         auto result = NativeExceptions{builder}.created(builder.CreateCall(functions[entry]), sources[root.syntax.file], root.syntax.name.span);
         auto returnsResult = root.result.kind == Type::Result;
@@ -1329,6 +1776,8 @@ std::unique_ptr<llvm::Module> lower(const CheckedModule& program, const std::vec
     }
     std::string reason;
     llvm::raw_string_ostream log(reason);
+    if constexpr (!windows) for (auto& fn : *module) if (!fn.isDeclaration()) fn.setUWTableKind(llvm::UWTableKind::Async);
+    if (debug) debug->builder.finalize();
     if (llvm::verifyModule(*module, &log)) throw Diagnostic{"LYB0001", "编译器生成的 LLVM 模块无效：" + reason};
     return module;
 }

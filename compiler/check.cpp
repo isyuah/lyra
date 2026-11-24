@@ -112,6 +112,10 @@ std::string typeName(const CheckedModule& module, Type type, bool canonical = fa
             return text + '>';
         }
         case Type::Variable: return module.variableNames[type.id];
+        case Type::Projection: {
+            const auto& projection = module.projections[type.id];
+            return canonical ? "$assoc:" + projection.member + '<' + name(projection.owner) + '>' : name(projection.owner) + '.' + projection.member;
+        }
         case Type::Task: return "Task<" + name(module.taskResults[type.id]) + ">";
         case Type::TaskLocal: return "TaskLocal<" + name(module.taskLocalValues[type.id]) + ">";
         case Type::List: return "List<" + name(module.listElements[type.id]) + ">";
@@ -252,6 +256,8 @@ struct Symbols {
     Names extensions{};
     std::vector<Extension> extensionDeclarations{};
     std::vector<Overloads> extensionMethods{};
+    std::vector<Names> extensionProperties{};
+    std::vector<std::size_t> functionCallables{};
     std::vector<std::vector<std::size_t>> visibleExtensions{};
     std::map<std::pair<std::size_t, std::vector<Type>>, Type> recordInstances{};
     std::map<std::pair<std::size_t, std::vector<Type>>, Type> enumInstances{};
@@ -260,12 +266,13 @@ struct Symbols {
     std::vector<NominalCheck> nominalChecks{};
     std::size_t nextNominalCheck{};
     bool boundsReady{};
+    std::vector<std::pair<Type, std::string>> resolvingAssociated{};
 
     struct TypeTrial {
         Symbols& symbols;
         std::size_t aggregates = symbols.module.aggregates.size(), enums = symbols.module.enums.size(), tasks = symbols.module.taskResults.size(),
             sums = symbols.module.sumTypes.size(), lists = symbols.module.listElements.size(), signatures = symbols.module.signatures.size(),
-            taskLocals = symbols.module.taskLocalValues.size();
+            taskLocals = symbols.module.taskLocalValues.size(), projections = symbols.module.projections.size();
         unsigned expanding = symbols.expandingNominal;
         std::size_t nominal = symbols.nominalChecks.size(), nextNominal = symbols.nextNominalCheck;
 
@@ -286,6 +293,7 @@ struct Symbols {
             symbols.module.sumTypes.resize(sums);
             symbols.module.listElements.resize(lists);
             symbols.module.signatures.resize(signatures);
+            symbols.module.projections.resize(projections);
         }
     };
 
@@ -378,17 +386,69 @@ struct Symbols {
         return {};
     }
 
+    RequiredMethod requiredShape(Type owner, const Trait& trait, const TraitMethod& method, const Source& use, Span site) {
+        auto resolve = [&](const Identifier& annotation) {
+            return resolveWith(typeForm(annotation.text), sources[trait.file], annotation.span, trait.associated, [&](std::size_t slot) {
+                return projectionType(owner, trait.associated[slot].text, use, site);
+            }).value();
+        };
+        RequiredMethod shape{{}, {}, resolve(method.result), method.asynchronous};
+        for (const auto& parameter : method.parameters) {
+            shape.labels.push_back(parameter.name.text);
+            shape.parameters.push_back(resolve(parameter.type));
+        }
+        return shape;
+    }
+
+    struct BoundMethod { const Trait* trait; const TraitMethod* method; RequiredMethod shape; };
+
+    std::optional<BoundMethod> boundMember(Type owner, const std::string& name, const Source& use, Span site) {
+        std::optional<BoundMethod> result;
+        for (const auto& bound : contracts.constraints(owner)) {
+            const auto& trait = contracts.declaration(bound);
+            auto method = std::ranges::find(trait.methods, name, [](const auto& entry) { return entry.name.text; });
+            if (method == trait.methods.end()) continue;
+            auto shape = requiredShape(owner, trait, *method, use, site);
+            if (!result) result = BoundMethod{&trait, &*method, std::move(shape)};
+            else if (result->shape != shape)
+                throw at(use, site, "LYG0006", "结构约束 " + result->trait->name.text + " 和 " + bound + " 为成员提供了冲突签名：" + name);
+        }
+        return result;
+    }
+
     void requireBounds(std::span<const Bound> bounds, std::size_t file, std::span<const Type> types, const Source& use, Span site) {
-        contracts.require(bounds, types, use, site, [&](Type receiver, const std::string& name, const RequiredMethod& expected) -> std::optional<RequiredMethod> {
-            if (receiver.kind == Type::Dyn) {
-                if (auto method = contracts.member(module.traits[receiver.id].name.text, name)) return *method;
-                return {};
+        const auto& definition = sources[file];
+        auto nameOf = [&](Type type) { return typeName(module, type); };
+        for (const auto& bound : bounds) {
+            auto actual = types[bound.parameter];
+            const auto& trait = contracts.declaration(bound.trait.text);
+            auto fail = [&](const std::string& reason) { return at(use, site, "LYG0005", nameOf(actual) + " 不满足 " + trait.name.text + "：" + reason); };
+            for (const auto& member : trait.associated)
+                if (!associatedType(actual, member.text, definition, site)) throw fail("缺少可见关联类型 " + member.text);
+            for (const auto& method : trait.methods) {
+                const auto& name = method.name.text;
+                auto expected = requiredShape(actual, trait, method, definition, site);
+                std::optional<RequiredMethod> found;
+                auto candidate = [&](const Trait& provided) {
+                    auto member = std::ranges::find(provided.methods, name, [](const auto& entry) { return entry.name.text; });
+                    if (member == provided.methods.end()) return false;
+                    auto shape = requiredShape(actual, provided, *member, definition, site);
+                    if (shape == expected) return true;
+                    found = std::move(shape);
+                    return false;
+                };
+                if (actual.kind == Type::Variable) {
+                    if (std::ranges::any_of(contracts.constraints(actual), [&](const auto& available) { return candidate(contracts.declaration(available)); })) continue;
+                } else if (actual.kind == Type::Dyn) {
+                    if (candidate(module.traits[actual.id])) continue;
+                } else {
+                    if (shapedMethod(actual, name, definition, [&](const auto& shape) { return shape == expected; })) continue;
+                    if (auto available = shapedMethod(actual, name, definition, [](const auto&) { return true; })) found = std::move(available->second);
+                }
+                auto reason = found ? "，实际为 " + describeRequirement(name, *found, nameOf) : "，缺少可见方法 " + name;
+                throw fail("需要 " + describeRequirement(name, expected, nameOf) + reason);
             }
-            const auto& definition = sources[file];
-            auto result = shapedMethod(receiver, name, definition, [&](const auto& shape) { return shape == expected; });
-            if (!result) result = shapedMethod(receiver, name, definition, [](const auto&) { return true; });
-            return result ? std::optional(std::move(result->second)) : std::nullopt;
-        }, [&](Type type) { return typeName(module, type); });
+        }
     }
 
     void requireBounds(const Function& target, std::span<const Type> types, const Source& use, Span site) {
@@ -482,7 +542,7 @@ struct Symbols {
 
     bool abstract(Type type) const {
         switch (type.kind) {
-            case Type::Variable: return true;
+            case Type::Variable: case Type::Projection: return true;
             case Type::Record: return module.aggregates[type.id].abstract;
             case Type::Enum: return module.enums[type.id].abstract;
             case Type::Task: return abstract(module.taskResults[type.id]);
@@ -496,6 +556,39 @@ struct Symbols {
             }
             default: return false;
         }
+    }
+
+    std::optional<Type> associatedType(Type owner, const std::string& member, const Source& source, Span site) {
+        if (owner.kind == Type::Variable) {
+            for (const auto& bound : contracts.constraints(owner)) {
+                const auto& members = contracts.declaration(bound).associated;
+                if (std::ranges::find(members, member, &Identifier::text) == members.end()) continue;
+                TypeProjection projection{owner, member};
+                auto found = std::ranges::find(module.projections, projection);
+                auto id = static_cast<std::size_t>(found - module.projections.begin());
+                if (found == module.projections.end()) module.projections.push_back(std::move(projection));
+                return Type{Type::Projection, id};
+            }
+            return {};
+        }
+        if (owner.kind != Type::Record) return {};
+        const auto& record = module.aggregates[owner.id];
+        const auto& definition = sources[record.syntax.file];
+        auto found = std::ranges::find_if(record.syntax.associated, [&](const auto& entry) { return entry.name.text == member; });
+        if (found == record.syntax.associated.end() || (!found->isPublic && source.moduleId != definition.moduleId)) return {};
+        auto key = std::pair(owner, member);
+        if (std::ranges::find(resolvingAssociated, key) != resolvingAssociated.end())
+            throw at(source, site, "LYG0007", "关联类型形成循环：" + typeName(module, owner) + '.' + member);
+        if (resolvingAssociated.size() >= 128) throw at(source, site, "LYG0004", "关联类型展开过深：" + member);
+        resolvingAssociated.push_back(std::move(key));
+        struct Pop { decltype(resolvingAssociated)& stack; ~Pop() { stack.pop_back(); } } restore{resolvingAssociated};
+        return resolveWith(typeForm(found->type.text), definition, found->type.span, record.syntax.typeParameters,
+            [&](std::size_t slot) { return record.arguments[slot]; });
+    }
+
+    Type projectionType(Type owner, const std::string& member, const Source& source, Span site) {
+        if (auto type = associatedType(owner, member, source, site)) return *type;
+        throw at(source, site, "LYG0007", typeName(module, owner) + " 没有可见关联类型 " + member);
     }
 
     Type recordType(std::size_t declaration, std::vector<Type> arguments, const Source& source, Span span) {
@@ -557,6 +650,8 @@ struct Symbols {
             if (form.name.starts_with("$dyn:")) {
                 auto trait = traitNames.find(form.name.substr(5));
                 if (trait == traitNames.end()) throw at(source, span, "LYG0005", "找不到动态接口 trait：" + form.name.substr(5));
+                if (!module.traits[trait->second].associated.empty())
+                    throw at(source, span, "LYG0007", "含关联类型的 trait 只能用作静态约束：" + form.name.substr(5));
                 return Type{Type::Dyn, trait->second};
             }
             for (Type type : scalarTypes) if (form.name == typeName(module, type)) return type;
@@ -568,6 +663,7 @@ struct Symbols {
             if (!value) return std::nullopt;
             arguments.push_back(*value);
         }
+        if (form.name.starts_with("$assoc:")) return projectionType(arguments.front(), form.name.substr(7), source, span);
         if (form.name == "$fn") {
             auto result = arguments.back();
             arguments.pop_back();
@@ -682,11 +778,14 @@ struct Checker {
 
     void declare(const Identifier& name, std::size_t slot) {
         if (!scopes.back().emplace(localKey(name), slot).second) throw at(source, name.span, "LYN0002", "名称已在此作用域声明：" + name.text);
-        if (!name.text.starts_with('$')) fn.locals[slot].declaration = name.span;
+        if (!name.text.starts_with('$')) {
+            fn.locals[slot].declaration = name.span;
+            fn.locals[slot].name = name.text;
+        }
     }
 
     void refer(const Identifier& name, std::size_t file, Span span) {
-        fn.references.push_back({{fn.syntax.file, name.span}, {file, span}});
+        if (!name.text.starts_with('$')) fn.references.push_back({{fn.syntax.file, name.span}, {file, span}, name.renameTarget});
     }
 
     void referLocal(const Identifier& name, std::size_t slot) {
@@ -837,7 +936,7 @@ struct Checker {
             return shape.parameters.empty() && !shape.asynchronous && shape.result == Type::String;
         };
         if (useMethod) {
-            if (const auto* method = symbols.contracts.member(type, "message"); method && hasMessage(*method)) return {};
+            if (auto method = symbols.boundMember(type, "message", source, site); method && hasMessage(method->shape)) return {};
             if (auto selected = symbols.shapedMethod(type, "message", source, hasMessage)) {
                 if (!materializing()) return {};
                 const auto& item = symbols.callables[selected->first];
@@ -895,7 +994,7 @@ struct Checker {
                     auto found = std::ranges::find(available, method.name.text, [](const TraitMethod& item) { return item.name.text; });
                     implementations.push_back(found - available.begin());
                 } else {
-                    const auto& expected = *symbols.contracts.member(trait.name.text, method.name.text);
+                    auto expected = symbols.requiredShape(actual, trait, method, source, operation.site);
                     auto selected = symbols.shapedMethod(actual, method.name.text, source, [&](const auto& shape) { return shape == expected; }).value().first;
                     const auto& entry = symbols.callables[selected];
                     auto function = entry.generic ? symbols.instantiate(selected, module.aggregates[actual.id].arguments, source, operation.site) : entry.target;
@@ -953,7 +1052,7 @@ struct Checker {
         if (type == Type::Never) return type;
         if (builtInDisplay(type)) return Type::String;
         if (type.kind == Type::Variable) {
-            if (const auto* method = symbols.contracts.member(type, "toString"); method && method->parameters.empty() && !method->asynchronous && method->result == Type::String) return Type::String;
+            if (auto method = symbols.boundMember(type, "toString", source, fn.syntax.expressions[id].span); method && method->shape.parameters.empty() && !method->shape.asynchronous && method->shape.result == Type::String) return Type::String;
         } else if (type.kind == Type::Record) {
             const auto& record = module.aggregates[type.id];
             if (auto found = symbols.shapedMethod(type, "toString", source, [](const auto& shape) {
@@ -1193,11 +1292,65 @@ struct Checker {
         return {PatternSlot{slot}};
     }
 
+    void remapPatternSlots(CheckedPattern& pattern, const std::unordered_map<std::size_t, std::size_t>& slots) {
+        if (auto* slot = std::get_if<PatternSlot>(&pattern.node)) slot->local = slots.at(slot->local);
+        for (auto& part : pattern.parts) remapPatternSlots(part, slots);
+    }
+
+    CheckedPattern alternativesPattern(const Pattern& pattern, Type subject) {
+        std::vector<CheckedPattern> checked;
+        std::vector<Names> bindings;
+        for (const auto& alternative : pattern.parts) {
+            scopes.emplace_back();
+            checked.push_back(checkPattern(alternative, subject));
+            bindings.push_back(std::move(scopes.back()));
+            scopes.pop_back();
+        }
+        const auto& canonical = bindings.front();
+        for (std::size_t index = 1; index < bindings.size(); ++index) {
+            if (bindings[index].size() != canonical.size())
+                throw at(source, pattern.parts[index].span, "LYT0011", "OR 模式的每个分支必须绑定相同名称和类型");
+            for (const auto& [name, slot] : canonical) {
+                auto found = bindings[index].find(name);
+                if (found == bindings[index].end() || fn.locals[found->second].type != fn.locals[slot].type)
+                    throw at(source, pattern.parts[index].span, "LYT0011", "OR 模式的每个分支必须绑定相同名称和类型");
+            }
+        }
+        for (std::size_t index = 0; index < bindings.size(); ++index) {
+            std::unordered_map<std::size_t, std::size_t> slots;
+            for (const auto& [name, slot] : bindings[index]) {
+                auto canonicalSlot = canonical.at(name);
+                slots.emplace(slot, canonicalSlot);
+                if (index) {
+                    auto sourceBinding = fn.locals[slot].declaration;
+                    auto canonicalBinding = fn.locals[canonicalSlot].declaration;
+                    if (sourceBinding && canonicalBinding)
+                        fn.references.push_back({{fn.syntax.file, *sourceBinding}, {fn.syntax.file, *canonicalBinding}, {}});
+                }
+            }
+            remapPatternSlots(checked[index], slots);
+        }
+        for (const auto& [name, slot] : canonical) {
+            if (!scopes.back().emplace(name, slot).second) {
+                auto declaration = fn.locals[slot].declaration.value_or(pattern.span);
+                throw at(source, declaration, "LYN0002", "名称已在此模式作用域声明");
+            }
+        }
+        return {CheckedAlternatives{}, std::move(checked)};
+    }
+
     CheckedPattern checkPattern(const Pattern& pattern, Type subject) {
         const auto& node = pattern.node;
+        if (std::holds_alternative<PatternAlternatives>(node)) return alternativesPattern(pattern, subject);
         if (auto* named = std::get_if<PatternName>(&node)) return namedPattern(pattern, subject, *named);
         if (auto* tag = std::get_if<SumTag>(&node)) return sumPattern(pattern, subject, *tag);
         if (std::holds_alternative<std::monostate>(node)) return {};
+        if (auto* range = std::get_if<PatternIntegerRange>(&node)) {
+            if (!integerType(subject)) throw at(source, pattern.span, "LYT0011", "整数区间模式不能匹配 " + typeName(module, subject));
+            checkIntegerLiteral(pattern.span, subject, range->lower);
+            checkIntegerLiteral(pattern.span, subject, range->upper);
+            return {CheckedIntegerRange{integerBits(range->lower), integerBits(range->upper), range->inclusive, subject.kind == Type::Int}};
+        }
         if (auto* literal = std::get_if<IntegerLiteral>(&node)) {
             if (!integerType(subject)) throw at(source, pattern.span, "LYT0011", "整数字面量不能匹配 " + typeName(module, subject));
             checkIntegerLiteral(pattern.span, subject, *literal);
@@ -1549,12 +1702,34 @@ struct Checker {
             if (member.name.text == "cause") return slot(ErrorMember::Cause, symbols.sum(Type::Option, Type::Error));
             if (member.name.text == "suppressed") return slot(ErrorMember::Suppressed, symbols.list(Type::Error));
         }
-        auto field = memberIndex(owner, member.name, symbols.fields);
-        fn.expressions[id].target = field;
-        const auto& record = module.aggregates[owner.id];
-        visible(record.syntax.file, record.syntax.fields[field].isPublic, member.name);
-        refer(member.name, record.syntax.file, record.syntax.fields[field].name.span);
-        return record.fields[field];
+        if (owner.kind == Type::Record) {
+            auto declaration = module.aggregates[owner.id].declaration;
+            if (auto field = symbols.fields[declaration].find(member.name.text); field != symbols.fields[declaration].end()) {
+                fn.expressions[id].target = field->second;
+                const auto& record = module.aggregates[owner.id];
+                visible(record.syntax.file, record.syntax.fields[field->second].isPublic, member.name);
+                refer(member.name, record.syntax.file, record.syntax.fields[field->second].name.span);
+                return record.fields[field->second];
+            }
+        }
+        std::vector<std::pair<std::size_t, std::vector<Type>>> properties;
+        for (auto extension : symbols.visibleExtensions[fn.syntax.file]) {
+            auto property = symbols.extensionProperties[extension].find(member.name.text);
+            if (property == symbols.extensionProperties[extension].end()) continue;
+            auto types = symbols.extensionTypes(extension, owner);
+            if (types) properties.emplace_back(extension, std::move(*types));
+        }
+        if (properties.size() > 1) throw at(source, member.name.span, "LYT0019", "扩展属性存在歧义：" + member.name.text);
+        if (!properties.empty()) {
+            auto [extension, types] = std::move(properties.front());
+            const auto& property = symbols.extensionDeclarations[extension].properties[symbols.extensionProperties[extension].at(member.name.text)];
+            auto callable = symbols.functionCallables[property.getter];
+            Call getter{member.name, {}, member.receiver};
+            auto result = declaredCall(callable, id, getter, expected, types);
+            fn.expressions[id].callee = Callee::ExtensionProperty;
+            return result;
+        }
+        throw at(source, member.name.span, "LYN0001", typeName(module, owner) + " 没有成员：" + member.name.text);
     }
 
     std::vector<std::optional<Type>> argumentHints(ExprId id, const Call& call, const Function& target,
@@ -1562,6 +1737,7 @@ struct Checker {
         std::vector<std::optional<Type>> inferred(target.typeParameters.size());
         std::copy(known.begin(), known.end(), inferred.begin());
         auto learn = [&](auto&& self, const TypeForm& key, Type type, bool widen) -> void {
+            if (key.name.starts_with("$assoc:")) return;
             if (auto param = genericParameter(target, key.name)) {
                 if (!inferred[*param]) inferred[*param] = type;
                 else if (widen && *param >= known.size()) if (auto common = commonInteger(*inferred[*param], type)) inferred[*param] = *common;
@@ -1784,6 +1960,21 @@ struct Checker {
             if (const auto* item = enumNamespace(*call.receiver)) return variant(id, TypeQualifier{*item}, call, expected);
             auto owner = visit(*call.receiver);
             if (owner == Type::Never) return owner;
+            if (owner == Type::Any && (call.name.text == "typeName" || call.name.text == "fieldCount" ||
+                call.name.text == "fieldNames" || call.name.text == "field")) {
+                noTypeArgs();
+                info.callee = call.name.text == "typeName" ? Callee::ReflectTypeName :
+                    call.name.text == "fieldCount" ? Callee::ReflectFieldCount :
+                    call.name.text == "fieldNames" ? Callee::ReflectFieldName : Callee::ReflectField;
+                if (call.name.text == "field") {
+                    if (arguments(id, call, 1, [](auto) { return "name"; }, [](auto) { return Type{Type::String}; })) return Type::Never;
+                    return symbols.sum(Type::Option, Type::Any);
+                }
+                if (!call.arguments.empty()) throw at(source, call.name.span, "LYT0002", "Any." + call.name.text + " 不接收实参");
+                if (call.name.text == "typeName") return Type::String;
+                if (call.name.text == "fieldCount") return Type::Int;
+                return symbols.list(Type::String);
+            }
             bool privateMember = false, staticMember = false;
             if (owner.kind == Type::Result && call.name.text == "failureInfo") {
                 noTypeArgs();
@@ -1817,31 +2008,36 @@ struct Checker {
                 }
             }
             if (owner.kind == Type::Variable) {
-                if (auto method = symbols.contracts.member(owner, call.name.text)) {
+                if (auto method = symbols.boundMember(owner, call.name.text, source, call.name.span)) {
                     noTypeArgs();
-                    info.boundTrait = *symbols.contracts.constraint(owner);
-                    bool exits = arguments(id, call, method->parameters.size(), [&](auto slot) -> std::string_view { return method->labels[slot]; }, [&](auto slot) { return method->parameters[slot]; });
-                    return exits ? Type{Type::Never} : method->asynchronous ? symbols.task(method->result) : method->result;
+                    info.boundTrait = method->trait->name.text;
+                    refer(call.name, method->trait->file, method->method->name.span);
+                    const auto& shape = method->shape;
+                    bool exits = arguments(id, call, shape.parameters.size(), [&](auto slot) -> std::string_view { return shape.labels[slot]; }, [&](auto slot) { return shape.parameters[slot]; });
+                    return exits ? Type{Type::Never} : shape.asynchronous ? symbols.task(shape.result) : shape.result;
                 }
             }
             if (owner.kind == Type::Dyn) {
                 const auto& trait = module.traits[owner.id];
-                if (auto method = symbols.contracts.member(trait.name.text, call.name.text)) {
+                auto declaration = std::ranges::find(trait.methods, call.name.text, [](const TraitMethod& candidate) { return candidate.name.text; });
+                if (declaration != trait.methods.end()) {
                     noTypeArgs();
-                    auto declaration = std::ranges::find(trait.methods, call.name.text, [](const TraitMethod& candidate) { return candidate.name.text; });
+                    auto method = symbols.requiredShape(owner, trait, *declaration, source, call.name.span);
                     refer(call.name, trait.file, declaration->name.span);
                     info.callee = Callee::Dynamic;
                     info.target = declaration - trait.methods.begin();
-                    info.interfaceAsync = method->asynchronous;
-                    bool exits = arguments(id, call, method->parameters.size(), [&](auto slot) -> std::string_view { return method->labels[slot]; }, [&](auto slot) { return method->parameters[slot]; });
-                    return exits ? Type{Type::Never} : method->asynchronous ? symbols.task(method->result) : method->result;
+                    info.interfaceAsync = method.asynchronous;
+                    bool exits = arguments(id, call, method.parameters.size(), [&](auto slot) -> std::string_view { return method.labels[slot]; }, [&](auto slot) { return method.parameters[slot]; });
+                    return exits ? Type{Type::Never} : method.asynchronous ? symbols.task(method.result) : method.result;
                 }
             }
             if (owner.kind == Type::Record) {
                 const auto& decl = module.aggregates[owner.id];
                 ownerTypes = decl.arguments;
                 if (call.boundTrait) {
-                    const auto& required = *symbols.contracts.member(*call.boundTrait, call.name.text);
+                    const auto& trait = symbols.contracts.declaration(*call.boundTrait);
+                    const auto& method = *std::ranges::find_if(trait.methods, [&](const auto& entry) { return entry.name.text == call.name.text; });
+                    auto required = symbols.requiredShape(owner, trait, method, source, call.name.span);
                     auto chosen = symbols.shapedMethod(owner, call.name.text, source, [&](const auto& shape) { return shape == required; });
                     return declaredCall(chosen.value().first, id, call, expected, ownerTypes);
                 }
@@ -2045,6 +2241,7 @@ struct Checker {
             return !info.callableType && !info.constantRef && fn.locals[info.target].writable;
         }
         if (auto member = std::get_if<Member>(&expr.node)) {
+            if (fn.expressions[id].callee == Callee::ExtensionProperty) return false;
             auto type = fn.expressions[member->receiver].type;
             if (type.kind != Type::Record) return false;
             const auto& owner = module.aggregates[type.id].syntax;
@@ -2125,7 +2322,7 @@ struct Checker {
             return Type::Bool;
         }
         right = fit(binary.right, right, left);
-        if (equality && (left.kind == Type::Option || left.kind == Type::Result || left.kind == Type::Enum || left.kind == Type::Closure || left.kind == Type::Any || left.kind == Type::Dyn || left.kind == Type::Error || left.kind == Type::Variable || (left.kind == Type::Record && !module.aggregates[left.id].syntax.reference))) throw at(source, binary.site, "LYT0006", typeName(module, left) + " 未提供 Eq，不能用 == 或 != 比较");
+        if (equality && (left.kind == Type::Option || left.kind == Type::Result || left.kind == Type::Enum || left.kind == Type::Closure || left.kind == Type::Any || left.kind == Type::Dyn || left.kind == Type::Error || left.kind == Type::Variable || left.kind == Type::Projection || (left.kind == Type::Record && !module.aggregates[left.id].syntax.reference))) throw at(source, binary.site, "LYT0006", typeName(module, left) + " 未提供 Eq，不能用 == 或 != 比较");
         if (binary.op == Op::Add && left == Type::String) return Type::String;
         if (!equality) throw mismatch(module, source, binary.site, Type::Int, left);
         return Type::Bool;
@@ -2204,8 +2401,8 @@ struct Checker {
 
     IterationMethod iterationMethod(Type owner, const std::string& name, Span site) {
         if (owner.kind == Type::Variable) {
-            if (const auto* method = symbols.contracts.member(owner, name); method && method->parameters.empty() && !method->asynchronous)
-                return {method->result, {}};
+            if (auto method = symbols.boundMember(owner, name, source, site); method && method->shape.parameters.empty() && !method->shape.asynchronous)
+                return {method->shape.result, {}};
         } else if (owner.kind == Type::Record) {
             const auto& record = module.aggregates[owner.id];
             auto selected = symbols.shapedMethod(owner, name, source, [](const auto& shape) { return shape.parameters.empty() && !shape.asynchronous; });
@@ -2329,10 +2526,17 @@ CheckedModule check(Module module, const std::vector<Source>& sources, bool requ
     symbols.variants.resize(symbols.enumDeclarations.size());
     symbols.extensionDeclarations = std::move(module.extensions);
     symbols.extensionMethods.resize(symbols.extensionDeclarations.size());
+    symbols.extensionProperties.resize(symbols.extensionDeclarations.size());
+    symbols.functionCallables.resize(module.functions.size());
     symbols.visibleExtensions.resize(sources.size());
     for (std::size_t index = 0; index < symbols.extensionDeclarations.size(); ++index) {
         const auto& group = symbols.extensionDeclarations[index];
         reserveType(group, symbols.extensions, index);
+        for (std::size_t property = 0; property < group.properties.size(); ++property) {
+            const auto& name = group.properties[property].name;
+            if (!symbols.extensionProperties[index].emplace(name.text, property).second)
+                throw at(sources[group.file], name.span, "LYN0002", "扩展属性重复：" + name.text);
+        }
     }
     if (!symbols.extensionDeclarations.empty()) for (std::size_t file = 0; file < sources.size(); ++file) {
         std::set<std::size_t> visible;
@@ -2362,11 +2566,18 @@ CheckedModule check(Module module, const std::vector<Source>& sources, bool requ
     for (std::size_t id = 0; id < symbols.recordDeclarations.size(); ++id) {
         const auto& syntax = symbols.recordDeclarations[id];
         const auto& source = sources[syntax.file];
+        std::set<std::string> associated;
+        for (const auto& member : syntax.associated)
+            if (!associated.insert(member.name.text).second) throw at(source, member.name.span, "LYN0002", "关联类型重复：" + member.name.text);
         for (std::size_t slot = 0; slot < syntax.fields.size(); ++slot) {
             const auto& field = syntax.fields[slot];
             if (!symbols.fields[id].emplace(field.name.text, slot).second) throw at(source, field.name.span, "LYN0002", "字段重复：" + field.name.text);
         }
         auto type = symbols.recordType(id, typeVariables(syntax), source, syntax.name.span);
+        for (const auto& member : syntax.associated) {
+            auto resolved = symbols.projectionType(type, member.name.text, source, member.type.span);
+            if (syntax.isPublic && member.isPublic) expose(resolved, source, member.type.span);
+        }
         if (syntax.isPublic) {
             exposeBounds(syntax);
             for (std::size_t slot = 0; slot < syntax.fields.size(); ++slot) if (syntax.fields[slot].isPublic)
@@ -2375,11 +2586,19 @@ CheckedModule check(Module module, const std::vector<Source>& sources, bool requ
     }
     for (const auto& trait : module.traits) {
         const auto& source = sources[trait.file];
-        symbols.contracts.define(trait, source, [&](const Identifier& type) {
-            auto resolved = symbols.resolve(source, type);
-            if (trait.isPublic) expose(resolved, source, type.span);
-            return resolved;
-        });
+        Type owner{Type::Unit};
+        if (!trait.associated.empty()) {
+            owner = {Type::Variable, checked.variableNames.size()};
+            checked.variableNames.push_back("Self");
+            symbols.contracts.bind(owner, trait.name, source);
+        }
+        for (const auto& method : trait.methods) {
+            auto shape = symbols.requiredShape(owner, trait, method, source, method.name.span);
+            if (!trait.isPublic) continue;
+            expose(shape.result, source, method.result.span);
+            for (std::size_t slot = 0; slot < method.parameters.size(); ++slot)
+                expose(shape.parameters[slot], source, method.parameters[slot].type.span);
+        }
     }
     for (std::size_t id = 0; id < symbols.enumDeclarations.size(); ++id) {
         const auto& syntax = symbols.enumDeclarations[id];
@@ -2436,7 +2655,8 @@ CheckedModule check(Module module, const std::vector<Source>& sources, bool requ
         }
         candidates.push_back(symbols.callables.size());
     };
-    for (auto& function : module.functions) {
+    for (std::size_t functionIndex = 0; functionIndex < module.functions.size(); ++functionIndex) {
+        auto& function = module.functions[functionIndex];
         const auto& source = sources[function.file];
         auto owner = function.owner ? std::optional(symbols.records.at(function.owner->text)) : std::nullopt;
         auto group = function.extensionGroup ? std::optional(symbols.extensions.at(function.extensionGroup->text)) : std::nullopt;
@@ -2444,7 +2664,13 @@ CheckedModule check(Module module, const std::vector<Source>& sources, bool requ
             if (symbols.initializers[*owner]) throw at(source, function.name.span, "LYN0002", "class 只允许一个 init");
             symbols.initializers[*owner] = symbols.callables.size();
         }
-        else if (group) addOverload(symbols.extensionMethods[*group][function.name.text], function, source);
+        else if (group) {
+            if (!function.extensionProperty) {
+                if (symbols.extensionProperties[*group].contains(function.name.text))
+                    throw at(source, function.name.span, "LYN0002", "扩展成员名称重复：" + function.name.text);
+                addOverload(symbols.extensionMethods[*group][function.name.text], function, source);
+            }
+        }
         else if (owner) {
             auto& names = function.hasReceiver ? symbols.methods[*owner] : symbols.staticMethods[*owner];
             if (function.hasReceiver && symbols.fields[*owner].contains(function.name.text))
@@ -2463,6 +2689,7 @@ CheckedModule check(Module module, const std::vector<Source>& sources, bool requ
         if (!function.typeParameters.empty()) {
             if (!owner && !group && requireEntry && function.name.text == "main") throw at(source, function.name.span, "LYG0001", "main 不能声明类型形参");
             auto variables = typeVariables(function);
+            symbols.functionCallables[functionIndex] = symbols.callables.size();
             symbols.callables.push_back({0, std::move(function), std::move(variables)});
             continue;
         }
@@ -2478,6 +2705,7 @@ CheckedModule check(Module module, const std::vector<Source>& sources, bool requ
             } else if (concrete.result != Type::Unit) throw mismatch(checked, source, syntax.result.span, Type::Unit, concrete.result);
             checked.entry = checked.functions.size();
         }
+        symbols.functionCallables[functionIndex] = symbols.callables.size();
         symbols.callables.push_back({checked.functions.size(), {}, {}});
         symbols.addConcrete(std::move(concrete));
     }

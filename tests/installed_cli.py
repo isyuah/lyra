@@ -1,21 +1,24 @@
+import argparse
+import contextlib
 import functools
 import hashlib
+import http.client
 import http.server
 import json
 import os
 from pathlib import Path
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
 import threading
 import unittest
 
-from platform_cli import assert_linkage, c_archive, executable
+from platform_cli import assert_linkage, c_archive, executable, running
 
 
-CMAKE = Path(sys.argv.pop(1)).resolve()
-BUILD = Path(sys.argv.pop(1)).resolve()
+EXAMPLES = Path(__file__).resolve().parents[1] / 'examples'
 
 
 class StaticRegistry(http.server.SimpleHTTPRequestHandler):
@@ -28,11 +31,22 @@ class StaticRegistry(http.server.SimpleHTTPRequestHandler):
 
 
 class Installed(unittest.TestCase):
+    def install(self, root):
+        staged = root / 'staging'
+        prefix = root / '搬迁工具链 relocated'
+        if OPTIONS.sdk is not None:
+            shutil.copytree(OPTIONS.sdk, staged)
+        else:
+            cmake, build = OPTIONS.build_tree
+            result = subprocess.run([cmake, '--install', build, '--prefix', staged], capture_output=True, text=True, timeout=60)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        shutil.move(staged, prefix)
+        return prefix
+
     def test_relocated_distribution_builds_from_a_locked_source_release(self):
         with tempfile.TemporaryDirectory(prefix='lyra-relocation-') as temporary:
             root = Path(temporary)
-            staged = root / 'staging'
-            prefix = root / '搬迁工具链 relocated'
+            prefix = self.install(root)
             cache = root / '独立缓存 private'
             environment = {**os.environ, 'LYRA_CACHE': str(cache), 'NO_PROXY': '127.0.0.1', 'no_proxy': '127.0.0.1'}
 
@@ -49,9 +63,6 @@ class Installed(unittest.TestCase):
                 path = package / 'lyra.json5'
                 write(path, json.dumps({**json.loads(path.read_text()), **changes}))
 
-            run(CMAKE, '--install', BUILD, '--prefix', staged)
-            shutil.copytree(staged, prefix)
-            shutil.rmtree(staged)
             compiler = executable(prefix / 'bin/lyra')
             write(prefix / 'share/lyra/std/installprobe/src/identity.ly', 'pub fn identity(): String { "relocated" }')
             app = root / '使用方 consumer app'
@@ -67,8 +78,8 @@ class Installed(unittest.TestCase):
             inputs = {'declare': {'title': 'inputs/title.txt'}, 'stamp': {'snapshot': 'inputs/snapshot.txt'}}
             manifest(library, macroInputs=inputs)
             files = {
-                'src/.macros/declare.ly': 'fn declare(target: String, argument: String): String { "fn title(): String { " + macroQuote(macroInput("title")) + " }" }',
-                'src/.expressions/stamp.ly': 'fn stamp(target: String, argument: String): String { macroQuote(macroInput("snapshot")) }',
+                'src/.macros/declare.ly': 'fn declare(target: String, argument: String): Syntax { syntaxCode("fn title(): String { " + macroQuote(macroInput("title")) + " }") }',
+                'src/.expressions/stamp.ly': 'fn stamp(target: String, argument: String): Syntax { syntaxString(macroInput("snapshot")) }',
                 'inputs/title.txt': '打包时的标题',
                 'inputs/snapshot.txt': 'v1',
             }
@@ -197,6 +208,83 @@ async fn main(): Unit { assert(label() == "relocated: 打包时的标题:v1", "w
             self.assertEqual(lock.read_bytes(), frozen)
             self.assertEqual(server.requests, online_requests, 'an offline command invoked the network transport')
 
+    def test_relocated_sdk_runs_both_application_workspaces(self):
+        with tempfile.TemporaryDirectory(prefix='lyra-apps-') as temporary:
+            root = Path(temporary)
+            compiler = executable(self.install(root) / 'bin/lyra')
+            environment = {**os.environ, 'LYRA_CACHE': str(root / '编译 cache')}
+            isolated = {**environment, 'PATH': '', 'LIB': '', 'INCLUDE': ''}
+            jsonlines = root / 'JSONL 工作区'
+            service = root / 'HTTP 工作区'
+            for name, destination in (('jsonlines', jsonlines), ('http-sqlite', service)):
+                shutil.copytree(EXAMPLES / name, destination, ignore=shutil.ignore_patterns('build', '.lyra', '__pycache__'))
+
+            def run(*args):
+                result = subprocess.run([compiler, *args, '--locked', '--offline'], cwd=root, env=environment,
+                                        capture_output=True, text=True, timeout=60)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                return result.stdout
+
+            self.assertIn('ok tools/metrics/readings.ly', run('test', jsonlines))
+            run('check', service / 'users')
+            database = root / '查询 数据库.db'
+            with contextlib.closing(sqlite3.connect(database)) as connection, connection:
+                connection.executescript("CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT); INSERT INTO users VALUES(7,'Ada');")
+            profiles = (('debug', ()), ('release', ('--release',)))
+            verified = []
+            for profile, flags in profiles:
+                with self.subTest(profile=profile):
+                    cli = executable(root / 'deploy' / profile / 'stats')
+                    server = executable(root / 'deploy' / profile / 'users')
+                    run('build', jsonlines / 'stats', *flags, '-o', cli)
+                    run('build', service, *flags, '-o', server)
+                    result = subprocess.run([cli], input=b'{"station":"west","delta":7}\ninvalid\n',
+                                            cwd=root, env=isolated, capture_output=True, timeout=10)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(json.loads(result.stdout), {'rows': 1, 'total': 7, 'rejected': 1})
+                    self.assertIn(b'line 2:', result.stderr)
+                    with running([server, database], cwd=root, env=isolated) as (process, output):
+                        port = int(output.line())
+                        for user, expected in ((7, 200), (8, 404)):
+                            with contextlib.closing(http.client.HTTPConnection('127.0.0.1', port, timeout=5)) as connection:
+                                connection.request('GET', f'/users/{user}')
+                                response = connection.getresponse()
+                                self.assertEqual(response.status, expected)
+                                body = response.read()
+                                if expected == 200:
+                                    self.assertEqual(json.loads(body), {'id': 7, 'name': 'Ada'})
+                        self.assertIsNone(process.poll())
+                    assert_linkage(self, cli)
+                    assert_linkage(self, server, 'libsqlite3.so.0')
+                    verified.append(profile)
+            if OPTIONS.deployment_bundle is not None and len(verified) == len(profiles):
+                bundle = OPTIONS.deployment_bundle
+                bundle.mkdir(parents=True)
+                shutil.copy2(database, bundle / 'users.db')
+                shutil.copy2(Path(__file__).with_name('windows-deploy-smoke.ps1'), bundle / 'verify.ps1')
+                for profile in verified:
+                    destination = bundle / profile
+                    destination.mkdir()
+                    for application in ('stats', 'users'):
+                        name = executable(Path(application))
+                        shutil.copy2(root / 'deploy' / profile / name, destination / name)
+
 
 if __name__ == '__main__':
-    unittest.main()
+    parser = argparse.ArgumentParser(description='Verify a relocated Lyra SDK and standalone applications.')
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument('--sdk', type=Path, help='path to an unpacked SDK prefix')
+    source.add_argument('--build-tree', nargs=2, type=Path, metavar=('CMAKE', 'BUILD'))
+    parser.add_argument('--deployment-bundle', type=Path, help='write the Windows standalone apps and smoke script into a new directory')
+    OPTIONS, tests = parser.parse_known_args()
+    if OPTIONS.sdk is not None:
+        OPTIONS.sdk = OPTIONS.sdk.resolve()
+        if not executable(OPTIONS.sdk / 'bin/lyra').is_file():
+            parser.error('expected an SDK prefix containing bin/lyra')
+    if OPTIONS.deployment_bundle is not None:
+        if os.name != 'nt' or OPTIONS.sdk is None:
+            parser.error('--deployment-bundle requires --sdk on Windows')
+        OPTIONS.deployment_bundle = OPTIONS.deployment_bundle.resolve()
+        if OPTIONS.deployment_bundle.exists():
+            parser.error('--deployment-bundle must name a new directory')
+    unittest.main(argv=[sys.argv[0], *tests])

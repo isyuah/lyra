@@ -63,6 +63,12 @@ Task Context 绑定逻辑 Task，不绑定 Worker 线程。**在首次激活时*
 
 首个实测互操作场景为同步 SQLite 连接、查询和 statement 操作。C 侧句柄以明确的作用域 API 确定性关闭，不依赖 GC；首期不包括 C 新线程反向回调 Lyra 闭包。
 
+## 并行池与并行遍历
+
+现有 Runtime 将 CPU 并行域与原生阻塞工作放在不同的有界池。`LYRA_PARALLEL_WORKERS` 设置 CPU 池容量，`UV_THREADPOOL_SIZE` 设置 libuv 阻塞池容量。闲置 CPU Worker 可从其他 Worker 的就绪队列取得可迁移域；仍有活动 loop 资源的域留在原执行器，任何域都不会被两条线程同时驱动。调度细节见[运行时实现](../runtime/managed-tasks.md#显式-cpu-并行)。
+
+[`parallelFor`](../std/collections/README.md#有界并行遍历) 以受限数量的域分担列表遍历，返回冷 Task，保留组取消和收尾语义。可用[独立基准](../tests/benchmarks/README.md)比较 1、2、4 个 Worker 下的同一份 CPU 负载。
+
 ## 已接受验收行为
 
 - 冷任务创建会执行一次参数表达式，但不会执行函数体。
@@ -81,7 +87,7 @@ Task Context 绑定逻辑 Task，不绑定 Worker 线程。**在首次激活时*
 
 ## 仍开放
 
-- 执行域的负载均衡和 Worker 容量配置；公开的互斥、原子实现见 [std.sync](../std/sync/README.md)。
+- 更细的调度公平性、默认 Worker 自动调优和运行时队列指标；公开的互斥、原子实现见 [std.sync](../std/sync/README.md)。
 - 未启动 Task 被丢弃时捕获状态的回收诊断；运行时是否警告未使用句柄。
 - 聚合异常的结构化访问 API。
 - 库作者声明阻塞函数的方式及后台服务根组接口。阻塞池的默认容量由 Runtime 原型压测决定，不属于语言契约。

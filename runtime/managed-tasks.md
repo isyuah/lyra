@@ -82,9 +82,9 @@ async fn main(): Result<Unit, String> {
 
 ### 显式 CPU 并行
 
-原生 `lyraTaskParallel` 懒建一个与 libuv 阻塞池分开的有界池。当前每个手动驱动的根执行器配置两个 Worker；每个 Worker 驱动自己的 libuv 循环，复用给多个逻辑域。挂起的域不独占 Worker，因此嵌套启动和等待不需要再创建线程。分配时避开调用者所在的执行器；只有显式换域会带来同时执行的用户代码，同域的 `spawn` 仍串行。
+原生 `lyraTaskParallel` 懒建一个与 libuv 阻塞池分开的有界池。默认启动两个 Worker，可用 `LYRA_PARALLEL_WORKERS` 配置 1–64 个；每个 Worker 驱动自己的 libuv 循环，复用给多个逻辑域。挂起的域不独占 Worker，因此嵌套启动和等待不需要再创建线程。分配时避开调用者所在的执行器。就绪且没有活动 libuv 句柄的域进入可迁移队列，Worker 空闲时从其他 Worker 窃取最旧的可迁移域；运行中或仍持有定时器、断连监听、阻塞池工作等 loop 资源的域不会被并发迁移。任务域串行性不变：只有显式换域会带来同时执行的用户代码，同域的 `spawn` 仍串行。
 
-跨线程发布只同步任务状态、父子关系和就绪队列，再通过 `uv_async_send` 唤醒目标执行器。运行用户步骤和执行 `defer` 时不持调度锁；父任务清理由它自己的执行器执行。根执行器等待已启动的 Worker 子任务完成后再销毁，Worker 退出前清完 libuv 句柄并注销 GC 栈。
+跨线程发布只同步任务状态、父子关系和就绪队列，再通过 `uv_async_send` 唤醒目标执行器。运行用户步骤和执行 `defer` 时不持调度锁；父任务清理由它自己的执行器执行。loop 句柄的 pin 覆盖到 libuv 关闭回调完成，避免句柄关闭期间逻辑域提前迁移。根执行器等待已启动的 Worker 子任务及其句柄收尾后再销毁，Worker 退出前清完 libuv 句柄并注销 GC 栈。
 
 [原生门闩用例](../tests/runtime_tasks.cpp)让两个 Worker 和调用者在不同 OS 线程到达同一个门闩，随后跨域 `await` 回到调用者，保留各自的 Context 和只由挂起线程栈持有的对象。用例也覆盖超过池大小的嵌套等待、取消后等不透明 C 调用返回、父域清理和跨域失败排序。`taskGroup` 和 `parallel` 通过[异步源码用例](../tests/async_cli.py)验证块尾值和组收尾、锁的异常安全及跨域上下文。
 
@@ -96,8 +96,8 @@ async fn main(): Result<Unit, String> {
 
 ```sh
 out=$(mktemp -d)
-clang++-18 -std=c++23 -O2 -I runtime -I include runtime/managed.cpp runtime/exceptions.cpp runtime/strings.cpp tests/runtime_managed.cpp $(pkg-config --cflags --libs bdw-gc) -o "$out/managed"
-clang++-18 -std=c++23 -O2 -I runtime -I include runtime/managed.cpp runtime/tasks.cpp runtime/strings.cpp runtime/context.cpp runtime/exceptions.cpp runtime/net.cpp tests/runtime_tasks.cpp $(pkg-config --cflags --libs bdw-gc libuv) -o "$out/tasks"
+clang++-18 -std=c++23 -O2 -I runtime -I include runtime/managed.cpp runtime/exceptions.cpp runtime/backtrace.cpp runtime/strings.cpp tests/runtime_managed.cpp $(pkg-config --cflags --libs bdw-gc) -ldl -o "$out/managed"
+clang++-18 -std=c++23 -O2 -I runtime -I include runtime/managed.cpp runtime/tasks.cpp runtime/strings.cpp runtime/context.cpp runtime/exceptions.cpp runtime/backtrace.cpp runtime/net.cpp tests/runtime_tasks.cpp $(pkg-config --cflags --libs bdw-gc libuv) -ldl -o "$out/tasks"
 "$out/managed" && "$out/tasks" && UV_THREADPOOL_SIZE=1 "$out/tasks"
 readelf -d "$out/tasks" | grep NEEDED
 ```

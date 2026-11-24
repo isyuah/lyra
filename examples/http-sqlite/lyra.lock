@@ -1,15 +1,26 @@
 {
   "format": 1,
   "members": [
-    "."
+    ".",
+    "users"
   ],
   "packages": [
     {
-      "dependencies": {},
+      "dependencies": {
+        "users": "path:users|example/users"
+      },
       "id": "path:.|example/http-sqlite",
       "name": "example/http-sqlite",
-      "sha256": "de66f41848b3c2602750eb7d787db27f0a07a7f4c3da9585e93c7df19f6bf9d1",
+      "sha256": "5a4a4ed6bb34e932d1a3d1caf7137657ddd27042ef175b9c1526f12a9dab21e3",
       "source": "path:.",
+      "version": "0.1.0"
+    },
+    {
+      "dependencies": {},
+      "id": "path:users|example/users",
+      "name": "example/users",
+      "sha256": "d99fd8dd71441ef18ee08910c4cc42e8795f41b14ac01ffff388a9bdd2e2dfac",
+      "source": "path:users",
       "version": "0.1.0"
     }
   ]

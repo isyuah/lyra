@@ -40,4 +40,4 @@
 - [C1 · `?` 复用普通 `implicit`](errors-and-resources.md#c1-conversions)：不同具体错误类型之间只查一条直接转换；缺失或歧义在 `?` 处报告。
 - [F1 · 声明宏、表达式宏与外部输入](metaprogramming-data.md#f1-macro-inputs)：宏按声明的只读输入离线展开；连库和外部生成器由显式授权的独立工具处理。
 
-具体收集器、GC 根追踪、接口装箱、沙箱实现等交给原型验证。后续版本的完整反射、关联类型、静态空镜像和私有包中心不阻塞[首个编译器切片](compiler-acceptance.md)。
+具体收集器、GC 根追踪、接口装箱、沙箱实现等交给原型验证。关联类型当前用于静态结构约束；完整动态反射、静态空镜像和私有包中心不属于 [Alpha 验收](compiler-acceptance.md#alpha-的交付门槛与复现)。

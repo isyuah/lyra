@@ -1,0 +1,4 @@
+{
+  name: 'example/users', version: '0.1.0', kind: 'lib',
+  macroInputs: { userQuery: { schema: 'inputs/schema.sql', snapshot: 'inputs/userById.snapshot' } },
+}

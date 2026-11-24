@@ -146,6 +146,19 @@ fn main(): Unit {
                 self.assertEqual(error['code'], code)
                 self.assertIn(message, error['message'])
 
+    def test_extension_property_cannot_read_uninitialized_this(self):
+        self.main.write_text('''
+extension View for Item { val label: String get() { "item" } }
+class Item { val value: Int; init() { print(this.label); value = 1 } }
+fn main(): Unit { Item() }
+''', encoding='utf-8')
+        result = subprocess.run([COMPILER, 'check', self.package, '--diagnostics=json'],
+                                capture_output=True, timeout=10)
+        self.assertNotEqual(result.returncode, 0)
+        error, = json.loads(result.stderr)
+        self.assertEqual(error['code'], 'LYT0017')
+        self.assertIn('使用 this', error['message'])
+
     def test_implicit_receiver_respects_shadowing_defaults_and_capture(self):
         self.run_source('''
 fn read(): Int { -1 }

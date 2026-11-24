@@ -9,5 +9,6 @@ import lyra.check;
 
 export namespace lyra {
 
-std::unique_ptr<llvm::Module> lower(const CheckedModule& functions, const std::vector<Source>& sources, llvm::LLVMContext& context);
+std::unique_ptr<llvm::Module> lower(const CheckedModule& functions, const std::vector<Source>& sources,
+    llvm::LLVMContext& context, bool optimized, bool symbols);
 }

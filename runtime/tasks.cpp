@@ -3,7 +3,6 @@
 #include "locks.h"
 #include "managed.h"
 
-#include <array>
 #include <new>
 #include <stdio.h>
 #include <stdlib.h>
@@ -16,10 +15,36 @@
 #endif
 
 struct Executor;
+struct ReadyDomains;
 struct LyraDomain {
     Executor *executor;
-    size_t live;
-    bool pooled;
+    LyraTask *first, *last;
+    ReadyDomains *queued;
+    LyraDomain *previousReady, *nextReady;
+    size_t live, loopUsers;
+    bool pooled, running;
+};
+
+struct ReadyDomains {
+    LyraDomain *first, *last;
+
+    void append(LyraDomain& domain) {
+        domain.queued = this;
+        domain.previousReady = last;
+        if (last) last->nextReady = &domain;
+        else first = &domain;
+        last = &domain;
+    }
+
+    LyraDomain *remove(LyraDomain& domain) {
+        if (domain.previousReady) domain.previousReady->nextReady = domain.nextReady;
+        else first = domain.nextReady;
+        if (domain.nextReady) domain.nextReady->previousReady = domain.previousReady;
+        else last = domain.previousReady;
+        domain.previousReady = domain.nextReady = nullptr;
+        domain.queued = nullptr;
+        return &domain;
+    }
 };
 
 struct ParallelPool;
@@ -28,14 +53,13 @@ struct Executor {
     uv_idle_t idle;
     uv_async_t inbox;
     uv_thread_t thread;
-    LyraTask *first;
-    LyraTask *last;
+    ReadyDomains pinned, movable;
     ParallelPool *pool;
-    size_t leases, steps;
-    bool worker, running, stopping;
+    size_t leases, steps, nextVictim;
+    bool worker, running, stepping, stopping, sleeping, preferMovable;
 };
 
-struct ParallelPool { std::array<Executor, 2> workers; size_t next; };
+struct ParallelPool { Executor *workers; size_t workerCount, next; };
 
 struct DisconnectWatch;
 struct DeadlineWatch;
@@ -82,10 +106,11 @@ struct DisconnectWatch {
     int fd;
 #endif
     LyraTask *task;
+    LyraDomain *domain;
     DisconnectWatch *next;
 };
 
-struct DeadlineWatch { uv_timer_t timer; LyraTask *task; };
+struct DeadlineWatch { uv_timer_t timer; LyraTask *task; LyraDomain *domain; };
 
 namespace {
 
@@ -96,6 +121,8 @@ uv_mutex_t taskState;
 uv_once_t taskStateInitialized = UV_ONCE_INIT;
 uv_mutex_t sharedAccess;
 uv_once_t sharedInitialized = UV_ONCE_INIT;
+uv_once_t parallelWorkerCountInitialized = UV_ONCE_INIT;
+size_t configuredParallelWorkerCount;
 
 void require(bool condition, const char *error) {
     if (!condition) {
@@ -133,7 +160,8 @@ void publish(TaskLock& lock, LyraTask *task);
 void requestCancel(LyraTask *task);
 
 void refresh(Executor& executor) {
-    if (executor.first) require(uv_idle_start(&executor.idle, dispatch) == 0, "cannot schedule a domain step");
+    if (executor.pinned.first || (executor.worker && !executor.sleeping))
+        require(uv_idle_start(&executor.idle, dispatch) == 0, "cannot schedule a domain step");
     else uv_idle_stop(&executor.idle);
     auto *inbox = reinterpret_cast<uv_handle_t *>(&executor.inbox);
     if (executor.worker || executor.leases) uv_ref(inbox);
@@ -146,13 +174,14 @@ void notify(Executor& executor) {
 }
 
 void closeExecutor(Executor& executor) {
-    require(!executor.first && !executor.leases, "cannot close executor with pending work");
+    require(!executor.pinned.first && !executor.movable.first && !executor.leases, "cannot close executor with pending work");
     uv_close(reinterpret_cast<uv_handle_t *>(&executor.idle), nullptr);
     uv_close(reinterpret_cast<uv_handle_t *>(&executor.inbox), nullptr);
 }
 
 void initExecutor(Executor& executor, bool worker) {
     executor.worker = worker;
+    executor.sleeping = worker;
     require(uv_loop_init(&executor.loop) == 0, "cannot initialize event loop");
     require(uv_idle_init(&executor.loop, &executor.idle) == 0, "cannot initialize ready queue");
     require(uv_async_init(&executor.loop, &executor.inbox, [](uv_async_t *inbox) {
@@ -175,11 +204,40 @@ void workExecutor(void *storage) {
     lyraGcLeaveWorker(registration);
 }
 
+void readParallelWorkerCount() {
+    char text[16];
+    size_t length = sizeof(text);
+    auto status = uv_os_getenv("LYRA_PARALLEL_WORKERS", text, &length);
+    if (status == UV_ENOENT) {
+        configuredParallelWorkerCount = 2;
+        return;
+    }
+    require(status == 0 && length > 0, "LYRA_PARALLEL_WORKERS must be an integer from 1 to 64");
+    size_t configured = 0;
+    for (size_t index = 0; index < length; ++index) {
+        auto digit = text[index] - '0';
+        require(digit >= 0 && digit <= 9 && configured <= 64,
+                "LYRA_PARALLEL_WORKERS must be an integer from 1 to 64");
+        configured = configured * 10 + static_cast<size_t>(digit);
+    }
+    require(configured >= 1 && configured <= 64, "LYRA_PARALLEL_WORKERS must be an integer from 1 to 64");
+    configuredParallelWorkerCount = configured;
+}
+
+size_t parallelWorkerCount() {
+    uv_once(&parallelWorkerCountInitialized, readParallelWorkerCount);
+    return configuredParallelWorkerCount;
+}
+
 ParallelPool& parallelPool(Executor& executor) {
     if (executor.pool) return *executor.pool;
     auto *pool = allocateRuntime<ParallelPool>("cannot allocate parallel executor pool");
+    pool->workerCount = parallelWorkerCount();
+    pool->workers = static_cast<Executor *>(calloc(pool->workerCount, sizeof(Executor)));
+    require(pool->workers != nullptr, "cannot allocate parallel executors");
     executor.pool = pool;
-    for (auto& worker : pool->workers) {
+    for (size_t index = 0; index < pool->workerCount; ++index) {
+        auto& worker = pool->workers[index];
         worker.pool = pool;
         initExecutor(worker, true);
         require(uv_thread_create(&worker.thread, workExecutor, &worker) == 0, "cannot start parallel executor");
@@ -188,47 +246,113 @@ ParallelPool& parallelPool(Executor& executor) {
 }
 
 void transferLease(LyraDomain *receiver, LyraDomain *sender, bool acquire) {
+    if (receiver->pooled || !sender->pooled) return;
     auto& executor = *receiver->executor;
-    if (executor.worker || !sender->executor->worker) return;
     if (acquire) ++executor.leases;
     else --executor.leases;
     notify(executor);
 }
 
+void wakeWorker(Executor& executor) {
+    executor.sleeping = false;
+    notify(executor);
+}
+
+void schedule(LyraDomain& domain) {
+    if (domain.running || !domain.first) return;
+    auto& executor = *domain.executor;
+    bool stealable = domain.pooled && !domain.loopUsers;
+    auto& queue = stealable ? executor.movable : executor.pinned;
+    if (domain.queued == &queue) return;
+    if (domain.queued) domain.queued->remove(domain);
+    queue.append(domain);
+    if (!executor.worker) notify(executor);
+    else if (executor.sleeping) wakeWorker(executor);
+    else if (stealable && (executor.stepping || executor.pinned.first || executor.movable.first != executor.movable.last)) for (size_t index = 0; index < executor.pool->workerCount; ++index) {
+        auto& peer = executor.pool->workers[index];
+        if (peer.sleeping && !peer.stopping) { wakeWorker(peer); break; }
+    }
+}
+
+void settleDomain(LyraDomain& domain) {
+    if (domain.running) return;
+    if (domain.pooled && !domain.live && !domain.loopUsers) free(&domain);
+    else schedule(domain);
+}
+
+void releaseWatchPin(LyraDomain& domain) {
+    TaskLock lock;
+    --domain.loopUsers;
+    settleDomain(domain);
+}
+
+LyraDomain *nextDomain(Executor& executor) {
+    if (auto *domain = executor.movable.first; domain && (executor.preferMovable || !executor.pinned.first)) {
+        executor.preferMovable = false;
+        return executor.movable.remove(*domain);
+    }
+    if (auto *domain = executor.pinned.first) {
+        executor.preferMovable = true;
+        return executor.pinned.remove(*domain);
+    }
+    if (!executor.worker) return nullptr;
+    auto& pool = *executor.pool;
+    for (size_t attempt = 0; attempt < pool.workerCount; ++attempt) {
+        auto& victim = pool.workers[executor.nextVictim++ % pool.workerCount];
+        if (auto *domain = victim.movable.last; &victim != &executor && domain) {
+            victim.movable.remove(*domain);
+            domain->executor = &executor;
+            return domain;
+        }
+    }
+    return nullptr;
+}
+
 void dispatch(uv_idle_t *idle) {
     TaskLock lock;
     auto& executor = *static_cast<Executor *>(idle->data);
-    auto *task = executor.first;
-    executor.first = task->nextReady;
-    task->nextReady = nullptr;
-    if (!executor.first) {
-        executor.last = nullptr;
-        uv_idle_stop(&executor.idle);
-    }
-    task->state = LYRA_TASK_RUNNING;
-    if (task->joining) { publish(lock, task); return; }
-    if (!executor.worker) ++executor.steps;
-    if (task->cancelRequested && task->firstChild) {
-        task->state = LYRA_TASK_SUSPENDED;
-        task->resumeAfterChildren = true;
+    auto *domain = nextDomain(executor);
+    if (!domain) {
+        executor.sleeping = executor.worker;
+        refresh(executor);
         return;
     }
-    auto *previous = currentTask;
-    currentTask = task;
-    lock.unlock();
-    task->step(task, task->frame);
-    currentTask = previous;
-    lock.lock();
-    require(task->state != LYRA_TASK_RUNNING, "step returned without completing or suspending");
+    executor.stepping = true;
+    domain->running = true;
+    auto *task = domain->first;
+    domain->first = task->nextReady;
+    if (!domain->first) domain->last = nullptr;
+    task->nextReady = nullptr;
+    task->state = LYRA_TASK_RUNNING;
+    if (task->joining) publish(lock, task);
+    else {
+        if (!executor.worker) ++executor.steps;
+        if (task->cancelRequested && task->firstChild) {
+            task->state = LYRA_TASK_SUSPENDED;
+            task->resumeAfterChildren = true;
+        } else {
+            auto *previous = currentTask;
+            currentTask = task;
+            lock.unlock();
+            task->step(task, task->frame);
+            currentTask = previous;
+            lock.lock();
+            require(task->state != LYRA_TASK_RUNNING, "step returned without completing or suspending");
+        }
+    }
+    domain->running = false;
+    executor.stepping = false;
+    settleDomain(*domain);
+    if (!executor.worker) refresh(executor);
 }
 
 void enqueue(LyraTask *task) {
-    auto& executor = *task->domain->executor;
+    auto& domain = *task->domain;
     task->state = LYRA_TASK_READY;
-    if (executor.last) executor.last->nextReady = task;
-    else executor.first = task;
-    executor.last = task;
-    notify(executor);
+    if (domain.last) domain.last->nextReady = task;
+    else domain.first = task;
+    domain.last = task;
+    schedule(domain);
 }
 
 struct BlockingRequest {
@@ -257,6 +381,7 @@ void finishBlocking(uv_work_t *work, int status) {
     lyraGcRootDrop(request->payloadRoot);
     free(request);
     TaskLock lock;
+    --task->domain->loopUsers;
     task->blocking = false;
     enqueue(task);
 }
@@ -303,22 +428,32 @@ void closeWatch(DisconnectWatch *watch) {
 #ifdef _WIN32
     if (watch->waiter) require(UnregisterWaitEx(watch->waiter, INVALID_HANDLE_VALUE) != 0, "cannot stop disconnect wait");
     CloseHandle(watch->event);
-    uv_close(reinterpret_cast<uv_handle_t *>(&watch->ready), [](uv_handle_t *handle) { free(handle->data); });
+    auto *handle = reinterpret_cast<uv_handle_t *>(&watch->ready);
 #else
     uv_poll_stop(&watch->poll);
-    uv_close(reinterpret_cast<uv_handle_t *>(&watch->poll), [](uv_handle_t *handle) {
-        auto *closing = static_cast<DisconnectWatch *>(handle->data);
-        close(closing->fd);
-        free(closing);
-    });
+    auto *handle = reinterpret_cast<uv_handle_t *>(&watch->poll);
 #endif
+    uv_close(handle, [](uv_handle_t *handle) {
+        auto *closing = static_cast<DisconnectWatch *>(handle->data);
+#ifndef _WIN32
+        close(closing->fd);
+#endif
+        auto *domain = closing->domain;
+        free(closing);
+        releaseWatchPin(*domain);
+    });
 }
 
 void stopDeadline(LyraTask *task) {
     if (auto *watch = task->deadlineWatch) {
         task->deadlineWatch = nullptr;
         uv_timer_stop(&watch->timer);
-        uv_close(reinterpret_cast<uv_handle_t *>(&watch->timer), [](uv_handle_t *handle) { free(handle->data); });
+        uv_close(reinterpret_cast<uv_handle_t *>(&watch->timer), [](uv_handle_t *handle) {
+            auto *closing = static_cast<DeadlineWatch *>(handle->data);
+            auto *domain = closing->domain;
+            free(closing);
+            releaseWatchPin(*domain);
+        });
     }
 }
 
@@ -329,12 +464,14 @@ void armDeadline(LyraTask *task, int64_t remaining) {
     auto& loop = task->domain->executor->loop;
     require(uv_timer_init(&loop, &watch->timer) == 0, "cannot initialize deadline timer");
     watch->task = task;
+    watch->domain = task->domain;
     watch->timer.data = watch;
     task->deadlineWatch = watch;
     uv_update_time(&loop);
     require(uv_timer_start(&watch->timer, [](uv_timer_t *timer) {
         lyraTaskRequestCancel(static_cast<DeadlineWatch *>(timer->data)->task);
     }, static_cast<uint64_t>(remaining), 0) == 0, "cannot schedule deadline");
+    ++task->domain->loopUsers;
 }
 
 void finish(TaskLock& lock, LyraTask *task, LyraTaskState state, void *outcome) {
@@ -407,7 +544,7 @@ void publish(TaskLock& lock, LyraTask *task) {
         }
     }
     task->domain = nullptr;
-    if (--domain->live == 0 && domain->pooled) free(domain);
+    --domain->live;
     auto *root = task->activeRoot;
     task->activeRoot = nullptr;
     lyraGcRootDrop(root);
@@ -517,6 +654,8 @@ LyraDomain *lyraDomainCreate() {
     return domain;
 }
 
+int64_t lyraTaskParallelism() { return static_cast<int64_t>(parallelWorkerCount()); }
+
 size_t lyraDomainRun(LyraDomain *domain) {
     auto& executor = *domain->executor;
     {
@@ -540,14 +679,17 @@ void lyraDomainDestroy(LyraDomain *domain) {
     {
         TaskLock lock;
         require(!domain->pooled && domain->live == 0 && !executor->running, "cannot close a domain with live tasks or a running event loop");
-        if (executor->pool) for (auto& worker : executor->pool->workers) {
+        if (executor->pool) for (size_t index = 0; index < executor->pool->workerCount; ++index) {
+            auto& worker = executor->pool->workers[index];
             worker.stopping = true;
             require(uv_async_send(&worker.inbox) == 0, "cannot stop parallel executor");
         }
         closeExecutor(*executor);
     }
     if (auto *pool = executor->pool) {
-        for (auto& worker : pool->workers) require(uv_thread_join(&worker.thread) == 0, "cannot join parallel executor");
+        for (size_t index = 0; index < pool->workerCount; ++index)
+            require(uv_thread_join(&pool->workers[index].thread) == 0, "cannot join parallel executor");
+        free(pool->workers);
         free(pool);
     }
     uv_run(&executor->loop, UV_RUN_DEFAULT);
@@ -594,10 +736,12 @@ void lyraTaskSharedCopy(void *destination, const void *source, size_t bytes) {
 
 int lyraTaskWatchDisconnect(uintptr_t monitor) {
     if (!currentTask || !monitor) return 0;
+    TaskLock lock;
     auto *watch = static_cast<DisconnectWatch *>(calloc(1, sizeof(DisconnectWatch)));
     require(watch != nullptr, "cannot allocate disconnect watch");
     watch->task = currentTask;
-    auto *loop = &currentTask->domain->executor->loop;
+    watch->domain = currentTask->domain;
+    auto *loop = &watch->domain->executor->loop;
 #ifdef _WIN32
     auto *process = GetCurrentProcess();
     if (!DuplicateHandle(process, reinterpret_cast<HANDLE>(monitor), process, &watch->event, 0, FALSE, DUPLICATE_SAME_ACCESS)) { free(watch); return 0; }
@@ -606,6 +750,7 @@ int lyraTaskWatchDisconnect(uintptr_t monitor) {
         lyraTaskRequestCancel(static_cast<DisconnectWatch *>(handle->data)->task);
     })) { CloseHandle(watch->event); free(watch); return 0; }
     watch->ready.data = watch;
+    ++watch->domain->loopUsers;
     if (!RegisterWaitForSingleObject(&watch->waiter, watch->event, [](void *data, BOOLEAN) {
         uv_async_send(&static_cast<DisconnectWatch *>(data)->ready);
     }, watch, INFINITE, WT_EXECUTEONLYONCE)) { closeWatch(watch); return 0; }
@@ -614,6 +759,7 @@ int lyraTaskWatchDisconnect(uintptr_t monitor) {
     if (watch->fd < 0) { free(watch); return 0; }
     if (uv_poll_init_socket(loop, &watch->poll, watch->fd)) { close(watch->fd); free(watch); return 0; }
     watch->poll.data = watch;
+    ++watch->domain->loopUsers;
     int status = uv_poll_start(&watch->poll, UV_DISCONNECT, [](uv_poll_t *poll, int status, int events) {
         auto *watch = static_cast<DisconnectWatch *>(poll->data);
         if (status < 0 || (events & UV_DISCONNECT)) {
@@ -646,11 +792,12 @@ LyraTask *lyraTaskParallel(LyraTask *parent, LyraTask *target) {
     if (target->state != LYRA_TASK_COLD) return target;
     auto& host = *parent->domain->executor;
     auto& pool = parallelPool(host);
-    auto next = [&]() -> Executor* { return &pool.workers[pool.next++ % pool.workers.size()]; };
+    auto next = [&]() -> Executor* { return &pool.workers[pool.next++ % pool.workerCount]; };
     auto *executor = next();
-    if (executor == &host) executor = next();
+    if (executor == &host && pool.workerCount > 1) executor = next();
     auto *domain = allocateRuntime<LyraDomain>("cannot allocate parallel execution domain");
-    *domain = {executor, 0, true};
+    domain->executor = executor;
+    domain->pooled = true;
     startChild(parent, target, true, domain);
     return target;
 }
@@ -718,6 +865,7 @@ void lyraTaskBlock(LyraTask *task, LyraNativeWork work, void *nativeData) {
     request->request.data = request;
     task->state = LYRA_TASK_SUSPENDED;
     task->blocking = true;
+    ++task->domain->loopUsers;
     require(uv_queue_work(&task->domain->executor->loop, &request->request, runBlocking, finishBlocking) == 0, "cannot schedule native work");
 }
 

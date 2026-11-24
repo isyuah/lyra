@@ -86,7 +86,7 @@ std::string decodeLiteral(const Source& source, Token token) {
 
 class Lexer {
 public:
-    explicit Lexer(const Source& source) : source(source), text(source.text) {}
+    explicit Lexer(const Source& source, std::vector<SyntaxToken>* comments = nullptr) : source(source), text(source.text), comments(comments) {}
 
     Token next() {
         bool newline = false;
@@ -96,12 +96,15 @@ public:
                 newline |= current == '\n' || current == '\r';
                 ++offset;
             } else if (text.substr(offset, 2) == "//") {
+                auto begin = offset;
                 offset = text.find_first_of("\r\n", offset + 2);
                 if (offset == text.npos) offset = text.size();
+                if (comments) comments->push_back({{begin, offset}, "comment"});
             } else if (text.substr(offset, 2) == "/*") {
                 auto end = text.find("*/", offset + 2);
                 if (end == text.npos) throw at(source, {offset, offset + 2}, "LYL0001", "块注释缺少 */");
                 newline |= text.substr(offset, end - offset).find_first_of("\r\n") != text.npos;
+                if (comments) comments->push_back({{offset, end + 2}, "comment"});
                 offset = end + 2;
             } else break;
         }
@@ -164,7 +167,7 @@ public:
             constexpr std::string_view doubles[] = {"+=", "-=", "*=", "/=", "%=", "==", "!=", "<=", ">=", "&&", "||", "=>", "?.", "??", "->", ".."};
             if (text.substr(start, 3) == "..." || text.substr(start, 3) == "..<") offset += 2;
             else if (std::ranges::find(doubles, text.substr(start, 2)) != std::end(doubles)) ++offset;
-            else if (std::string_view("()[]{},.:;+-*/%=<>!#@?").find(current) == text.npos) {
+            else if (std::string_view("()[]{},.:;+-*/%=<>!#@?|&").find(current) == text.npos) {
                 while (offset < text.size() && (static_cast<unsigned char>(text[offset]) & 0xc0) == 0x80) ++offset;
                 throw at(source, {start, offset}, "LYL0001", "此处不是受支持的 Lyra 记号");
             }
@@ -175,6 +178,7 @@ public:
 private:
     const Source& source;
     std::string_view text;
+    std::vector<SyntaxToken>* comments;
     std::size_t offset = 0;
     struct Interpolation { std::size_t opening; unsigned braces; };
     std::vector<Interpolation> interpolations{};
@@ -260,8 +264,20 @@ public:
                 bool decorator = text(consume()) == "@";
                 auto name = identifier();
                 std::optional<Identifier> argument;
-                if (is("(")) { consume(); argument = metadataValue(); require(")"); }
-                module.expansions.push_back({file, std::move(name), std::move(argument), decorator, false, 0});
+                std::vector<Identifier> extra, exports;
+                if (is("(")) {
+                    consume();
+                    if (!is(")") && !is("export")) argument = metadataValue();
+                    while (!is(")")) {
+                        if (argument || !exports.empty()) require(",");
+                        if (is("export")) { consume(); exports.push_back(identifier()); }
+                        else if (!decorator && name.text == "derive" && exports.empty()) extra.push_back(metadataValue());
+                        else throw at(source, token.span, "LYM0001", "此处需要 export name 或结束宏实参");
+                    }
+                    require(")");
+                }
+                module.expansions.push_back({file, name, std::move(argument), decorator, false, 0, exports});
+                for (auto& item : extra) module.expansions.push_back({file, name, std::move(item), decorator, false, 0, exports});
             }
             bool pub = visibility();
             if (is("const")) {
@@ -269,8 +285,8 @@ public:
                 auto prefix = consume().span;
                 if (is("fn") && !token.newlineBefore) {
                     auto fn = function({}, pub);
-                    if (fn.name.text == "main" || fn.result.text.empty() || !fn.typeParameters.empty() || std::ranges::any_of(fn.parameters, [](const auto& param) { return param.variadic || param.defaultValue; }))
-                        throw at(source, prefix, "LYCT0001", "const fn 需要显式返回类型；首版不支持入口、泛型、默认实参和变长形参");
+                    if (fn.name.text == "main" || fn.result.text.empty() || std::ranges::any_of(fn.parameters, [](const auto& param) { return param.variadic; }))
+                        throw at(source, prefix, "LYCT0001", "const fn 需要显式返回类型，且不能是入口函数或变长函数");
                     fn.constant = ConstKind::Function;
                     module.functions.push_back(std::move(fn));
                 } else {
@@ -329,6 +345,11 @@ public:
             } else if (is("struct") || is("class")) aggregate(module, pub);
             else module.functions.push_back(function({}, pub));
         }
+    }
+
+    void expansionExpression() {
+        expression(true);
+        if (token.kind != Kind::End) throw at(source, token.span, "LYM0002", "表达式宏需要恰好一个表达式");
     }
 
 private:
@@ -427,8 +448,7 @@ private:
             if (parameters.size() != 1) throw at(source, {start, end}, "LYP0001", "函数类型在形参列表后需要 -> 返回类型");
             auto name = std::move(parameters.front());
             name.span = {start, end};
-            while (is("?")) { name.span.end = consume().span.end; name.text = "Option<" + name.text + ">"; }
-            return name;
+            return typeSuffixes(std::move(name));
         }
         auto name = [&] {
             if (!is("dyn") || next.newlineBefore || (next.kind != Kind::Name && next.kind != Kind::Escaped)) return identifier();
@@ -442,6 +462,16 @@ private:
             while (is(",")) { consume(); name.text += ',' + type().text; }
             name.span.end = require(">").span.end;
             name.text += '>';
+        }
+        return typeSuffixes(std::move(name));
+    }
+
+    Identifier typeSuffixes(Identifier name) {
+        while (is(".") && !token.newlineBefore) {
+            consume();
+            auto member = identifier();
+            name.text = "$assoc:" + member.text + '<' + name.text + '>';
+            name.span.end = member.span.end;
         }
         while (is("?")) { name.span.end = consume().span.end; name.text = "Option<" + name.text + ">"; }
         return name;
@@ -461,22 +491,27 @@ private:
         Trait declaration{file, identifier(), {}, pub};
         require("{");
         while (!is("}")) {
-            bool asynchronous = is("async");
-            if (asynchronous) consume();
-            require("fn");
-            auto name = identifier();
-            require("(");
-            std::vector<Parameter> parameters;
-            while (!is(")")) {
-                auto parameter = identifier(); require(":");
-                parameters.push_back({std::move(parameter), type()});
-                if (!is(",")) break;
+            if (is("type")) {
                 consume();
+                declaration.associated.push_back(identifier());
+            } else {
+                bool asynchronous = is("async");
+                if (asynchronous) consume();
+                require("fn");
+                auto name = identifier();
+                require("(");
+                std::vector<Parameter> parameters;
+                while (!is(")")) {
+                    auto parameter = identifier(); require(":");
+                    parameters.push_back({std::move(parameter), type()});
+                    if (!is(",")) break;
+                    consume();
+                }
+                require(")"); require(":");
+                declaration.methods.push_back({std::move(name), std::move(parameters), type(), asynchronous});
             }
-            require(")"); require(":");
-            declaration.methods.push_back({std::move(name), std::move(parameters), type(), asynchronous});
             if (is(";")) consume();
-            else if (!is("}") && !token.newlineBefore) throw at(source, token.span, "LYP0001", "约束方法签名之间需要换行或分号");
+            else if (!is("}") && !token.newlineBefore) throw at(source, token.span, "LYP0001", "结构约束成员之间需要换行或分号");
         }
         consume();
         return declaration;
@@ -503,7 +538,14 @@ private:
         consume();
         for (;;) {
             parameters.push_back(identifier());
-            if (is(":")) { consume(); bounds.push_back({parameters.size() - 1, identifier()}); }
+            if (is(":")) {
+                consume();
+                for (;;) {
+                    bounds.push_back({parameters.size() - 1, identifier()});
+                    if (!is("&")) break;
+                    consume();
+                }
+            }
             if (!is(",")) break;
             consume();
         }
@@ -580,7 +622,8 @@ private:
     }
 
     void aggregate(Module& module, bool pub) {
-        bool reference = text(consume()) == "class";
+        auto start = consume();
+        bool reference = text(start) == "class";
         Aggregate decl{file, identifier(), reference, {}, pub};
         typeParameters(decl.typeParameters, decl.bounds);
         bool primary = is("(");
@@ -600,7 +643,13 @@ private:
             while (!is("}")) {
                 auto marks = attributes();
                 bool publicMember = visibility();
-                if (is("init")) {
+                if (is("type")) {
+                    if (!marks.empty()) throw at(source, marks.front().name.span, "LYM0003", "此处的标记只适用于字段和形参");
+                    consume();
+                    auto name = identifier();
+                    require("=");
+                    decl.associated.push_back({std::move(name), type(), publicMember});
+                } else if (is("init")) {
                     if (!reference || primary || initializer)
                         throw at(source, token.span, "LYP0001", "仅没有主构造参数列表的 class 可以声明一个 init 构造函数");
                     if (!marks.empty()) throw at(source, marks.front().name.span, "LYM0003", "此处的标记只适用于字段和形参");
@@ -618,6 +667,7 @@ private:
             consume();
         }
         bindFieldDefaults(module, decl, initializer ? &module.functions[*initializer] : nullptr);
+        decl.span = {start.span.begin, token.span.begin};
         module.aggregates.push_back(std::move(decl));
     }
 
@@ -630,8 +680,30 @@ private:
         require("{");
         if (is("}")) throw at(source, token.span, "LYP0001", "扩展组至少声明一个实例方法");
         while (!is("}")) {
-            if (!is("fn") && !is("async")) throw at(source, token.span, "LYP0001", "扩展组只声明实例方法，公开性由扩展组决定");
-            module.functions.push_back(function({}, pub, decl.typeParameters, false, false, decl.bounds, &decl));
+            if (is("val")) {
+                consume();
+                auto name = identifier();
+                if (std::ranges::any_of(decl.properties, [&](const auto& property) { return property.name.text == name.text; }))
+                    throw at(source, name.span, "LYN0002", "扩展属性重复：" + name.text);
+                require(":");
+                auto result = type();
+                require("get");
+                require("(");
+                require(")");
+                auto body = block();
+                auto getter = module.functions.size();
+                std::vector<Parameter> parameters{{{"$this", name.span}, decl.receiver}};
+                Function function{file, name, std::move(parameters), std::move(result), std::exchange(nodes, {}), body, {}, pub,
+                    decl.typeParameters, false, {}, false, decl.bounds};
+                function.hasReceiver = true;
+                function.extensionGroup = decl.name;
+                function.extensionProperty = true;
+                module.functions.push_back(std::move(function));
+                decl.properties.push_back({std::move(name), module.functions.back().result, getter});
+            } else {
+                if (!is("fn") && !is("async")) throw at(source, token.span, "LYP0001", "扩展组成员需要声明实例方法或只读属性");
+                module.functions.push_back(function({}, pub, decl.typeParameters, false, false, decl.bounds, &decl));
+            }
             if (is(";")) consume();
             else if (!is("}") && !token.newlineBefore) throw at(source, token.span, "LYP0001", "成员之间需要换行或分号");
         }
@@ -890,15 +962,40 @@ private:
         return value;
     }
 
+    IntegerLiteral patternInteger(Span& span) {
+        bool negative = is("-");
+        if (negative) consume();
+        if (token.kind != Kind::Number) throw at(source, token.span, "LYP0001", "整数区间模式需要整数字面量端点");
+        auto literal = consume();
+        span.end = literal.span.end;
+        if (realSpelling(text(literal))) throw at(source, {span.begin, span.end}, "LYT0011", "浮点匹配请使用守卫条件");
+        return integer(source, literal.span, negative);
+    }
+
     Pattern pattern() {
+        auto first = patternAtom();
+        if (!is("|")) return first;
+        auto begin = first.span.begin;
+        std::vector<Pattern> alternatives;
+        alternatives.push_back(std::move(first));
+        do {
+            consume();
+            alternatives.push_back(patternAtom());
+        } while (is("|"));
+        auto end = alternatives.back().span.end;
+        return {{begin, end}, PatternAlternatives{}, std::move(alternatives)};
+    }
+
+    Pattern patternAtom() {
         auto site = token.span;
         if (token.kind == Kind::Number || (is("-") && next.kind == Kind::Number)) {
-            bool negative = is("-");
-            if (negative) consume();
-            auto literal = consume();
-            auto span = Span{site.begin, literal.span.end};
-            if (realSpelling(text(literal))) throw at(source, span, "LYT0011", "浮点匹配请使用守卫条件");
-            return {span, integer(source, literal.span, negative)};
+            auto lower = patternInteger(site);
+            if (is("..") || is("..<")) {
+                bool inclusive = text(consume()) == "..";
+                auto upper = patternInteger(site);
+                return {site, PatternIntegerRange{lower, upper, inclusive}};
+            }
+            return {site, lower};
         }
         if (token.kind == Kind::String) {
             auto literal = stringLiteral();
@@ -1173,28 +1270,23 @@ void parseFile(Module& module, const Source& source, std::size_t file, std::vect
     Parser(source, file, expressions).appendTo(module);
 }
 
-std::vector<MacroSplice> macroSplices(const Source& generated, std::size_t count) {
-    std::vector<MacroSplice> result;
-    Lexer lexer(generated);
-    constexpr std::string_view prefix = "__lyraMacroArg";
-    std::vector<char> delimiters;
-    for (auto token = lexer.next(); token.kind != Kind::End; token = lexer.next()) {
-        auto word = std::string_view(generated.text).substr(token.span.begin, token.span.end - token.span.begin);
-        if (word == "#") throw at(generated, token.span, "LYM0002", "宏不能递归生成新的宏调用");
-        if (word == "(" || word == "[" || word == "{") delimiters.push_back(word == "(" ? ')' : word == "[" ? ']' : '}');
-        if (word == ")" || word == "]" || word == "}") {
-            if (delimiters.empty() || delimiters.back() != word.front()) throw at(generated, token.span, "LYM0002", "表达式宏输出括号不匹配");
-            delimiters.pop_back();
+void validateMacroExpression(const Source& generated) {
+    try { Parser(generated, 0).expansionExpression(); }
+    catch (Diagnostic& failure) { failure.code = "LYM0002"; throw; }
+}
+
+std::vector<SyntaxToken> syntaxTokens(const Source& source, bool comments, bool partial) {
+    std::vector<SyntaxToken> tokens;
+    Lexer lexer(source, comments ? &tokens : nullptr);
+    try {
+        for (auto token = lexer.next(); token.kind != Kind::End; token = lexer.next()) {
+            auto kind = token.kind == Kind::Name || token.kind == Kind::Escaped ? "name" : token.kind == Kind::Keyword ? "keyword" :
+                token.kind == Kind::String || token.kind == Kind::Bytes || token.kind == Kind::Char || token.kind == Kind::TextHead ||
+                    token.kind == Kind::TextMiddle || token.kind == Kind::TextTail ? "string" : token.kind == Kind::Number ? "number" : "token";
+            tokens.push_back({token.span, kind});
         }
-        if (token.kind != Kind::Name || !word.starts_with(prefix)) continue;
-        word.remove_prefix(prefix.size());
-        std::size_t index;
-        auto [stopped, error] = std::from_chars(word.data(), word.data() + word.size(), index);
-        if (error != std::errc{} || stopped != word.data() + word.size() || index >= count) throw at(generated, token.span, "LYM0002", "无效的宏实参插槽");
-        result.push_back({token.span, index});
-    }
-    if (!delimiters.empty()) throw at(generated, {0, generated.text.size()}, "LYM0002", "表达式宏输出括号未闭合");
-    return result;
+    } catch (const Diagnostic&) { if (!partial) throw; }
+    return tokens;
 }
 
 }

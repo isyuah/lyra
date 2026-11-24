@@ -43,7 +43,8 @@ class Macros(unittest.TestCase):
         return error
 
     def macro(self, source):
-        (self.src / '.macros/make.ly').write_text('fn make(target: String, argument: String): String { ' + source + ' }')
+        (self.src / '.macros/make.ly').write_text('fn fragment(target: String, argument: String): String { ' + source + ' }\n'
+                                                  'fn make(target: String, argument: String): Syntax { syntaxCode(fragment(target, argument)) }')
 
     def test_declared_input_and_cold_decorator(self):
         self.manifest(macroInputs={'make': {'greeting': 'inputs/message.txt'}})
@@ -65,6 +66,114 @@ async fn main(): Unit { val pending = work(); print("cold"); print(await pending
         self.assertEqual(packed.returncode, 0, packed.stderr.decode())
         self.assertIn(b'inputs/message.txt', (self.root / 'example.lypkg').read_bytes())
 
+    def test_expansion_cache_reuses_output_and_invalidates_changed_dependencies(self):
+        cache = self.root / 'cache/compiler/macros'
+        expressions = self.src / '.expressions'
+        expressions.mkdir()
+        implementation = expressions / 'value.ly'
+        macro = '''fn value(target: String, raw: String): Syntax {
+    syntaxCall(syntaxName("combine"), syntaxArgs(syntaxArgument(0), syntaxCode(macroInput("extra") + " + 1")))
+}'''
+        implementation.write_text(macro)
+        main = self.src / 'main.ly'
+        source = 'fn main(): Unit { print(#value(7)) }\n'
+        main.write_text(source)
+        helper = self.src / 'helper.ly'
+        helper.write_text('fn combine(first: Int, second: Int): Int { first + second }')
+        snapshot = self.pkg / 'extra.txt'
+        snapshot.write_text('5')
+        self.manifest(macroInputs={'value': {'extra': 'extra.txt'}})
+
+        def run(expected):
+            result = self.cli('run', self.pkg)
+            self.assertEqual(result.returncode, 0, result.stderr.decode())
+            self.assertEqual(result.stdout.decode().splitlines(), [str(expected)])
+
+        run(13)
+        entry, = cache.glob('*.expansion')
+        contents = entry.read_bytes()
+        old_time = 1_000_000_000
+        os.utime(entry, ns=(old_time, old_time))
+        run(13)
+        self.assertEqual(list(cache.iterdir()), [entry])
+        self.assertEqual(entry.stat().st_mtime_ns, old_time)
+
+        helper.write_text('fn combine(first: Bool, second: Int): Int { second }')
+        error = self.diagnostic('LYT0001')
+        self.assertEqual((Path(error['file']), error['range']['start']['offset']), (main, source.index('7')))
+        self.assertEqual(entry.stat().st_mtime_ns, old_time)
+        helper.write_text('fn combine(first: Int, second: Int): Int { first + second }')
+
+        entry.write_bytes(b'incomplete expansion')
+        run(13)
+        self.assertEqual(entry.read_bytes(), contents)
+        snapshot.write_text('6')
+        run(14)
+        main.write_text(source.replace('7', '8'))
+        run(15)
+        implementation.write_text(macro.replace(' + 1', ' + 2'))
+        run(16)
+        self.assertEqual(len(list(cache.glob('*.expansion'))), 4)
+
+        snapshot.unlink()
+        self.diagnostic('LYM0002', '不存在')
+        self.assertEqual(len(list(cache.glob('*.expansion'))), 4)
+
+    def test_cached_field_defaults_are_resolved_again_for_the_current_module(self):
+        main = self.src / 'main.ly'
+        main.write_text('''#derive(Json)
+struct Item(pub val count: Int = 41 + 1)
+fn main(): Unit {
+    print(match decodeItem("{}") { Ok(item) => item.count, Err(_) => -1 })
+}
+''')
+        result = self.cli('run', self.pkg)
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+        self.assertEqual(result.stdout.decode().splitlines(), ['42'])
+        entry, = (self.root / 'cache/compiler/macros').glob('*.expansion')
+        old_time = 1_000_000_000
+        os.utime(entry, ns=(old_time, old_time))
+        (self.src / 'early.ly').write_text('fn early(): Bool { true }')
+        result = self.cli('run', self.pkg)
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+        self.assertEqual(result.stdout.decode().splitlines(), ['42'])
+        self.assertEqual(entry.stat().st_mtime_ns, old_time)
+
+    def test_unavailable_cache_leaves_macro_behavior_unchanged(self):
+        (self.src / 'main.ly').write_text('#make\nfn main(): Unit { print(generated()) }')
+        self.macro('"fn generated(): Int { 42 }"')
+        self.manifest(macroInputs={'make': {'unused': 'missing.txt'}})
+        result = self.cli('check', self.pkg)
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+        self.assertFalse((self.root / 'cache/compiler/macros').exists())
+
+        self.manifest()
+        (self.root / 'cache').mkdir(exist_ok=True)
+        (self.root / 'cache/compiler').write_text('not a directory')
+        result = self.cli('check', self.pkg)
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+
+    def test_class_decorator_generates_authorized_api(self):
+        decorators = self.src / '.decorators'
+        decorators.mkdir()
+        (decorators / 'describe.ly').write_text('''
+fn describe(target: String, argument: String): Syntax {
+    syntaxCode("pub fn generatedTypeName(): String { " + macroQuote(target) + " }")
+}
+''')
+        self.native('''
+@describe(export generatedTypeName)
+class Record(val value: Int)
+fn main(): Unit { print(generatedTypeName() + ":" + Record(7).value.toString()) }
+''', ['Record:7'])
+
+        (self.src / 'main.ly').write_text('''
+@describe
+class Record(val value: Int)
+fn main(): Unit {}
+''')
+        self.diagnostic('LYM0002', '公开')
+
     def test_denials_limits_and_generated_error_locations(self):
         main = self.src / 'main.ly'
         main.write_text('#make\nfn main(): Unit {}')
@@ -85,7 +194,7 @@ async fn main(): Unit { val pending = work(); print("cold"); print(await pending
         error = self.diagnostic('LYT0001')
         self.assertEqual((Path(error['file']), error['range']['start']['line'], error['range']['start']['column']), (main, 1, 2))
         self.assertIn('fn wrong', error['generated']['source'])
-        (self.src / '.macros/make.ly').write_text('extern fn forbidden(): Int;\nfn make(target: String, argument: String): String { "" }')
+        (self.src / '.macros/make.ly').write_text('extern fn forbidden(): Int;\nfn make(target: String, argument: String): Syntax { syntaxCode("") }')
         self.diagnostic('LYM0002', 'extern')
 
     def test_derive_strict_roundtrip_and_optional_states(self):
@@ -356,10 +465,10 @@ fn main(): Unit {
         self.assertEqual(result.returncode, 0, result.stderr.decode())
 
     def test_attributes_generate_a_typed_adapter_without_changing_direct_calls(self):
-        (self.src / '.macros/post.ly').write_text('''fn post(target: String, route: String): String {
-    if !fieldHasAttribute(0, "path") || fieldType(0) != "Int" { return macroFail("expected Int path") }
+        (self.src / '.macros/post.ly').write_text('''fn post(target: String, route: String): Syntax {
+    if !fieldHasAttribute(0, "path") || fieldType(0) != "Int" { return syntaxError(syntaxTarget(), "expected Int path") }
     val key = macroQuote(fieldAttributeValue(1, "query"))
-    "fn adapt(request: Request): String { " + target + "(request." + fieldName(0) + ", request.query(" + key + ")) }\\nfn route(): String { " + macroQuote(route) + " }"
+    syntaxCode("fn adapt(request: Request): String { " + target + "(request." + fieldName(0) + ", request.query(" + key + ")) }\\nfn route(): String { " + macroQuote(route) + " }")
 }''')
         self.native('''struct Request(val id: Int) { fn query(key: String): String { key + "!" } }
 #post("/teams/{id}")
@@ -376,9 +485,11 @@ fn main(): Unit { print(route()); print(adapt(Request(7))); print(show(8, "direc
         directory = self.src / '.expressions'
         directory.mkdir()
         expression = directory / 'make.ly'
-        expression.write_text('''fn make(target: String, raw: String): String {
-    if argumentCount() != 2 { return macroFail("expected two expressions") }
-    "{ val temp = 10; if " + argumentCode(0) + " { temp + " + argumentCode(1) + " } else { 0 } }"
+        expression.write_text('''fn make(target: String, raw: String): Syntax {
+    if argumentCount() != 2 { return syntaxError(syntaxCode(""), "expected two expressions") }
+    syntaxConcat(syntaxCode("{ val temp = 10; if "),
+        syntaxConcat(syntaxArgument(0), syntaxConcat(syntaxCode(" { temp + "),
+            syntaxConcat(syntaxArgument(1), syntaxCode(" } else { 0 } }")))))
 }''')
         self.native('''fn add(left: Int, right: Int): Int { print("add"); left + right }
 fn first<A,B>(first: A, second: B): A { first }
@@ -397,7 +508,7 @@ fn main(): Unit {
         main.write_text('fn main(): Unit {\n    print(#make(true, false))\n}')
         error = self.diagnostic('LYT0001')
         self.assertEqual((error['range']['start']['line'], error['range']['start']['column']), (2, 23))
-        expression.write_text('fn make(target: String, raw: String): String { "temp" }')
+        expression.write_text('fn make(target: String, raw: String): Syntax { syntaxName("temp") }')
         main.write_text('fn main(): Unit { val temp = 7; print(#make()) }')
         error = self.diagnostic('LYN0001', 'temp')
         self.assertEqual(error['range']['start']['column'], main.read_text().index('#make') + 2)
@@ -407,9 +518,9 @@ fn main(): Unit {
         directory = self.src / '.expressions'
         directory.mkdir()
         impl = directory / 'query.ly'
-        impl.write_text('''fn query(target: String, raw: String): String {
-    if argumentString(0) != macroInput("statement") { return macroFail("refresh query snapshot") }
-    "bindId(" + argumentCode(1) + ")"
+        impl.write_text('''fn query(target: String, raw: String): Syntax {
+    if argumentString(0) != macroInput("statement") { return syntaxError(syntaxArgument(0), "refresh query snapshot") }
+    syntaxCall(syntaxName("bindId"), syntaxArgument(1))
 }''')
         self.manifest(macroInputs={'query': {'statement': 'inputs/query.sql'}})
         (self.pkg / 'inputs').mkdir()
@@ -419,15 +530,70 @@ fn main(): Unit {
         self.assertNotEqual(self.cli('build', self.pkg, '-o', impl).returncode, 0)
         main = self.src / 'main.ly'
         main.write_text(code.replace('SELECT ?1', 'SELECT ?2'))
-        self.diagnostic('LYM0002', 'snapshot')
+        error = self.diagnostic('LYM0002', 'snapshot')
+        self.assertEqual(error['range']['start']['offset'], main.read_bytes().index(b'"SELECT ?2"'))
+        main.write_text(code.replace(', 7)', ', "bad")'))
+        error = self.diagnostic('LYT0001')
+        self.assertEqual(error['range']['start']['offset'], main.read_bytes().index(b'"bad"'))
+        snapshot = self.pkg / 'inputs/query.sql'
+        snapshot.unlink()
+        main.write_text(code)
+        self.diagnostic('LYM0002', '不存在')
+        snapshot.write_text('SELECT ?1')
         main.write_text(code.replace('"SELECT ?1"', '7'))
         self.diagnostic('LYM0002', '字面量')
         main.write_text(code)
         for generated in ('1); pub fn escaped(): Int { 9 }', '#query(7)'):
-            impl.write_text('fn query(target: String, raw: String): String { ' + json.dumps(generated) + ' }')
+            impl.write_text('fn query(target: String, raw: String): Syntax { syntaxCode(' + json.dumps(generated) + ') }')
             self.diagnostic('LYM0002')
         main.write_text('fn main(): Unit { print(#derive(Json)) }')
         self.diagnostic('LYM0001', '表达式宏')
+
+    def test_declaration_nodes_keep_positions_and_only_requested_names_are_public(self):
+        macro = self.src / '.macros/checkBody.ly'
+        macro.write_text('''fn checkBody(target: String, argument: String): Syntax {
+    val body = syntaxBody()
+    val statement = syntaxChild(body, 0)
+    if syntaxKind(statement) != "return" { return syntaxError(statement, "first statement must return") }
+    if syntaxLine(statement) < 3 || syntaxStart(statement) >= syntaxEnd(statement) { return syntaxError(statement, "missing span") }
+    syntaxCode("pub fn generated(): Int { 7 }")
+}''')
+        self.native('''#checkBody(export generated)
+fn target(): Int {
+    return 42
+}
+fn main(): Unit { print(generated()) }
+''', ['7'])
+        main = self.src / 'main.ly'
+        main.write_text('#checkBody(export generated)\nfn target(): Int { 42 }\nfn main(): Unit {}\n')
+        error = self.diagnostic('LYM0002', 'first statement')
+        self.assertEqual(error['range']['start']['offset'], main.read_bytes().index(b'42'))
+        main.write_text('#checkBody\nfn target(): Int {\n    return 42\n}\nfn main(): Unit {}\n')
+        self.diagnostic('LYM0002', '公开')
+
+    def test_decorator_composes_success_and_failure_without_eager_async_execution(self):
+        decorators = self.src / '.decorators'
+        decorators.mkdir()
+        (decorators / 'observe.ly').write_text('''fn observe(target: String, label: String): Syntax {
+    syntaxAround(
+        syntaxCall(syntaxName("print"), syntaxString(label + ":before")),
+        syntaxCode("if result is Int { print(" + macroQuote(label + ":ok") + "); print(result as? Int ?? 0) }"),
+        syntaxCode("print(" + macroQuote(label + ":error") + "); print(exception.message)"))
+}''')
+        self.native('''exception Oops
+@observe("outer")
+@observe("inner")
+async fn work(fail: Bool): Int { if fail { throw Oops("failed") }; 42 }
+async fn main(): Unit {
+    val callable: (Bool) -> Task<Int> = work
+    val cold = callable(false)
+    print("cold")
+    print(await cold)
+    print(await cold)
+    try { await work(true); } catch error: Oops { print(error.message) }
+}
+''', ['cold', 'outer:before', 'inner:before', 'inner:ok', '42', 'outer:ok', '42', '42', '42',
+      'outer:before', 'inner:before', 'inner:error', 'failed', 'outer:error', 'failed', 'failed'])
 
 
 if __name__ == '__main__':

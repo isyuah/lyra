@@ -26,6 +26,11 @@ LyraStringView lyraStringView(const LyraString* value) {
     return {lyraStringBytes(value), lyraStringLength(value)};
 }
 
+LyraBytesView lyraBytesView(const LyraBytes* value) {
+    if (!value) return {nullptr, 0};
+    return {reinterpret_cast<const unsigned char*>(lyraStringBytes(value)), lyraStringLength(value)};
+}
+
 uint8_t lyraUtf8Valid(const char* bytes, std::size_t size) {
     for (std::size_t index = 0; index < size;) {
         auto lead = static_cast<unsigned char>(bytes[index++]);

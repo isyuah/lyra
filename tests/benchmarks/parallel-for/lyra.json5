@@ -1,0 +1,5 @@
+{
+  "name": "benchmarks/parallel-for",
+  "version": "0.1.0",
+  "kind": "app"
+}

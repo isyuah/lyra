@@ -4,9 +4,11 @@ extern fn lyraContextWithTimeout(context: CPtr, milliseconds: Int): CPtr;
 extern fn lyraContextTrace(context: CPtr): String;
 extern fn lyraContextRemaining(context: CPtr): Int;
 extern fn lyraContextEnter(context: CPtr): Bool;
+extern fn lyraTaskParallelism(): Int;
 
 pub fn trace(): String { lyraContextTrace(lyraContextCurrent()) }
 pub fn remainingMs(): Int { lyraContextRemaining(lyraContextCurrent()) }
+pub fn parallelism(): Int { lyraTaskParallelism() }
 
 pub async fn withTrace<T>(label: String, body: Task<T>): T {
     lyraContextEnter(lyraContextWithTrace(lyraContextCurrent(), label))

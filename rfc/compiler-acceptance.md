@@ -9,7 +9,7 @@ H 由作者委托设计。顺序是先证明**写错能指出原因、写对能�
 | 验收编号 | 输入 | 验收条件 |
 |---|---|---|
 | CC-001 | [fail/src/main.ly](../examples/compiler-smoke/fail/src/main.ly) | `check` 和 `build` 非零退出；返回类型不匹配码 `LYT0001`，主源码范围指向 `total` 末尾的 `;`，实际 `Unit`、期望 `Int`。文本提示可去掉分号；机器可读诊断给出相同的码和范围。此次构建不产生可执行文件。 |
-| CC-002 | [pass/src/main.ly](../examples/compiler-smoke/pass/src/main.ly) | `check` 成功；`build` 产出 Linux 原生文件。在[最低验收镜像](native-toolchain.md)上只复制产物、使用列明的系统库，不安装 Lyra 或 LLVM；运行输出 `3` 并正常退出。Debug 和优化构建结果相同。 |
+| CC-002 | [pass/src/main.ly](../examples/compiler-smoke/pass/src/main.ly) | `check` 成功；`build` 产出本机 PE 或 ELF。在[部署目标](native-toolchain.md)上只复制产物、使用列明的系统库，不安装 Lyra 或 LLVM；运行输出 `3` 并正常退出。Debug 和优化构建结果相同。 |
 
 **首片实测：CC-001、CC-002 已通过。** [命令行验收用例](../tests/compiler_cli.py)在 WSL Ubuntu 24.04 和 Ubuntu 22.04 构建环境均通过。在 22.04 链接的 Debug、Release 产物分别复制进干净的官方 Ubuntu Base 22.04.5 amd64 根文件系统；不安装 Lyra、LLVM 或 Clang，均输出 `3` 和换行、退出码为 `0`，ELF 的 `DT_NEEDED` 仅含 `libc.so.6`。[构建说明](../README.md)提供用两阶段容器复现的命令。
 
@@ -23,18 +23,23 @@ H 由作者委托设计。顺序是先证明**写错能指出原因、写对能�
 |---|---|
 | M0–M1：工具链、诊断与核心 | `cmake --preset dev` 使用 Clang 18、C++23 命名模块和 Ninja。[前端与原生用例](../tests/compiler_cli.py)覆盖分号返回 `Unit`、副作用顺序、溢出和失败时不覆盖产物。[语法用例](../tests/syntax_cli.py)在 Windows 和 Linux 验证换行、反引号、泛型尖括号与 `await`/`?`/负号优先级。 |
 | M2：数据与 GC | [对象测试](../tests/objects_cli.py)检查值复制和引用身份；[文本测试](../tests/text_cli.py)检查 Unicode、无损字节转换和跨 `await` 的插值。[原生任务测试](../tests/runtime_tasks.cpp)让 GC 在任务挂起期间运行；恢复后能读到同一对象。 |
-| M3：类型、集合与调用 | [泛型](../tests/generics_cli.py)、[集合](../tests/collections_cli.py)、[和类型](../tests/sums_cli.py)、[隐式转换](../tests/conversions_cli.py)以及[可空与遍历](../tests/sugar_cli.py)分别核对推断、默认值、展开、空值层数、提前返回和转换歧义。[普通函数重载](../tests/overloads_cli.py)核对逐实参排序、胜出后才报转换歧义、默认值只执行一次、函数值和跨包公开候选。 |
-| M3：泛型对象与公开 API | [对象](../tests/objects_cli.py)核对实例/静态方法重载和结构约束分派；[模块](../tests/modules_cli.py)核对跨包泛型枚举、扩展组导入和优先级，以及嵌套签名的私有类型检查。 |
+| M3：类型、集合与调用 | [泛型](../tests/generics_cli.py)、[集合](../tests/collections_cli.py)、[和类型](../tests/sums_cli.py)、[隐式转换](../tests/conversions_cli.py)以及[可空与遍历](../tests/sugar_cli.py)分别核对推断、默认值、展开、空值层数、OR / 整数范围穷尽匹配、提前返回和转换歧义。[普通函数重载](../tests/overloads_cli.py)核对逐实参排序、胜出后才报转换歧义、默认值只执行一次、函数值和跨包公开候选。 |
+| M3：泛型对象与公开 API | [对象](../tests/objects_cli.py)核对隐式 `this`、实例/静态方法重载与只读扩展属性；[泛型](../tests/generics_cli.py)检查关联类型、多重结构约束与静态分派；[模块](../tests/modules_cli.py)核对跨包泛型枚举、扩展组导入和优先级，以及嵌套签名的私有类型检查。 |
 | 日常类型推断 | [返回推断与可空收窄](../tests/inference_cli.py)检查私有函数、泛型方法、递归需标注、短路和提前返回，以及跨 `await` 读取同一局部快照。 |
-| M4：模块、包与工具分发 | [安装验收](../tests/installed_cli.py)搬迁完整工具链、发布库、锁定并拉取源码，移走注册中心和生产者源码，在仓库外用离线缓存原生编译并执行。 |
-| M5：异步、异常与收尾 | [词法清理](../tests/defer_cli.py)、[异常](../tests/exceptions_cli.py)和[Context](../tests/context_cli.py)区分业务错误、普通异常和取消。[异步源码用例](../tests/async_cli.py)核对组的清理顺序、跨域门闩与类型化任务局部值；[原生任务用例](../tests/runtime_tasks.cpp)检查等待者回到自身域、跨线程 GC 和取消时的 C 工作收尾。 |
+| M4：模块、包与工具分发 | [安装验收](../tests/installed_cli.py)可直接使用解包的 SDK。搬迁工具链后锁定并拉取源码，移走本地注册中心和生产者源码，在仓库外用离线缓存和 C 静态库编译、执行。还从同一 SDK 构建和运行两个双包应用。 |
+| M5：异步、异常与收尾 | [词法清理](../tests/defer_cli.py)、[异常](../tests/exceptions_cli.py)和[Context](../tests/context_cli.py)区分业务错误、普通异常和取消。[异步源码用例](../tests/async_cli.py)核对组的清理与错误顺序、类型化任务局部值和有界 `parallelFor`；[原生任务用例](../tests/runtime_tasks.cpp)用门闩验证不同 OS 线程推进、work stealing、单 Worker、等待者回到自身域、跨线程 GC 和取消时等待 C 工作收尾。 |
 | M6：C ABI 与服务 | [HTTP/SQLite](../tests/http_cli.py)使用真实 TCP 和系统 SQLite。另一个连接断开时，数据库工作安全收尾，释放 statement 和连接；服务仍接受后续请求。 |
-| 编译期常量 | [常量用例](../tests/const_cli.py)核对跨包重导出、别名和常量身份，检查纯度、整型范围、求值环以及步数和递归预算。 |
-| M7：宏与独立应用 | [宏](../tests/macros_cli.py)检查显式派生、嵌套字段/数组错误路径、标记、入口装饰器、表达式拼接和受控文件输入。[JSONL CLI](../tests/jsonlines_cli.py)检查正确输入、坏行、流错误以及工具链外的双包部署。 |
+| 编译期计算 | [常量用例](../tests/const_cli.py)核对普通纯同步函数、临时 Class/List、闭包与共享捕获、跨包常量身份和重导出；检查纯度、范围、依赖环、预算和拒绝将可变引用保存为常量。 |
+| M7：宏与独立应用 | [宏](../tests/macros_cli.py)检查带范围的语法节点、函数/类装饰器、显式派生、生成公开声明的授权和受控输入缓存；参数化查询的快照过期、缺失和类型错误各自报到源码。[JSONL CLI](../tests/jsonlines_cli.py)检查正确输入、坏行、流错误和离线双包部署。 |
+| M8：日常标准库与 HTTP | [文件与集合](../tests/stdlib_daily_cli.py)核对字节 I/O、EOF/失败和集合链式调用；[JSON codec](../tests/json_codec_cli.py)与[TOML](../tests/toml_cli.py)核对跨包编解码、未知键与路径、默认值和不可无损表示的状态；[HTTP/SQLite](../tests/http_cli.py)覆盖 Router、手写 handler、`#post`、重复 query、JSON body 和固定并发容量。 |
+| M9：LSP 与编辑器 | [协议测试](../tests/lsp_cli.py)检查未保存文件、依赖变化、UTF-16、宏源码映射、补全、悬停、定义、引用、重命名和格式化；[VS Code 联调](../editors/vscode/README.md#真实编辑器验收)用双包项目验证跨包跳转、磁盘变化和带中文与 emoji 的未保存诊断。 |
+| 原生调试和反射 | [调试用例](../tests/debug_info_cli.py)检查 DWARF、CodeView/PDB、复合布局、优化版符号与原生回溯。[反射用例](../tests/reflection_cli.py)检查规范类型名、只读公开字段和字段值的类型身份。 |
 
-运行 `ctest --preset dev --output-on-failure` 执行这些套件；`release` preset 另测优化版编译器。最低部署目标由[Jammy 两阶段验收](../tests/jammy-smoke.sh)分别验证只有 libc 的应用和额外依赖系统 SQLite 的应用；量测条件和结果见[原生工具链](native-toolchain.md)。
+LSP 按入口包和可达依赖复用分析快照。影响该闭包的源码、清单、锁文件、标准库或授权宏输入变化会重新链接并检查闭包，复用未变且未展开宏的文件的 AST；不相关的包不触发重检。不涉及宏且 token、源码范围都不变的编辑可复用已有类型检查结果。标准库也使用未保存文档的内容。没有函数级增量类型检查。原生目标文件缓存按精确 IR、目标、Clang 版本和编译选项匹配，并校验缓存内容；读写失败或缓存损坏时重新编译。该缓存不跳过前端或链接。
 
-**仍属设计、不能当作现有 API：** 运行时字段反射和 TOML 派生。编辑器集成、`fmt` 和 `doc` 另行交付。[设计服务](../examples/user-service/README.md)保留最终写法；目前编译运行的是[原生服务](../examples/http-sqlite/README.md)。
+**Alpha 实测。** Windows x64 的 `windows-dev`、`windows-release` 和 Ubuntu 22.04、24.04 的 `dev`、`release` 共六轮 CTest，每轮 43 项全通过。两端都从[解包后的 SDK](native-toolchain.md#打包与复验-sdk)离线构建、运行两个双包应用，并用 VS Code 1.147.0 加载打包后的 VSIX 通过联调。干净 Ubuntu 22.04.5 根文件系统中，[独立运行验收](../tests/jammy-smoke.sh)只复制应用，HTTP/SQLite 额外安装 `libsqlite3-0`。Windows 在清空构建工具环境后运行了 `.exe`，并检查 PE 仅导入系统 DLL；全新 Windows 虚拟机首跑待用[部署包](native-toolchain.md#打包与复验-sdk)复验。
+
+`lyra fmt` 与 LSP 共用[词法格式化用例](../tests/format_cli.py)：整理缩进和行尾空白，保留语义换行、注释和字面量。`std.reflect` 只读公开字段，完整版反射和文档生成后置。[设计服务](../examples/user-service/README.md)保留早期目标写法；Alpha 编译运行的是[原生服务](../examples/http-sqlite/README.md)。
 
 ## 后续扩展仍要守住的三个验收点
 

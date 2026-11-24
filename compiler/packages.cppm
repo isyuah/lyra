@@ -27,7 +27,7 @@ import lyra.platform;
 
 export namespace lyra {
 
-struct PackageOptions { bool locked = false, offline = false, update = false; };
+struct PackageOptions { bool locked = false, offline = false, update = false, readOnly = false; };
 struct PackageError { std::string code, message; };
 struct ResolvedPackage {
     std::string id, name, version;
@@ -479,7 +479,7 @@ struct Store {
         else if (fs::is_regular_file(file)) contents = readFile(file);
         else io(string(options.offline ? "离线缺少索引：" : "缺少包索引：") + request.name + " " + request.range + " (" + request.source + ")");
         auto records = recordsFrom(objectFrom(contents, id), id, request.name);
-        if (online || local) replaceFile(file, contents);
+        if ((online || local) && !options.readOnly) replaceFile(file, contents);
         return indexes.emplace(id, std::move(records)).first->second;
     }
 
@@ -508,9 +508,10 @@ struct Store {
         auto files = unpack(bytes, label); auto manifest = manifestFrom(files.at(manifestFile), label);
         if (manifest.name != request.name || manifest.version != record.version.text) invalid(label + "：归档清单与索引不一致");
         for (const auto& [alias, dep] : manifest.dependencies) if (!dep.path.empty() || (dep.registry != "self" && !isWeb(dep.registry))) invalid(label + "：发布包不能包含本地依赖：" + alias);
-        if (!fs::is_regular_file(cached)) replaceFile(cached, bytes);
+        if (!options.readOnly && !fs::is_regular_file(cached)) replaceFile(cached, bytes);
         auto root = cache / "sources" / record.hash;
         if (!fs::exists(root)) {
+            if (options.readOnly) io("编辑器缺少已展开的依赖：" + label + "，请先运行 lyra fetch");
             StagingDirectory scratch(root.parent_path());
             auto staged = scratch.path / "srcpkg";
             fs::create_directories(staged / "src");
@@ -663,6 +664,7 @@ void visitGraph(const string& id, const std::map<string, ResolvedPackage>& packa
 }
 
 PackageGraph resolvePackages(const fs::path& directory, PackageOptions options) {
+    if (options.readOnly) options.offline = true;
     if (options.update && options.locked) fail("LYK0001", "--update 与 --locked 不能并用");
     auto ws = layout(directory); auto lockPath = ws.root / "lyra.lock";
     fs::path cache = ws.root / ".lyra" / "cache";
@@ -714,7 +716,7 @@ PackageGraph resolvePackages(const fs::path& directory, PackageOptions options) 
     json::Object lock{{"format", 1}, {"members", std::move(members)}, {"packages", std::move(entries)}};
     if (!old || *old != lock) {
         if (options.locked) fail("LYK0003", "清单与锁文件不符：" + pathText(lockPath));
-        replaceFile(lockPath, render(json::Value(std::move(lock))));
+        if (!options.readOnly) replaceFile(lockPath, render(json::Value(std::move(lock))));
     }
     for (auto& [id, package] : packages) graph.packages.push_back(std::move(package));
     return graph;

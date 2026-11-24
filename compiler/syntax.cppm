@@ -14,7 +14,7 @@ export namespace lyra {
 
 using ExprId = std::size_t;
 
-struct Identifier { std::string text; Span span; std::string linked{}; bool exportedOnly{}; };
+struct Identifier { std::string text; Span span; std::string linked{}; bool exportedOnly{}; std::optional<SourceAnchor> renameTarget{}; };
 struct Attribute { Identifier name; std::optional<Identifier> argument; };
 struct Argument { std::optional<Identifier> label; ExprId value; std::optional<Span> spread{}, trailing{}; };
 struct TypeQualifier { Identifier name; std::vector<Identifier> arguments{}; };
@@ -71,9 +71,11 @@ struct PatternName {
     std::optional<std::vector<std::optional<Identifier>>> labels{};
     bool escaped{};
 };
+struct PatternIntegerRange { IntegerLiteral lower, upper; bool inclusive; };
+struct PatternAlternatives {};
 struct Pattern {
     Span span;
-    std::variant<std::monostate, PatternName, SumTag, IntegerLiteral, bool, StringLiteral, CharLiteral> node;
+    std::variant<std::monostate, PatternName, SumTag, IntegerLiteral, PatternIntegerRange, PatternAlternatives, bool, StringLiteral, CharLiteral> node;
     std::vector<Pattern> parts{};
 };
 struct MatchArm { Pattern pattern; ExprId value; std::optional<ExprId> guard{}; };
@@ -88,9 +90,10 @@ struct Expr {
 
 struct Parameter { Identifier name, type; bool variadic{}; std::optional<ExprId> defaultValue{}; std::vector<Attribute> attributes{}; };
 struct Bound { std::size_t parameter; Identifier trait; };
-struct Extension { std::size_t file; Identifier name, receiver; bool isPublic; std::vector<Identifier> typeParameters{}; std::vector<Bound> bounds{}; };
+struct ExtensionProperty { Identifier name, type; std::size_t getter; };
+struct Extension { std::size_t file; Identifier name, receiver; bool isPublic; std::vector<Identifier> typeParameters{}; std::vector<Bound> bounds{}; std::vector<ExtensionProperty> properties{}; };
 struct TraitMethod { Identifier name; std::vector<Parameter> parameters; Identifier result; bool asynchronous; };
-struct Trait { std::size_t file; Identifier name; std::vector<TraitMethod> methods; bool isPublic; };
+struct Trait { std::size_t file; Identifier name; std::vector<TraitMethod> methods; bool isPublic; std::vector<Identifier> associated{}; };
 enum class ConstKind { None, Value, Function };
 struct Function {
     std::size_t file;
@@ -110,24 +113,27 @@ struct Function {
     bool hasReceiver{};
     std::optional<Identifier> extensionGroup{};
     ConstKind constant{};
+    bool extensionProperty{};
 };
 
 struct FieldDefault { std::size_t function; bool emptyOption; };
 struct Field { Identifier name, type; bool writable; bool isPublic{}; std::vector<Attribute> attributes{}; std::optional<FieldDefault> defaultValue{}; };
 std::string fieldDefaultName(const std::string& record, const std::string& field) { return record + "$fieldDefault$" + field; }
-struct Aggregate { std::size_t file; Identifier name; bool reference; std::vector<Field> fields; bool isPublic{}; std::vector<Identifier> typeParameters{}; std::vector<Bound> bounds{}; };
+struct TypeMember { Identifier name, type; bool isPublic; };
+struct Aggregate { std::size_t file; Identifier name; bool reference; std::vector<Field> fields; bool isPublic{}; std::vector<Identifier> typeParameters{}; std::vector<Bound> bounds{}; Span span{}; std::vector<TypeMember> associated{}; };
 struct EnumField { std::optional<Identifier> name; Identifier type; };
 struct EnumCase { Identifier name; std::vector<EnumField> fields; };
 struct Enumeration { std::size_t file; Identifier name; std::vector<EnumCase> cases; bool isPublic; std::vector<Identifier> typeParameters{}; std::vector<Bound> bounds{}; };
 struct ExceptionType { std::size_t file; Identifier name; bool isPublic; };
 struct Import { std::size_t file; bool isPublic; std::vector<Identifier> path; Identifier alias; };
-struct Expansion { std::size_t file; Identifier name; std::optional<Identifier> argument; bool decorator; bool record; std::size_t target; };
+struct Expansion { std::size_t file; Identifier name; std::optional<Identifier> argument; bool decorator; bool record; std::size_t target; std::vector<Identifier> exports{}; };
 struct MacroArgument { Span span; std::optional<std::string> literal; };
 struct ExpressionExpansion { Identifier name; Span span, argumentsSpan; std::vector<MacroArgument> arguments; };
-struct MacroSplice { Span span; std::size_t argument; };
+struct SyntaxToken { Span span; std::string kind; };
 struct Module { std::vector<Function> functions; std::vector<Aggregate> aggregates; std::vector<Import> imports; std::vector<Expansion> expansions; std::vector<Trait> traits{}; std::vector<Enumeration> enums{}; std::vector<Extension> extensions{}; std::vector<std::vector<std::string>> importedExtensions{}; std::vector<ExceptionType> exceptions{}; };
 Module parse(const std::vector<Source>& sources);
 void parseFile(Module& module, const Source& source, std::size_t file, std::vector<ExpressionExpansion>* expressions = nullptr);
-std::vector<MacroSplice> macroSplices(const Source& generated, std::size_t count);
+void validateMacroExpression(const Source& generated);
+std::vector<SyntaxToken> syntaxTokens(const Source& source, bool comments = false, bool partial = false);
 
 }

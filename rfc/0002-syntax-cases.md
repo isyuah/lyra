@@ -85,6 +85,10 @@ fn lookup<Key, Value>(key: Key): Value? { null }
 | S2-024 | `fn scaled(): Int { val _slot2 = 1_000; _slot2 + 2 * 3 }`；另测 `val count = 2 /* note` | 前者返回 `1006`；后者在 `/*` 报块注释未闭合。 |
 | S2-036 | `-1.toInt8Checked()`；另测 `(-1).toInt8Checked()` 和 `-9223372036854775808` | 首例的成员调用先结合，一元负号收到 `Int8?` 而出错；后两例分别得到 `Some(-1)` 和最小 `Int`。 |
 | S2-037 | `identity<Int> (7)`；另测 `value? .size` | 首例的 `>` 未与 `(` 相邻，不能识别为泛型调用；后者提示用 `(value?).size` 明确接收者。 |
+| S2-038 | `Text(value) | Failure(value)`，两分支的 `value` 类型相同；另测 `true | false` | 两个备选共用一个只读绑定；`true | false` 穷尽 `Bool`。OR 可嵌套在枚举载荷与 Struct 字段模式中。 |
+| S2-039 | 对 `Int8` 匹配 `-128..-1` 和 `0..127`；另测 `-10..<0` 与 `0..2` | 首例穷尽整个 `Int8` 域；闭区间包含上界，`..<` 不包含上界。 |
+| S2-040 | `Left(item) | Right(item)`，其中载荷分别为 `Int` 和 `String`；另测 `Left(item) | Right(other)` | 两例都在 OR 模式处拒绝：备选必须绑定相同名称且类型一致。 |
+| S2-041 | `Int8` 只匹配 `-128..0` | 在 match 处报告缺失值 `1`；范围参与穷尽性分析，而不是退化成 `_`。 |
 
 **S2-025 · 提前返回只退出当前 lambda。** `readInt()` 总返回 `Err`，`note` 记录字符串。下面的 `probe()` 须返回 `9`，并依次记录 `second, first, after`。把 `Ok(readInt()?)` 换成 `return Ok(3)` 后，同样记录三项并返回 `3`。外层声明返回 `Int`，并不是 `?` 或 `return Ok(3)` 要匹配的返回类型。
 

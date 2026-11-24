@@ -88,9 +88,9 @@ async fn main(): Unit {
         macros = self.package / 'src/.expressions'
         macros.mkdir()
         (macros / 'wrap.ly').write_text('''
-fn wrap(target: String, arguments: String): String {
-    if argumentCount() != 2 { return macroFail("expected two arguments") }
-    "${macroQuote(argumentString(1))} + ${argumentCode(0)}"
+fn wrap(target: String, arguments: String): Syntax {
+    if argumentCount() != 2 { return syntaxError(syntaxCode(""), "expected two arguments") }
+    syntaxConcat(syntaxString(argumentString(1)), syntaxConcat(syntaxCode(" + "), syntaxArgument(0)))
 }
 ''')
         self.native(r'''

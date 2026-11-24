@@ -52,7 +52,7 @@ Site Source::site(Span span) const {
 }
 
 Site Source::userSite(Span span) const {
-    return origin ? *origin : site(span);
+    return origin && !previous ? *origin : site(span);
 }
 
 Position Source::position(std::size_t offset) const {
@@ -73,8 +73,8 @@ std::optional<Site> Source::generatedSite(Span span) const {
 }
 
 Diagnostic at(const Source& source, Span span, std::string code, std::string message) {
-    Diagnostic error{std::move(code), std::move(message), source.site(span)};
-    if (source.origin) { error.generated = std::move(error.site); error.site = source.origin; }
+    Diagnostic error{std::move(code), std::move(message), source.userSite(span)};
+    if (source.origin && !source.previous) error.generated = source.site(span);
     else error.generated = source.generatedSite(span);
     return error;
 }
@@ -129,7 +129,8 @@ std::vector<Source> loadSources(const fs::path& package) {
     return sources;
 }
 
-Source loadSource(const fs::path& path, std::string moduleId) {
+Source loadSource(const fs::path& path, std::string moduleId, const SourceOverlay* overlay) {
+    if (overlay) if (auto found = overlay->find(path); found != overlay->end()) return sourceText(path, found->second, std::move(moduleId));
     std::ifstream input(path, std::ios::binary);
     if (!input) throw Diagnostic{"LYI0001", "无法打开源码：" + pathText(path)};
     std::string text;

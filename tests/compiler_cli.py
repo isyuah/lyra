@@ -130,6 +130,22 @@ class Frontend(PackageTest):
 
 
 class Native(PackageTest):
+    def test_unavailable_or_corrupt_object_cache_does_not_break_build(self):
+        self.fixture('pass')
+        cache = self.package / '对象 cache'
+
+        def run(cache_path):
+            result = self.cli('run', '--release', env={**os.environ, 'LYRA_CACHE': str(cache_path)})
+            self.assertEqual((result.returncode, result.stdout, result.stderr), (0, '3\n', ''))
+
+        run(self.main)
+        run(cache)
+        entry, = (cache / 'compiler' / 'objects').iterdir()
+        truncated = entry.read_bytes()[:-8]
+        entry.write_bytes(truncated)
+        run(cache)
+        self.assertNotEqual(entry.read_bytes(), truncated)
+
     def test_fixed_width_integers_floats_and_checked_conversions(self):
         self.main.write_text('''
 fn flip(flag: Bool): Int8 { if flag { 1 + 2 } else { -128 } }

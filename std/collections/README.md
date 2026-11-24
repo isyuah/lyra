@@ -1,20 +1,31 @@
 # std.collections
 
-`map`、`filter` 和 `fold` 是普通 Lyra 泛型函数，没有特殊的编译器规则。按输入列表的顺序处理，空列表不会调用回调。前两者返回新列表；若元素是 class，只复制对象引用。`fold` 在空列表上返回初值。
+`map`、`filter`、`fold`、`any` 和 `find` 都可作为普通泛型函数单独导入。显式导入 `ListOps` 后，也可用方法链调用它们。
 
 ```lyra
-import std.collections.filter
-import std.collections.map
-import std.collections.fold
+import std.collections.ListOps
 
 fn main(): Unit {
-    val selected = filter([1, 2, 3, 4]) { it > 2 }
-    val doubled = map(selected) { it * 2 }
-    print(fold(doubled, 0, (total: Int, value: Int) => { total + value }))
+    val doubled = [1, 2, 3, 4].filter { it > 2 }.map { it * 2 }
+    print(doubled.fold(0, (total: Int, value: Int) => { total + value }))
+    print(doubled.find { it > 6 } ?? 0)
 }
 ```
 
-程序打印 `14`。尾部块只绑定在固定的最后一个函数形参；`it` 表示这个块的单个参数。也可以按位置传入已有的具名函数。
+程序打印 `14`、`8`。操作按输入列表的顺序处理，空列表不调用回调。`map`、`filter` 返回新列表；若元素是 Class，只复制对象引用。空列表的 `fold` 返回初值。`any` 和 `find` 在首个匹配处停止；无匹配分别返回 `false`、`None`，而匹配到可空元素 `None` 时，`find` 返回 `Some(None)`。单参尾部块里的 `it` 是当前元素，也可以传入已有的具名函数。
+
+## 有界并行遍历
+
+`parallelFor(values, maxConcurrency) { item => ... }` 返回冷 `Task<Unit>`；首次 `await` 或 `spawn` 才启动，完成前等待任务组里的并行域收尾。回调形参是 `T -> Task<Unit>`，因此可在回调中 `await` I/O 或其他异步工作。并发上限取传入值与 `std.task.parallelism()` 的较小值，缺省使用 Worker 池容量；超出列表长度时按元素数裁剪。并行域通过共享的原子游标领取下一项，每个域一次等待一个回调，不为每个元素启动线程或并行域。显式传入的并发上限必须大于零；空列表无需启动 Worker。
+
+```lyra
+import std.collections.parallelFor
+
+async fn process(item: Int): Unit { await blocking { writeRecord(item) } }
+async fn main(): Unit { await parallelFor([1, 2, 3, 4]) { process(it) } }
+```
+
+回调可能在不同 OS 线程同时执行；共享可变对象仍由调用方用锁或原子操作保护。`parallelFor` 不会复制输入列表：从 Task 首次启动到完成期间，调用方和回调都不得经任何别名修改它（包括追加、删除或替换元素），也不得让其他执行域同时修改。此期间的列表修改不受支持；需要更新数据时，请在回调中写入独立结果，等待遍历完成后再合并。失败会使任务组按结构化并发规则取消其他并行域并等待其清理；显式取消返回的 Task 也会传播到工作域，并等待其清理。
 
 ## 字典与集合
 

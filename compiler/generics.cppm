@@ -68,6 +68,7 @@ std::vector<Type> inferGenericArguments(const Function& declaration, const Call&
     std::vector<std::optional<Type>> bound(parameters.size());
     for (std::size_t index = 0; index < explicitTypes.size(); ++index) bound[index] = explicitTypes[index];
     auto unify = [&](auto&& self, const TypeForm& form, Type value, Span span, bool fromResult, bool widen) -> void {
+        if (form.name.starts_with("$assoc:")) return;
         if (auto index = genericParameter(declaration, form.name)) {
             if (!bound[*index]) bound[*index] = value;
             else if (!fromResult && *bound[*index] != value) {
