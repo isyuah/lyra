@@ -436,7 +436,9 @@ class LanguageServer(unittest.TestCase):
             imported = position_at(text, len('import kit.'))
             self.assertEqual(defined['range']['start'], imported)
             alias_end = position_at(text, len('import kit.net'))
-            edits = results[5]['changes'][uri(source)]
+            document, = results[5]['documentChanges']
+            self.assertEqual(document['textDocument'], {'uri': uri(source), 'version': 1})
+            edits = document['edits']
             self.assertIn({'range': {'start': alias_end, 'end': alias_end}, 'newText': ' as network'}, edits)
             self.assertEqual({edit['range']['start']['line'] for edit in edits if edit['newText'] == 'network'}, {1, 3})
             self.assertEqual(len(edits), 4)
@@ -692,7 +694,9 @@ class LanguageServer(unittest.TestCase):
             self.assertIn('val router', results[5]['contents']['value'])
             self.assertEqual(results[6][0]['range']['start'], position_at(text, router_start))
             self.assertEqual([results[number] for number in range(7, 11)], [None] * 4)
-            self.assertEqual(len(results[11]['changes'][uri(source)]), 2)
+            document, = results[11]['documentChanges']
+            self.assertEqual(document['textDocument'], {'uri': uri(source), 'version': 3})
+            self.assertEqual(len(document['edits']), 2)
             diagnostics = [item['params']['diagnostics'] for item in output if item.get('method') == 'textDocument/publishDiagnostics']
             self.assertEqual([[item['code'] for item in listing] for listing in diagnostics], [[], ['LYN0001'], []])
             self.assertEqual(diagnostics[1][0]['range']['end'], prefix)
@@ -788,9 +792,107 @@ class LanguageServer(unittest.TestCase):
             self.assertEqual(results[4]['result']['contents']['value'], '```lyra\nfn greet(name: String): String\n```')
             self.assertTrue(any(item['label'] == 'greet' for item in results[5]['result']['items']))
             self.assertIn('newText', results[6]['result'][0])
-            rename = results[7]['result']['changes'][uri(source)]
+            document, = results[7]['result']['documentChanges']
+            self.assertEqual(document['textDocument'], {'uri': uri(source), 'version': 1})
+            rename = document['edits']
             self.assertEqual(len(rename), 2)
             self.assertTrue(all(item['newText'] == 'welcome' for item in rename))
+
+    def test_rename_rejects_both_directions_of_capture_without_rejecting_shadowing(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / 'src/main.ly'
+            source.parent.mkdir()
+            text = ('fn main(): Unit {\n'
+                    '    val outside = 1\n'
+                    '    if true { val inside = 2; print(outside); print(inside) }\n'
+                    '    if true { val separate = 3; print(separate) }\n'
+                    '}\n')
+            source.write_text(text, encoding='utf-8')
+            outside = position_at(text, text.index('outside'))
+            inside = position_at(text, text.index('inside'))
+            messages = [document_request(2, source, 'rename', position=outside, newName='inside'),
+                        document_request(3, source, 'rename', position=inside, newName='outside'),
+                        document_request(4, source, 'rename', position=inside, newName='separate'),
+                        document_request(5, source, 'rename', position=position_at(text, text.index('main')), newName='start')]
+            results = {item['id']: item['result'] for item in run_server([(source, text)], messages) if 'id' in item}
+            self.assertEqual([results[2], results[3], results[5]], [None, None, None])
+            document, = results[4]['documentChanges']
+            self.assertEqual(document['textDocument'], {'uri': uri(source), 'version': 1})
+            self.assertEqual([edit['newText'] for edit in document['edits']], ['separate', 'separate'])
+            self.assertEqual({edit['range']['start']['line'] for edit in document['edits']}, {2})
+            self.assertEqual(source.read_text(encoding='utf-8'), text)
+
+    def test_exported_rename_includes_unopened_workspace_consumers_and_tests(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            library = root / 'kit/src/library.ly'
+            client = root / 'client/src/main.ly'
+            unopened = root / 'other/src/main.ly'
+            test = root / 'kit/tests/check.ly'
+            api = 'pub fn choose(value: Int): Int { value }\n'
+            main = 'import kit\nfn main(): Unit { print(kit.choose(1)) }\n'
+            case = 'import self.{choose}\nfn main(): Unit { print(choose(7)) }\n'
+            dependency = 'dependencies:{kit:{name:"kit",version:"0.1.0",path:"../kit"}}'
+            for path, content in [
+                (root / 'lyra.json5', '{workspace:{members:["kit","client","other"]}}'),
+                (root / 'kit/lyra.json5', '{name:"kit",version:"0.1.0",kind:"lib"}'),
+                (root / 'client/lyra.json5', '{name:"client",version:"0.1.0",' + dependency + '}'),
+                (root / 'other/lyra.json5', '{name:"other",version:"0.1.0",' + dependency + '}'),
+                (library, api), (client, main), (unopened, main), (test, case),
+            ]:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(content, encoding='utf-8')
+            results = run_server([(client, main), (library, api)], [document_request(2, client, 'rename',
+                position=position_at(main, main.index('choose')), newName='selectValue')], folders=[root])
+            changes = next(item['result']['documentChanges'] for item in results if item.get('id') == 2)
+            by_file = {edit['textDocument']['uri']: edit for edit in changes}
+            self.assertEqual(set(by_file), {uri(library), uri(client), uri(unopened), uri(test)})
+            for path, version, edits in [(library, 1, 1), (client, 1, 1), (unopened, None, 1), (test, None, 2)]:
+                document = by_file[uri(path)]
+                self.assertEqual(document['textDocument']['version'], version)
+                self.assertEqual([edit['newText'] for edit in document['edits']], ['selectValue'] * edits)
+            self.assertFalse((root / 'lyra.lock').exists())
+
+    def test_named_argument_rename_follows_the_selected_overload(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / 'src/main.ly'
+            source.parent.mkdir()
+            text = ('fn choose<T>(value: T, count: Int): Int { count }\n'
+                    'fn choose(count: Int): Int { count }\n'
+                    'fn main(): Unit { print(choose("😀", count: 3)); print(choose(count: 5)) }\n')
+            source.write_text(text, encoding='utf-8')
+            selected = position_at(text, text.index('count: 3'))
+            output = run_server([(source, text)], [document_request(2, source, 'rename', position=selected, newName='limit')])
+            rename = next(item['result'] for item in output if item.get('id') == 2)
+            document, = rename['documentChanges']
+            positions = [position_at(text, text.index('count: Int')), position_at(text, text.index('{ count }') + 2), selected]
+            self.assertEqual([item['range']['start'] for item in document['edits']], positions)
+            self.assertEqual([item['newText'] for item in document['edits']], ['limit'] * 3)
+
+    def test_rename_declines_external_and_generated_symbols(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            dependency = root / 'kit/src/library.ly'
+            source = root / 'app/src/main.ly'
+            macro = root / 'app/src/.macros/emit.ly'
+            text = ('import kit\n#emit\nfn shared(): Int { 1 }\n'
+                    'fn main(): Unit { print(kit.read()); print(created()); print(shared()) }\n')
+            output = 'fn created(): Int { shared() }'
+            for path, content in [
+                (root / 'app/lyra.json5', '{name:"app",version:"0.1.0",dependencies:{kit:{name:"kit",version:"0.1.0",path:"../kit"}}}'),
+                (root / 'kit/lyra.json5', '{name:"kit",version:"0.1.0",kind:"lib"}'),
+                (dependency, 'pub fn read(): Int { 7 }\n'),
+                (macro, f'fn emit(target: String, raw: String): Syntax {{ syntaxCode({json.dumps(output)}) }}'),
+                (source, text),
+            ]:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(content, encoding='utf-8')
+            messages = [document_request(index, source, 'rename', position=position_at(text, text.rindex(name)), newName='replacement')
+                        for index, name in enumerate(('read()', 'created()', 'shared()'), 2)]
+            results = run_server([(source, text)], messages)
+            self.assertEqual([item['result'] for item in results if item.get('id') in (2, 3, 4)], [None, None, None])
+            diagnostics = next(item for item in results if item.get('method') == 'textDocument/publishDiagnostics')
+            self.assertEqual(diagnostics['params']['diagnostics'], [])
 
     def test_cross_package_definition_targets_the_selected_overload(self):
         with tempfile.TemporaryDirectory() as temporary:

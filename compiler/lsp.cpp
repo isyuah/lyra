@@ -185,13 +185,14 @@ fs::path packageRoot(fs::path file) {
     return directory;
 }
 
-Workspace loadWorkspace(const fs::path& root, const SourceOverlay& overlays, const std::optional<PackageGraph>& graph, ParseCache& parseCache, EditorProbe* probe = nullptr) {
+Workspace loadWorkspace(const fs::path& root, const SourceOverlay& overlays, const std::optional<PackageGraph>& graph, ParseCache& parseCache,
+                        EditorProbe* probe = nullptr, const std::optional<fs::path>& testFile = {}) {
     Workspace workspace;
     workspace.editor.probe = probe;
     try {
         Compilation program;
         if (graph) {
-            program = loadProgram(*graph, graph->entry, {}, &overlays, &parseCache, probe != nullptr, probe ? nullptr : &workspace.diagnostics);
+            program = loadProgram(*graph, graph->entry, testFile, &overlays, &parseCache, probe != nullptr, probe ? nullptr : &workspace.diagnostics);
         } else {
             auto sources = loadSources(root);
             for (auto& source : sources) if (auto found = overlays.find(source.path); found != overlays.end()) source = sourceText(source.path, found->second, {});
@@ -207,7 +208,7 @@ Workspace loadWorkspace(const fs::path& root, const SourceOverlay& overlays, con
         if (probe) check(std::move(program.syntax), workspace.sources, false, nullptr, &workspace.editor);
         else if (!program.incompleteDeclaration) {
             workspace.generated = editorDeclarations(program.syntax, workspace.sources, true);
-            checkForDiagnostics(std::move(program.syntax), workspace.sources, false, workspace.diagnostics, &workspace.editor);
+            checkForDiagnostics(std::move(program.syntax), workspace.sources, testFile.has_value(), workspace.diagnostics, &workspace.editor);
         }
     } catch (const Diagnostic& error) { workspace.diagnostics.add(error); }
     catch (const EditorProbeFinished&) {}
@@ -426,6 +427,144 @@ const NameReference* referenceAt(const Workspace& workspace, const Source& sourc
 }
 
 SourceAnchor renameAnchor(const NameReference& reference) { return reference.renameTarget.value_or(reference.declaration); }
+
+struct RenameSite {
+    std::string file;
+    Span span;
+    auto operator<=>(const RenameSite&) const = default;
+};
+
+struct RenameIndex {
+    const Workspace& workspace;
+    std::vector<std::string> keys;
+
+    explicit RenameIndex(const Workspace& workspace) : workspace(workspace) {
+        for (const auto& source : workspace.sources) keys.push_back(source.origin ? std::string{} : pathKey(source.path));
+    }
+
+    std::optional<RenameSite> authored(SourceAnchor anchor) const {
+        if (anchor.file >= keys.size() || keys[anchor.file].empty()) return {};
+        if (auto span = workspace.sources[anchor.file].authoredSpan(anchor.span)) return RenameSite{keys[anchor.file], *span};
+        return {};
+    }
+
+    const Source& source(std::size_t file) const {
+        auto original = &workspace.sources[file];
+        while (original->previous) original = original->previous.get();
+        return *original;
+    }
+};
+
+struct RenameDeclaration { bool exported{}, moduleAlias{}, implicitAlias{}; };
+
+std::optional<RenameDeclaration> renameDeclaration(const Source& source, Span at, std::string_view newName) {
+    auto syntax = indexFileSyntax(source);
+    for (const auto& use : syntax.imports) if (use.alias.span == at) {
+        if (use.kind != ImportKind::Runtime) return {};
+        return RenameDeclaration{use.isPublic, !use.member, !use.member && use.path.back().span == at};
+    }
+    for (const auto& record : syntax.aggregates) {
+        if (record.name.span == at) return RenameDeclaration{record.isPublic};
+        for (const auto& field : record.fields) if (field.name.span == at) return RenameDeclaration{record.isPublic && field.isPublic};
+        for (const auto& member : record.associated) if (member.name.span == at) return {};
+    }
+    for (const auto& item : syntax.enums) {
+        if (item.name.span == at) return RenameDeclaration{item.isPublic};
+        for (const auto& variant : item.cases) {
+            if (variant.name.span == at) return RenameDeclaration{item.isPublic};
+            for (const auto& field : variant.fields) if (field.name && field.name->span == at) return RenameDeclaration{item.isPublic};
+        }
+    }
+    for (const auto& trait : syntax.traits) {
+        if (trait.name.span == at) return RenameDeclaration{trait.isPublic};
+        for (const auto& member : trait.associated) if (member.span == at) return {};
+        for (const auto& method : trait.methods) {
+            if (method.name.span == at) return {};
+            for (const auto& parameter : method.parameters) if (parameter.name.span == at) return {};
+        }
+    }
+    for (const auto& alias : syntax.aliases) if (alias.name.span == at) return RenameDeclaration{alias.isPublic};
+    for (const auto& item : syntax.exceptions) if (item.name.span == at) return RenameDeclaration{item.isPublic};
+    for (const auto& group : syntax.extensions) if (group.name.span == at) return RenameDeclaration{group.isPublic};
+    for (const auto& fn : syntax.functions) {
+        if (fn.name.span == at) {
+            constexpr std::string_view protocol[] = {"equals", "hashCode", "iterator", "asyncIterator", "next", "message", "toString"};
+            auto implicit = [&](std::string_view name) { return std::ranges::find(protocol, name) != std::ranges::end(protocol); };
+            if (fn.initializer || fn.conversion || fn.foreignSymbol ||
+                (!fn.owner && !fn.extensionGroup && (fn.name.text == "main" || newName == "main")) ||
+                (fn.hasReceiver && (implicit(fn.name.text) || implicit(newName)))) return {};
+            return RenameDeclaration{fn.isPublic};
+        }
+        for (const auto& parameter : fn.parameters) if (parameter.name.span == at) return RenameDeclaration{fn.isPublic};
+    }
+    return RenameDeclaration{};
+}
+
+struct RenameChange { std::string text; Span after{}; };
+struct RenameFile {
+    const Source& source;
+    std::map<Span, RenameChange> edits{};
+    std::string changed{};
+
+    bool prepare() {
+        std::size_t previous = 0;
+        for (auto& [before, change] : edits) {
+            if (before.begin < previous) return false;
+            changed.append(source.text, previous, before.begin - previous);
+            change.after.begin = changed.size();
+            changed += change.text;
+            change.after.end = changed.size();
+            previous = before.end;
+        }
+        changed.append(source.text, previous, std::string::npos);
+        return true;
+    }
+
+    std::optional<Span> translate(Span span) const {
+        auto next = edits.lower_bound({span.begin, span.begin});
+        if (next != edits.end() && next->first == span) return next->second.after;
+        if (next != edits.end() && next->first == Span{span.begin, span.begin}) ++next;
+        if (next != edits.end() && next->first.begin < span.end) return {};
+        if (next == edits.begin()) return span;
+        const auto& [before, change] = *std::prev(next);
+        if (before.end > span.begin) return {};
+        return Span{change.after.end + (span.begin - before.end), change.after.end + (span.end - before.end)};
+    }
+};
+using RenameFiles = std::map<std::string, RenameFile>;
+
+struct RenameBindings {
+    std::set<RenameSite> declarations;
+    std::set<std::tuple<RenameSite, std::optional<RenameSite>, std::optional<RenameSite>>> references;
+    bool operator==(const RenameBindings&) const = default;
+};
+
+std::optional<RenameBindings> renameBindings(const RenameIndex& index, const RenameSite& target,
+    const RenameFiles* files = nullptr, const RenameSite* alias = nullptr) {
+    auto locate = [&](SourceAnchor anchor) -> std::optional<RenameSite> {
+        auto site = index.authored(anchor);
+        if (!site || !files) return site;
+        if (alias && *site == target) return *alias;
+        auto edited = files->find(site->file);
+        if (edited == files->end()) return site;
+        if (auto translated = edited->second.translate(site->span)) return RenameSite{std::move(site->file), *translated};
+        return {};
+    };
+    RenameBindings result;
+    for (const auto& [anchor, binding] : index.workspace.editor.bindings) {
+        if (auto site = locate(anchor)) result.declarations.insert(std::move(*site));
+        else if (index.authored(anchor)) return {};
+    }
+    for (const auto& reference : index.workspace.editor.references) {
+        auto site = locate(reference.use);
+        auto declaration = locate(reference.declaration);
+        auto binding = locate(renameAnchor(reference));
+        if ((!site && (index.authored(reference.use) || index.authored(renameAnchor(reference)) == target)) ||
+            (!declaration && index.authored(reference.declaration)) || (!binding && index.authored(renameAnchor(reference)))) return {};
+        if (site) result.references.emplace(std::move(*site), std::move(declaration), std::move(binding));
+    }
+    return result;
+}
 
 std::optional<SourceAnchor> bindingAt(const Workspace& workspace, const Source& source, std::size_t offset) {
     auto file = originalFile(workspace, source);
@@ -1339,6 +1478,127 @@ private:
         return snapshots.insert_or_assign(root, Snapshot{std::move(inputs), std::move(overlays), std::move(workspace)}).first->second.workspace;
     }
 
+    json::Value checkedRename(const fs::path& root, const Documents& documents, const Workspace& workspace, SourceAnchor anchor,
+                              std::string_view newName) {
+        RenameIndex initial(workspace);
+        auto target = initial.authored(anchor);
+        if (!target || newName == "_") return nullptr;
+        auto declaration = renameDeclaration(initial.source(anchor.file), target->span, newName);
+        if (!declaration) return nullptr;
+        auto spelling = declaration->moduleAlias ? editorModuleAlias(newName) : editorIdentifier(newName);
+        if (spelling.empty()) return nullptr;
+
+        auto [inputs, graph, overlays] = collectInputs(root, documents);
+        if (inputs != snapshots.at(root).inputs || overlays != snapshots.at(root).overlays) return nullptr;
+        auto owner = packageRoot(fromUtf8(target->file));
+        if ((!declaration->exported || !graph) && owner != root) return nullptr;
+        std::set<fs::path> editable{root};
+        std::vector<fs::path> additionalRoots;
+        if (declaration->exported && graph) {
+            if (graph->workspace == root && graph->members.size() == 1) return nullptr;
+            auto package = std::ranges::find(graph->packages, owner, &ResolvedPackage::root);
+            if (package == graph->packages.end() || std::ranges::find(graph->members, package->id) == graph->members.end()) return nullptr;
+            std::map<std::string, const ResolvedPackage*> packages;
+            for (const auto& member : graph->packages) packages.emplace(member.id, &member);
+            std::map<std::string, bool> reachesOwner;
+            auto reaches = [&](auto&& self, const std::string& id) -> bool {
+                auto [cached, inserted] = reachesOwner.try_emplace(id, false);
+                if (inserted) cached->second = id == package->id || std::ranges::any_of(packages.at(id)->dependencies,
+                    [&](const auto& dependency) { return self(self, dependency.second); });
+                return cached->second;
+            };
+            for (const auto& id : graph->members) if (reaches(reaches, id)) {
+                const auto& member = packages.at(id)->root;
+                editable.insert(member);
+                if (member != root) additionalRoots.push_back(member);
+            }
+        }
+
+        struct View {
+            fs::path root;
+            std::optional<PackageGraph> graph;
+            SourceOverlay overlays;
+            std::vector<std::pair<std::optional<fs::path>, const Workspace*>> checks{};
+        };
+        std::deque<Workspace> additional;
+        std::vector<View> views;
+        views.push_back({root, std::move(graph), std::move(overlays), {{std::nullopt, &workspace}}});
+        for (const auto& member : additionalRoots) {
+            auto current = collectInputs(member, documents);
+            additional.push_back(loadWorkspace(member, current.overlays, current.graph, parseCache));
+            views.push_back({member, std::move(current.graph), std::move(current.overlays), {{std::nullopt, &additional.back()}}});
+        }
+        if (declaration->exported && views.front().graph) for (auto& view : views) {
+            auto directory = view.root / "tests";
+            if (!fs::is_directory(directory)) continue;
+            for (const auto& entry : fs::directory_iterator(directory)) {
+                const auto& path = entry.path();
+                if (path.extension() != ".ly" || !entry.is_regular_file()) continue;
+                if (auto document = documents.find(pathKey(path)); document != documents.end()) view.overlays.insert_or_assign(path, document->second.text);
+                additional.push_back(loadWorkspace(view.root, view.overlays, view.graph, parseCache, nullptr, path));
+                view.checks.emplace_back(path, &additional.back());
+            }
+        }
+
+        RenameFiles files;
+        auto add = [&](const RenameIndex& index, SourceAnchor use) {
+            auto site = index.authored(use);
+            if (!site || !std::ranges::any_of(editable, [&](const fs::path& package) {
+                auto path = fromUtf8(site->file);
+                return inside(package / "src", path) || inside(package / "tests", path);
+            })) return false;
+            const auto& source = index.source(use.file);
+            auto [file, inserted] = files.try_emplace(site->file, RenameFile{source});
+            if (!inserted && file->second.source.text != source.text) return false;
+            bool insertAlias = declaration->implicitAlias && *site == *target;
+            auto span = insertAlias ? Span{site->span.end, site->span.end} : site->span;
+            file->second.edits.try_emplace(span, RenameChange{insertAlias ? " as " + spelling : spelling});
+            return true;
+        };
+        if (!add(initial, anchor)) return nullptr;
+        for (const auto& view : views) for (const auto& [testFile, before] : view.checks) {
+            if (!before->diagnostics.errors.empty()) return nullptr;
+            RenameIndex index(*before);
+            for (const auto& reference : before->editor.references) if (index.authored(renameAnchor(reference)) == target) {
+                if (!index.authored(reference.declaration) || !add(index, reference.use)) return nullptr;
+            }
+        }
+        for (auto& [file, edits] : files) if (!edits.prepare()) return nullptr;
+
+        const auto& targetFile = files.at(target->file);
+        auto renamed = *target;
+        if (declaration->implicitAlias) {
+            auto insertion = targetFile.edits.at({target->span.end, target->span.end}).after;
+            renamed.span = {insertion.end - spelling.size(), insertion.end};
+        } else renamed.span = targetFile.edits.at(target->span).after;
+        for (const auto& view : views) for (const auto& [testFile, before] : view.checks) {
+            RenameIndex index(*before);
+            auto expected = renameBindings(index, *target, &files, declaration->implicitAlias ? &renamed : nullptr);
+            if (!expected) return nullptr;
+            auto proposed = view.overlays;
+            for (std::size_t file = 0; file < index.keys.size(); ++file)
+                if (auto edited = files.find(index.keys[file]); edited != files.end()) proposed.insert_or_assign(index.source(file).path, edited->second.changed);
+            auto checked = loadWorkspace(view.root, proposed, view.graph, parseCache, nullptr, testFile);
+            if (!checked.diagnostics.errors.empty() || renameBindings(RenameIndex(checked), renamed) != expected) return nullptr;
+        }
+
+        json::Array changes;
+        for (const auto& [file, edits] : files) {
+            auto document = documents.find(file);
+            auto path = fromUtf8(file);
+            if (document == documents.end() && loadSource(path, {}).text != edits.source.text) return nullptr;
+            if (document != documents.end() && document->second.text != edits.source.text) return nullptr;
+            json::Array replacements;
+            for (const auto& [span, change] : edits.edits)
+                replacements.push_back(json::Object{{"range", jsonRange(edits.source, span)}, {"newText", change.text}});
+            auto uri = document == documents.end() ? encodeUri(path) : document->second.uri;
+            auto version = document == documents.end() ? json::Value(nullptr) : json::Value(document->second.version);
+            changes.push_back(json::Object{{"textDocument", json::Object{{"uri", std::move(uri)}, {"version", std::move(version)}}},
+                {"edits", std::move(replacements)}});
+        }
+        return json::Object{{"documentChanges", std::move(changes)}};
+    }
+
     static void send(const json::Value& value) {
         auto body = llvm::formatv("{0}", value).str();
         static std::mutex output;
@@ -1674,7 +1934,8 @@ private:
     json::Value checkedRequest(std::string_view method, const json::Object& params, const Document& document, const Documents& documents,
         std::span<const EditorDefinition> macros = {}) {
         const auto& path = document.path;
-        const auto& workspace = analyze(packageRoot(fromUtf8(pathKey(path))), documents);
+        auto root = packageRoot(fromUtf8(pathKey(path)));
+        const auto& workspace = analyze(root, documents);
         auto source = sourceFor(workspace, path);
         if (!source || source->text != document.text) return unavailable(method);
         if (method == "textDocument/semanticTokens/full") return semanticTokens(workspace, *source, macros);
@@ -1715,45 +1976,10 @@ private:
             return locationsFor(workspace, renameAnchor(*reference), include);
         }
         if (method == "textDocument/rename") {
-            if (!workspace.diagnostics.errors.empty() || !reference) return unavailable(method);
+            if (!workspace.diagnostics.errors.empty()) return nullptr;
             auto newName = params.getString("newName");
-            if (!newName || newName->empty() || (!std::isalpha(static_cast<unsigned char>((*newName)[0])) && (*newName)[0] != '_')) throw Diagnostic{"LYLSP0001", "新名称必须是有效 Lyra 标识符"};
-            if (!std::all_of(newName->begin() + 1, newName->end(), [](unsigned char ch) { return std::isalnum(ch) || ch == '_'; })) throw Diagnostic{"LYLSP0001", "新名称必须是有效 Lyra 标识符"};
-            auto target = renameAnchor(*reference);
-            auto edits = locationsFor(workspace, target, true);
-            auto spelling = newName->str();
-            std::optional<Span> implicitAlias;
-            if (auto resolved = resolveAnchor(workspace, target); resolved && resolved->first == source) {
-                auto syntax = indexFileSyntax(*source);
-                for (const auto& use : syntax.imports) if (use.kind == ImportKind::Runtime && !use.member && use.alias.span == resolved->second) {
-                    spelling = editorModuleAlias(*newName);
-                    if (use.alias.span == use.path.back().span && use.alias.text != *newName) implicitAlias = use.alias.span;
-                    break;
-                }
-            }
-            auto implicitLocation = implicitAlias ? jsonLocation(*source, *implicitAlias) : json::Object{};
-            json::Object changes;
-            std::map<std::string, json::Array> grouped;
-            for (const auto& location : edits) {
-                auto item = location.getAsObject();
-                auto uri = item->getString("uri");
-                auto range = item->getObject("range");
-                if (uri && range) {
-                    json::Object change;
-                    auto start = range->getObject("start"), end = range->getObject("end");
-                    if (!start || !end) continue;
-                    bool insertAlias = implicitAlias && item->getString("uri") == implicitLocation.getString("uri") && *range == *implicitLocation.getObject("range");
-                    if (insertAlias) start = end;
-                    json::Object clonedRange;
-                    clonedRange["start"] = json::Object{{"line", start->getInteger("line").value_or(0)}, {"character", start->getInteger("character").value_or(0)}};
-                    clonedRange["end"] = json::Object{{"line", end->getInteger("line").value_or(0)}, {"character", end->getInteger("character").value_or(0)}};
-                    change["range"] = std::move(clonedRange);
-                    change["newText"] = insertAlias ? " as " + spelling : spelling;
-                    grouped[uri->str()].push_back(std::move(change));
-                }
-            }
-            for (auto& [uri, changesForUri] : grouped) changes[uri] = std::move(changesForUri);
-            return json::Object{{"changes", std::move(changes)}};
+            auto target = reference ? std::optional(renameAnchor(*reference)) : bindingAt(workspace, *source, offset);
+            return newName && target ? checkedRename(root, documents, workspace, *target, *newName) : json::Value(nullptr);
         }
         if (method == "textDocument/hover") {
             if (!reference) return json::Value(nullptr);

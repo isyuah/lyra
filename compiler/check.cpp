@@ -2674,6 +2674,9 @@ struct Checker {
                 throw at(source, site, "LYT0001", "展开需要 List，实际是 " + typeName(module, inferred));
             }
             auto value = fitArgument(expr, inferred, type, spread);
+            if (const auto& label = call.arguments[index].label)
+                refer(*label, target.file, target.parameters[selected.index + skip].name.span,
+                    fields.empty() ? EditorKind::Parameter : EditorKind::Field);
             checked[index] = true;
             if (value == Type::Never) exits = true;
         }
