@@ -68,9 +68,9 @@ fn main(): Unit {
 
     def test_worker_cleanup_closes_sqlite_before_repeated_await(self):
         self.run_source('''
-import std.sqlite.DbError
-import std.sqlite.DbErrorKind
-import std.sqlite.open
+import std.sqlite.{DbError}
+import std.sqlite.{DbErrorKind}
+import std.sqlite.{open}
 
 fn require<T>(result: Result<T, DbError>): T {
     match result { Ok(value) => value, Err(error) => throw Exception(error.message()) }

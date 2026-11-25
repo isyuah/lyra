@@ -1,97 +1,83 @@
-import users.CreatedUser
-import users.NewUser
-import users.createdUserCodec
-import users.findUser
-import users.insertUser
-import users.newUserCodec
-import users.userCodec
-import std.cli.Command
-import std.cli.parseArgs
-import std.http.listen
-import std.http.Request
-import std.http.Response
-import std.http.Router
-import std.httpClient.HttpClientOptions
-import std.httpClient.httpGet
-import std.httpTls.listenTls
-import std.io.readBytes
-import std.io.writeError
-import std.json.jsonInt
-import std.json.jsonObject
-import std.json.jsonString
-import std.log.LogFormat
-import std.log.Logger
-import std.sqlite.DbError
-import std.text.StringOps
+import users
+import users.{newUserCodec}
+import std.cli
+import std.http
+import std.httpClient
+import std.httpTls
+import std.io
+import std.json
+import std.log
+import std.sqlite
+import std.text.{StringOps}
 
-fn text(code: Int, body: String): Response { Response.text(code, body) }
+fn text(code: Int, body: String): http.Response { http.Response.text(code, body) }
 
-fn databaseFailure(logger: Logger, route: String, error: DbError): Response {
-    val fields = jsonObject().put("route", jsonString(route))
-        .put("operation", jsonString(error.operation)).put("code", jsonInt(error.code)).build()
+fn databaseFailure(logger: log.Logger, route: String, error: sqlite.DbError): http.Response {
+    val fields = json.jsonObject().put("route", json.jsonString(route))
+        .put("operation", json.jsonString(error.operation)).put("code", json.jsonInt(error.code)).build()
     val _ = logger.error("database error", fields: fields)
     text(500, "database error")
 }
 
-async fn getUser(request: Request, path: String, logger: Logger): Response {
+async fn getUser(request: http.Request, path: String, logger: log.Logger): http.Response {
     val id = match request.pathInt("id") {
         Ok(Some(value)) => value,
         _ => return text(400, "invalid id"),
     }
-    val result = await blocking { findUser(path, id) }
+    val result = await blocking { users.findUser(path, id) }
     match result {
-        Ok(Some(user)) => Response.json(user, userCodec()),
+        Ok(Some(user)) => http.Response.json(user, users.userCodec()),
         Ok(None) => text(404, "not found"),
         Err(error) => databaseFailure(logger, "GET /users/{id}", error),
     }
 }
 
-async fn postUser(request: Request, path: String, logger: Logger): Response {
+async fn postUser(request: http.Request, path: String, logger: log.Logger): http.Response {
     val input = match request.json(newUserCodec()) {
         Ok(value) => value,
         Err(error) => return text(400, error.message()),
     }
-    val result = await blocking { insertUser(path, input) }
+    val result = await blocking { users.insertUser(path, input) }
     match result {
-        Ok(user) => Response.json(user, userCodec(), code: 201),
+        Ok(user) => http.Response.json(user, users.userCodec(), code: 201),
         Err(error) => databaseFailure(logger, "POST /users", error),
     }
 }
 
-async fn getUpstream(url: String, options: HttpClientOptions, logger: Logger): Response {
-    match await httpGet(url, options) {
-        Ok(response) => Response.bytes(response.status, "application/octet-stream", response.body),
+async fn getUpstream(url: String, options: httpClient.HttpClientOptions, logger: log.Logger): http.Response {
+    match await httpClient.httpGet(url, options) {
+        Ok(response) => http.Response.bytes(response.status, "application/octet-stream", response.body),
         Err(error) => {
-            val _ = logger.error(error.message(), fields: jsonObject().put("route", jsonString("GET /upstream")).build())
+            val _ = logger.error(error.message(), fields: json.jsonObject().put("route", json.jsonString("GET /upstream")).build())
             text(502, "upstream unavailable")
         },
     }
 }
 
-async fn barrier(request: Request): Response {
+async fn barrier(request: http.Request): http.Response {
     print("barrier")
-    Response.text(200, request.target())
+    http.Response.text(200, request.target())
 }
 
 #post("/teams/{teamId}")
 @trace
-async fn createUser([path] teamId: Int, [query("tag")] tags: List<String>, [query("single")] label: String, [body("newUserCodec")] input: NewUser): Response {
-    Response.json(CreatedUser(teamId, tags, label, input.name), createdUserCodec())
+async fn createUser([path] teamId: Int, [query("tag")] tags: List<String>, [query("single")] label: String, [body("newUserCodec")] input: users.NewUser): http.Response {
+    http.Response.json(users.CreatedUser(teamId, tags, label, input.name), users.createdUserCodec())
 }
 
 fn usageError(message: String): Int {
-    val _ = writeError(message + "\n")
+    val _ = io.writeError(message + "\n")
     2
 }
 
 fn pem(path: String): Bytes {
-    match readBytes(path) { Ok(value) => value, Err(error) => throw Exception(error.message()) }
+    match io.readBytes(path) { Ok(value) => value, Err(error) => throw Exception(error.message()) }
 }
 
 async fn main(): Int {
-    val spec = Command("users").option("--host").option("--port")
+    val spec = cli.Command("users").option("--host").option("--port")
         .option("--cert").option("--key").option("--upstream").option("--ca")
-    val arguments = match parseArgs(spec) {
+    val arguments = match cli.parseArgs(spec) {
         Ok(Run(command)) => command,
         Ok(Help(usage)) => { print(usage); return 0 },
         Err(problem) => return usageError(problem.message()),
@@ -107,23 +93,23 @@ async fn main(): Int {
     val key = arguments.value("--key")
     if (cert == None) != (key == None) { return usageError("--cert and --key must be supplied together") }
     val started = match cert {
-        Some(file) => listenTls(port, pem(file), pem(key ?? ""), host: host),
-        None => listen(port, host: host),
+        Some(file) => httpTls.listenTls(port, pem(file), pem(key ?? ""), host: host),
+        None => http.listen(port, host: host),
     }
     val listener = match started {
         Ok(value) => value,
         Err(error) => throw Exception(error.message()),
     }
     defer listener.close()
-    val logger = Logger("users", format: LogFormat.Json)
-    val router = Router()
-    router.get("/users/{id}", (request: Request) => { getUser(request, path, logger) })
-    router.post("/users", (request: Request) => { postUser(request, path, logger) })
-    router.get("/barrier", (request: Request) => { barrier(request) })
+    val logger = log.Logger("users", format: log.LogFormat.Json)
+    val router = http.Router()
+    router.get("/users/{id}", (request: http.Request) => { getUser(request, path, logger) })
+    router.post("/users", (request: http.Request) => { postUser(request, path, logger) })
+    router.get("/barrier", (request: http.Request) => { barrier(request) })
     if let Some(url) = arguments.value("--upstream") {
         val ca = match arguments.value("--ca") { Some(file) => Some(pem(file)), None => None }
-        val options = HttpClientOptions(caPem: ca)
-        router.get("/upstream", (request: Request) => { getUpstream(url, options, logger) })
+        val options = httpClient.HttpClientOptions(caPem: ca)
+        router.get("/upstream", (request: http.Request) => { getUpstream(url, options, logger) })
     }
     createUserRoute(router)
     print(listener.port())

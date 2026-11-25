@@ -62,9 +62,9 @@ class Macros(unittest.TestCase):
         (provider / 'own.txt').write_text('unused provider input')
         expressions = provider / 'src/tools/.expressions'
         expressions.mkdir(parents=True)
-        (expressions / 'emitValue.ly').write_text('''import self.calc.offset
+        (expressions / 'emitValue.ly').write_text('''import self.calc
 pub fn emitValue(target: String, argument: String): Syntax {
-    const Base: Int = offset(4)
+    const Base: Int = calc.offset(4)
     val value = syntaxArgument(0)
     val extra = syntaxInt(Base + macroInput("amount").size())
     quote { { val value = 2; splice(value) + splice(extra) + value } }
@@ -123,11 +123,30 @@ fn main(): Unit { print(api()) }
         implementation.write_text(code.removeprefix('pub '))
         self.diagnostic('LYM0001', 'pub fn')
 
+    def test_generated_imports_inherit_the_calling_file_without_leaking(self):
+        for module, declarations in (
+            ('model', 'pub fn value(): Int { 20 }'),
+            ('support', 'pub fn value(): Int { 21 }\npub const Offset: Int = 1'),
+        ):
+            folder = self.src / module
+            folder.mkdir()
+            (folder / 'api.ly').write_text(declarations)
+        self.macro(r'"import self.support as extras\nfn generated(): Int { model.value() + extras.value() + start }"')
+        self.native('''import self.model
+import self.support.{Offset as start}
+#make
+fn main(): Unit { print(generated()) }
+''', ['42'])
+        sibling = self.src / 'sibling.ly'
+        sibling.write_text('fn leak(): Int { extras.value() }')
+        error = self.diagnostic('LYN0001', 'extras')
+        self.assertEqual(Path(error['file']), sibling)
+
     def test_macro_phase_rejects_generated_and_decorated_dependencies(self):
         provider = self.library('provider')
         expressions = provider / 'src/.expressions'
         expressions.mkdir()
-        (expressions / 'current.ly').write_text('''import self.answer
+        (expressions / 'current.ly').write_text('''import self.{answer}
 pub fn current(target: String, argument: String): Syntax { syntaxInt(answer()) }
 ''')
         (provider / 'src/.macros').mkdir()
@@ -452,10 +471,10 @@ fn main(): Unit {
         aliases = model / 'model.ly'
         api = self.src / 'api'
         api.mkdir()
-        (api / 'api.ly').write_text('pub import self.model.Payload as Wire\npub import self.model.Named', encoding='utf-8')
+        (api / 'api.ly').write_text('pub import self.model.{Payload as Wire}\npub import self.model.{Named}', encoding='utf-8')
         main = self.src / 'main.ly'
-        main.write_text('''import self.api.Wire as Alias
-import self.api.Named as PublicName
+        main.write_text('''import self.api.{Wire as Alias}
+import self.api.{Named as PublicName}
 #inspect
 struct Probe<T>(val items: Alias, val other: T, val record: PublicName)
 fn main(): Unit { print(shape()) }
@@ -498,7 +517,7 @@ fn main(): Unit { print(shape()) }
         self.native(code + '}', expected + ['$.rows[1][2]: out of range for UInt8'])
 
     def test_derive_floats_roundtrip_and_report_nested_failures(self):
-        self.native(r'''import std.json.parseJson
+        self.native(r'''import std.json.{parseJson}
 #derive(Json)
 struct Measure([jsonName("wide-real")] pub val wide: Float, pub val entries: List<List<Float32?>>, pub val extra: Option<Float64?>)
 fn show(text: String): String { match decodeMeasure(text) { Ok(value) => encodeMeasure(value), Err(error) => error } }
@@ -568,8 +587,8 @@ fn main(): Unit {
        *(['$["display-mark"]' + expected_char] * 4), '$.rows[1][0]' + expected_char, 'invalid Unicode rejected'])
 
     def test_json_ignores_unknown_fields_only_on_the_selected_view(self):
-        self.native(r'''import std.json.JsonValue
-import std.json.parseJson
+        self.native(r'''import std.json.{JsonValue}
+import std.json.{parseJson}
 #derive(Json)
 struct User([jsonName("user-id")] pub val id: Int)
 struct Tagged(pub val user: User)

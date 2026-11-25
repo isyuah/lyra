@@ -4,6 +4,17 @@
 
 [语法命令行用例](../tests/syntax_cli.py)直接验证关键字与反引号、LF/CRLF、调用尖括号、列表展开和前后缀优先级。拒绝用例使用原始 UTF-8 字节范围定位 token。
 
+## 模块限定名与分组导入
+
+| 输入 | 预期 |
+|---|---|
+| `import cfg.net as remote`；`remote.Box<Int>.make(7)` | 在 `remote` 模块中查找公开的泛型类型，再按静态调用规则解析 `make`。 |
+| `import cfg.net.{↵Box,↵port as defaultPort,↵}` | 只引入 `Box` 与 `defaultPort`，不引入 `net`，同目录其他文件也不获得这些裸名。 |
+| `import cfg.net`；`import self.net` | 在第二个 `net` 处报告导入名冲突；第二条改用 `as localNet` 后通过。 |
+| `import cfg.net.port`；`import cfg.net.{*}`；`pub import cfg.net` | 分别拒绝把声明当模块、通配导入和整模块重导出。 |
+
+[模块命令行用例](../tests/modules_cli.py)同时验证重载、可见性以及限定模式和结构约束。
+
 ## 一个回调，加多少个实参？
 
 沿用正文的两个函数：`visit` 的末尾形参是 `values: Int...`；`visitList` 的 `values: List<Int>` 是固定形参。`printInt` 记录传入的整数，`ids: List<Int>` 含 `2, 5`。`makeIds()` 记录一次调用并返回 `ids`。

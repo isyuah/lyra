@@ -3,10 +3,10 @@
 `jsonlReader` 从 `LineReader` 逐行读取，可传入 `JsonCodec<T>` 或自定义解码函数 `(String) -> Result<T,String>`。它不缓存整个输入。
 
 ```lyra
-import std.io.IoError
-import std.io.LineReader
-import std.json.jsonCodecInt
-import std.jsonl.jsonlReader
+import std.io.{IoError}
+import std.io.{LineReader}
+import std.json.{jsonCodecInt}
+import std.jsonl.{jsonlReader}
 
 fn readNumbers(): Result<Unit, IoError> {
     val rows = jsonlReader(LineReader.stdin()?, jsonCodecInt())

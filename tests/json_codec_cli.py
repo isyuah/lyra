@@ -24,7 +24,7 @@ class JsonCodecs(unittest.TestCase):
         (lib / 'lyra.json5').write_text(json.dumps(dict(name='models', version='0.1.0', kind='lib')))
         (self.app / 'lyra.json5').write_text(json.dumps(dict(name='app', version='0.1.0', dependencies={
             'model': dict(name='models', version='^0.1.0', path='../models')})))
-        (lib / 'src/user.ly').write_text('''import std.json.JsonCodec
+        (lib / 'src/user.ly').write_text('''import std.json.{JsonCodec}
 #derive(Json)
 pub struct User([jsonName("display-name")] pub val name: String = "guest", val secret: String = "private")
 pub fn wire(): JsonCodec<User> { jsonCodecUser() }
@@ -37,10 +37,10 @@ pub fn pageWire<T>(item: JsonCodec<T>): JsonCodec<Page<T>> { jsonCodecPage(item)
         return subprocess.run([COMPILER, action, self.app, *flags], capture_output=True, timeout=40, env=self.env)
 
     def test_public_codec_with_type_and_factory_aliases(self):
-        self.main.write_text(r'''import model.User as JsonValue
-import model.wire as value
-import model.wire as intText
-import std.json.parseJson
+        self.main.write_text(r'''import model.{User as JsonValue}
+import model.{wire as value}
+import model.{wire as intText}
+import std.json.{parseJson}
 #derive(Json)
 struct Batch([jsonName("user.rows")][jsonCodec("value")] pub val rows: List<List<JsonValue?>?>? = None,
              [jsonCodec("intText")] pub val delta: Option<JsonValue?>)
@@ -75,9 +75,9 @@ fn main(): Unit {
                 self.assertEqual(run.stdout.decode().splitlines(), expected)
 
     def test_handwritten_codec_composes_and_preserves_paths(self):
-        self.main.write_text(r'''import std.json.JsonCodec
-import std.json.jsonCodec
-import std.json.quoteJson
+        self.main.write_text(r'''import std.json.{JsonCodec}
+import std.json.{jsonCodec}
+import std.json.{quoteJson}
 struct Label(pub val text: String)
 fn labelWire(): JsonCodec<Label> {
     jsonCodec<Label>((item) => { quoteJson(item.text) }, (node, path) => { Ok(Label(node.readString(path)?)) })
@@ -95,14 +95,14 @@ fn main(): Unit {
         self.assertEqual(run.stdout.decode().splitlines(), ['{"labels":["A"]}', '0', '$.labels[1]: expected String'])
 
     def test_composed_codecs_keep_paths_and_nested_sum_states(self):
-        self.main.write_text(r'''import model.wire as userWire
-import std.collections.stringMap
-import std.json.jsonCodecInt
-import std.json.jsonCodecString
-import std.json.jsonCodecList
-import std.json.jsonCodecOption
-import std.json.jsonCodecResult
-import std.json.jsonCodecStringMap
+        self.main.write_text(r'''import model.{wire as userWire}
+import std.collections.{stringMap}
+import std.json.{jsonCodecInt}
+import std.json.{jsonCodecString}
+import std.json.{jsonCodecList}
+import std.json.{jsonCodecOption}
+import std.json.{jsonCodecResult}
+import std.json.{jsonCodecStringMap}
 
 fn main(): Unit {
     val codec = jsonCodecStringMap(jsonCodecList(userWire()))
@@ -139,8 +139,8 @@ fn main(): Unit {
 
     def test_codec_type_and_export_are_checked(self):
         for source, code, reason in (
-            ('import model.jsonCodecUser\nfn main(): Unit {}', 'LYN0003', 'jsonCodecUser'),
-            ('import model.wire\n#derive(Json)\nstruct Wrong([jsonCodec("wire")] pub val items: List<Int?>)\nfn main(): Unit {}',
+            ('import model.{jsonCodecUser}\nfn main(): Unit {}', 'LYN0003', 'jsonCodecUser'),
+            ('import model.{wire}\n#derive(Json)\nstruct Wrong([jsonCodec("wire")] pub val items: List<Int?>)\nfn main(): Unit {}',
              'LYT0001', 'JsonCodec'),
             ('#derive(Json)\nstruct Wrong([jsonCodec("unknown")] pub val id: Int)\nfn main(): Unit {}',
              'LYN0001', 'unknown'),
@@ -156,14 +156,14 @@ fn main(): Unit {
                 self.assertIn(reason, diagnostic['message'])
 
     def test_generic_records_and_enums_roundtrip_across_packages(self):
-        self.main.write_text(r'''import model.Page as RemotePage
-import model.User
-import model.pageWire as remoteWire
-import model.wire as userWire
-import std.collections.HashMap as Table
-import std.json.jsonCodecString
-import std.json.JsonCodec
-import std.json.jsonCodecInt
+        self.main.write_text(r'''import model.{Page as RemotePage}
+import model.{User}
+import model.{pageWire as remoteWire}
+import model.{wire as userWire}
+import std.collections.{HashMap as Table}
+import std.json.{jsonCodecString}
+import std.json.{JsonCodec}
+import std.json.{jsonCodecInt}
 type Count = Int
 type Owners = RemotePage<User>
 #derive(Json)

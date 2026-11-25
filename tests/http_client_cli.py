@@ -117,13 +117,13 @@ class HttpClient(unittest.TestCase):
 
     def test_binary_headers_requests_redirects_proxy_and_limits(self):
         for app in self.programs(r'''
-import std.httpClient.ClientResponse
-import std.httpClient.HttpClientError
-import std.httpClient.HttpClientOptions
-import std.httpClient.HttpHeader
-import std.httpClient.httpGet
-import std.httpClient.httpRequest
-import std.os.args
+import std.httpClient.{ClientResponse}
+import std.httpClient.{HttpClientError}
+import std.httpClient.{HttpClientOptions}
+import std.httpClient.{HttpHeader}
+import std.httpClient.{httpGet}
+import std.httpClient.{httpRequest}
+import std.os.{args}
 
 fn require(result: Result<ClientResponse, HttpClientError>): ClientResponse {
     match result { Ok(response) => response, Err(problem) => throw Exception(problem.message()) }
@@ -201,12 +201,12 @@ subjectAltName = DNS:localhost
         tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         tls.load_cert_chain(certificate, key)
         for app in self.programs('''
-import std.httpClient.ClientResponse
-import std.httpClient.HttpClientError
-import std.httpClient.HttpClientOptions
-import std.httpClient.httpGet
-import std.io.readBytes
-import std.os.args
+import std.httpClient.{ClientResponse}
+import std.httpClient.{HttpClientError}
+import std.httpClient.{HttpClientOptions}
+import std.httpClient.{httpGet}
+import std.io.{readBytes}
+import std.os.{args}
 
 fn show(result: Result<ClientResponse, HttpClientError>): Unit {
     match result {
@@ -234,10 +234,10 @@ async fn main(): Unit {
 
     def test_cancel_waits_for_native_transfer_to_close(self):
         for app in self.programs('''
-import std.httpClient.HttpClientOptions
-import std.httpClient.httpGet
-import std.io.readLine
-import std.os.args
+import std.httpClient.{HttpClientOptions}
+import std.httpClient.{httpGet}
+import std.io.{readLine}
+import std.os.{args}
 
 async fn main(): Unit {
     val base = match args() { Ok(value) => value[0], Err(problem) => throw Exception(problem.message()) }
@@ -273,12 +273,12 @@ async fn main(): Unit {
 
     def test_total_timeout_includes_waiting_for_a_native_worker(self):
         for app in self.programs('''
-import std.httpClient.HttpClientErrorKind
-import std.httpClient.HttpClientOptions
-import std.httpClient.httpGet
-import std.io.readLine
-import std.os.args
-import std.sync.AtomicInt
+import std.httpClient.{HttpClientErrorKind}
+import std.httpClient.{HttpClientOptions}
+import std.httpClient.{httpGet}
+import std.io.{readLine}
+import std.os.{args}
+import std.sync.{AtomicInt}
 
 async fn main(): Unit {
     val entered = AtomicInt()

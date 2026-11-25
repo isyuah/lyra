@@ -33,11 +33,13 @@ code --install-extension lyra-language.vsix
 
 补全按当前位置区分顶层声明、函数体、类型、成员和导入。函数体输入 `v` 可补全 `val`、`var`，输入 `pr` 可找到内置 `print`；顶层输入 `#` 可找到 `derive`、`post`，表达式里的 `#` 可找到 `assert`，`@` 可找到 `trace` 和可见装饰器。`router.` 或 `value?.` 提示实际类型上可访问的成员及已导入的扩展。自动弹出遵循 VS Code 的 `editor.quickSuggestions`，也可按 `Ctrl+Space` 手动触发。
 
-输入 `import std.`、`import self.` 或 `import <依赖简称>.` 可逐段选择模块和公开声明，支持 `pub import`、`import macro` 和 `import decorator`。在普通代码里选择尚未导入的候选时，编辑器才添加对应的 `import`；不会自动导入扩展组或下载依赖。
+输入 `import std.`、`import self.` 或 `import <依赖简称>.` 选择模块。输入 `import std.http.{` 可选公开声明；只写 `import std.http` 时，输入 `http.` 才补全该模块的公开成员，普通名称补全不会混入全部依赖的 API。`pub import std.http.{…}`、`import macro` 和 `import decorator` 也支持补全。
 
-输入 `listen(8080, ho` 会提示 `host:`；参数提示会列出匹配已输入实参的重载。声明前的 `///` 文档显示在补全、悬停和签名提示里。可从宏、装饰器调用或导入跳到实现。诊断在后台合并连续编辑，只发布当前版本，源码错误不会变成悬停或跳转失败弹窗。
+普通名称报未解析时，按 `Ctrl+.` 打开 Quick Fix。编辑器优先复用现有模块别名，否则可添加模块导入并把当前用处改成限定名。同名声明分来源列出；默认别名冲突时，建议一个未占用的别名。扩展组仍需显式选入，语言服务不下载依赖。
 
-省略类型的 `val`、`var` 和函数／方法返回值会显示淡色的原生 Inlay Hints，例如 `val router: Router = Router()` 中的 `: Router`。提示不写入源码，可用 `editor.inlayHints.enabled` 控制显示。
+输入 `http.listen(8080, ho` 会提示 `host:`；参数提示会列出匹配已输入实参的重载。声明前的 `///` 文档显示在补全、悬停和签名提示里。可从宏、装饰器调用或导入跳到实现。重命名默认模块别名会补 `as`，保留导入路径。诊断在后台合并连续编辑，只发布当前版本，源码错误不会变成悬停或跳转失败弹窗。
+
+省略类型的 `val`、`var` 和函数／方法返回值会显示淡色的原生 Inlay Hints，例如 `val router: Router = http.Router()` 中的 `: Router`。提示不写入源码，可用 `editor.inlayHints.enabled` 控制显示。
 
 **Format Document** 使用和 `lyra fmt` 一样的词法规则，处理编辑器缓冲区并遵循缩进设置，不要求类型检查通过。
 
@@ -49,6 +51,6 @@ code --install-extension lyra-language.vsix
 python editors/vscode/tests/smoke.py <VS-Code-桌面程序路径> <Lyra-SDK-程序路径>
 ```
 
-第一个路径在 Windows 填 `Code.exe`，Linux 填桌面程序 `code`，不是同发行包里的 `bin/code` 启动脚本。测试使用独立配置和临时项目，检查跨包定义、自动导入、磁盘依赖更新、未保存的 Unicode 宏报错，以及在 HTTP/SQLite 示例中输入一半时的补全、签名提示、诊断和行内类型提示。
+第一个路径在 Windows 填 `Code.exe`，Linux 填桌面程序 `code`，不是同发行包里的 `bin/code` 启动脚本。测试使用独立配置和临时项目，检查跨包定义、导入 Quick Fix、磁盘依赖更新、未保存的 Unicode 宏报错，以及在 HTTP/SQLite 示例中输入一半时的补全、签名提示、诊断和行内类型提示。
 
 打包后可加 `--vsix <扩展包路径>`，改为加载从 VSIX 解包的扩展和依赖；验收该包时不读取源码目录的 `node_modules`。第二个参数可以直接指向解包后 SDK 的 `bin/lyra` 或 `bin/lyra.exe`。

@@ -25,17 +25,17 @@ fn main(): Unit {
 - 若声明 `pub val name: String? = "guest"`，`{}` 解为 `"guest"`，`{"name":null}` 解为 `None`。编码这个 `None` 会写 `null`。单层可空字段没有默认值，或默认值直接写 `None` / `null` 时，编码 `None` 会省略键。其他默认表达式一律按可能产生非空值处理，编码不执行该表达式。
 - `Option<T?>` 在没有默认值或默认值直接写 `None` / `null` 时区分三种状态：缺键得到 `None`，显式 `null` 得到 `Some(None)`，非空值得到 `Some(Some(value))`。这种字段若使用其他默认表达式，或字段有第三层可空类型，须手写映射。
 - 私有字段必须有显式默认值。解码时由默认值初始化，编码时省略，类型可以没有 JSON 编解码实现。输入中的私有字段名按未知键处理。自动派生面向 `struct` 和 `enum`，`class` 身份图需手写映射。
-- 非固定 schema 可 `import std.json.parseJson`：它返回 `Result<JsonValue,String>`。用 `isObject()`、`isArray()`、`size()`、`key(index)`、`field(name)`、`item(index)` 检查结构，用 `readString(path)`、`readChar(path)`、`readBool(path)` 或 `read` 加数值类型名（如 `readUInt16(path)`、`readFloat32(path)`）读取标量。`missing()` 和 `isNull()` 可分别检查缺键和显式空值。
+- 非固定 schema 可 `import std.json.{parseJson}`：它返回 `Result<JsonValue,String>`。用 `isObject()`、`isArray()`、`size()`、`key(index)`、`field(name)`、`item(index)` 检查结构，用 `readString(path)`、`readChar(path)`、`readBool(path)` 或 `read` 加数值类型名（如 `readUInt16(path)`、`readFloat32(path)`）读取标量。`missing()` 和 `isNull()` 可分别检查缺键和显式空值。
 - 手写 `read类型名Json(value: JsonValue, path: String)` 时，可把 `value.field(name)`、`value.item(index)` 直接交给其他解码器，它们继承当前视图的策略。若手动遍历未知键，按 `value.rejectsUnknownFields` 决定是否报错。`value.ignoringUnknownFields()` 与原视图共用解析结果，不修改原视图。
 
 ### 构造动态 JSON
 
 ```lyra
-import std.json.jsonArray
-import std.json.jsonInt
-import std.json.jsonNull
-import std.json.jsonObject
-import std.json.jsonString
+import std.json.{jsonArray}
+import std.json.{jsonInt}
+import std.json.{jsonNull}
+import std.json.{jsonObject}
+import std.json.{jsonString}
 
 fn main(): Unit {
     val rows = jsonArray().add(jsonInt(7)).add(jsonNull()).build()
@@ -53,7 +53,7 @@ fn main(): Unit {
 库可以从公开函数返回 `JsonCodec<T>`。例如，`models` 包对外提供 `User` 的 JSON 格式，库作者选择公开名称 `userWire`。
 
 ```lyra
-import std.json.JsonCodec
+import std.json.{JsonCodec}
 
 #derive(Json)
 pub struct User(pub val name: String)
@@ -64,8 +64,8 @@ pub fn userWire(): JsonCodec<User> { jsonCodecUser() }
 使用方按普通模块规则导入类型和工厂。`[jsonCodec("userFormat")]` 将工厂绑定到字段里每一个 `Author` 值。`List`、可空状态和字段默认值仍由外层结构体处理。
 
 ```lyra
-import models.User as Author
-import models.userWire as userFormat
+import models.{User as Author}
+import models.{userWire as userFormat}
 
 #derive(Json)
 struct Article([jsonCodec("userFormat")] pub val authors: List<Author?>)

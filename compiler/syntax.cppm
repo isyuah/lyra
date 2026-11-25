@@ -15,10 +15,18 @@ export namespace lyra {
 
 using ExprId = std::size_t;
 
-struct Identifier { std::string text; Span span; std::string linked{}; bool exportedOnly{}; std::optional<SourceAnchor> renameTarget{}; };
+struct Identifier {
+    std::string text;
+    Span span;
+    std::string linked{};
+    bool exportedOnly{};
+    std::optional<SourceAnchor> renameTarget{};
+    std::optional<SourceAnchor> moduleAlias{};
+    bool moduleMember{};
+};
 struct Attribute { Identifier name; std::optional<Identifier> argument; };
 struct Argument { std::optional<Identifier> label; ExprId value; std::optional<Span> spread{}, trailing{}; };
-struct TypeQualifier { Identifier name; std::vector<Identifier> arguments{}; };
+struct TypeQualifier { Identifier name; std::vector<Identifier> arguments{}; std::optional<ExprId> moduleReceiver{}; };
 struct Call {
     Identifier name;
     std::vector<Argument> arguments;
@@ -77,6 +85,7 @@ struct PatternName {
     std::optional<Identifier> owner{};
     std::optional<std::vector<std::optional<Identifier>>> labels{};
     bool escaped{};
+    std::optional<Identifier> module{};
 };
 struct PatternIntegerRange { IntegerLiteral lower, upper; bool inclusive; };
 struct PatternAlternatives {};
@@ -155,7 +164,14 @@ Identifier nominalAnnotation(const auto& declaration) {
     return result;
 }
 enum class ImportKind { Runtime, Macro, Decorator };
-struct Import { std::size_t file; bool isPublic; std::vector<Identifier> path; Identifier alias; ImportKind kind{}; };
+struct Import {
+    std::size_t file;
+    bool isPublic;
+    std::vector<Identifier> path;
+    Identifier alias;
+    ImportKind kind{};
+    std::optional<Identifier> member{};
+};
 enum class ExpansionTarget { Function, Aggregate, Enumeration };
 struct Expansion { std::size_t file; Identifier name; std::optional<Identifier> argument; bool decorator; ExpansionTarget kind; std::size_t target; std::vector<Identifier> exports{}; };
 struct MacroArgument { Span span; std::optional<std::string> literal; };
@@ -168,15 +184,18 @@ struct EditorSymbol { std::string label; EditorKind kind; Span name{}; std::stri
 struct EditorParameter { std::string name, label; bool variadic{}; };
 struct EditorSignature { std::string label, documentation; std::vector<EditorParameter> parameters; std::optional<std::size_t> active{}; };
 enum class CompletionPlace { None, TopLevel, MemberDeclaration, FieldDeclaration, TraitDeclaration, ExtensionDeclaration, EnumMethod, FunctionModifier,
-    Statement, Expression, AfterExpression, Type, Constraint, Import, ImportAlias, Member, DeclarationMacro, ExpressionMacro, Decorator };
+    Statement, Expression, AfterExpression, Type, Constraint, Import, ImportMember, ImportAlias, Member, TypeMember, ConstraintMember,
+    DeclarationMacro, ExpressionMacro, Decorator };
 struct SyntaxCompletion {
     Span replacement;
     CompletionPlace place{};
     std::vector<EditorSymbol> suggestions{};
     std::vector<Identifier> importPath{};
+    std::vector<Identifier> selectedImports{};
     ImportKind importKind{};
     std::optional<Span> callOpen{};
-    bool argumentLabel{}, incomplete{}, afterPublic{}, asynchronous{};
+    std::optional<Identifier> qualifier{};
+    bool argumentLabel{}, incomplete{}, afterPublic{}, asynchronous{}, implicitReceiver{};
 };
 struct Module { std::vector<Function> functions; std::vector<Aggregate> aggregates; std::vector<Import> imports; std::vector<Expansion> expansions; std::vector<Trait> traits{}; std::vector<Enumeration> enums{}; std::vector<Extension> extensions{}; std::vector<std::vector<std::string>> importedExtensions{}; std::vector<ExceptionType> exceptions{}; std::vector<TypeAlias> aliases{}; };
 Module parse(const std::vector<Source>& sources);
@@ -187,6 +206,7 @@ SyntaxCompletion completeSyntax(const Source& source, std::size_t offset);
 Module indexFileSyntax(const Source& source, std::vector<ExpressionExpansion>* expressions = nullptr);
 std::string editorDocumentation(const Source& source, std::size_t declarationStart);
 std::string editorSpelling(const Source& source, const Identifier& name);
+std::string editorModuleAlias(std::string_view name);
 std::string editorIdentifier(std::string_view name);
 EditorSignature describeFunction(const Source& source, const Function& function, std::string_view label,
     const std::vector<std::string>& parameterTypes = {}, std::string_view result = {}, std::size_t enclosingTypes = 0);

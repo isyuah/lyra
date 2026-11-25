@@ -1,6 +1,6 @@
 # 原生标准包和 C 边界
 
-直接 `import std.io.readLine`、`std.sqlite.open` 或 `std.toml.parseToml`。编译器从随工具链安装的源码解析标准包，编译出的应用不需要复制这些 `.ly` 文件。
+直接 `import std.io.{readLine}`、`std.sqlite.open` 或 `std.toml.parseToml`。编译器从随工具链安装的源码解析标准包，编译出的应用不需要复制这些 `.ly` 文件。
 
 | 场景 | 标准库入口 |
 |---|---|

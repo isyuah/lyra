@@ -138,8 +138,8 @@ pub class Counter<Item> {
 }
 ''', encoding='utf-8')
         self.run_source('''
-import self.models.Packet as Envelope
-import self.models.Counter
+import self.models.{Packet as Envelope}
+import self.models.{Counter}
 fn mark(value: Int): Int { -1 }
 fn supplied(value: Int): Int { print(value); value }
 fn main(): Unit {
@@ -151,7 +151,7 @@ fn main(): Unit {
     print(counter.count); print(counter.item)
 }
 ''', b'9\n7\n2\n9\n7\n2\n3\nAda\n3\n4\n11\ninit\n')
-        self.main.write_text('import self.models.Packet\nfn main(): Unit { Packet(7, base: 99); }')
+        self.main.write_text('import self.models.{Packet}\nfn main(): Unit { Packet(7, base: 99); }')
         result = subprocess.run([COMPILER, 'check', self.package, '--diagnostics=json'], capture_output=True, timeout=10)
         self.assertNotEqual(result.returncode, 0)
         error, = json.loads(result.stderr)
@@ -336,7 +336,7 @@ pub class Box<Item> {
 }
 ''', encoding="utf-8")
         self.run_source('''
-import self.models.Box as ItemBox
+import self.models.{Box as ItemBox}
 class User(val name: String)
 fn main(): Unit {
     val first = ItemBox(User("存活"))

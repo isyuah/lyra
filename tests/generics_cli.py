@@ -65,8 +65,8 @@ class Generics(unittest.TestCase):
         module.mkdir()
         (module / 'ids.ly').write_text('pub type UserId = Int\npub type UserIds = List<UserId>\n')
         self.program('''
-            import self.types.UserId
-            import self.types.UserIds
+            import self.types.{UserId}
+            import self.types.{UserIds}
             fn identity(id: UserId): UserId { id }
             fn first(ids: UserIds): UserId { ids[0] }
             fn main(): Unit {
@@ -156,8 +156,8 @@ class Generics(unittest.TestCase):
         (library / 'draw.ly').write_text('''pub trait Render { fn render(prefix: String): String }
 pub fn draw<T: Render>(value: T): String { value.render(prefix: ">") }
 pub fn relay<T: Render>(value: T): String { draw(value) }''')
-        self.program('''import self.drawing.relay
-            import self.drawing.Render as Printable
+        self.program('''import self.drawing.{relay}
+            import self.drawing.{Render as Printable}
             struct Tag(val text: String) { pub fn render(prefix: String): String { prefix + text } }
             class Flag { pub fn render(prefix: String): String { prefix + "flag" } }
             fn localRender<T: Printable>(value: T): String { value.render("/") }
@@ -236,11 +236,11 @@ pub fn readValue<T: Reader>(reader: T): T.Item { reader.read() }
 pub fn pair<T: Reader>(reader: T, other: T.Item): List<T.Item> { [reader.read(), other] }
 ''')
         self.program('''
-            import self.data.Reader as Readable
-            import self.data.TextReader
-            import self.data.NumberReader
-            import self.data.readValue
-            import self.data.pair
+            import self.data.{Reader as Readable}
+            import self.data.{TextReader}
+            import self.data.{NumberReader}
+            import self.data.{readValue}
+            import self.data.{pair}
             class Box<Value>(pub val item: Value) {
                 pub type Item = Value
                 pub fn read(): Value { item }
@@ -267,7 +267,7 @@ pub extension ListView<T> for List<T> {
 }
 ''')
         self.program('''
-            import self.data.ListView
+            import self.data.{ListView}
             struct Entry(val value: Int)
             extension EntryView for Entry {
                 val value: Int get() { 999 }
@@ -305,9 +305,9 @@ pub extension EntryView for Entry { val secret: Int get() { 999 } }
 pub fn makeEntry(): Entry { Entry(2) }
 ''')
         self.program('''
-            import self.data.Entry
-            import self.data.EntryView
-            import self.data.makeEntry
+            import self.data.{Entry}
+            import self.data.{EntryView}
+            import self.data.{makeEntry}
             fn main(): Unit { print(makeEntry().secret) }
         ''')
         self.rejects('LYN0003', '模块私有', 'secret')
@@ -319,19 +319,19 @@ pub fn makeEntry(): Entry { Entry(2) }
         (library / 'reader.ly').write_text('''pub trait Reader { type Item; fn read(): Item }
 pub fn readValue<T: Reader>(reader: T): T.Item { reader.read() }''')
         self.program('''
-            import self.data.readValue
+            import self.data.{readValue}
             struct Missing { pub fn read(): String { "missing" } }
             fn main(): Unit { print(readValue(Missing())) }
         ''')
         self.rejects('LYG0005', 'Item', 'readValue')
         self.program('''
-            import self.data.readValue
+            import self.data.{readValue}
             struct Hidden { type Item = String; pub fn read(): String { "hidden" } }
             fn main(): Unit { print(readValue(Hidden())) }
         ''')
         self.rejects('LYG0005', 'Item', 'readValue')
         self.program('''
-            import self.data.readValue
+            import self.data.{readValue}
             struct Wrong { pub type Item = String; pub fn read(): Int { 0 } }
             fn main(): Unit { print(readValue(Wrong())) }
         ''')
@@ -356,9 +356,9 @@ pub type TextReader = dyn Reader<Index=Int, Item=String>
 pub fn genericRead<T>(reader: dyn Reader<Item=T,Index=Int>): T { reader.read(0) }
 ''')
         self.program('''
-            import self.data.Reader as Input
-            import self.data.TextReader
-            import self.data.genericRead
+            import self.data.{Reader as Input}
+            import self.data.{TextReader}
+            import self.data.{genericRead}
             trait View { type Item; fn read(index: Int): Item }
             struct Label<T>(val text: T) { pub type Item = T; pub type Index = Int64; pub fn read(index: Int): T { text } }
             class Words(val values: List<String>) { pub type Item = String; pub type Index = Int; pub fn read(index: Int): String { values[index] } }

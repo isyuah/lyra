@@ -1,5 +1,5 @@
-import std.task.parallelism
-import std.sync.AtomicInt
+import std.task.{parallelism}
+import std.sync.{AtomicInt}
 
 pub fn map<T, R>(values: List<T>, transform: (T) -> R): List<R> {
     val output: List<R> = []

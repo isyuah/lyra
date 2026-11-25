@@ -40,13 +40,13 @@ class Conversions(unittest.TestCase):
             self.assertEqual(result.stdout.splitlines(), output)
 
     def test_direct_return_generic_arguments_and_result_propagation(self):
-        self.source('data/item.ly', '''import self.reply.Response
+        self.source('data/item.ly', '''import self.reply.{Response}
 pub class User(pub val name: String)
 pub implicit (user: User): Response { print("convert"); Response(user.name) }
 ''')
         self.source('reply/result.ly', 'pub struct Response(pub val message: String)')
-        self.source('main.ly', '''import self.data.User as Person
-import self.reply.Response
+        self.source('main.ly', '''import self.data.{User as Person}
+import self.reply.{Response}
 fn identity<T>(value: T): T { print("identity"); value }
 fn implicitReturn(user: Person): Response { identity(user) }
 fn explicitArgument(user: Person): Response { identity<Response>(user) }
@@ -62,10 +62,10 @@ fn main(): Unit {
         self.runBoth(['identity', 'convert', 'Ada', 'convert', 'identity', 'Ada', '9', 'convert', 'Ada'])
 
     def test_visibility_duplicate_orphan_and_ambiguity(self):
-        model = 'import self.web.Response\npub struct User(pub val id: Int)\n'
-        web = 'import self.model.User\npub struct Response(pub val id: Int)\n'
+        model = 'import self.web.{Response}\npub struct User(pub val id: Int)\n'
+        web = 'import self.model.{User}\npub struct Response(pub val id: Int)\n'
         conversion = 'implicit (user: User): Response { Response(user.id) }\n'
-        main = 'import self.model.User\nimport self.web.Response\nfn send(user: User): Response { user }\nfn main(): Unit {}\n'
+        main = 'import self.model.{User}\nimport self.web.{Response}\nfn send(user: User): Response { user }\nfn main(): Unit {}\n'
         self.source('model/model.ly', model + conversion)
         self.source('web/web.ly', web)
         self.source('main.ly', main)

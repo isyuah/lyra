@@ -1,4 +1,4 @@
-import self.parseLine
+import self.{parseLine}
 
 fn main(): Unit {
     val good = parseLine("{\"station\":\"north\",\"delta\":-3}")

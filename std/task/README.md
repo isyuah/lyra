@@ -1,9 +1,9 @@
 # std.task：不用逐层传 context
 
 ```text
-import std.task.trace
-import std.task.withTrace
-import std.task.withTimeout
+import std.task.{trace}
+import std.task.{withTrace}
+import std.task.{withTimeout}
 
 async fn query(): String { await blocking { trace() } }
 async fn main(): Unit {

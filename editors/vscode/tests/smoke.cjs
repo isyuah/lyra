@@ -90,24 +90,24 @@ async function checkSmoke() {
     await waitForDiagnostics(source, listing => listing.length === 0, 'diagnostic did not clear after reverting');
     assert.ok(!document.isDirty);
 
-    const addImport = 'fn autoImportProbe(): Unit { val _ = Clo.now() }';
+    const addImport = 'fn importProbe(): Unit { val _ = Clock.now() }';
     const end = document.positionAt(document.getText().length);
     assert.ok(await sourceEditor.edit(edit => edit.insert(end, endOfLine + addImport + endOfLine)));
     try {
-        const position = end.translate(1, addImport.indexOf('Clo') + 'Clo'.length);
-        await waitForDiagnostics(source, listing => listing.some(item => item.code === 'LYN0001'), 'missing unresolved auto-import probe');
-        const completions = await vscode.commands.executeCommand('vscode.executeCompletionItemProvider', source, position);
-        const clock = completions.items.find(item => (item.label.label ?? item.label) === 'Clock');
-        assert.equal(clock.kind, vscode.CompletionItemKind.Class);
-        assert.equal(clock.additionalTextEdits.length, 1);
-        assert.equal(clock.additionalTextEdits[0].newText, `import std.time.Clock${endOfLine}`);
-        assert.ok(!document.getText().includes('import std.time.Clock'));
-        const edit = new vscode.WorkspaceEdit();
-        edit.set(source, [...clock.additionalTextEdits, vscode.TextEdit.replace(clock.range.replacing ?? clock.range, clock.insertText)]);
-        assert.ok(await vscode.workspace.applyEdit(edit));
-        assert.ok(document.getText().includes('Clock.now()'));
+        const start = end.translate(1, addImport.indexOf('Clock'));
+        const diagnostics = await waitForDiagnostics(source, listing => listing.some(item => item.code === 'LYN0001'), 'missing unresolved import probe');
+        const completions = await vscode.commands.executeCommand('vscode.executeCompletionItemProvider', source, start.translate(0, 3));
+        assert.ok(!completions.items.some(item => (item.label.label ?? item.label) === 'Clock'));
+        const range = diagnostics.find(item => item.code === 'LYN0001').range;
+        const actions = await vscode.commands.executeCommand('vscode.executeCodeActionProvider', source, range, 'quickfix');
+        const action = actions.find(item => item.edit && item.title.includes('import std.time'));
+        assert.ok(action, `missing module import action: ${JSON.stringify(actions.map(item => item.title))}`);
+        assert.ok(!document.getText().includes('import std.time'));
+        assert.ok(await vscode.workspace.applyEdit(action.edit));
+        assert.ok(document.getText().includes(`import std.time${endOfLine}`));
+        assert.ok(document.getText().includes('time.Clock.now()'));
         await waitForDiagnostics(source, listing => !listing.some(item => item.severity === vscode.DiagnosticSeverity.Error),
-            'auto import did not make Clock.now resolve');
+            'module import action did not make Clock.now resolve');
     } finally {
         await vscode.commands.executeCommand('workbench.action.files.revert');
     }
@@ -159,13 +159,18 @@ async function checkTyping() {
         assert.ok(await editor.edit(edit => edit.replace(new vscode.Range(start, start.translate(0, 2)), 'router.')));
         const members = (await complete(start.translate(0, 'router.'.length))).items;
         assert.ok(members.some(item => item.label === 'serve' && item.kind === vscode.CompletionItemKind.Method));
-        const call = 'val _ = listen(8080, ho';
-        assert.ok(await editor.edit(edit => edit.replace(new vscode.Range(start, start.translate(0, 'router.'.length)), call)));
+        const module = 'http.';
+        assert.ok(await editor.edit(edit => edit.replace(new vscode.Range(start, start.translate(0, 'router.'.length)), module)));
+        const moduleMembers = (await complete(start.translate(0, module.length))).items;
+        assert.ok(moduleMembers.some(item => item.label === 'Router' && item.kind === vscode.CompletionItemKind.Class));
+        assert.ok(moduleMembers.some(item => item.label === 'listen' && item.kind === vscode.CompletionItemKind.Function));
+        const call = 'val _ = http.listen(8080, ho';
+        assert.ok(await editor.edit(edit => edit.replace(new vscode.Range(start, start.translate(0, module.length)), call)));
         const signature = await vscode.commands.executeCommand('vscode.executeSignatureHelpProvider', source, start.translate(0, call.length));
         assert.ok(signature.signatures.some(item => item.parameters.some(parameter => parameter.label.includes('host:'))));
         assert.ok((await complete(start.translate(0, call.length))).items.some(item => item.label === 'host:'));
         assert.ok(document.isDirty);
-        assert.ok(document.getText().includes('val router = Router()'));
+        assert.ok(document.getText().includes('val router = http.Router()'));
     } finally {
         await vscode.commands.executeCommand('workbench.action.files.revert');
     }
@@ -178,7 +183,7 @@ async function run() {
     try {
         await checkSmoke();
         await checkTyping();
-        await writeFile(report, `PASS VS Code ${vscode.version}: cross-package definitions, auto import, Unicode macro diagnostics, member completion, signatures and inlay hints\n`);
+        await writeFile(report, `PASS VS Code ${vscode.version}: cross-package definitions, module completion and import Quick Fix, Unicode macro diagnostics, signatures and inlay hints\n`);
     } catch (error) {
         await writeFile(report, `${error.stack}\n`);
         throw error;

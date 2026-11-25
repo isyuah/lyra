@@ -37,7 +37,7 @@ class Closures(unittest.TestCase):
                     self.assertEqual(ran.stderr, '')
 
     def test_functions_explicit_tail_lambda_and_shared_cells(self):
-        self.executable('''import self.tools.plusOne as next
+        self.executable('''import self.tools.{plusOne as next}
 class Pair(val bump: (Int) -> Int, val read: () -> Int)
 fn make(start: Int): Pair {
     var running = start

@@ -1,8 +1,8 @@
 # `std.httpClient`
 
 ```lyra
-import std.httpClient.HttpClientOptions
-import std.httpClient.httpGet
+import std.httpClient.{HttpClientOptions}
+import std.httpClient.{httpGet}
 
 async fn main(): Unit {
     val result = await httpGet("https://example.com", HttpClientOptions(timeoutMs: 4000))

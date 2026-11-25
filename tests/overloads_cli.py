@@ -47,13 +47,13 @@ class Overloads(unittest.TestCase):
         return diagnostic['message']
 
     def conversionModules(self, competing=False):
-        self.write('app/src/model/user.ly', '''import self.web.Response
+        self.write('app/src/model/user.ly', '''import self.web.{Response}
 pub struct User(pub val id: Int)
 pub implicit (user: User): Response { print("model"); Response(user.id) }
 ''')
         conversion = 'pub implicit (user: User): Response { print("web"); Response(user.id) }\n' if competing else ''
-        self.write('app/src/web/response.ly', 'import self.model.User\npub struct Response(pub val id: Int)\n' + conversion)
-        return 'import self.model.User\nimport self.web.Response\n'
+        self.write('app/src/web/response.ly', 'import self.model.{User}\npub struct Response(pub val id: Int)\n' + conversion)
+        return 'import self.model.{User}\nimport self.web.{Response}\n'
 
     def test_direct_conversion_runs_only_when_selected(self):
         imports = self.conversionModules(competing=True)
@@ -182,21 +182,21 @@ fn read(value: Int): Int { value + 1 }
     def test_reexport_exposes_only_public_candidates(self):
         self.write('lib/lyra.json5', '{name:"lib", version:"0.1.0", kind:"lib"}')
         self.write('app/lyra.json5', '''{name:"app", version:"0.1.0", dependencies:{lib:{name:"lib", version:"^0.1.0", path:"../lib"}}}''')
-        self.write('lib/src/lib.ly', 'pub import self.impl.pick as select\n')
+        self.write('lib/src/lib.ly', 'pub import self.impl.{pick as select}\n')
         self.write('lib/src/impl/pick.ly', '''fn pick(value: Int): String { "private" }
 pub fn pick(value: Int?): String { "public nullable" }
 pub fn pick(value: String): String { "public string" }
 pub fn internal(): String { pick(1) }
 ''')
-        self.main('''import lib.select as choose
-import lib.impl.internal
+        self.main('''import lib.{select as choose}
+import lib.impl.{internal}
 fn main(): Unit {
     print(choose(1))
     print(choose("text"))
     print(internal())
 }''')
         self.runBoth('public nullable', 'public string', 'private')
-        self.main('''import lib.select as choose
+        self.main('''import lib.{select as choose}
 fn main(): Unit { val callback: (Int) -> String = choose }''')
         self.assertNotIn('choose(Int) @', self.reject('LYT0019', 2))
 

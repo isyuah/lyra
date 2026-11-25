@@ -1,10 +1,10 @@
 # `std.config`
 
 ```lyra
-import std.cli.ParsedCommand
-import std.config.Config
-import std.config.ConfigError
-import std.config.intKey
+import std.cli.{ParsedCommand}
+import std.config.{Config}
+import std.config.{ConfigError}
+import std.config.{intKey}
 
 fn port(arguments: ParsedCommand): Result<Int,ConfigError> {
     val settings = Config.load("server.toml")?

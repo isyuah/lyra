@@ -19,7 +19,7 @@ class SQLite(unittest.TestCase):
             for name in ('Connection', 'Statement', 'Transaction'):
                 with self.subTest(name=name):
                     (package / 'src/main.ly').write_text(
-                        f'import std.sqlite.{name}\nfn main(): Unit {{ val _ = {name}(CPtr.nullPtr()) }}\n', encoding='utf-8')
+                        f'import std.sqlite.{{{name}}}\nfn main(): Unit {{ val _ = {name}(CPtr.nullPtr()) }}\n', encoding='utf-8')
                     result = subprocess.run([COMPILER, 'check', package], capture_output=True, timeout=30)
                     self.assertNotEqual(result.returncode, 0)
                     self.assertIn(b'LYN0003', result.stderr)
@@ -30,12 +30,12 @@ class SQLite(unittest.TestCase):
             (package / "src").mkdir()
             (package / "lyra.json5").write_text("{name:'test/query',version:'1.0.0'}")
             (package / "src" / "main.ly").write_text(r'''
-import std.sqlite.Busy
-import std.sqlite.Connection
-import std.sqlite.DbError
-import std.sqlite.DbErrorKind
-import std.sqlite.open
-import std.sqlite.openReadOnly
+import std.sqlite.{Busy}
+import std.sqlite.{Connection}
+import std.sqlite.{DbError}
+import std.sqlite.{DbErrorKind}
+import std.sqlite.{open}
+import std.sqlite.{openReadOnly}
 
 fn require<T>(result: Result<T, DbError>): T {
     match result { Ok(value) => value, Err(error) => throw Exception(error.message()) }
@@ -119,13 +119,13 @@ fn main(): Unit {
 
     def test_scoped_transactions_and_storage_types(self):
         source = r'''
-import std.sqlite.Busy
-import std.sqlite.Connection
-import std.sqlite.DbError
-import std.sqlite.DbErrorKind
-import std.sqlite.Statement
-import std.sqlite.Transaction
-import std.sqlite.open
+import std.sqlite.{Busy}
+import std.sqlite.{Connection}
+import std.sqlite.{DbError}
+import std.sqlite.{DbErrorKind}
+import std.sqlite.{Statement}
+import std.sqlite.{Transaction}
+import std.sqlite.{open}
 
 exception Stop
 struct Escaped(pub val transaction: Transaction, pub val cursor: Statement, pub val rowid: Int)

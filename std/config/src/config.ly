@@ -1,14 +1,8 @@
-import std.cli.ParsedCommand
-import std.io.IoError
-import std.io.readFile
-import std.os.env
-import std.text.StringOps
-import std.toml.TomlCodec
-import std.toml.TomlValue
-import std.toml.parseToml
-import std.toml.tomlCodecBool
-import std.toml.tomlCodecInt
-import std.toml.tomlCodecString
+import std.cli.{ParsedCommand}
+import std.io.{IoError, readFile}
+import std.os.{env}
+import std.text.{StringOps}
+import std.toml.{TomlCodec, TomlValue, parseToml, tomlCodecBool, tomlCodecInt, tomlCodecString}
 
 pub enum ConfigErrorKind { ReadFile(IoError), InvalidToml, ReadEnv(IoError), InvalidKey, InvalidValue }
 

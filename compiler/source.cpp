@@ -79,6 +79,12 @@ Diagnostic at(const Source& source, Span span, std::string code, std::string mes
     return error;
 }
 
+Diagnostic missingName(const Source& source, Span span, std::string code, std::string message, MissingNameKind kind, const std::string& name) {
+    auto error = at(source, span, std::move(code), std::move(message));
+    if (!error.generated && !name.empty() && name.find_first_of(".$:") == name.npos) error.missingName = MissingName{kind, name};
+    return error;
+}
+
 static llvm::json::Object jsonPosition(Position position) {
     return llvm::json::Object{{"offset", position.offset}, {"line", position.line}, {"column", position.column}};
 }

@@ -18,10 +18,10 @@ class Reflection(unittest.TestCase):
             (package / 'lyra.json5').write_text('{name:"reflection",version:"0.1.0"}', encoding='utf-8')
             source = package / 'src/main.ly'
             source.write_text('''
-import std.reflect.typeName
-import std.reflect.fieldCount
-import std.reflect.fieldNames
-import std.reflect.field
+import std.reflect.{typeName}
+import std.reflect.{fieldCount}
+import std.reflect.{fieldNames}
+import std.reflect.{field}
 struct User(pub val name: String, pub val age: Int, val secret: String)
 class Account(pub val id: Int)
 fn main(): Unit {
@@ -72,11 +72,11 @@ pub fn createUser(): User { User("Ada", "hidden") }
                 encoding='utf-8')
             source = package / 'src/main.ly'
             source.write_text('''
-import model.createUser
-import std.reflect.typeName
-import std.reflect.fieldCount
-import std.reflect.fieldNames
-import std.reflect.field
+import model.{createUser}
+import std.reflect.{typeName}
+import std.reflect.{fieldCount}
+import std.reflect.{fieldNames}
+import std.reflect.{field}
 fn main(): Unit {
     val user: Any = createUser()
     print(typeName(user))

@@ -1,7 +1,5 @@
-import std.io.IoError
-import std.io.IoErrorKind
-pub import std.io.TempFile
-pub import std.io.createTempFile
+import std.io.{IoError, IoErrorKind}
+pub import std.io.{TempFile, createTempFile}
 
 extern fn lyraFsPathJoin(base: String, segment: String): String;
 extern fn lyraFsListDir(path: String): CPtr;

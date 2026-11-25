@@ -37,13 +37,13 @@ class ApplicationStd(unittest.TestCase):
 
     def test_jsonl_streams_stdin_and_file_with_recoverable_line_errors(self):
         for package, app in self.programs('''
-import std.io.File
-import std.io.IoError
-import std.io.LineReader
-import std.json.jsonCodecInt
-import std.jsonl.JsonlErrorKind
-import std.jsonl.jsonlReader
-import std.os.args
+import std.io.{File}
+import std.io.{IoError}
+import std.io.{LineReader}
+import std.json.{jsonCodecInt}
+import std.jsonl.{JsonlErrorKind}
+import std.jsonl.{jsonlReader}
+import std.os.{args}
 
 fn read(input: LineReader): Result<Unit, IoError> {
     val reader = jsonlReader(input, jsonCodecInt())
@@ -84,8 +84,8 @@ fn main(): Unit { match run() { Ok(_) => {}, Err(problem) => throw Exception(pro
 
     def test_cli_uses_actual_arguments_and_reports_bad_options(self):
         for _, app in self.programs('''
-import std.cli.Command
-import std.cli.parseArgs
+import std.cli.{Command}
+import std.cli.{parseArgs}
 
 fn main(): Unit {
     val command = Command("stats").option("--input", required: true).option("--limit").flag("--verbose")
@@ -119,14 +119,14 @@ fn main(): Unit {
 
     def test_config_precedence_and_source_without_secret(self):
         for package, app in self.programs('''
-import std.cli.Command
-import std.cli.parseArgs
-import std.config.Config
-import std.config.boolKey
-import std.config.configKey
-import std.config.intKey
-import std.config.stringKey
-import std.toml.tomlCodecInt
+import std.cli.{Command}
+import std.cli.{parseArgs}
+import std.config.{Config}
+import std.config.{boolKey}
+import std.config.{configKey}
+import std.config.{intKey}
+import std.config.{stringKey}
+import std.toml.{tomlCodecInt}
 
 fn main(): Unit {
     val arguments = match parseArgs(Command("config").option("--port").option("--mode").flag("--enabled")) {
@@ -171,12 +171,12 @@ fn main(): Unit {
 
     def test_log_emits_timestamp_trace_and_structured_fields_on_stderr(self):
         for _, app in self.programs(r'''
-import std.io.IoError
-import std.json.jsonInt
-import std.json.jsonObject
-import std.log.LogFormat
-import std.log.Logger
-import std.task.withTrace
+import std.io.{IoError}
+import std.json.{jsonInt}
+import std.json.{jsonObject}
+import std.log.{LogFormat}
+import std.log.{Logger}
+import std.task.{withTrace}
 
 fn check(result: Result<Unit, IoError>): Unit {
     match result { Ok(_) => {}, Err(error) => throw Exception(error.message()) }
@@ -210,12 +210,12 @@ async fn main(): Unit {
     @unittest.skipUnless(sys.platform.startswith('linux'), 'POSIX SIGPIPE and FIFO')
     def test_closed_pipe_returns_io_errors_for_log_and_buffered_file_writes(self):
         for package, app in self.programs('''
-import std.io.CloseError
-import std.io.File
-import std.io.IoError
-import std.io.readLine
-import std.log.Logger
-import std.os.args
+import std.io.{CloseError}
+import std.io.{File}
+import std.io.{IoError}
+import std.io.{readLine}
+import std.log.{Logger}
+import std.os.{args}
 
 fn require<T>(result: Result<T, IoError>): T {
     match result { Ok(value) => value, Err(error) => throw Exception(error.message()) }

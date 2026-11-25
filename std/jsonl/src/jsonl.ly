@@ -1,7 +1,5 @@
-import std.io.IoError
-import std.io.IoErrorKind
-import std.io.LineReader
-import std.json.JsonCodec
+import std.io.{IoError, IoErrorKind, LineReader}
+import std.json.{JsonCodec}
 
 pub enum JsonlErrorKind { InvalidUtf8, LineTooLong, Decode(String) }
 

@@ -52,8 +52,8 @@ LLVM 后端给每个异步函数生成一个用于创建冷 Task 的普通函数
 `blocking { ... }` 创建冷 `Task<T>`，本身不阻塞，`await` 或 `spawn` 首次启动后将块提交给 libuv 阻塞池。闭包捕获绑定而非当前值：同一个外层 `var` 经同步函数返回、GC 和挂起仍可读写，循环中的新绑定则每轮独立。同步块有自己的返回目标，`return` 和 `?` 均只退出块；没有上下文可推断 `?` 的目标时可给绑定写 `Task<T?>` 或 `Task<Result<T,E>>` 注解。块内不可直接 `await`/`spawn`。对于跨 Worker 共享的捕获与对象字段，编译器对一次读或一次写同步复制；`number += 1` 的读、改、写仍不是一个原子操作。
 
 ```text
-import std.sqlite.DbError
-import std.sqlite.open
+import std.sqlite.{DbError}
+import std.sqlite.{open}
 fn readAnswer(): Result<Int?, DbError> {
     val db = open(":memory:")?
     defer db.close()

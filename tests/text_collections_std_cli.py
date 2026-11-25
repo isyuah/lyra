@@ -28,7 +28,7 @@ class TextAndCollections(unittest.TestCase):
 
     def test_unicode_slices_prefixes_whitespace_and_literal_split(self):
         self.run_program(r'''
-import std.text.StringOps
+import std.text.{StringOps}
 
 fn main(): Unit {
     val text = "中🙂e\u{0301}\0"
@@ -53,8 +53,8 @@ fn main(): Unit {
 
     def test_parse_int_checks_entire_input_and_both_integer_limits(self):
         self.run_program(r'''
-import std.text.ParseIntError
-import std.text.StringOps
+import std.text.{ParseIntError}
+import std.text.{StringOps}
 
 fn format(result: Result<Int, ParseIntError>): String {
     match result {
@@ -88,10 +88,10 @@ fn main(): Unit {
 
     def test_stable_sorted_by_sum_distinct_and_independent_shallow_keys(self):
         self.run_program('''
-import std.collections.ListOps
-import std.collections.distinct
-import std.collections.hashMap
-import std.collections.sum
+import std.collections.{ListOps}
+import std.collections.{distinct}
+import std.collections.{hashMap}
+import std.collections.{sum}
 
 class Item(val rank: Int, var label: String)
 

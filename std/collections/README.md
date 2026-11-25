@@ -3,7 +3,7 @@
 `map`、`filter`、`fold`、`any` 和 `find` 都可作为普通泛型函数单独导入。显式导入 `ListOps` 后，也可用方法链调用它们。
 
 ```lyra
-import std.collections.ListOps
+import std.collections.{ListOps}
 
 fn main(): Unit {
     val doubled = [1, 2, 3, 4].filter { it > 2 }.map { it * 2 }
@@ -25,7 +25,7 @@ fn main(): Unit {
 `parallelFor(values, maxConcurrency) { item => ... }` 返回冷 `Task<Unit>`；首次 `await` 或 `spawn` 才启动，完成前等待任务组里的并行域收尾。回调形参是 `T -> Task<Unit>`，因此可在回调中 `await` I/O 或其他异步工作。并发上限取传入值与 `std.task.parallelism()` 的较小值，缺省使用 Worker 池容量；超出列表长度时按元素数裁剪。并行域通过共享的原子游标领取下一项，每个域一次等待一个回调，不为每个元素启动线程或并行域。显式传入的并发上限必须大于零；空列表无需启动 Worker。
 
 ```lyra
-import std.collections.parallelFor
+import std.collections.{parallelFor}
 
 async fn process(item: Int): Unit { await blocking { writeRecord(item) } }
 async fn main(): Unit { await parallelFor([1, 2, 3, 4]) { process(it) } }
@@ -36,8 +36,8 @@ async fn main(): Unit { await parallelFor([1, 2, 3, 4]) { process(it) } }
 ## 字典与集合
 
 ```lyra
-import std.collections.stringMap
-import std.collections.intSet
+import std.collections.{stringMap}
+import std.collections.{intSet}
 
 fn main(): Unit {
     val scores = stringMap<Int>()

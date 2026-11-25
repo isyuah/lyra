@@ -1,11 +1,7 @@
-import std.io.IoError
-import std.io.writeError
-import std.json.JsonValue
-import std.json.jsonObject
-import std.json.jsonString
-import std.json.quoteJson
-import std.task.trace
-import std.time.Clock
+import std.io.{IoError, writeError}
+import std.json.{JsonValue, jsonObject, jsonString, quoteJson}
+import std.task.{trace}
+import std.time.{Clock}
 
 pub enum LogLevel { Debug, Info, Warn, Error }
 pub enum LogFormat { Text, Json }

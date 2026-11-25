@@ -32,9 +32,9 @@ class DailyStdlib(unittest.TestCase):
 
     def test_list_methods_are_ordered_short_circuiting_and_preserve_nested_none(self):
         source = '''
-import std.collections.ListOps
-import std.collections.any as anyValue
-import std.collections.find as findValue
+import std.collections.{ListOps}
+import std.collections.{any as anyValue}
+import std.collections.{find as findValue}
 
 fn main(): Unit {
     var visits = 0
@@ -57,13 +57,13 @@ fn main(): Unit {
 
     def test_binary_files_preserve_data_and_separate_eof_from_io_errors(self):
         source = r'''
-import std.io.File
-import std.io.IoError
-import std.io.IoErrorKind
-import std.io.readBytes
-import std.io.readFile
-import std.io.writeBytes
-import std.os.args
+import std.io.{File}
+import std.io.{IoError}
+import std.io.{IoErrorKind}
+import std.io.{readBytes}
+import std.io.{readFile}
+import std.io.{writeBytes}
+import std.os.{args}
 
 fn copyFile(source: String, destination: String): Result<Int, IoError> {
     val input = File.openRead(source)?
@@ -126,10 +126,10 @@ fn main(): Unit {
     @unittest.skipUnless(hasattr(os, 'mkfifo'), 'requires a POSIX FIFO')
     def test_close_stays_busy_while_a_read_owns_the_handle(self):
         app = self.build('''
-import std.io.Busy
-import std.io.File
-import std.io.IoErrorKind
-import std.os.args
+import std.io.{Busy}
+import std.io.{File}
+import std.io.{IoErrorKind}
+import std.os.{args}
 
 async fn checkpoint(): Unit {}
 
@@ -168,9 +168,9 @@ async fn main(): Unit {
     @unittest.skipUnless(Path('/dev/full').exists(), 'requires a device that refuses writes')
     def test_write_bytes_reports_buffered_write_failure_and_preserves_error(self):
         app = self.build('''
-import std.io.IoError
-import std.io.writeBytes
-import std.os.args
+import std.io.{IoError}
+import std.io.{writeBytes}
+import std.os.{args}
 
 fn write(path: String): Result<Unit, Error> { writeBytes(path, b"data")?; Ok({}) }
 fn main(): Unit {

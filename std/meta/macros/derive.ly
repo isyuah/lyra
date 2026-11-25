@@ -1,5 +1,5 @@
 fn dataImport(name: String, prefix: String, json: Bool): String {
-    "import std." + (if json { "json." } else { "toml." }) + name + " as " + prefix + name + "\n"
+    "import std." + (if json { "json.{" } else { "toml.{" }) + name + " as " + prefix + name + "}\n"
 }
 
 fn isType(node: Syntax, name: String): Bool { syntaxKind(node) == "builtin" && syntaxText(node) == name }

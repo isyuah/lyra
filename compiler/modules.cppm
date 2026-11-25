@@ -30,7 +30,8 @@ Compilation loadProgram(const PackageGraph& graph, const std::string& entry, con
 struct EditorFileSyntax { std::string text; Module syntax; std::vector<ExpressionExpansion> expressions; };
 struct EditorParseCache { std::map<std::filesystem::path, EditorFileSyntax> files; };
 struct EditorDeclaration { std::size_t file; std::string name; EditorSymbol symbol; bool visible; };
-struct EditorImport { ImportKind kind; std::vector<std::string> path; EditorSymbol symbol; bool automatic{}; std::optional<MacroKind> macro{}; };
+struct EditorImport { ImportKind kind; std::vector<std::string> path; EditorSymbol symbol; bool automatic{}; std::optional<MacroKind> macro{}; std::string module{}; };
+struct EditorNamespace { std::string module; std::vector<EditorSymbol> members; };
 struct EditorMacro { MacroKind kind; EditorSymbol symbol; };
 struct EditorDefinition { Span use; std::filesystem::path path; Span target; EditorSymbol symbol; };
 struct EditorModuleIndex {
@@ -39,6 +40,7 @@ struct EditorModuleIndex {
     std::vector<EditorImport> imports;
     std::vector<EditorDefinition> definitions;
     std::set<std::string> occupied;
+    std::map<std::string, EditorNamespace> namespaces;
 };
 std::vector<EditorDeclaration> editorDeclarations(const Module& syntax, std::span<const Source> sources, bool generatedOnly = false);
 EditorModuleIndex indexModule(const PackageGraph& graph, const std::filesystem::path& path, const SourceOverlay& overlays, EditorParseCache& cache);
@@ -49,7 +51,7 @@ namespace fs = std::filesystem;
 namespace {
 
 struct LinkedDeclaration { SourceAnchor anchor; bool visible; };
-enum class SymbolKind { Type, Callable, Constant, Extension };
+enum class SymbolKind { Type, Callable, Constant, Extension, Module };
 struct Symbol {
     std::string name;
     SymbolKind kind;
@@ -60,7 +62,7 @@ struct Symbol {
 struct Space {
     const ResolvedPackage* package;
     std::map<std::string, Symbol> definitions{};
-    std::map<std::string, Import> imports{};
+    std::map<std::string, Import> exports{};
 };
 
 struct ImportTarget { std::string package, module; fs::path directory; };
@@ -94,14 +96,14 @@ const std::string& declarationGroup(const Function& function) {
     return function.owner ? function.owner->text : function.extensionGroup ? function.extensionGroup->text : function.name.text;
 }
 
-ImportTarget importTarget(const Source& source, const ResolvedPackage& from, const Import& use,
+ImportTarget importTarget(const Source& source, const ResolvedPackage& from, std::span<const Identifier> path,
     const std::map<std::string, std::string>& prefixes) {
-    const auto& first = use.path.front();
-    if (use.path.size() < 2) throw at(source, first.span, "LYN0003", "import 需要包、可选模块路径和声明名");
+    const auto& first = path.front();
     auto package = from.id;
     std::size_t firstDir = 1;
-    if (first.text == "std" && use.path.size() >= 3) {
-        package = "$std/" + use.path[1].text;
+    if (first.text == "std") {
+        if (path.size() < 2) throw at(source, first.span, "LYN0003", "请在 std 后指定标准库模块，例如 import std.http");
+        package = "$std/" + path[1].text;
         firstDir = 2;
     } else if (first.text != "self") {
         auto found = from.dependencies.find(first.text);
@@ -111,9 +113,9 @@ ImportTarget importTarget(const Source& source, const ResolvedPackage& from, con
     auto prefix = prefixes.find(package);
     if (prefix == prefixes.end()) throw at(source, first.span, "LYN0003", "导入的包不在当前编译阶段：" + package);
     ImportTarget target{std::move(package), prefix->second, {}};
-    for (auto index = firstDir; index + 1 < use.path.size(); ++index) {
-        target.module += '/' + use.path[index].text;
-        target.directory /= fromUtf8(use.path[index].text);
+    for (auto index = firstDir; index < path.size(); ++index) {
+        target.module += '/' + path[index].text;
+        target.directory /= fromUtf8(path[index].text);
     }
     return target;
 }
@@ -126,6 +128,8 @@ struct Linker {
     std::vector<NameReference>& references;
     bool indexing;
     bool macroPhase{};
+    std::map<std::size_t, std::map<std::string, Import>> fileImports{};
+    std::map<const Import*, Symbol> resolvedImports{};
 
     void declare(std::size_t file, Identifier& id, bool visible, bool rewriteName, SymbolKind kind = SymbolKind::Type) {
         auto scope = sources[file].moduleId;
@@ -142,43 +146,162 @@ struct Linker {
         if (rewriteName) id.text = std::move(name);
     }
 
-    Symbol resolve(const Import& use, std::set<const Import*>& active) const {
-        const auto& source = sources[use.file];
-        if (!active.insert(&use).second) throw at(source, use.alias.span, "LYN0004", "重导出形成循环：" + use.alias.text);
-        auto target = importTarget(source, *spaces.at(source.moduleId).package, use, prefixes);
-        auto& name = use.path.back();
-        auto found = spaces.find(target.module);
-        if (found == spaces.end()) throw at(source, name.span, macroPhase ? "LYM0004" : "LYN0003", "导入的手写源码模块不存在");
-        auto& space = found->second;
-        if (auto hit = space.definitions.find(name.text); hit != space.definitions.end() && hit->second.visible && !hit->second.imported) {
+    std::optional<Symbol> exported(const Space& space, const std::string& name, std::set<const Import*>& active) const {
+        if (auto hit = space.definitions.find(name); hit != space.definitions.end() && hit->second.visible) {
             auto result = hit->second;
-            result.visible = use.isPublic;
             result.imported = true;
             std::erase_if(result.targets, [](const auto& target) { return !target.visible; });
             return result;
         }
-        if (auto alias = space.imports.find(name.text); alias != space.imports.end() && alias->second.isPublic) {
-            auto symbol = resolve(alias->second, active);
-            symbol.visible = use.isPublic;
-            if (indexing && alias->second.alias.span != alias->second.path.back().span)
-                symbol.renameTarget = SourceAnchor{alias->second.file, alias->second.alias.span};
-            return symbol;
+        if (auto use = space.exports.find(name); use != space.exports.end()) {
+            auto result = resolve(use->second, active);
+            if (indexing && use->second.alias.span != use->second.member->span)
+                result.renameTarget = SourceAnchor{use->second.file, use->second.alias.span};
+            return result;
         }
-        throw at(source, name.span, macroPhase ? "LYM0004" : "LYN0003", "目标模块没有可用的公开声明：" + name.text);
+        return {};
     }
 
-    Symbol import(const Import& use) {
+    Symbol resolve(const Import& use, std::set<const Import*>& active) const {
+        const auto& source = sources[use.file];
+        if (!active.insert(&use).second) throw at(source, use.alias.span, "LYN0004", "重导出形成循环：" + use.alias.text);
+        auto target = importTarget(source, *spaces.at(source.moduleId).package, use.path, prefixes);
+        auto found = spaces.find(target.module);
+        auto code = macroPhase ? "LYM0004" : "LYN0003";
+        if (found == spaces.end()) {
+            auto error = at(source, use.path.back().span, code, "找不到导入的模块：" + use.path.back().text);
+            auto rootSize = use.path.front().text == "std" ? 2u : 1u;
+            if (!use.member && use.path.size() > rootSize) {
+                const auto parent = spaces.find(target.module.substr(0, target.module.rfind('/')));
+                if (parent != spaces.end() && (parent->second.definitions.contains(use.path.back().text) || parent->second.exports.contains(use.path.back().text))) {
+                    auto name = editorSpelling(source, use.path.back());
+                    auto alias = use.alias.span == use.path.back().span ? "" : " as " + editorSpelling(source, use.alias);
+                    error.message = "此路径指向声明而非模块；请选择 .{" + name + alias + '}';
+                }
+            }
+            throw error;
+        }
+        if (!use.member) return {std::move(target.module), SymbolKind::Module, false, true, {}, SourceAnchor{use.file, use.alias.span}};
+        if (auto symbol = exported(found->second, use.member->text, active)) return std::move(*symbol);
+        throw at(source, use.member->span, code, "目标模块没有可用的公开声明：" + use.member->text);
+    }
+
+    Symbol resolve(const Import& use) const {
         std::set<const Import*> active;
-        auto result = resolve(use, active);
-        if (indexing && result.targets.size() == 1) {
+        return resolve(use, active);
+    }
+
+    void validateImport(const Import& use) {
+        auto result = [&] {
+            try { return resolve(use); }
+            catch (const Diagnostic&) {
+                if (!macroPhase || use.file < 2) throw;
+                return Symbol{"$unexpanded::" + use.alias.text, SymbolKind::Callable, false, true};
+            }
+        }();
+        if (indexing && result.kind == SymbolKind::Module) {
+            auto anchor = *result.renameTarget;
+            references.push_back({anchor, anchor, anchor});
+        } else if (indexing && result.targets.size() == 1) {
             auto target = result.targets.front().anchor;
-            references.push_back({{use.file, use.path.back().span}, target, result.renameTarget});
-            if (use.alias.span != use.path.back().span) {
+            references.push_back({{use.file, use.member->span}, target, result.renameTarget});
+            if (use.alias.span != use.member->span) {
                 result.renameTarget = SourceAnchor{use.file, use.alias.span};
                 references.push_back({*result.renameTarget, target, result.renameTarget});
             }
         }
-        return result;
+        resolvedImports.emplace(&use, std::move(result));
+    }
+
+    void addImport(const Import& use) {
+        const auto& source = sources[use.file];
+        auto& space = spaces.at(source.moduleId);
+        auto& imports = use.isPublic ? space.exports : fileImports[use.file];
+        if (space.definitions.contains(use.alias.text) || space.exports.contains(use.alias.text) || !imports.emplace(use.alias.text, use).second)
+            throw at(source, use.alias.span, "LYN0002", "导入名称已被使用：" + use.alias.text);
+    }
+
+    std::optional<Symbol> lookup(std::size_t file, const std::string& name) const {
+        auto binding = [&](const Import& use) {
+            if (auto found = resolvedImports.find(&use); found != resolvedImports.end()) return found->second;
+            auto symbol = resolve(use);
+            if (indexing && use.member && use.alias.span != use.member->span) symbol.renameTarget = SourceAnchor{use.file, use.alias.span};
+            return symbol;
+        };
+        for (auto current = std::optional(file); current; current = sources[*current].importParent) {
+            if (auto imports = fileImports.find(*current); imports != fileImports.end())
+                if (auto use = imports->second.find(name); use != imports->second.end()) return binding(use->second);
+        }
+        const auto& space = spaces.at(sources[file].moduleId);
+        if (auto found = space.definitions.find(name); found != space.definitions.end()) return found->second;
+        if (auto use = space.exports.find(name); use != space.exports.end()) return binding(use->second);
+        return {};
+    }
+
+    std::optional<Symbol> exported(const std::string& module, const std::string& name) const {
+        std::set<const Import*> active;
+        return exported(spaces.at(module), name, active);
+    }
+
+    TypeForm linkType(std::size_t file, TypeForm form, Span span, std::span<const Identifier> parameters,
+        std::set<std::string>* needs = nullptr) const {
+        auto parameter = [&](const std::string& name) { return std::ranges::find(parameters, name, &Identifier::text) != parameters.end(); };
+        auto qualified = [&](const std::string& alias, const std::string& name) -> std::optional<Symbol> {
+            if (parameter(alias)) return {};
+            auto scope = lookup(file, alias);
+            if (!scope || scope->kind != SymbolKind::Module) return {};
+            if (auto symbol = exported(scope->name, name); symbol && symbol->kind == SymbolKind::Type) return symbol;
+            throw at(sources[file], span, "LYN0003", "模块没有可用的公开类型：" + alias + '.' + name);
+        };
+        const bool dynamic = form.name.starts_with("$dyn:");
+        auto name = dynamic ? form.name.substr(5) : form.name;
+        std::optional<Symbol> target;
+        if (name.starts_with("$assoc:") && form.arguments.front().arguments.empty()) {
+            target = qualified(form.arguments.front().name, name.substr(7));
+            if (target) form.arguments.clear();
+        } else if (auto dot = name.find('.'); dot != name.npos) {
+            target = qualified(name.substr(0, dot), name.substr(dot + 1));
+        } else if (!name.starts_with('$') && (dynamic || !parameter(name))) {
+            target = lookup(file, name);
+            if (target && target->kind != SymbolKind::Type) target.reset();
+        }
+        if (target) {
+            if (needs) needs->insert(target->name);
+            form.name = dynamic ? "$dyn:" + target->name : target->name;
+        }
+        for (auto& part : form.arguments) part = linkType(file, std::move(part), span, parameters, needs);
+        return form;
+    }
+
+    void indexTypeNames(std::size_t file, Span span, std::span<const Identifier> parameters) {
+        const auto& source = sources[file];
+        auto text = std::string_view(source.text).substr(span.begin, span.end - span.begin);
+        auto tokens = syntaxTokens(sourceText(source.path, std::string(text), {}), false, true);
+        auto spelling = [&](std::size_t index) { const auto token = tokens[index].span; return text.substr(token.begin, token.end - token.begin); };
+        auto identifier = [&](std::size_t index) {
+            auto word = spelling(index);
+            return std::string(word.starts_with('`') ? word.substr(1, word.size() - 2) : word);
+        };
+        auto anchor = [&](std::size_t index) {
+            auto token = tokens[index].span;
+            return SourceAnchor{file, {span.begin + token.begin, span.begin + token.end}};
+        };
+        auto indexSymbol = [&](std::size_t index, const Symbol& symbol) {
+            if (symbol.kind == SymbolKind::Type && symbol.targets.size() == 1)
+                references.push_back({anchor(index), symbol.targets.front().anchor, symbol.renameTarget});
+        };
+        for (std::size_t index = 0; index < tokens.size(); ++index) {
+            if (tokens[index].kind != "name" || (index > 0 && spelling(index - 1) == ".") ||
+                (index + 1 < tokens.size() && spelling(index + 1) == "=")) continue;
+            auto name = identifier(index);
+            if (std::ranges::find(parameters, name, &Identifier::text) != parameters.end()) continue;
+            auto symbol = lookup(file, name);
+            if (!symbol) continue;
+            if (symbol->kind == SymbolKind::Module && index + 2 < tokens.size() && spelling(index + 1) == "." && tokens[index + 2].kind == "name") {
+                references.push_back({anchor(index), *symbol->renameTarget, symbol->renameTarget});
+                if (auto member = exported(symbol->name, identifier(index + 2))) indexSymbol(index + 2, *member);
+            } else indexSymbol(index, *symbol);
+        }
     }
 
     void collect(Module& syntax, bool rewriteNames) {
@@ -190,15 +313,8 @@ struct Linker {
         for (auto& extension : syntax.extensions) declare(extension.file, extension.name, extension.isPublic, rewriteNames, SymbolKind::Extension);
         for (auto& fn : syntax.functions) if (!fn.owner && !fn.extensionGroup)
             declare(fn.file, fn.name, fn.isPublic, rewriteNames, fn.constant == ConstKind::Value ? SymbolKind::Constant : SymbolKind::Callable);
-        for (const auto& use : syntax.imports) {
-            if (use.kind != ImportKind::Runtime) continue;
-            const auto& source = sources[use.file];
-            if (source.origin) continue;
-            auto& space = spaces.at(source.moduleId);
-            if (space.definitions.contains(use.alias.text) || !space.imports.emplace(use.alias.text, use).second) {
-                throw at(source, use.alias.span, "LYN0002", "导入名称已被使用：" + use.alias.text);
-            }
-        }
+        for (bool shared : {true, false}) for (const auto& use : syntax.imports)
+            if (use.kind == ImportKind::Runtime && use.isPublic == shared) addImport(use);
     }
 
     void rewrite(Module& syntax, SymbolDependencies* dependencies = nullptr) {
@@ -206,67 +322,29 @@ struct Linker {
         if (macroPhase) {
             auto& scope = spaces.at("$macroImplementation");
             for (const auto& [name, symbol] : spaces.at("$macroPrelude").definitions)
-                if (scope.imports.contains(name) || !scope.definitions.emplace(name, symbol).second)
+                if (lookup(1, name) || !scope.definitions.emplace(name, symbol).second)
                     throw at(sources[1], {0, 0}, "LYM0002", "宏预定义名称不能被重定义：" + name);
         }
-        std::map<std::size_t, std::map<std::string, const Import*>> generatedImports;
-        for (const auto& use : syntax.imports) if (const auto& source = sources[use.file]; use.kind == ImportKind::Runtime && source.origin) {
-            if (!generatedImports[use.file].emplace(use.alias.text, &use).second) throw at(source, use.alias.span, "LYN0002", "生成代码中重复的导入名称：" + use.alias.text);
-        }
-        for (auto& [moduleId, space] : spaces) {
-            for (const auto& [name, use] : space.imports) {
-                try { space.definitions.emplace(name, import(use)); }
-                catch (const Diagnostic&) {
-                    if (!macroPhase || use.file < 2) throw;
-                    space.definitions.emplace(name, Symbol{"$unexpanded::" + name, SymbolKind::Callable, false, true});
-                }
-            }
-        }
-        std::map<std::size_t, std::map<std::string, Symbol>> generatedScopes;
-        for (const auto& [file, imports] : generatedImports) {
-            auto& scope = generatedScopes[file] = spaces.at(sources[file].moduleId).definitions;
-            for (const auto& [name, use] : imports) scope[name] = import(*use);
-        }
-        auto scopeOf = [&](std::size_t file) -> const auto& {
-            auto generated = generatedScopes.find(file);
-            return generated == generatedScopes.end() ? spaces.at(sources[file].moduleId).definitions : generated->second;
-        };
+        for (const auto& [module, space] : spaces) for (const auto& [name, use] : space.exports) validateImport(use);
+        for (const auto& [file, imports] : fileImports) for (const auto& [name, use] : imports) validateImport(use);
         std::set<std::string>* needs{};
         auto group = [&](const auto& name) { if (dependencies) needs = &(*dependencies)[name]; };
         std::map<std::string, std::vector<std::string>> moduleExtensions;
         if (dependencies) for (const auto& extension : syntax.extensions)
             moduleExtensions[sources[extension.file].moduleId].push_back(extension.name.text);
         auto renameTypeIn = [&](std::size_t file, Identifier& type, std::span<const Identifier> parameters = {}) {
-            const auto& scope = scopeOf(file);
-            if (indexing && type.span.end > type.span.begin) {
-                const auto& source = sources[file];
-                auto text = source.text.substr(type.span.begin, type.span.end - type.span.begin);
-                auto fragment = sourceText(source.path, text, {});
-                bool projection = false;
-                for (const auto& token : syntaxTokens(fragment, false, true)) {
-                    auto name = std::string_view(text).substr(token.span.begin, token.span.end - token.span.begin);
-                    if (name == ".") { projection = true; continue; }
-                    if (std::exchange(projection, false) || token.kind != "name") continue;
-                    auto after = text.find_first_not_of(" \t\r\n", token.span.end);
-                    if (after != text.npos && text[after] == '=') continue;
-                    if (name.starts_with('`')) name = name.substr(1, name.size() - 2);
-                    if (std::ranges::any_of(parameters, [&](const auto& parameter) { return parameter.text == name; })) continue;
-                    if (auto found = scope.find(std::string(name)); found != scope.end() && found->second.kind == SymbolKind::Type && found->second.targets.size() == 1)
-                        references.push_back({{file, {type.span.begin + token.span.begin, type.span.begin + token.span.end}}, found->second.targets.front().anchor, found->second.renameTarget});
-                }
-            }
-            type.text = mapTypeNames(typeForm(type.text), [&](const std::string& name) {
-                if (std::ranges::any_of(parameters, [&](const auto& parameter) { return parameter.text == name; })) return name;
-                auto found = scope.find(name);
-                if (found == scope.end()) return name;
-                if (needs) needs->insert(found->second.name);
-                return found->second.name;
-            });
+            if (indexing && type.span.end > type.span.begin) indexTypeNames(file, type.span, parameters);
+            type.text = mapTypeNames(linkType(file, typeForm(type.text), type.span, parameters, needs), [](const auto& name) { return name; });
         };
         syntax.importedExtensions.resize(sources.size());
         if (!syntax.extensions.empty()) for (std::size_t file = 0; file < sources.size(); ++file) {
             std::set<std::string> groups;
-            for (const auto& [alias, symbol] : scopeOf(file)) if (symbol.imported && symbol.kind == SymbolKind::Extension) groups.insert(symbol.name);
+            std::set<std::string> names;
+            for (const auto& [name, use] : spaces.at(sources[file].moduleId).exports) names.insert(name);
+            for (auto current = std::optional(file); current; current = sources[*current].importParent)
+                if (auto imports = fileImports.find(*current); imports != fileImports.end())
+                    for (const auto& [name, use] : imports->second) names.insert(name);
+            for (const auto& name : names) if (auto symbol = lookup(file, name); symbol->kind == SymbolKind::Extension) groups.insert(symbol->name);
             syntax.importedExtensions[file].assign(groups.begin(), groups.end());
         }
         auto renameBounds = [&](const auto& declaration, auto& bounds) {
@@ -306,9 +384,9 @@ struct Linker {
             }
         }
         for (auto& fn : syntax.functions) {
-            const auto& scope = scopeOf(fn.file);
             auto rename = [&](Identifier& name) {
-                if (auto found = scope.find(name.text); found != scope.end()) name.text = found->second.name;
+                const auto& definitions = spaces.at(sources[fn.file].moduleId).definitions;
+                if (auto found = definitions.find(name.text); found != definitions.end()) name.text = found->second.name;
             };
             auto renameType = [&](Identifier& name) {
                 renameTypeIn(fn.file, name, fn.typeParameters);
@@ -325,19 +403,41 @@ struct Linker {
             if (!fn.result.text.empty()) renameType(fn.result);
             for (auto& type : fn.throwsTypes) renameType(type);
             for (auto& param : fn.parameters) renameType(param.type);
+            auto link = [&](Identifier& name, const Symbol& symbol) {
+                if (symbol.kind == SymbolKind::Module) {
+                    name.moduleAlias = symbol.renameTarget;
+                    return;
+                }
+                name.linked = symbol.name;
+                name.exportedOnly = symbol.imported;
+                name.renameTarget = symbol.renameTarget;
+                if (needs) needs->insert(symbol.name);
+            };
             auto reference = [&](Identifier& name, std::optional<SymbolKind> kind = {}) {
-                if (auto found = scope.find(name.text); found != scope.end()) {
-                    if (kind && found->second.kind != *kind) return;
-                    name.linked = found->second.name;
-                    name.exportedOnly = found->second.imported;
-                    name.renameTarget = found->second.renameTarget;
-                    if (needs) needs->insert(found->second.name);
+                if (auto found = lookup(fn.file, name.text)) {
+                    if (!kind || found->kind == *kind) link(name, *found);
                 }
                 else if (!kind && name.text == "main") name.linked = sources[fn.file].moduleId + "::main";
             };
+            auto qualify = [&](const Identifier& alias, Identifier& name, std::optional<SymbolKind> kind = {}) {
+                auto scope = lookup(fn.file, alias.text);
+                if (!scope || scope->kind != SymbolKind::Module) return false;
+                name.moduleMember = true;
+                if (auto found = exported(scope->name, name.text); found && (!kind || found->kind == *kind) && found->kind != SymbolKind::Extension) link(name, *found);
+                return true;
+            };
+            auto qualifyReceiver = [&](ExprId receiver, Identifier& name, std::optional<SymbolKind> kind = {}) {
+                if (auto* alias = std::get_if<Identifier>(&fn.expressions[receiver].node)) qualify(*alias, name, kind);
+            };
             auto renamePattern = [&](auto&& self, Pattern& pattern) -> void {
                 if (auto* name = std::get_if<PatternName>(&pattern.node)) {
-                    if (name->owner) reference(*name->owner, SymbolKind::Type);
+                    if (name->module) {
+                        reference(*name->module, SymbolKind::Module);
+                        qualify(*name->module, *name->owner, SymbolKind::Type);
+                    } else if (name->owner && qualify(*name->owner, name->name, name->labels ? SymbolKind::Type : SymbolKind::Constant)) {
+                        name->module = std::exchange(name->owner, {});
+                        reference(*name->module, SymbolKind::Module);
+                    } else if (name->owner) reference(*name->owner, SymbolKind::Type);
                     else if (name->labels) reference(name->name, SymbolKind::Type);
                     else if (!name->escaped) reference(name->name, SymbolKind::Constant);
                 }
@@ -346,13 +446,16 @@ struct Linker {
             for (auto& expr : fn.expressions) {
                 if (auto* name = std::get_if<Identifier>(&expr.node)) reference(*name);
                 auto renameQualifier = [&](TypeQualifier& owner) {
-                    reference(owner.name);
+                    if (owner.moduleReceiver) qualifyReceiver(*owner.moduleReceiver, owner.name, SymbolKind::Type);
+                    else reference(owner.name);
                     for (auto& type : owner.arguments) renameType(type);
                 };
+                if (auto* member = std::get_if<Member>(&expr.node)) qualifyReceiver(member->receiver, member->name);
                 if (auto* member = std::get_if<QualifiedMember>(&expr.node)) renameQualifier(member->owner);
                 if (auto* call = std::get_if<Call>(&expr.node)) {
                     if (call->typeOwner) renameQualifier(*call->typeOwner);
-                    else if (!call->receiver && !call->function) reference(call->name);
+                    else if (call->receiver) qualifyReceiver(*call->receiver, call->name);
+                    else if (!call->function) reference(call->name);
                     for (auto& type : call->typeArguments) renameType(type);
                 }
                 if (auto* binding = std::get_if<Binding>(&expr.node); binding && binding->annotation) renameType(*binding->annotation);
@@ -395,6 +498,12 @@ struct DeclarationTypes {
     std::string fingerprint() const {
         llvm::SHA256 hash;
         auto text = [&](std::string_view value) { hash.update(std::to_string(value.size()) + ':'); hash.update(value); };
+        auto import = [&](const std::string& name, const Import& use) {
+            text("import"); text(name);
+            text(std::to_string(use.path.size()));
+            for (const auto& part : use.path) text(part.text);
+            text(use.member ? use.member->text : "");
+        };
         for (const auto& [scope, space] : linker.spaces) {
             text("module"); text(scope); text(space.package->id);
             for (const auto& [alias, dependency] : space.package->dependencies) {
@@ -403,11 +512,11 @@ struct DeclarationTypes {
             for (const auto& [name, symbol] : space.definitions) if (symbol.kind == SymbolKind::Type) {
                 text("type"); text(name); text(symbol.visible ? "public" : "private");
             }
-            for (const auto& [name, use] : space.imports) {
-                text("import"); text(name); text(use.isPublic ? "public" : "private");
-                text(std::to_string(use.path.size()));
-                for (const auto& part : use.path) text(part.text);
-            }
+            for (const auto& [name, use] : space.exports) import(name, use);
+        }
+        for (const auto& [file, imports] : linker.fileImports) {
+            text("file"); text(pathText(linker.sources[file].path));
+            for (const auto& [name, use] : imports) import(name, use);
         }
         for (const auto& [name, alias] : aliases) {
             text("alias"); text(name); text(alias.target.text); text(std::to_string(alias.typeParameters.size()));
@@ -440,33 +549,26 @@ struct DeclarationTypes {
             const bool dynamic = name.starts_with("$dyn:");
             auto lookup = dynamic ? name.substr(5) : name;
             if (!dynamic && form.arguments.empty()) if (auto parameter = generics.find(name); parameter != generics.end()) return parameter->second;
-            const auto& scope = linker.spaces.at(source.moduleId);
-            std::optional<Symbol> symbol;
-            if (auto found = scope.definitions.find(lookup); found != scope.definitions.end()) symbol = found->second;
-            else if (auto found = scope.imports.find(lookup); found != scope.imports.end()) {
-                std::set<const Import*> imports;
-                symbol = linker.resolve(found->second, imports);
-            }
-            if (symbol && symbol->kind == SymbolKind::Type) {
-                auto separator = symbol->name.rfind("::");
-                if (!dynamic) if (auto alias = aliases.find(symbol->name); alias != aliases.end()) {
+            if (auto separator = lookup.rfind("::"); separator != lookup.npos) {
+                if (!dynamic) if (auto alias = aliases.find(lookup); alias != aliases.end()) {
                     const auto& target = alias->second;
                     if (form.arguments.size() != target.typeParameters.size()) throw at(source, span, "LYT0003", "类型别名的类型实参数量不符：" + lookup);
                     Bindings mapped;
                     for (std::size_t slot = 0; slot < form.arguments.size(); ++slot)
                         mapped.emplace(target.typeParameters[slot].text, self(self, form.arguments[slot], from, span, generics, depth + 1));
-                    if (std::ranges::find(active, symbol->name) != active.end()) throw at(source, span, "LYT0003", "透明类型别名形成循环：" + lookup);
-                    active.push_back(symbol->name);
-                    auto result = self(self, typeForm(target.target.text), target.file, target.target.span, mapped, depth + 1);
+                    if (std::ranges::find(active, lookup) != active.end()) throw at(source, span, "LYT0003", "透明类型别名形成循环：" + lookup);
+                    active.push_back(lookup);
+                    auto linked = linker.linkType(target.file, typeForm(target.target.text), target.target.span, target.typeParameters);
+                    auto result = self(self, linked, target.file, target.target.span, mapped, depth + 1);
                     active.pop_back();
                     return result;
                 }
-                auto shape = shapes.find(symbol->name);
+                auto shape = shapes.find(lookup);
                 if (shape == shapes.end() || shape->second.trait != dynamic || shape->second.arity != form.arguments.size())
                     throw at(source, span, "LYT0003", "找不到类型或类型实参数量不符：" + lookup);
                 if (dynamic) for (const auto& binding : form.arguments) if (!shape->second.members.contains(binding.name.substr(6)))
                     throw at(source, span, "LYG0007", "动态接口没有关联类型：" + binding.name.substr(6));
-                auto module = symbol->name.substr(0, separator);
+                auto module = lookup.substr(0, separator);
                 auto standard = module.starts_with("$std/");
                 if (standard) module = "std." + module.substr(5);
                 else {
@@ -475,9 +577,9 @@ struct DeclarationTypes {
                     module = path == std::string::npos ? std::move(prefix) : prefix + module.substr(path);
                     std::ranges::replace(module, '/', '.');
                 }
-                return make(dynamic ? "dyn" : standard ? "standard" : "named", symbol->name.substr(separator + 2), std::move(module));
+                return make(dynamic ? "dyn" : standard ? "standard" : "named", lookup.substr(separator + 2), std::move(module));
             }
-            if (!symbol && !dynamic) {
+            if (!dynamic) {
                 if (form.arguments.empty() && (numberType(name) || name == "Bool" || name == "String" || name == "Char" || name == "Bytes" || name == "Unit" || name == "Never" || name == "CPtr" || name == "CCallback" || name == "Exception" || name == "ChannelClosed" || name == "Any" || name == "Error"))
                     return make("builtin", name);
                 if (form.arguments.size() == 1 && (name == "List" || name == "FrozenList" || name == "Option" || name == "Range" || name == "Task" || name == "TaskLocal" || name == "Channel" || name == "TaskOutcome"))
@@ -488,7 +590,8 @@ struct DeclarationTypes {
         };
         Bindings generics;
         for (const auto& param : parameters) generics.emplace(param.text, MacroType{"parameter", param.text, {}});
-        return visit(visit, typeForm(annotation.text), file, annotation.span, generics, 0);
+        auto linked = linker.linkType(file, typeForm(annotation.text), annotation.span, parameters);
+        return visit(visit, linked, file, annotation.span, generics, 0);
     }
 };
 
@@ -599,8 +702,8 @@ struct MacroImports {
         if (auto bound = bindings.find(key); bound != bindings.end()) return bound->second;
         const auto& source = sources[use.file];
         if (!active.insert(&use).second) throw at(source, use.alias.span, "LYM0004", "编译期宏重导出形成依赖环：" + use.alias.text);
-        auto target = importTarget(source, *spaces.at(source.moduleId).package, use, prefixes);
-        const auto& name = use.path.back();
+        auto target = importTarget(source, *spaces.at(source.moduleId).package, use.path, prefixes);
+        const auto& name = *use.member;
         std::optional<MacroOrigin> origin;
         if (auto alias = aliases.find({target.module, use.kind, name.text}); alias != aliases.end() && alias->second->isPublic)
             origin = resolve(*alias->second, kind, active);
@@ -621,7 +724,7 @@ struct MacroImports {
             bool found = false;
             for (auto kind : {MacroKind::Declaration, MacroKind::Expression, MacroKind::Decorator})
                 if (family(kind) == use->kind) found |= resolve(*use, kind, active).has_value();
-            if (!found) throw at(sources[use->file], use->path.back().span, "LYM0001", "找不到以 pub fn 导出的宏或装饰器：" + use->path.back().text);
+            if (!found) throw at(sources[use->file], use->member->span, "LYM0001", "找不到以 pub fn 导出的宏或装饰器：" + use->member->text);
         }
     }
 
@@ -698,7 +801,7 @@ struct MacroDependencies {
             if (use.kind != ImportKind::Runtime) continue;
             const auto& source = code[use.file];
             const auto& from = *scopes.at(source.moduleId).package;
-            if (use.path.size() >= 3 && use.path.front().text == "std") {
+            if (use.path.size() >= 2 && use.path.front().text == "std") {
                 auto name = use.path[1].text;
                 auto key = "$std/" + name;
                 if (!names.contains(key)) {
@@ -720,7 +823,7 @@ struct MacroDependencies {
                 }
             }
             std::optional<ImportTarget> target;
-            try { target = importTarget(code[use.file], from, use, names); }
+            try { target = importTarget(code[use.file], from, use.path, names); }
             catch (const Diagnostic&) { if (use.file == 1) throw; }
             if (!target || !read.insert(target->module).second) continue;
             auto space = spaces.find(target->module);
@@ -886,7 +989,7 @@ struct ModuleCatalog {
             const auto& package = *packages.at(id);
             for (const auto& [alias, target] : package.dependencies) pending.push_back(target);
             auto directory = package.root / "src";
-            auto paths = sourcePaths(directory, &overlays, false, !id.starts_with("$std/"));
+            auto paths = sourcePaths(directory, &overlays, false);
             addModule(package, {});
             if (id == entry.id && std::ranges::find(paths, path) == paths.end()) paths.push_back(path);
             for (const auto& filePath : paths) {
@@ -917,51 +1020,67 @@ struct ModuleCatalog {
     void macroSymbols();
 };
 
-Import editorImport(std::size_t file, const std::vector<std::string>& route, ImportKind kind) {
-    std::vector<Identifier> segments;
-    for (const auto& word : route) segments.push_back({word, {0, 0}});
-    auto alias = segments.back();
-    return {file, false, std::move(segments), std::move(alias), kind};
-}
-
 void ModuleCatalog::runtimeSymbols() {
     const auto& source = sources[*current];
-    for (const auto& use : imports) {
+    for (bool shared : {true, false}) for (const auto& use : imports) {
+        if (use.isPublic != shared) continue;
         const auto& module = sources[use.file].moduleId;
         if (use.kind == ImportKind::Runtime) {
-            if (module == source.moduleId) index.occupied.insert(use.alias.text);
-            spaces.at(module).imports.try_emplace(use.alias.text, use);
+            if ((use.isPublic && module == source.moduleId) || use.file == *current) index.occupied.insert(use.alias.text);
+            try { linker.addImport(use); }
+            catch (const Diagnostic&) { continue; }
         } else macroImports.aliases.try_emplace(std::tuple{module, use.kind, use.alias.text}, &use);
     }
-    auto resolve = [&](const Import& use) -> std::optional<Symbol> {
-        std::set<const Import*> active;
-        try { return linker.resolve(use, active); }
-        catch (const Diagnostic&) { return {}; }
-    };
     auto describe = [&](const Symbol& symbol, const std::string& alias) {
         auto anchor = symbol.targets.front().anchor;
         auto description = symbols.at({anchor.file, anchor.span.begin});
         description.label = editorIdentifier(alias);
         return description;
     };
-    std::set<std::pair<std::size_t, std::size_t>> visibleTargets;
-    auto visible = [&](const std::string& alias, const Symbol& symbol) {
-        index.visible.push_back(describe(symbol, alias));
-        for (const auto& target : symbol.targets) visibleTargets.emplace(target.anchor.file, target.anchor.span.begin);
+    auto listExports = [&](const std::string& module, const auto& emit) {
+        const auto& space = spaces.at(module);
+        auto selected = [&](const std::string& name) {
+            try { if (auto symbol = linker.exported(module, name)) emit(name, *symbol); }
+            catch (const Diagnostic&) { return; }
+        };
+        for (const auto& [name, symbol] : space.definitions) if (symbol.visible) selected(name);
+        for (const auto& [name, use] : space.exports) selected(name);
     };
     const auto& own = spaces.at(source.moduleId);
-    for (const auto& [name, symbol] : own.definitions) { index.occupied.insert(name); visible(name, symbol); }
-    for (const auto& [alias, use] : own.imports) if (auto symbol = resolve(use)) {
-        if (!own.definitions.contains(alias)) visible(alias, *symbol);
-        if (use.file == *current) for (const auto& target : symbol->targets) {
-            auto anchor = target.anchor;
-            auto description = symbols.at({anchor.file, anchor.span.begin});
-            index.definitions.push_back({use.path.back().span, sources[anchor.file].path, anchor.span, description});
-            if (use.alias.span != use.path.back().span) index.definitions.push_back({use.alias.span, sources[anchor.file].path, anchor.span, description});
-        }
+    for (const auto& [name, symbol] : own.definitions) {
+        index.occupied.insert(name);
+        index.visible.push_back(describe(symbol, name));
+    }
+    auto imported = [&](const Import& use) {
+        try {
+            auto symbol = linker.resolve(use);
+            if (symbol.kind == SymbolKind::Module) {
+                auto& nameSpace = index.namespaces.emplace(use.alias.text, EditorNamespace{symbol.name, {}}).first->second;
+                listExports(symbol.name, [&](const auto& name, const auto& item) { nameSpace.members.push_back(describe(item, name)); });
+                auto pathSpan = Span{use.path.front().span.begin, use.path.back().span.end};
+                index.visible.push_back({editorModuleAlias(use.alias.text), EditorKind::Module, use.alias.span,
+                    "import " + editorSpelling(source, Identifier{"", pathSpan})});
+                return;
+            }
+            index.visible.push_back(describe(symbol, use.alias.text));
+            if (use.file != *current) return;
+            for (const auto& target : symbol.targets) {
+                auto anchor = target.anchor;
+                auto description = symbols.at({anchor.file, anchor.span.begin});
+                index.definitions.push_back({use.member->span, sources[anchor.file].path, anchor.span, description});
+                if (use.alias.span != use.member->span) index.definitions.push_back({use.alias.span, sources[anchor.file].path, anchor.span, description});
+            }
+        } catch (const Diagnostic&) { return; }
+    };
+    for (const auto& [name, use] : own.exports) imported(use);
+    if (auto file = linker.fileImports.find(*current); file != linker.fileImports.end()) {
+        for (const auto& [name, use] : file->second) imported(use);
     }
     for (const auto& [module, space] : spaces) {
         auto [first, last] = routes.equal_range(space.package->id);
+        if (first == last) continue;
+        std::vector<std::pair<std::string, EditorSymbol>> exports;
+        listExports(module, [&](const auto& name, const auto& symbol) { exports.emplace_back(name, describe(symbol, name)); });
         for (auto base = first; base != last; ++base) {
             auto route = base->second;
             bool standardLibrary = route.front() == "std";
@@ -974,20 +1093,11 @@ void ModuleCatalog::runtimeSymbols() {
                 }
             }
             if (std::ranges::any_of(route, [](const auto& word) { return editorIdentifier(word).empty(); })) continue;
-            auto exported = [&](const std::string& name, const Symbol& symbol) {
+            for (const auto& [name, symbol] : exports) {
                 auto qualified = route;
                 qualified.push_back(name);
-                bool automatic = symbol.kind != SymbolKind::Extension && !index.occupied.contains(name) &&
-                    std::ranges::none_of(symbol.targets, [&](const auto& target) { return visibleTargets.contains({target.anchor.file, target.anchor.span.begin}); });
-                index.imports.push_back({ImportKind::Runtime, std::move(qualified), describe(symbol, name), automatic});
-            };
-            for (const auto& [name, symbol] : space.definitions) if (symbol.visible) {
-                auto qualified = route;
-                qualified.push_back(name);
-                if (auto resolved = resolve(editorImport(*current, qualified, ImportKind::Runtime))) exported(name, *resolved);
+                index.imports.push_back({ImportKind::Runtime, std::move(qualified), symbol, false, {}, module});
             }
-            for (const auto& [alias, use] : space.imports)
-                if (use.isPublic && !space.definitions.contains(alias)) if (auto symbol = resolve(use)) exported(alias, *symbol);
         }
     }
 }
@@ -1059,7 +1169,7 @@ void ModuleCatalog::macroSymbols() {
                 if (resolved) visible.emplace(std::pair{macro, alias}, *resolved);
             }
             if (resolved && use->file == *current) {
-                resolved->use = use->path.back().span;
+                resolved->use = use->member->span;
                 index.definitions.push_back(*resolved);
                 if (use->alias.span != resolved->use) { resolved->use = use->alias.span; index.definitions.push_back(*resolved); }
             }
@@ -1138,6 +1248,7 @@ Compilation loadProgram(const PackageGraph& graph, const std::string& entry, con
     for (const auto& id : reachable) {
         auto package = packages.at(id);
         auto directory = package->root / "src";
+        spaces.try_emplace(prefixes.at(id), Space{package});
         for (const auto& path : sourcePaths(directory, overlays, true)) {
             auto module = directoryModule(prefixes.at(id), directory, path);
             spaces.try_emplace(module, Space{package});
@@ -1171,7 +1282,7 @@ Compilation loadProgram(const PackageGraph& graph, const std::string& entry, con
     auto loadBundled = [&](Module& syntax, bool handwritten) {
         for (; loadedImports < syntax.imports.size(); ++loadedImports) {
             const auto& use = syntax.imports[loadedImports];
-            if (use.kind != ImportKind::Runtime || use.path.size() < 3 || use.path[0].text != "std") continue;
+            if (use.kind != ImportKind::Runtime || use.path.size() < 2 || use.path[0].text != "std") continue;
             auto name = use.path[1].text;
             auto key = "$std/" + name;
             if (bundled.contains(key)) continue;

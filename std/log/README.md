@@ -1,10 +1,10 @@
 # `std.log`
 
 ```lyra
-import std.json.jsonInt
-import std.json.jsonObject
-import std.log.LogFormat
-import std.log.Logger
+import std.json.{jsonInt}
+import std.json.{jsonObject}
+import std.log.{LogFormat}
+import std.log.{Logger}
 
 val logger = Logger("worker", format: LogFormat.Json)
 val result = logger.info("job completed", fields: jsonObject().put("job", jsonInt(7)).build())

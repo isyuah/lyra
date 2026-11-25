@@ -5,8 +5,8 @@
 例如，读取已有 `notes.db` 中的一条留言：
 
 ```lyra
-import std.sqlite.DbError
-import std.sqlite.openReadOnly
+import std.sqlite.{DbError}
+import std.sqlite.{openReadOnly}
 
 fn lookup(id: Int): Result<String?, DbError> {
     val db = openReadOnly("notes.db")?
@@ -36,8 +36,8 @@ fn main(): Unit {
 `db.exec(sql)` 与 `tx.exec(sql)` 用于一次执行一条不带绑定参数、也不返回列的命令，例如 `CREATE TABLE`。`SELECT`、`RETURNING` 和参数化语句用 `prepare`。可用 `lastInsertRowid()` 读取连接最近一次成功插入的 SQLite rowid；即使这次插入随后回滚，SQLite 也不会重置该值。若要原子地关联插入和取 rowid，两步都在同一个事务回调里执行。
 
 ```lyra
-import std.sqlite.Connection
-import std.sqlite.DbError
+import std.sqlite.{Connection}
+import std.sqlite.{DbError}
 
 fn addLog(db: Connection, payload: Bytes): Result<Int, DbError> {
     db.transaction<Int>() { tx =>

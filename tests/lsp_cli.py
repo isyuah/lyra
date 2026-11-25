@@ -166,7 +166,7 @@ class LanguageServer(unittest.TestCase):
                        for item in output if item.get('id', 0) > 1}
             self.assertEqual(results, {2: [('routeName', 3, 'routeName')], 3: [('`val`', 3, '`val`')]})
 
-    def test_module_completion_uses_public_exports_and_adds_import_only_to_the_selected_item(self):
+    def test_module_and_group_completion_preserve_the_file_scope(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             app = root / 'client'
@@ -179,17 +179,20 @@ class LanguageServer(unittest.TestCase):
                                     'pending:{name:"missing",version:"0.1.0",registry:"https://invalid.invalid"}}}'),
                 (root / 'kit/lyra.json5', '{name:"kit",version:"0.1.0",kind:"lib"}'),
                 (declaration, '/// Builds a heading.\npub fn renderTitle(): String { "hello" }\nfn hiddenTitle(): String { "private" }\n'),
-                (export, 'pub import kit.sub.renderTitle as title\n'),
-                (sibling, 'import std.http.Router as WebRouter\n'),
+                (export, 'pub import kit.sub.{renderTitle as title}\n'),
+                (sibling, 'import std.http.{Router as WebRouter}\n'),
                 (source, ''),
             ]:
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text(text, encoding='utf-8')
-            text = ('// 文件头\r\n\r\nimport \r\nimport std.ht\r\nimport std.http.Ro\r\n'
-                    'pub import kit.su\r\nimport kit.sub.\r\nimport self.api.\r\n'
-                    '/// Main docs.\r\nfn main(): Unit { val _ = "中文🙂"; renderTi; Web; tit }\r\n')
-            markers = ['import ', 'std.ht', 'http.Ro', 'kit.su', 'kit.sub.', 'self.api.', 'renderTi', 'Web', 'tit }']
-            offsets = [text.index(marker) + len(marker.removesuffix(' }')) for marker in markers]
+            text = ('// 文件头\r\n\r\nimport \r\nimport std.ht\r\nimport std.http\r\nimport std.http.{Request, }\r\n'
+                    'import kit.sub as net\r\nimport self.api as api\r\nimport kit.su\r\n'
+                    'pub import kit.sub.{ }\r\n'
+                    'fn typed(value: http.Req): Unit {}\r\n'
+                    'fn main(): Unit { val _ = "中文🙂"; net.renderTi; http.Ro; api.tit; renderTi; Web; tit; htt }\r\n')
+            markers = ['import ', 'std.ht', 'std.http.{Request, ', 'kit.su\r', 'pub import kit.sub.{',
+                       'net.renderTi', 'http.Ro', 'api.tit', '; renderTi', 'Web', '; tit', 'http.Req', '; htt']
+            offsets = [text.index(marker) + len(marker.rstrip('\r')) for marker in markers]
             output = run_server([(source, text)], [document_request(index, source, 'completion', position=position_at(text, offset))
                                                     for index, offset in enumerate(offsets, 2)])
             items = {item['id']: {entry['label']: entry for entry in item['result']['items']}
@@ -197,18 +200,123 @@ class LanguageServer(unittest.TestCase):
             self.assertTrue({'kit', 'pending', 'self', 'std'} <= items[2].keys())
             self.assertTrue({'http', 'httpClient', 'httpTls'} <= items[3].keys())
             self.assertIn('Router', items[4])
+            self.assertNotIn('Request', items[4])
             self.assertEqual(set(items[5]), {'sub'})
             self.assertEqual(set(items[6]), {'renderTitle'})
-            self.assertEqual(set(items[7]), {'title'})
-            auto = items[8]['renderTitle']
-            self.assertEqual(auto['documentation']['value'], 'Builds a heading.')
-            self.assertEqual(auto['additionalTextEdits'], [{'range': {'start': position_at(text, text.index('import ')),
-                                                                     'end': position_at(text, text.index('import '))},
-                                                            'newText': 'import kit.sub.renderTitle\r\n'}])
-            self.assertNotIn('additionalTextEdits', items[9]['WebRouter'])
-            self.assertEqual(items[10]['title']['additionalTextEdits'][0]['newText'], 'import self.api.title\r\n')
+            member = items[7]['renderTitle']
+            self.assertEqual(member['documentation']['value'], 'Builds a heading.')
+            self.assertNotIn('additionalTextEdits', member)
+            self.assertEqual(member['textEdit']['newText'], 'renderTitle')
+            self.assertIn('Router', items[8])
+            self.assertEqual(set(items[9]), {'title'})
+            self.assertEqual(items[10], {})
+            self.assertEqual(items[11], {})
+            self.assertEqual(items[12], {})
+            self.assertIn('Request', items[13])
+            self.assertEqual(items[14]['http']['kind'], 9)
             self.assertFalse((app / 'lyra.lock').exists())
             self.assertEqual(source.read_bytes(), b'')
+
+    def test_namespace_alias_navigation_respects_overloads_and_local_shadowing(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            app = root / 'app'
+            source = app / 'src/main.ly'
+            api = root / 'kit/src/net/api.ly'
+            api.parent.mkdir(parents=True)
+            source.parent.mkdir(parents=True)
+            (app / 'lyra.json5').write_text('{name:"app",version:"0.1.0",dependencies:{kit:{name:"kit",version:"0.1.0",path:"../kit"}}}', encoding='utf-8')
+            (root / 'kit/lyra.json5').write_text('{name:"kit",version:"0.1.0",kind:"lib"}', encoding='utf-8')
+            library = ('pub struct Box(pub val value: Int)\n'
+                       'pub fn render(count: Int): String { count.toString() }\n'
+                       'pub fn render(text: String): String { text }\n')
+            api.write_text(library, encoding='utf-8')
+            text = ('import kit.net\nfn take(box: net.Box): Int { box.value }\n'
+                    'fn main(): Unit {\n    print(net.render(7)); print(net.render("text"))\n'
+                    '    { val net = [1]; print(net.size) }\n}\n')
+            source.write_text(text, encoding='utf-8')
+            integer = position_at(text, text.index('net.render(7)') + len('net.r'))
+            string = position_at(text, text.index('net.render("text")') + len('net.r'))
+            alias = position_at(text, text.index('net.Box') + 1)
+            local = position_at(text, text.index('net.size') + len('net.'))
+            output = run_server([(source, text)], [
+                document_request(2, source, 'definition', position=integer),
+                document_request(3, source, 'definition', position=string),
+                document_request(4, source, 'definition', position=alias),
+                document_request(5, source, 'rename', position=alias, newName='network'),
+                document_request(6, source, 'completion', position=local),
+            ])
+            results = {item['id']: item['result'] for item in output if 'id' in item}
+            for index, signature in ((2, 'render(count'), (3, 'render(text')):
+                location, = results[index]
+                self.assertEqual(location['uri'], uri(api))
+                self.assertEqual(location['range']['start'], position_at(library, library.index(signature)))
+            defined, = results[4]
+            imported = position_at(text, len('import kit.'))
+            self.assertEqual(defined['range']['start'], imported)
+            alias_end = position_at(text, len('import kit.net'))
+            edits = results[5]['changes'][uri(source)]
+            self.assertIn({'range': {'start': alias_end, 'end': alias_end}, 'newText': ' as network'}, edits)
+            self.assertEqual({edit['range']['start']['line'] for edit in edits if edit['newText'] == 'network'}, {1, 3})
+            self.assertEqual(len(edits), 4)
+            members = {item['label'] for item in results[6]['items']}
+            self.assertIn('size', members)
+            self.assertFalse({'render', 'Box'} & members)
+
+    def test_import_quick_fix_reuses_alias_and_keeps_multiple_sources_separate(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            app = root / 'app'
+            source = app / 'src/main.ly'
+            for path, text in [
+                (app / 'lyra.json5', '{name:"app",version:"0.1.0",dependencies:{kit:{name:"kit",version:"0.1.0",path:"../kit"}}}'),
+                (root / 'kit/lyra.json5', '{name:"kit",version:"0.1.0",kind:"lib"}'),
+                (root / 'kit/src/net/api.ly', 'pub fn renderTitle(): String { "kit" }\n'),
+                (app / 'src/net/api.ly', 'pub fn renderTitle(): String { "self" }\n'),
+                (source, ''),
+            ]:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(text, encoding='utf-8')
+
+            original = '// 中文🙂\r\nimport std.time as times\r\nfn main(): Unit { val _ = Clock.now() }\r\n'
+            changed = ('// 中文🙂\r\nimport kit.net as kitNet\r\n'
+                       'fn main(): Unit { val net = 7; print("中文🙂"); print(renderTitle()) }\r\n')
+
+            def request(number, text, name, **context):
+                start = text.index(name)
+                return document_request(number, source, 'codeAction', range={
+                    'start': position_at(text, start), 'end': position_at(text, start + len(name)),
+                }, context={'diagnostics': [], **context})
+
+            output = run_server([(source, original)], [
+                request(2, original, 'Clock', only=['quickfix']),
+                request(3, original, 'Clock', only=['refactor']),
+                request(4, original, 'main'),
+                {'jsonrpc': '2.0', 'method': 'textDocument/didChange', 'params': {
+                    'textDocument': {'uri': uri(source), 'version': 2}, 'contentChanges': [{'text': changed}],
+                }},
+                request(5, changed, 'renderTitle'),
+            ])
+            results = {item['id']: item['result'] for item in output if 'id' in item}
+            self.assertIn('codeActionProvider', results[1]['capabilities'])
+            self.assertEqual(results[3], [])
+            self.assertEqual(results[4], [])
+
+            def versioned_edits(action, version):
+                self.assertEqual(action['kind'], 'quickfix')
+                document, = action['edit']['documentChanges']
+                self.assertEqual(document['textDocument'], {'uri': uri(source), 'version': version})
+                return document['edits']
+
+            reuse, = results[2]
+            self.assertEqual([edit['newText'] for edit in versioned_edits(reuse, 1)], ['times.Clock'])
+            reuse, add = results[5]
+            self.assertEqual([edit['newText'] for edit in versioned_edits(reuse, 2)], ['kitNet.renderTitle'])
+            replace, insert = versioned_edits(add, 2)
+            self.assertEqual(replace['range'], request(6, changed, 'renderTitle')['params']['range'])
+            self.assertEqual(replace['newText'], 'net2.renderTitle')
+            self.assertEqual(insert, {'range': {'start': {'line': 1, 'character': 0}, 'end': {'line': 1, 'character': 0}},
+                                      'newText': 'import self.net as net2\r\n'})
 
     def test_member_completion_and_overload_signatures_use_current_types(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -223,7 +331,7 @@ class LanguageServer(unittest.TestCase):
                            'pub enum State { Closed, Opened(Int) }\n'
                            'pub extension BoxOps<T> for Box<T> { fn unwrap(): T { this.value } }\n'
                            'pub extension OtherOps<T> for Box<T> { fn unwanted(): T { this.value } }\n', encoding='utf-8')
-            text = ('import self.api.Box\nimport self.api.BoxOps\nimport self.api.State\nimport std.http.listen\n'
+            text = ('import self.api.{Box, BoxOps, State}\nimport std.http\n'
                     '/// Integer lookup.\nfn lookup(count: Int, limit: Int): Int { count + limit }\n'
                     'fn lookup(count: Int, label: String): String { label }\n'
                     'fn lookup(text: String, other: Bool): Bool { other }\n'
@@ -231,7 +339,7 @@ class LanguageServer(unittest.TestCase):
                     'fn optionProbe(): Unit { val optional: Box<Int>? = Box(5); optional?. }\n'
                     'fn staticProbe(): Unit { Box<Int>. }\nfn enumProbe(): Unit { State. }\n'
                     'fn listProbe(): Unit { [1, 2]. }\nfn overloadProbe(): Unit { lookup(1, li) }\n'
-                    'fn main(): Unit { listen(8080, ho\n}\n')
+                    'fn main(): Unit { http.listen(8080, ho\n}\n')
             source.write_text('', encoding='utf-8')
             points = [(word, 'completion') for word in ['first.', 'optional?.', 'Box<Int>.', 'State.', '[1, 2].', 'lookup(1, li', 'listen(8080, ho']]
             points.extend([('lookup(1, li', 'signatureHelp'), ('listen(8080, ho', 'signatureHelp')])
@@ -329,7 +437,7 @@ class LanguageServer(unittest.TestCase):
             source.parent.mkdir()
             (root / 'lyra.json5').write_text('{name:"app",version:"0.1.0"}', encoding='utf-8')
             (source.parent / 'sibling.ly').write_text('fn rowOutsideFile(): Int { 1 }\n', encoding='utf-8')
-            text = ('import std.http.Router as WebRouter\n'
+            text = ('import std.http.{Router as WebRouter}\n'
                     'fn unrelated(): Unit { val rogue = 0; }\n'
                     'fn serve(route: String): Unit {\n'
                     '    val router = WebRouter()\n'
@@ -519,7 +627,7 @@ class LanguageServer(unittest.TestCase):
                 encoding='utf-8',
             )
             source = package / 'src/main.ly'
-            text = 'import dependency.select\nfn main(): Unit { print(select(1)); }\n'
+            text = 'import dependency.{select}\nfn main(): Unit { print(select(1)); }\n'
             source.write_text(text, encoding='utf-8')
             line = text.splitlines()[1]
             call = line.index('select(')
@@ -551,7 +659,7 @@ class LanguageServer(unittest.TestCase):
             library = root / 'library' / 'src/api.ly'
             tool = root / 'tool' / 'src/main.ly'
             initial = 'pub fn select(value: Int): Int { value }\npub fn select(value: String): String { value }\n'
-            text = 'import library.select\nfn main(): Unit { print(select(1)); }\n'
+            text = 'import library.{select}\nfn main(): Unit { print(select(1)); }\n'
             tool_text = 'fn main(): Unit { print(0) }\n'
             for path, content in ((source, text), (library, initial), (tool, tool_text)):
                 path.parent.mkdir(parents=True)
@@ -626,7 +734,7 @@ class LanguageServer(unittest.TestCase):
             library = root / 'library/src/main.ly'
             macro = root / 'app/src/.macros/declare.ly'
             macro_input = root / 'app/inputs/value.txt'
-            source_text = ('import library.setting\n#declare\nfn main(): Unit {\n'
+            source_text = ('import library.{setting}\n#declare\nfn main(): Unit {\n'
                            '    val current: Int = setting(); print(current + configured());\n}\n')
             library_text = 'pub fn setting(): Int { 1 }\n'
             for path, content in (
@@ -698,7 +806,7 @@ class LanguageServer(unittest.TestCase):
             )
             model.write_text(model_text, encoding='utf-8')
             source = package / 'src/main.ly'
-            text = 'import self.model.Pair\nimport self.model.PairOps\nfn main(): Unit { print(Pair("Lyra").combined) }\n'
+            text = 'import self.model.{Pair}\nimport self.model.{PairOps}\nfn main(): Unit { print(Pair("Lyra").combined) }\n'
             source.write_text(text, encoding='utf-8')
             prefix = package / 'src/a.ly'
             prefix_text = '// prefix\n'
@@ -804,7 +912,7 @@ class LanguageServer(unittest.TestCase):
             source = package / 'src/main.ly'
             source.parent.mkdir(parents=True)
             (package / 'lyra.json5').write_text('{"name":"app","version":"0.1.0"}', encoding='utf-8')
-            text = 'import std.io.readLine\nfn main(): Unit { val _ = readLine() }\n'
+            text = 'import std.io.{readLine}\nfn main(): Unit { val _ = readLine() }\n'
             source.write_text(text, encoding='utf-8')
             standard_source = COMPILER.parent.parent / 'share' / 'lyra' / 'std' / 'io' / 'src' / 'io.ly'
             standard_text = standard_source.read_text(encoding='utf-8')

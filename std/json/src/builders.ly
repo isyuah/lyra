@@ -1,4 +1,4 @@
-import std.collections.hashMap
+import std.collections.{HashMap, hashMap}
 
 extern fn lyraJsonNull(): CPtr;
 extern fn lyraJsonBool(value: Bool): CPtr;

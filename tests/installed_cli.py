@@ -168,8 +168,8 @@ int64_t distributionRead(const LyraString *value, const LyraString *empty, int64
 }
 ''')
             archive = c_archive(native / 'read.c', native / 'lib fixture', '-O2', '-Wall', '-Wextra', '-Werror', '-I', prefix / 'include')
-            write(app / 'src/main.ly', '''import catalog.banner
-import std.installprobe.identity
+            write(app / 'src/main.ly', '''import catalog.{banner}
+import std.installprobe.{identity}
 extern fn distributionRead(value: String, empty: String, number: Int): Int;
 extern fn distributionMeet(): Unit;
 pub fn label(): String { identity() + ": " + banner() }
@@ -183,8 +183,8 @@ pub async fn score(): Int {
 async fn main(): Unit { print(label()); print(await score()) }
 ''')
             (app / 'tests/answer.ly').unlink()
-            write(app / 'tests/contract.ly', '''import self.label
-import self.score
+            write(app / 'tests/contract.ly', '''import self.{label}
+import self.{score}
 async fn main(): Unit { #assert(label() == "relocated: 打包时的标题:v1", "wrong installed input"); #assert(await score() == 42, "wrong C ABI result") }
 ''')
             environment['UV_THREADPOOL_SIZE'] = '2'
@@ -287,8 +287,8 @@ async fn main(): Unit { #assert(label() == "relocated: 打包时的标题:v1", "
             plain_http = root / 'plain-http/src/main.ly'
             plain_http.parent.mkdir(parents=True)
             (plain_http.parent.parent / 'lyra.json5').write_text('{name:"test/plain-http",version:"0.1.0"}', encoding='utf-8')
-            plain_http.write_text('''import std.http.listen
-import std.httpTls.listenTls
+            plain_http.write_text('''import std.http.{listen}
+import std.httpTls.{listenTls}
 
 fn main(): Unit {
     match listen(0) {

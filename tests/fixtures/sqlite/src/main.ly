@@ -1,5 +1,4 @@
-import std.sqlite.DbError
-import std.sqlite.open
+import std.sqlite.{DbError, open}
 
 fn read(): Result<String?, DbError> {
     val db = open(":memory:")?

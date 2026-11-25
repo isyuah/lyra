@@ -48,7 +48,7 @@ fn main(): Unit {
                                                                        'two:443', '1000', 'demo', 'true'])
 
     def test_strict_paths_missing_defaults_and_parser_errors(self):
-        source = r'''import std.toml.parseToml
+        source = r'''import std.toml.{parseToml}
 #derive(Toml)
 struct Record([tomlName("team.name")] pub val name: String, pub val num: Int8)
 #derive(Toml)
@@ -103,10 +103,10 @@ fn main(): Unit {
                 self.assertIn(message, error['message'])
 
     def test_generic_and_enum_derives_share_defaults_paths_and_codecs(self):
-        source = r'''import std.toml.tomlCodecString
-import std.toml.tomlCodecOption
-import std.toml.tomlCodecInt
-import std.toml.parseToml
+        source = r'''import std.toml.{tomlCodecString}
+import std.toml.{tomlCodecOption}
+import std.toml.{tomlCodecInt}
+import std.toml.{parseToml}
 type Counter = UInt16
 #derive(Json, Toml)
 enum Status<T> { Ready, Failed(T), Retry(T, Counter) }

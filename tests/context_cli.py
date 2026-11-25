@@ -18,11 +18,11 @@ class TaskContext(unittest.TestCase):
             (root / 'src').mkdir()
             (root / 'lyra.json5').write_text("{name:'test/context',version:'1.0.0'}")
             (root / 'src/main.ly').write_text('''
-import std.io.readLine
-import std.task.trace
-import std.task.remainingMs
-import std.task.withTrace
-import std.task.withTimeout
+import std.io.{readLine}
+import std.task.{trace}
+import std.task.{remainingMs}
+import std.task.{withTrace}
+import std.task.{withTimeout}
 
 async fn inspect(): String {
     val first = trace()

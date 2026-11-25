@@ -369,7 +369,7 @@ fn main(): Unit {
     @unittest.skipUnless(WINDOWS, 'Windows keeps a loaded executable mapped')
     def test_failed_rebuild_preserves_the_running_executable(self):
         (self.package / 'lyra.json5').write_text('{name:"reload",version:"1.0.0"}')
-        self.main.write_text('import std.io.readLine\nfn main(): Unit { print(1); val _ = readLine(); print(2) }')
+        self.main.write_text('import std.io.{readLine}\nfn main(): Unit { print(1); val _ = readLine(); print(2) }')
         output = executable(self.package / 'running')
         built = self.cli('build', '-o', output)
         self.assertEqual(built.returncode, 0, built.stderr)

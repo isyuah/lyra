@@ -1031,7 +1031,7 @@ struct Symbols {
         if (form.name.starts_with("$dyn:")) {
             auto name = form.name.substr(5);
             auto found = traitNames.find(name);
-            if (found == traitNames.end()) throw at(source, span, "LYG0005", "找不到动态接口 trait：" + name);
+            if (found == traitNames.end()) throw missingName(source, span, "LYG0005", "找不到动态接口 trait：" + name, MissingNameKind::Constraint, name);
             if (traitUsesSelf(module.traits[found->second])) throw at(source, span, "LYG0007", "签名使用 Self 的 trait 只能用于静态约束：" + name);
             const auto& associated = module.traits[found->second].associated;
             if (form.arguments.size() != associated.size())
@@ -1084,7 +1084,7 @@ struct Symbols {
         if (arguments.size() == 2 && form.name == "Result") return sum(Type::Result, arguments[0], arguments[1]);
         if (auto record = records.find(form.name); record != records.end()) return recordType(record->second, std::move(arguments), source, span);
         if (auto item = enums.find(form.name); item != enums.end()) return enumType(item->second, std::move(arguments), source, span);
-        throw at(source, span, "LYT0003", "找不到类型或类型实参数量不符：" + form.name);
+        throw missingName(source, span, "LYT0003", "找不到类型或类型实参数量不符：" + form.name, MissingNameKind::Type, form.name);
     }
 
     Type resolveForm(const TypeForm& form, const Source& source, Span span, const Function* signature, std::span<const Type> types) {
@@ -1283,6 +1283,7 @@ struct Checker {
     }
 
     std::optional<std::size_t> lookupLocal(const Identifier& name) const {
+        if (name.moduleMember) return {};
         auto key = localKey(name);
         for (auto scope = scopes.rbegin(); scope != scopes.rend(); ++scope)
             if (auto found = scope->find(key); found != scope->end()) return found->second;
@@ -1340,7 +1341,7 @@ struct Checker {
     }
 
     bool implicitMember(const Identifier& name) const {
-        if (!receiverSlot || source.hygieneAt(name.span)) return false;
+        if (!receiverSlot || name.moduleMember || source.hygieneAt(name.span)) return false;
         auto receiver = fn.locals[*receiverSlot].type;
         if (receiver.kind == Type::Enum) return symbols.instanceMethods(receiver).contains(name.text);
         if (receiver.kind != Type::Record) return false;
@@ -1365,6 +1366,43 @@ struct Checker {
         fn.expressions.resize(fn.syntax.expressions.size());
     }
 
+    const Identifier* namespaceReceiver(ExprId id) const {
+        auto name = std::get_if<Identifier>(&fn.syntax.expressions[id].node);
+        return name && name->moduleAlias && !lookupLocal(*name) && !implicitMember(*name) ? name : nullptr;
+    }
+
+    void referNamespace(const Identifier& name) {
+        const auto anchor = *name.moduleAlias;
+        refer(name, anchor.file, anchor.span);
+    }
+
+    void requireExport(const Identifier& alias, const Identifier& member) {
+        if (atEditorProbe(member)) {
+            editor->probe->namespaceReceiver = true;
+            throw EditorProbeFinished{};
+        }
+        referNamespace(alias);
+        if (member.linked.empty()) throw at(source, member.span, "LYN0003", "模块没有可用的公开声明：" + alias.text + '.' + member.text);
+    }
+
+    void resolveNamespaceMember(ExprId id) {
+        auto& node = fn.syntax.expressions[id].node;
+        auto* member = std::get_if<Member>(&node);
+        if (!member || !member->name.moduleMember) return;
+        if (auto alias = namespaceReceiver(member->receiver)) {
+            requireExport(*alias, member->name);
+            auto name = std::move(member->name);
+            node = std::move(name);
+        } else member->name = Identifier{std::move(member->name.text), member->name.span};
+    }
+
+    void resolveQualifier(const TypeQualifier& qualifier) {
+        if (!qualifier.moduleReceiver) return;
+        auto alias = namespaceReceiver(*qualifier.moduleReceiver);
+        if (!alias) throw at(source, qualifier.name.span, "LYT0003", "限定泛型类型需要未被遮蔽的模块别名");
+        requireExport(*alias, qualifier.name);
+    }
+
     void resolveReceiver(ExprId id) {
         auto& node = fn.syntax.expressions[id].node;
         if (id < implicitReceivers.size() && implicitReceivers[id]) {
@@ -1372,13 +1410,26 @@ struct Checker {
             if (auto* name = std::get_if<Identifier>(&node); name && !lookupLocal(*name)) node = Member{receiver, *name};
             else if (auto* call = std::get_if<Call>(&node); call && !call->typeOwner && !lookupLocal(call->name)) call->receiver = receiver;
         }
-        if (auto* call = std::get_if<Call>(&node); call && call->receiver) {
-            auto* name = std::get_if<Identifier>(&fn.syntax.expressions[*call->receiver].node);
-            if (name && symbols.records.contains(linkedName(*name)) && !lookupLocal(*name) && !implicitMember(*name)) {
-                call->typeOwner = TypeQualifier{*name};
-                call->receiver.reset();
+        if (auto* call = std::get_if<Call>(&node)) {
+            if (call->typeOwner) resolveQualifier(*call->typeOwner);
+            else if (call->receiver) {
+                if (auto alias = namespaceReceiver(*call->receiver); call->name.moduleMember && alias) {
+                    requireExport(*alias, call->name);
+                    call->receiver.reset();
+                } else {
+                    if (call->name.moduleMember) call->name = Identifier{std::move(call->name.text), call->name.span};
+                    resolveNamespaceMember(*call->receiver);
+                    auto* name = std::get_if<Identifier>(&fn.syntax.expressions[*call->receiver].node);
+                    if (name && symbols.records.contains(linkedName(*name)) && !lookupLocal(*name) && !implicitMember(*name)) {
+                        call->typeOwner = TypeQualifier{*name};
+                        call->receiver.reset();
+                    }
+                }
             }
-        }
+        } else if (auto* member = std::get_if<Member>(&node)) {
+            resolveNamespaceMember(member->receiver);
+            resolveNamespaceMember(id);
+        } else if (auto* member = std::get_if<QualifiedMember>(&node)) resolveQualifier(member->owner);
     }
 
     void enterFunction() {
@@ -1871,6 +1922,10 @@ struct Checker {
 
     CheckedPattern namedPattern(const Pattern& pattern, Type subject, const PatternName& named) {
         const auto& name = named.name;
+        if (named.module) {
+            if (!named.module->moduleAlias) throw at(source, named.module->span, "LYN0003", "找不到模式中的模块别名：" + named.module->text);
+            requireExport(*named.module, named.owner ? *named.owner : name);
+        }
         if (named.owner) {
             auto owner = symbols.enums.find(linkedName(*named.owner));
             if (owner == symbols.enums.end()) throw at(source, named.owner->span, "LYT0011", "分支模式需要可见的 enum：" + named.owner->text);
@@ -1878,7 +1933,7 @@ struct Checker {
                 throw at(source, named.owner->span, "LYT0011", named.owner->text + " 不能匹配 " + typeName(module, subject));
             return variantPattern(pattern, subject, named, variantIndex(owner->second, name));
         }
-        if (!named.escaped || named.labels) {
+        if (!named.module && (!named.escaped || named.labels)) {
             if (subject.kind == Type::Enum) {
                 const auto& variants = symbols.variants[module.enums[subject.id].declaration];
                 if (auto found = variants.find(name.text); found != variants.end()) return variantPattern(pattern, subject, named, found->second);
@@ -1913,7 +1968,7 @@ struct Checker {
             }
             return result;
         }
-        if (!named.escaped) {
+        if (!named.escaped || named.module) {
             if (auto slot = lookupLocal(name); slot && fn.locals[*slot].constant) {
                 auto type = fn.locals[*slot].type;
                 if (subject != type) throw mismatch(module, source, pattern.span, subject, type);
@@ -2231,8 +2286,9 @@ struct Checker {
 
     Type infer(ExprId id, const Identifier& name, std::optional<Type> expected, bool) {
         if (auto slot = lookupLocal(name)) return readLocal(id, name, *slot);
+        if (name.moduleAlias) throw at(source, name.span, "LYN0003", "模块不是运行时值；请用点号访问公开声明：" + name.text);
         auto candidates = symbols.visibleFunctions(source, name);
-        if (candidates.empty()) throw at(source, name.span, "LYN0001", "找不到绑定：" + name.text);
+        if (candidates.empty()) throw missingName(source, name.span, "LYN0001", "找不到绑定：" + name.text, MissingNameKind::Value, name.text);
         if (expected && expected->kind == Type::Option) expected = module.sumTypes[expected->id].success;
         auto index = candidates.size() == 1 ? candidates.front() : selectFunctionValue(name, candidates, expected);
         const auto& item = symbols.callables[index];
@@ -2561,7 +2617,9 @@ struct Checker {
     }
 
     const Identifier* enumNamespace(ExprId receiver) const {
-        auto* name = std::get_if<Identifier>(&fn.syntax.expressions[receiver].node);
+        const auto& node = fn.syntax.expressions[receiver].node;
+        const auto* name = std::get_if<Identifier>(&node);
+        if (const auto* member = std::get_if<Member>(&node); member && member->name.moduleMember && namespaceReceiver(member->receiver)) name = &member->name;
         return name && !lookupLocal(*name) && !implicitMember(*name) && symbols.enums.contains(linkedName(*name)) ? name : nullptr;
     }
 
@@ -2572,6 +2630,7 @@ struct Checker {
     }
 
     void editorMembers(std::optional<ExprId> receiver, const TypeQualifier* qualifier, Span site) {
+        editor->probe->receiverChecked = true;
         std::map<std::string, EditorSymbol> members;
         std::set<std::string> fields;
         auto add = [&](const std::string& name, EditorKind kind, std::string detail, std::string docs = {}) {
@@ -3045,6 +3104,7 @@ struct Checker {
         if (call.function) return invoke(visit(*call.function));
         const auto& key = call.name.linked.empty() ? call.name.text : call.name.linked;
         if (!call.receiver && !call.typeOwner) if (auto local = lookupLocal(call.name)) return invoke(readLocal(id, call.name, *local));
+        if (call.name.moduleAlias) throw at(source, call.name.span, "LYN0003", "模块不是函数；请用点号访问公开声明：" + call.name.text);
         if (call.receiver && !call.typeOwner) {
             const auto* qualifier = std::get_if<Identifier>(&fn.syntax.expressions[*call.receiver].node);
             auto builtin = qualifier && !lookupLocal(*qualifier) && !implicitMember(*qualifier) ? std::string_view(linkedName(*qualifier)) : std::string_view{};
@@ -3418,7 +3478,7 @@ struct Checker {
             }
         } else {
             auto candidates = symbols.visibleFunctions(source, call.name);
-            if (candidates.empty()) throw at(source, call.name.span, "LYN0001", "找不到函数：" + call.name.text);
+            if (candidates.empty()) throw missingName(source, call.name.span, "LYN0001", "找不到函数：" + call.name.text, MissingNameKind::Call, call.name.text);
             declaration = selectOverload(id, call, expected, candidates);
         }
         return declaredCall(declaration, id, call, expected, ownerTypes);

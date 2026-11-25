@@ -1,5 +1,4 @@
-import std.io.IoError
-import std.io.IoErrorKind
+import std.io.{IoError, IoErrorKind}
 
 extern fn lyraIoArgCount(): Int;
 extern fn lyraIoArgument(index: Int): CPtr;

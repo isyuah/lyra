@@ -1,7 +1,7 @@
-import std.collections.parallelFor
-import std.io.readLine
-import std.sync.AtomicInt
-import std.task.parallelism
+import std.collections.{parallelFor}
+import std.io.{readLine}
+import std.sync.{AtomicInt}
+import std.task.{parallelism}
 
 extern fn uv_hrtime(): UInt;
 

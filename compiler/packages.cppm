@@ -784,7 +784,7 @@ void newPackage(const fs::path& directory, const string& name, bool library) {
     string source = "pub fn answer(): Int { 42 }\n";
     if (!library) source += "\nfn main(): Unit { print(answer()) }\n";
     writeFile(stage / "src" / (library ? "lib.ly" : "main.ly"), source);
-    writeFile(stage / "tests" / "answer.ly", "import self.answer\n\n"
+    writeFile(stage / "tests" / "answer.ly", "import self.{answer}\n\n"
               "fn main(): Unit {\n    #assert(answer() == 42, \"expected 42\")\n}\n");
     fs::rename(stage, root);
     std::cout << pathText(root) << '\n';

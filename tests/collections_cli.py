@@ -48,9 +48,9 @@ fn main(): Unit {
 
     def test_standard_higher_order_collection_pipeline(self):
         (self.package / 'lyra.json5').write_text('{name:"test/collections",version:"0.1.0"}')
-        self.native('''import std.collections.map
-import std.collections.filter
-import std.collections.fold
+        self.native('''import std.collections.{map}
+import std.collections.{filter}
+import std.collections.{fold}
 fn main(): Unit {
     var visits = 0
     val input = [1, 2, 3, 4]
@@ -73,9 +73,9 @@ async fn main(): Unit { val cold = work(); print(5); print(await cold); print(aw
     def test_hash_collections_grow_remove_and_preserve_optional_values(self):
         (self.package / 'lyra.json5').write_text('{name:"test/hash-collections",version:"0.1.0"}')
         self.native(r'''
-import std.collections.hashMap
-import std.collections.intSet
-import std.collections.stringMap
+import std.collections.{hashMap}
+import std.collections.{intSet}
+import std.collections.{stringMap}
 
 fn main(): Unit {
     val map = hashMap<Int,String>((key) => { -1 }, (left, right) => { left == right })
@@ -107,7 +107,7 @@ fn main(): Unit {
 
     def test_structural_hash_keys_and_custom_equality(self):
         (self.package / 'lyra.json5').write_text('{name:"test/hash-derived",version:"0.1.0"}')
-        self.native('''import std.collections.hashSet
+        self.native('''import std.collections.{hashSet}
 struct User(val id: Int, val name: String)
 struct UserKey(val id: Int, val name: String) {
     fn equals(other: UserKey): Bool { id == other.id }
@@ -145,7 +145,7 @@ fn main(): Unit {
     def test_hash_capability_rejects_non_hashable_struct_fields(self):
         cases = [
             ('struct Key(val value: Any)\nfn main(): Unit { val items = hashSet<Key>() }', 'value'),
-            ('import std.io.File\nstruct Key(val file: File)\nfn main(): Unit { val items = hashSet<Key>() }', 'file'),
+            ('import std.io.{File}\nstruct Key(val file: File)\nfn main(): Unit { val items = hashSet<Key>() }', 'file'),
             ('struct Key(val callback: CCallback)\nfn main(): Unit { val items = hashSet<Key>() }', 'callback'),
             ('class Handle {}\nstruct Key(val value: Handle)\nfn main(): Unit { val items = hashSet<Key>() }', 'value'),
             ('struct Key(val callback: () -> Int)\nfn main(): Unit { val items = hashSet<Key>() }', 'callback'),
@@ -159,7 +159,7 @@ fn main(): Unit {
         (self.package / 'lyra.json5').write_text('{name:"test/hash-rejections",version:"0.1.0"}')
         for body, fragment in cases:
             with self.subTest(body=body):
-                self.main.write_text('import std.collections.hashSet\n' + body, encoding='utf-8')
+                self.main.write_text('import std.collections.{hashSet}\n' + body, encoding='utf-8')
                 check = subprocess.run([COMPILER, 'check', self.package, '--diagnostics=json'], capture_output=True, text=True, timeout=10)
                 self.assertNotEqual(check.returncode, 0, check.stdout)
                 error, = json.loads(check.stderr)
@@ -193,8 +193,8 @@ fn main(): Unit {
     def test_hash_collection_loops_traverse_shallow_snapshots(self):
         (self.package / 'lyra.json5').write_text('{name:"test/hash-iteration",version:"0.1.0"}')
         self.native('''
-import std.collections.hashSet
-import std.collections.intMap
+import std.collections.{hashSet}
+import std.collections.{intMap}
 
 fn main(): Unit {
     val scores = intMap<Int>()

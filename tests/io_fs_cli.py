@@ -11,8 +11,8 @@ from platform_cli import executable
 COMPILER = Path(sys.argv.pop(1)).resolve()
 
 REQUIRE = '''
-import std.io.IoError
-import std.io.IoErrorKind
+import std.io.{IoError}
+import std.io.{IoErrorKind}
 
 fn require<T>(result: Result<T, IoError>): T {
     match result { Ok(value) => value, Err(error) => throw Exception(error.message()) }
@@ -47,9 +47,9 @@ class IoFs(unittest.TestCase):
         data = '🙂\r\n'.encode() + b'12345\r\n' + b'x' * 130000 + b'\n\xff\n\nz\0\r\nlit\r'
         (self.package / '有界 输入.txt').write_bytes(data)
         self.run_app(r'''
-import std.io.File
-import std.io.LineReader
-import std.io.readLine
+import std.io.{File}
+import std.io.{LineReader}
+import std.io.{readLine}
 
 fn remainingLines(reader: LineReader): Unit {
     #assert(hasError(reader.readLine(), IoErrorKind.LineTooLong), "one byte over limit")
@@ -81,12 +81,12 @@ fn main(): Unit {
 
     def test_append_and_64_bit_seek_preserve_bytes_and_report_errors(self):
         self.run_app(r'''
-import std.io.File
-import std.io.SeekOrigin
-import std.io.readBytes
-import std.io.readFile
-import std.io.writeError
-import std.io.writeFile
+import std.io.{File}
+import std.io.{SeekOrigin}
+import std.io.{readBytes}
+import std.io.{readFile}
+import std.io.{writeError}
+import std.io.{writeFile}
 
 fn main(): Unit {
     val path = "追加 文件🙂"
@@ -131,13 +131,13 @@ fn main(): Unit {
     #assert(pathJoin("left", r"a\b") == r"left/a\b", "POSIX backslash is not a separator")
 '''
         self.run_app(r'''
-import std.fs.atomicWrite
-import std.fs.createTempFile
-import std.fs.listDir
-import std.fs.mkdirAll
-import std.fs.pathJoin
-import std.fs.removeFile
-import std.io.readBytes
+import std.fs.{atomicWrite}
+import std.fs.{createTempFile}
+import std.fs.{listDir}
+import std.fs.{mkdirAll}
+import std.fs.{pathJoin}
+import std.fs.{removeFile}
+import std.io.{readBytes}
 
 fn contains(values: List<String>, name: String): Bool {
     for value in values { if value == name { return true } }
@@ -182,7 +182,7 @@ fn main(): Unit {
         with open(os.fsencode(directory) + b'/\xff', 'wb'):
             pass
         self.run_app('''
-import std.fs.listDir
+import std.fs.{listDir}
 
 fn main(): Unit {
     #assert(hasError(listDir("invalid"), IoErrorKind.InvalidUtf8), "do not drop non-UTF-8 names")

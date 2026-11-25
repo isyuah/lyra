@@ -611,6 +611,7 @@ Source generatedSource(const Source& source, const Expansion& prefix, const std:
     result.origin = source.userSite(site);
     result.previous = std::make_shared<Source>(source);
     result.pieces = std::move(pieces);
+    result.importParent = prefix.file;
     return result;
 }
 }

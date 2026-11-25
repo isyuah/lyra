@@ -326,9 +326,9 @@ async fn main(): Unit {
     def test_parallel_domain_rendezvous_and_locked_gc_references(self):
         (self.package / "lyra.json5").write_text("{name:'test/domains',version:'1.0.0'}")
         self.run_source('''
-import std.sync.AtomicInt
-import std.sync.Mutex
-import std.sync.withLock
+import std.sync.{AtomicInt}
+import std.sync.{Mutex}
+import std.sync.{withLock}
 
 class Counter(var value: Int)
 async fn delimited(value: Int): Int { gcCollect(); value }
@@ -365,9 +365,9 @@ async fn main(): Unit {
     def test_parallel_for_respects_runtime_worker_capacity(self):
         (self.package / "lyra.json5").write_text("{name:'test/parallel-for',version:'1.0.0'}")
         source = '''
-import std.collections.parallelFor
-import std.sync.AtomicInt
-import std.task.parallelism
+import std.collections.{parallelFor}
+import std.sync.{AtomicInt}
+import std.task.{parallelism}
 
 class Totals(val active: AtomicInt, val maximum: AtomicInt, val sum: AtomicInt)
 async fn add(totals: Totals, value: Int, expectedWorkers: Int): Unit {
@@ -397,8 +397,8 @@ async fn main(): Unit {
     def test_parallel_for_empty_input_and_read_only_input_contract(self):
         (self.package / "lyra.json5").write_text("{name:'test/parallel-for-input',version:'1.0.0'}")
         self.run_source('''
-import std.collections.parallelFor
-import std.sync.AtomicInt
+import std.collections.{parallelFor}
+import std.sync.{AtomicInt}
 
 class Totals(val count: AtomicInt, val sum: AtomicInt)
 async fn record(totals: Totals, value: Int): Unit {
@@ -428,8 +428,8 @@ async fn main(): Unit {
     def test_parallel_for_failure_propagates_and_runs_cleanup(self):
         (self.package / "lyra.json5").write_text("{name:'test/parallel-for-failure',version:'1.0.0'}")
         self.run_source('''
-import std.collections.parallelFor
-import std.sync.AtomicInt
+import std.collections.{parallelFor}
+import std.sync.{AtomicInt}
 
 exception ItemFailed
 class State(val cleaned: AtomicInt, val completed: AtomicInt)
@@ -450,8 +450,8 @@ async fn main(): Unit {
     def test_parallel_for_cancellation_waits_for_worker_cleanup(self):
         (self.package / "lyra.json5").write_text("{name:'test/parallel-for-cancel',version:'1.0.0'}")
         source = '''
-import std.collections.parallelFor
-import std.sync.AtomicInt
+import std.collections.{parallelFor}
+import std.sync.{AtomicInt}
 
 class State(val started: AtomicInt, val release: AtomicInt, val cleaned: AtomicInt, val completed: AtomicInt)
 async fn action(state: State, item: Int): Unit {
@@ -483,7 +483,7 @@ async fn main(): Unit {
     def test_cpu_loop_cooperatively_checks_cancellation(self):
         (self.package / "lyra.json5").write_text("{name:'test/cooperative-cancel',version:'1.0.0'}")
         self.run_source('''
-import std.sync.AtomicInt
+import std.sync.{AtomicInt}
 
 class State(val started: AtomicInt, val observed: AtomicInt, val afterCheck: AtomicInt, val cleaned: AtomicInt)
 async fn spin(state: State): Unit {
@@ -516,7 +516,7 @@ async fn main(): Unit {
     def test_cancellation_check_observes_deadline_without_await(self):
         (self.package / "lyra.json5").write_text("{name:'test/cpu-deadline',version:'1.0.0'}")
         self.run_source('''
-import std.task.withTimeout
+import std.task.{withTimeout}
 
 async fn spin(): Unit {
     while true { Task.checkCancellation() }
@@ -567,9 +567,9 @@ async fn main(): Unit {
     def test_blocking_io_leaves_domain_free_and_sqlite_results_survive(self):
         (self.package / "lyra.json5").write_text("{name:'test/blocking',version:'1.0.0'}")
         self.main.write_text('''
-import std.io.readLine
-import std.sqlite.DbError
-import std.sqlite.open
+import std.io.{readLine}
+import std.sqlite.{DbError}
+import std.sqlite.{open}
 
 fn readDatabase(): Result<String?, DbError> {
     val db = open(":memory:")?

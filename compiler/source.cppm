@@ -48,6 +48,7 @@ struct Source {
     std::optional<Site> origin{};
     std::shared_ptr<const Source> previous{};
     std::vector<SourcePiece> pieces{};
+    std::optional<std::size_t> importParent{};
 
     Position position(std::size_t offset) const;
     Site site(Span span) const;
@@ -56,14 +57,18 @@ struct Source {
     std::optional<Site> generatedSite(Span span) const;
 };
 
+enum class MissingNameKind { Value, Call, Type, Constraint };
+struct MissingName { MissingNameKind kind; std::string name; };
 struct Diagnostic {
     std::string code, message;
     std::optional<Site> site = {};
     std::string expected = {}, actual = {}, hint = {};
     std::optional<Site> generated{};
+    std::optional<MissingName> missingName{};
 };
 
 Diagnostic at(const Source& source, Span span, std::string code, std::string message);
+Diagnostic missingName(const Source& source, Span span, std::string code, std::string message, MissingNameKind kind, const std::string& name);
 void report(const Diagnostic& error, bool json);
 void reportWarnings(const std::vector<Diagnostic>& warnings, bool json);
 void reportDiagnostics(const std::vector<Diagnostic>& warnings, const Diagnostic* error, bool json);

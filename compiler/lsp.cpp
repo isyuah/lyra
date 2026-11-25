@@ -12,6 +12,7 @@ module;
 #include <fstream>
 #include <functional>
 #include <iostream>
+#include <iterator>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -424,7 +425,8 @@ json::Array locationsFor(const Workspace& workspace, SourceAnchor target, bool i
         if (seen.insert(key).second) locations.push_back(jsonLocation(workspace, anchor));
     };
     if (includeDeclaration) append(target);
-    for (const auto& reference : workspace.editor.references) if (renameAnchor(reference) == target) append(reference.use);
+    for (const auto& reference : workspace.editor.references)
+        if (renameAnchor(reference) == target && (includeDeclaration || reference.use != target)) append(reference.use);
     return locations;
 }
 
@@ -495,13 +497,10 @@ ImportAnchor importAnchor(const Source& source) {
     return {offset, end, offset == 0 || text[offset - 1] == '\n'};
 }
 
-json::Object automaticImport(const Source& source, const ImportAnchor& anchor, const EditorImport& suggestion) {
+json::Object importEdit(const Source& source, const ImportAnchor& anchor, std::string directive) {
     std::string insertion;
     if (!anchor.startsOnNewLine) insertion += anchor.newline;
-    insertion += "import ";
-    if (suggestion.kind == ImportKind::Macro) insertion += "macro ";
-    if (suggestion.kind == ImportKind::Decorator) insertion += "decorator ";
-    insertion += qualifiedPath(suggestion.path);
+    insertion += std::move(directive);
     insertion += anchor.newline;
     return json::Object{{"range", jsonRange(source, {anchor.offset, anchor.offset})}, {"newText", std::move(insertion)}};
 }
@@ -509,6 +508,17 @@ json::Object automaticImport(const Source& source, const ImportAnchor& anchor, c
 bool typeSymbol(EditorKind kind) {
     return kind == EditorKind::Class || kind == EditorKind::Struct || kind == EditorKind::Enum || kind == EditorKind::Trait ||
         kind == EditorKind::TypeAlias || kind == EditorKind::TypeParameter;
+}
+
+bool completionSymbol(CompletionPlace place, const EditorSymbol& symbol) {
+    using enum CompletionPlace;
+    if (place == Constraint || place == ConstraintMember) return symbol.kind == EditorKind::Trait || symbol.kind == EditorKind::Module;
+    if (place == Type || place == TypeMember) return typeSymbol(symbol.kind) || symbol.kind == EditorKind::Module;
+    return symbol.kind != EditorKind::Trait && symbol.kind != EditorKind::Extension;
+}
+
+std::string_view bareIdentifier(std::string_view name) {
+    return name.starts_with('`') ? name.substr(1, name.size() - 2) : name;
 }
 
 json::Value completionItems(const Source& source, std::size_t offset, const SyntaxCompletion& syntax, const EditorModuleIndex* catalog,
@@ -541,7 +551,8 @@ json::Value completionItems(const Source& source, std::size_t offset, const Synt
             item["detail"] = (symbol.detail.empty() ? std::string{} : symbol.detail + " — ") + "import " + path;
             item["labelDetails"] = json::Object{{"description", path}};
             if (!anchor) anchor = importAnchor(source);
-            item["additionalTextEdits"] = json::Array{automaticImport(source, *anchor, *imported)};
+            auto directive = imported->kind == ImportKind::Macro ? "import macro " : "import decorator ";
+            item["additionalTextEdits"] = json::Array{importEdit(source, *anchor, directive + path)};
         }
         items.push_back(std::move(item));
     };
@@ -551,22 +562,21 @@ json::Value completionItems(const Source& source, std::size_t offset, const Synt
     }
     for (const auto& symbol : syntax.suggestions) append(symbol, symbol.kind == EditorKind::Keyword ? "2" : "1");
     if (place == Statement || place == Expression || place == Type || place == Constraint) {
-        auto accepts = [&](const EditorSymbol& symbol) {
-            if (place == Constraint) return symbol.kind == EditorKind::Trait;
-            if (place == Type) return typeSymbol(symbol.kind) && symbol.kind != EditorKind::Trait;
-            return symbol.kind != EditorKind::Trait && symbol.kind != EditorKind::Extension;
-        };
-        for (const auto& symbol : generated) if (accepts(symbol)) append(symbol, "1");
-        if (catalog) for (const auto& symbol : catalog->visible) if (accepts(symbol)) append(symbol, "1");
+        for (const auto& symbol : generated) if (completionSymbol(place, symbol)) append(symbol, "1");
+        if (catalog) for (const auto& symbol : catalog->visible) if (completionSymbol(place, symbol)) append(symbol, "1");
         for (const auto& builtin : editorBuiltins(place == Type, place == Constraint))
             if (builtin.label != "awaitOutcome" || syntax.asynchronous) append(builtin, "2");
-        if (catalog && !prefix.empty()) for (const auto& candidate : catalog->imports)
-            if (candidate.kind == ImportKind::Runtime && candidate.automatic && accepts(candidate.symbol) && !seen.contains({candidate.symbol.label, ""}))
-                append(candidate.symbol, "3", &candidate);
     }
-    if (catalog && place == Import) for (const auto& candidate : catalog->imports) {
+    if (catalog && syntax.qualifier && (place == Member || place == TypeMember || place == ConstraintMember) &&
+        (!probe || !probe->receiverChecked || probe->namespaceReceiver)) {
+        if (auto scope = catalog->namespaces.find(syntax.qualifier->text); scope != catalog->namespaces.end())
+            for (const auto& member : scope->second.members) if (completionSymbol(place, member)) append(member, "1");
+    }
+    if (catalog && (place == Import || place == ImportMember)) for (const auto& candidate : catalog->imports) {
         if (candidate.kind != syntax.importKind || candidate.path.size() != syntax.importPath.size() + 1) continue;
+        if (candidate.kind == ImportKind::Runtime && ((candidate.symbol.kind == EditorKind::Module) != (place == Import))) continue;
         if (!std::equal(syntax.importPath.begin(), syntax.importPath.end(), candidate.path.begin(), [](const Identifier& word, const std::string& segment) { return word.text == segment; })) continue;
+        if (std::ranges::find(syntax.selectedImports, candidate.path.back(), &Identifier::text) != syntax.selectedImports.end()) continue;
         append(candidate.symbol, "1");
     }
     if (catalog && (place == DeclarationMacro || place == ExpressionMacro || place == Decorator)) {
@@ -576,6 +586,78 @@ json::Value completionItems(const Source& source, std::size_t offset, const Synt
             if (candidate.macro == kind && candidate.automatic) append(candidate.symbol, "3", &candidate);
     }
     return json::Object{{"isIncomplete", syntax.incomplete}, {"items", std::move(items)}};
+}
+
+json::Array importActions(const Source& source, const Document& document, const Diagnostic& error, const EditorModuleIndex& catalog,
+    const json::Object& params) {
+    if (!error.missingName || !error.site || pathKey(fromUtf8(error.site->file)) != pathKey(source.path)) return {};
+    if (const auto* context = params.getObject("context")) if (const auto* only = context->getArray("only"))
+        if (std::ranges::none_of(*only, [](const auto& kind) { auto value = kind.getAsString(); return value && (value->empty() || *value == "quickfix"); })) return {};
+    const auto* range = params.getObject("range");
+    if (!range) return {};
+    const Span diagnostic{error.site->start.offset, error.site->end.offset};
+    const Span requested{requestOffset(source, range->getObject("start")), requestOffset(source, range->getObject("end"))};
+    if (requested.end < diagnostic.begin || requested.begin > diagnostic.end) return {};
+    const auto& missing = *error.missingName;
+    const auto tokens = syntaxTokens(source, false, true);
+    const auto text = std::string_view(source.text);
+    std::optional<Span> site;
+    bool receiver = false;
+    for (auto current = tokens.begin(); current != tokens.end(); ++current) {
+        const auto& token = *current;
+        if (token.kind != "name" || token.span.begin < diagnostic.begin || token.span.end > diagnostic.end) continue;
+        if (bareIdentifier(text.substr(token.span.begin, token.span.end - token.span.begin)) != missing.name) continue;
+        if (site) return {};
+        site = token.span;
+        const auto next = std::next(current);
+        receiver = next != tokens.end() && text.substr(next->span.begin, next->span.end - next->span.begin) == ".";
+    }
+    if (!site || requested.end < site->begin || requested.begin > site->end) return {};
+    auto syntax = completeSyntax(source, site->end);
+    auto unshadowed = [&](const std::string& alias) {
+        return std::ranges::none_of(syntax.suggestions, [&](const auto& symbol) { return bareIdentifier(symbol.label) == alias; });
+    };
+    auto accepts = [&](EditorKind kind) {
+        switch (missing.kind) {
+            case MissingNameKind::Type: return typeSymbol(kind);
+            case MissingNameKind::Constraint: return kind == EditorKind::Trait;
+            case MissingNameKind::Call: return kind == EditorKind::Function || kind == EditorKind::Class || kind == EditorKind::Struct;
+            case MissingNameKind::Value: return kind == EditorKind::Function || kind == EditorKind::Constant ||
+                (receiver && (kind == EditorKind::Class || kind == EditorKind::Struct || kind == EditorKind::Enum));
+        }
+        std::abort();
+    };
+    json::Array reused, added;
+    std::set<std::string> seen;
+    auto occupied = catalog.occupied;
+    for (bool types : {false, true}) for (const auto& builtin : editorBuiltins(types)) occupied.insert(builtin.label);
+    for (const auto& candidate : catalog.imports) {
+        if (candidate.kind != ImportKind::Runtime || candidate.module.empty() || !accepts(candidate.symbol.kind) ||
+            candidate.path.back() != missing.name) continue;
+        auto route = candidate.path;
+        route.pop_back();
+        auto path = qualifiedPath(route);
+        const auto existing = std::ranges::find_if(catalog.namespaces, [&](const auto& entry) {
+            return entry.second.module == candidate.module && unshadowed(entry.first);
+        });
+        auto alias = existing == catalog.namespaces.end() ? route.back() : existing->first;
+        auto directive = "import " + path;
+        if (existing == catalog.namespaces.end()) {
+            for (unsigned suffix = 2; occupied.contains(alias) || !unshadowed(alias); ++suffix) alias = route.back() + std::to_string(suffix);
+            if (alias != route.back()) directive += " as " + editorModuleAlias(alias);
+        }
+        auto name = editorModuleAlias(alias) + '.' + candidate.symbol.label;
+        if (!seen.insert(existing == catalog.namespaces.end() ? path + ':' + name : name).second) continue;
+        json::Array edits{json::Object{{"range", jsonRange(source, *site)}, {"newText", name}}};
+        if (existing == catalog.namespaces.end()) edits.push_back(importEdit(source, importAnchor(source), directive));
+        auto title = existing == catalog.namespaces.end() ? "添加导入：" + directive + " → " + name : "使用已导入的 " + name;
+        auto& actions = existing == catalog.namespaces.end() ? added : reused;
+        actions.push_back(json::Object{{"title", std::move(title)}, {"kind", "quickfix"}, {"edit", json::Object{
+            {"documentChanges", json::Array{json::Object{{"textDocument", json::Object{{"uri", document.uri}, {"version", document.version}}}, {"edits", std::move(edits)}}}}
+        }}});
+    }
+    for (auto& action : added) reused.push_back(std::move(action));
+    return reused;
 }
 
 std::string_view tokenText(const Source& source, const SyntaxToken& token) {
@@ -994,7 +1076,8 @@ private:
             relativeWatchers = watch && watch->getBoolean("dynamicRegistration").value_or(false) && watch->getBoolean("relativePatternSupport").value_or(false);
             return json::Object{{"capabilities", json::Object{
             {"positionEncoding", "utf-16"}, {"textDocumentSync", json::Object{{"openClose", true}, {"change", 2}}},
-            {"completionProvider", json::Object{{"triggerCharacters", json::Array{".", "@", "#"}}}},
+            {"completionProvider", json::Object{{"triggerCharacters", json::Array{".", "@", "#", "{"}}}},
+            {"codeActionProvider", json::Object{{"codeActionKinds", json::Array{"quickfix"}}}},
             {"signatureHelpProvider", json::Object{{"triggerCharacters", json::Array{"(", ",", ":"}}, {"retriggerCharacters", json::Array{")"}}}},
             {"hoverProvider", true}, {"definitionProvider", true}, {"referencesProvider", true},
             {"renameProvider", true}, {"documentFormattingProvider", true}, {"inlayHintProvider", true}}}};
@@ -1093,7 +1176,7 @@ private:
 
     static json::Value unavailable(std::string_view method) {
         if (method == "textDocument/completion") return json::Object{{"isIncomplete", false}, {"items", json::Array{}}};
-        if (method == "textDocument/references" || method == "textDocument/inlayHint" || method == "textDocument/formatting") return json::Array{};
+        if (method == "textDocument/references" || method == "textDocument/inlayHint" || method == "textDocument/formatting" || method == "textDocument/codeAction") return json::Array{};
         return nullptr;
     }
 
@@ -1129,9 +1212,11 @@ private:
                 return {};
             }
             using enum CompletionPlace;
+            if (const auto* context = params.getObject("context"); syntax.place != ImportMember && context && context->getString("triggerCharacter") == "{")
+                return unavailable(method);
             const EditorModuleIndex* index = nullptr;
             if (syntax.place == Statement || syntax.place == Expression || syntax.place == Type || syntax.place == Constraint || syntax.place == Import ||
-                syntax.place == DeclarationMacro || syntax.place == ExpressionMacro || syntax.place == Decorator) {
+                syntax.place == ImportMember || syntax.qualifier || syntax.place == DeclarationMacro || syntax.place == ExpressionMacro || syntax.place == Decorator) {
                 try { index = &catalog(source.path); }
                 catch (const PackageError&) {}
                 catch (const fs::filesystem_error&) {}
@@ -1141,7 +1226,8 @@ private:
                 std::lock_guard lock(workMutex);
                 if (revision == generatedRevision) if (auto found = generated.find(key); found != generated.end()) expanded = found->second;
             }
-            if (syntax.place == Member || syntax.argumentLabel) {
+            bool moduleMember = index && syntax.qualifier && index->namespaces.contains(syntax.qualifier->text);
+            if ((syntax.place == Member && (!moduleMember || syntax.implicitReceiver)) || syntax.argumentLabel) {
                 std::optional<EditorModuleIndex> copied = index ? std::optional(*index) : std::nullopt;
                 enqueue(id, unavailable(method), [this, source = std::move(source), offset, syntax = std::move(syntax),
                     index = std::move(copied), expanded = std::move(expanded), documents = documents] {
@@ -1151,6 +1237,20 @@ private:
                 return {};
             }
             return completionItems(source, offset, syntax, index, nullptr, expanded);
+        }
+        if (method == "textDocument/codeAction") {
+            try {
+                auto index = catalog(document.path);
+                enqueue(id, unavailable(method), [this, params, key, index = std::move(index), documents = documents] {
+                    const auto& document = documents.at(key);
+                    const auto& workspace = analyze(packageRoot(fromUtf8(key)), documents);
+                    auto source = sourceFor(workspace, document.path);
+                    if (!workspace.error || !source || source->text != document.text) return json::Array{};
+                    return importActions(*source, document, *workspace.error, index, params);
+                });
+                return {};
+            } catch (const PackageError&) { return unavailable(method); }
+            catch (const fs::filesystem_error&) { return unavailable(method); }
         }
         if (method == "textDocument/formatting") {
             FormatOptions options;
@@ -1218,6 +1318,17 @@ private:
             if (!std::all_of(newName->begin() + 1, newName->end(), [](unsigned char ch) { return std::isalnum(ch) || ch == '_'; })) throw Diagnostic{"LYLSP0001", "新名称必须是有效 Lyra 标识符"};
             auto target = renameAnchor(*reference);
             auto edits = locationsFor(workspace, target, true);
+            auto spelling = newName->str();
+            std::optional<Span> implicitAlias;
+            if (auto resolved = resolveAnchor(workspace, target); resolved && resolved->first == source) {
+                auto syntax = indexFileSyntax(*source);
+                for (const auto& use : syntax.imports) if (use.kind == ImportKind::Runtime && !use.member && use.alias.span == resolved->second) {
+                    spelling = editorModuleAlias(*newName);
+                    if (use.alias.span == use.path.back().span && use.alias.text != *newName) implicitAlias = use.alias.span;
+                    break;
+                }
+            }
+            auto implicitLocation = implicitAlias ? jsonLocation(*source, *implicitAlias) : json::Object{};
             json::Object changes;
             std::map<std::string, json::Array> grouped;
             for (const auto& location : edits) {
@@ -1228,11 +1339,13 @@ private:
                     json::Object change;
                     auto start = range->getObject("start"), end = range->getObject("end");
                     if (!start || !end) continue;
+                    bool insertAlias = implicitAlias && item->getString("uri") == implicitLocation.getString("uri") && *range == *implicitLocation.getObject("range");
+                    if (insertAlias) start = end;
                     json::Object clonedRange;
                     clonedRange["start"] = json::Object{{"line", start->getInteger("line").value_or(0)}, {"character", start->getInteger("character").value_or(0)}};
                     clonedRange["end"] = json::Object{{"line", end->getInteger("line").value_or(0)}, {"character", end->getInteger("character").value_or(0)}};
                     change["range"] = std::move(clonedRange);
-                    change["newText"] = newName->str();
+                    change["newText"] = insertAlias ? " as " + spelling : spelling;
                     grouped[uri->str()].push_back(std::move(change));
                 }
             }

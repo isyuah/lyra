@@ -92,6 +92,7 @@ struct EditorProbe {
     std::vector<EditorSymbol> members{};
     std::vector<EditorSignature> signatures{};
     std::vector<EditorSymbol> labels{};
+    bool namespaceReceiver{}, receiverChecked{};
 };
 struct EditorProbeFinished {};
 struct EditorIndex {

@@ -11,9 +11,9 @@ from platform_cli import assert_linkage, c_archive, executable
 COMPILER = Path(sys.argv.pop(1)).resolve()
 
 IO_HELPERS = '''
-import std.io.IoError
-import std.io.IoErrorKind
-import std.os.args
+import std.io.{IoError}
+import std.io.{IoErrorKind}
+import std.os.{args}
 
 fn require<T>(result: Result<T, IoError>): T {
     match result { Ok(value) => value, Err(error) => throw Exception(error.message()) }
@@ -45,10 +45,10 @@ class IO(unittest.TestCase):
 
     def test_utf8_args_file_stdin_and_stderr(self):
         source = IO_HELPERS + r'''
-import std.io.readFile
-import std.io.writeFile
-import std.io.readLine
-import std.io.writeError
+import std.io.{readFile}
+import std.io.{writeFile}
+import std.io.{readLine}
+import std.io.{writeError}
 fn main(): Unit {
     val arguments = require(args())
     #assert(arguments.size == 2, "argc")
@@ -80,9 +80,9 @@ fn main(): Unit {
                 result = subprocess.run([app, invalid, empty, missing], input=raw, capture_output=True, timeout=5)
                 self.assertEqual((result.returncode, result.stdout, result.stderr), (0, b"", b""))
         self.example(IO_HELPERS + r'''
-import std.io.readFile
-import std.io.readLine
-import std.io.writeFile
+import std.io.{readFile}
+import std.io.{readLine}
+import std.io.{writeFile}
 fn main(): Unit {
     val arguments = require(args())
     #assert(failed(readFile(arguments[0]), IoErrorKind.InvalidUtf8), "invalid file")

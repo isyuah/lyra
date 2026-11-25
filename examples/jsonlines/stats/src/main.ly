@@ -1,16 +1,8 @@
-import metrics.parseLine
-import metrics.summary
-import std.cli.Command
-import std.cli.parseArgs
-import std.config.Config
-import std.config.intKey
-import std.config.stringKey
-import std.io.File
-import std.io.IoError
-import std.io.LineReader
-import std.io.writeError
-import std.jsonl.JsonlErrorKind
-import std.jsonl.jsonlReader
+import metrics.{parseLine, summary}
+import std.cli.{Command, parseArgs}
+import std.config.{Config, intKey, stringKey}
+import std.io.{File, IoError, LineReader, writeError}
+import std.jsonl.{JsonlErrorKind, jsonlReader}
 
 fn aggregate(input: LineReader): Result<Unit,IoError> {
     val reader = jsonlReader(input, parseLine)

@@ -209,8 +209,8 @@ fn main(): Unit { call(); }
     def test_typed_catches_filter_in_source_order_and_keep_identity(self):
         (self.package / 'src/errors').mkdir()
         (self.package / 'src/errors/types.ly').write_text('pub exception Missing\npub exception Invalid\n')
-        self.executable('''import self.errors.Missing as MissingEntry
-import self.errors.Invalid
+        self.executable('''import self.errors.{Missing as MissingEntry}
+import self.errors.{Invalid}
 fn wrongGuard(): Bool { print("wrong guard"); true }
 async fn reject(error: MissingEntry): Bool {
     await blocking { gcCollect() }
@@ -303,7 +303,7 @@ async fn main(): Unit {
     def test_throws_is_cross_module_documentation_not_an_effect(self):
         (self.package / 'src/errors').mkdir()
         (self.package / 'src/errors/types.ly').write_text('pub exception Missing\n')
-        self.executable('''import self.errors.Missing as MissingEntry
+        self.executable('''import self.errors.{Missing as MissingEntry}
 pub fn preserve<T>(value: T): T throws MissingEntry, Exception { value }
 fn throws(): Int { 7 }
 fn unexpected(): Unit throws MissingEntry { throw Exception("not declared") }

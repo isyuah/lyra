@@ -1,10 +1,7 @@
-import std.collections.HashMap
-import std.collections.HashSet
-import std.collections.stringMap
-import std.collections.stringSet
-import std.io.IoError
-import std.os.args
-import std.text.StringOps
+import std.collections.{HashMap, HashSet, stringMap, stringSet}
+import std.io.{IoError}
+import std.os.{args}
+import std.text.{StringOps}
 
 pub enum CliErrorKind {
     ReadArgs(IoError), UnknownOption(String), MissingValue(String), UnexpectedValue(String),

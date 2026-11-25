@@ -88,8 +88,8 @@ lyra lsp --stdio
 lyra fmt [--check] <文件.ly>...
 ```
 
-- `lyra.json5` 包中一个目录组成一个模块。`import self.net.port` 从本包导入，`import cfg.defaultPort as port` 从清单中简称为 `cfg` 的库导入。默认私有，`pub import` 可重导出。无清单的单模块冒烟样例只读取 `src` 直属文件。库包可独立 `check`，无需 `main`。
-- `test` 编译并运行每个 `tests/*.ly` 中的 `fn main(): Unit`，用 `import self.<名称>` 访问包的公开 API。workspace 根支持一次检查或测试多个成员。锁、缓存、只读 HTTP(S) 源和脚本边界见[包工具手册](compiler/packages.md)。
+- `lyra.json5` 包中一个目录组成一个模块。`import self.net` 只在本文件绑定 `net`；`import cfg.net as remote` 可换名，写 `remote.port()`。用 `import cfg.net.{Endpoint, port as remotePort}` 才引入裸名，`pub import cfg.net.{Endpoint}` 可重导出。无清单的单模块冒烟样例只读取 `src` 直属文件。库包可独立 `check`，无需 `main`。详见[模块 RFC](rfc/modules-packages.md)。
+- `test` 编译并运行每个 `tests/*.ly` 中的 `fn main(): Unit`，用 `import self as app` 或 `import self.{名称}` 访问包的公开 API。workspace 根支持一次检查或测试多个成员。锁、缓存、只读 HTTP(S) 源和脚本边界见[包工具手册](compiler/packages.md)。
 - 支持有符号和无符号整数 `Int8/16/32/64`、`UInt8/16/32/64`（`Int`、`UInt` 为 64 位别名）、`Float32`、`Float64`（`Float`）、`Bool` 和 `Unit`。提供数值四则、余数、比较和复合赋值；整数溢出或除零在 Debug/Release 都带源码位置报错。窄化可用 `value.toInt8Checked()` 等方法，返回 `Option`。
 - 支持具名形参、按源码顺序求值的命名实参、`val` / `var`、嵌套作用域、短路 `&&` / `||`、`if` / `else`、`while`、`break`、`continue` 和 `return`。普通块以末表达式为值，空块或带末尾分号的块取 `Unit`。
 - [文本与字节](rfc/language-core.md#文本与字节)：`String` 支持 UTF-8、拼接和 `"Hello, ${name}"` 插值；单引号给出 Unicode `Char`，`b"\xFF"` 给出不可变 `Bytes`，可显式检查和转换为文本。
@@ -116,7 +116,7 @@ lyra fmt [--check] <文件.ly>...
 - [JSON Lines 统计 CLI](examples/jsonlines/README.md) 是可直接运行的双包项目：公开库解码，命令行逐行统计，错误带行号。验收会实际发布库、移走源码和中心，再从锁和缓存重新原生编译。
 - `check` 不生成原生产物。`build` 由 LLVM 直接生成目标文件，再用 SDK 内的 LLD 链接。默认输出 `<包目录>/build/debug/app`（`-O0`，含源码级调试信息），`--release` 输出 `build/release/app`（`-O2`），`--release --debug-info` 保留优化版符号。Windows 的程序名为 `app.exe`，有符号时另生成同名 `.pdb`。目标文件按 LLVM IR、后端版本和发射选项缓存；每次仍进行类型检查与链接。缓存默认位于 `.lyra-cache/objects`，`LYRA_CACHE` 可指定共享缓存根。`-o` 指定完整目标路径；类型错误或链接失败不会覆盖已有产物。
 - 设置 `LYRA_NATIVE_BACKTRACE=1` 会在未捕获异常的 Lyra 源码链后显示原生帧。见[调试原生程序](rfc/native-toolchain.md#调试原生程序)。
-- `lyra lsp --stdio` 提供基于同一 parser/checker 的 VS Code 语言服务，支持未保存缓冲区诊断、上下文和成员补全、模块与自动导入、签名提示、悬停、定义（含宏）、引用、重命名、行内类型提示及格式化。扩展在 `editors/vscode/`，通过 `lyra.serverPath` 或 `PATH` 找到 SDK；服务端只读解析已有依赖，不下载包或执行准备脚本。LSP 行列使用 UTF-16，编译器诊断仍保留 UTF-8 字节范围。
+- `lyra lsp --stdio` 提供基于同一 parser/checker 的 VS Code 语言服务，支持未保存缓冲区诊断、上下文和成员补全、模块与分组补全、导入 Quick Fix、签名提示、悬停、定义（含宏）、引用、重命名、行内类型提示及格式化。扩展在 `editors/vscode/`，通过 `lyra.serverPath` 或 `PATH` 找到 SDK；服务端只读解析已有依赖，不下载包或执行准备脚本。LSP 行列使用 UTF-16，编译器诊断仍保留 UTF-8 字节范围。
 - `lyra fmt` 整理显式传入的 `.ly` 文件，`--check` 只检查不写入。首版整理缩进和 token 之外的行尾空白，不重排语句或改动字面量、注释内容和原有换行；无需解析包或展开宏。
 - 诊断写到标准错误；`--diagnostics=json` 输出诊断数组，成功为 `[]`。带源码位置时，`range.start/end` 是左闭右开区间：`offset` 为从 0 开始的原文件 UTF-8 字节偏移，`line/column` 从 1 开始，列按 Unicode 码点计，CRLF 和 LF 均算一次换行。
 

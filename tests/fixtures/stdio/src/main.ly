@@ -1,8 +1,5 @@
-import std.os.args
-import std.io.IoError
-import std.io.readFile
-import std.io.readLine
-import std.io.writeFile
+import std.os.{args}
+import std.io.{IoError, readFile, readLine, writeFile}
 
 fn copyLine(): Result<Unit, IoError> {
     val arguments = args()?

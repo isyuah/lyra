@@ -26,12 +26,12 @@ class HttpTls(unittest.TestCase):
             source.parent.mkdir()
             (root / 'lyra.json5').write_text('{name:"test/http-tls",version:"0.1.0"}', encoding='utf-8')
             source.write_text('''
-import std.http.Request
-import std.http.Response
-import std.http.Router
-import std.httpTls.listenTls
-import std.io.readBytes
-import std.os.args
+import std.http.{Request}
+import std.http.{Response}
+import std.http.{Router}
+import std.httpTls.{listenTls}
+import std.io.{readBytes}
+import std.os.{args}
 
 fn pem(path: String): Bytes {
     match readBytes(path) { Ok(value) => value, Err(error) => throw Exception(error.message()) }

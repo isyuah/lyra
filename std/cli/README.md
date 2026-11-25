@@ -1,8 +1,8 @@
 # `std.cli`
 
 ```lyra
-import std.cli.Command
-import std.cli.parseArgs
+import std.cli.{Command}
+import std.cli.{parseArgs}
 
 val spec = Command("stats")
     .option("--input", required: true)

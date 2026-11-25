@@ -162,13 +162,13 @@ pub const fn score(from: Int, through: Int): Int {
     sum
 }
 ''')
-        self.write('cfg/src/api.ly', '''pub import self.internal.total as entries
-pub import self.internal.text
-pub import self.internal.score
+        self.write('cfg/src/api.ly', '''pub import self.internal.{total as entries}
+pub import self.internal.{text}
+pub import self.internal.{score}
 ''')
-        self.write('app/src/main.ly', '''import cfg.entries as count
-import cfg.text
-import cfg.score
+        self.write('app/src/main.ly', '''import cfg.{entries as count}
+import cfg.{text}
+import cfg.{score}
 const maximum: UInt64 = 18446744073709551615
 const rounded: Float32 = (16777216.0f32 + 1.0f32) - 16777216.0f32
 const ok: Bool = true || (1 / 0 == 0)
@@ -192,7 +192,7 @@ fn main(): Unit {
                 result = self.cli('run', self.app, *mode)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(result.stdout.splitlines(), ['36', '值🙂=36', '6', '18446744073709551615', '0', 'true', '-9223372036854775808', 'true', '5'])
-        self.write('app/src/main.ly', 'import cfg.internal.base\nfn main(): Unit {}\n')
+        self.write('app/src/main.ly', 'import cfg.internal.{base}\nfn main(): Unit {}\n')
         self.diagnose(self.app, 'LYN0003', 'base')
 
     def test_constant_patterns_run_in_compile_time_functions(self):
@@ -220,8 +220,8 @@ fn main(): Unit { print(answer) }
         self.write('app/lyra.json5', '{name:"app",version:"0.1.0"}')
         (self.app / 'src/left').mkdir()
         (self.app / 'src/right').mkdir()
-        self.write('app/src/left/first.ly', 'import self.right.second\npub const first: Int = second\n')
-        self.write('app/src/right/second.ly', 'import self.left.first\npub const second: Int = first\n')
+        self.write('app/src/left/first.ly', 'import self.right.{second}\npub const first: Int = second\n')
+        self.write('app/src/right/second.ly', 'import self.left.{first}\npub const second: Int = first\n')
         self.write('app/src/main.ly', 'fn main(): Unit {}\n')
         diagnostic = self.diagnose(self.app, 'LYCT0002', '依赖环')
         self.assertEqual(Path(diagnostic['file']).name, 'second.ly')
@@ -394,10 +394,10 @@ pub fn compute(): Result<Summary,String> {
 }
 pub const summary: Result<Summary,String> = compute()
 ''')
-        self.write('app/src/main.ly', '''import cfg.Item
-import cfg.Summary
-import cfg.compute
-import cfg.summary
+        self.write('app/src/main.ly', '''import cfg.{Item}
+import cfg.{Summary}
+import cfg.{compute}
+import cfg.{summary}
 const saved: Result<Summary,String> = summary
 fn show(result: Result<Summary,String>): Unit {
     match result {

@@ -52,10 +52,10 @@ class OsTime(unittest.TestCase):
 
     def test_clock_calendar_and_explicit_offset(self):
         app = self.build('''
-import std.time.Clock
-import std.time.Date
-import std.time.DateTime
-import std.time.TimeError
+import std.time.{Clock}
+import std.time.{Date}
+import std.time.{DateTime}
+import std.time.{TimeError}
 
 fn date(value: Result<Date,TimeError>): Date {
     match value { Ok(parsed) => parsed, Err(_) => throw Exception("expected date") }
@@ -100,9 +100,9 @@ sys.stderr.buffer.write(b'y' * 80000)
 sys.exit(19)
 ''', encoding='utf-8')
         app = self.build('''
-import std.os.ProcessOptions
-import std.os.args
-import std.os.runProcess
+import std.os.{ProcessOptions}
+import std.os.{args}
+import std.os.{runProcess}
 
 async fn main(): Unit {
     val params = match args() { Ok(value) => value, Err(error) => throw Exception(error.message()) }
@@ -137,9 +137,9 @@ temporary.replace(marker)
 time.sleep(60)
 ''', encoding='utf-8')
         app = self.build('''
-import std.io.readLine
-import std.os.args
-import std.os.runProcess
+import std.io.{readLine}
+import std.os.{args}
+import std.os.{runProcess}
 
 async fn main(): Unit {
     val values = match args() { Ok(value) => value, Err(error) => throw Exception(error.message()) }
@@ -179,11 +179,11 @@ async fn main(): Unit {
     def test_process_timeout_releases_queued_work_without_starting_the_child(self):
         marker = self.root / 'never-started'
         app = self.build('''
-import std.io.readLine
-import std.os.ProcessOptions
-import std.os.args
-import std.os.runProcess
-import std.sync.AtomicInt
+import std.io.{readLine}
+import std.os.{ProcessOptions}
+import std.os.{args}
+import std.os.{runProcess}
+import std.sync.{AtomicInt}
 
 async fn main(): Unit {
     val entered = AtomicInt()

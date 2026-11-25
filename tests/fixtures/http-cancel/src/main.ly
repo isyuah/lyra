@@ -1,13 +1,7 @@
-import std.http.listen
-import std.http.HttpError
-import std.http.Request
-import std.http.Response
-import std.io.IoError
-import std.io.readLine
-import std.os.args
-import std.sqlite.DbError
-import std.sqlite.Statement
-import std.sqlite.openReadOnly
+import std.http.{listen, HttpError, Request, Response}
+import std.io.{IoError, readLine}
+import std.os.{args}
+import std.sqlite.{DbError, Statement, openReadOnly}
 
 fn require<T>(result: Result<T, DbError>): T {
     match result { Ok(value) => value, Err(error) => throw Exception(error.message()) }

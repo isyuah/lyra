@@ -19,8 +19,8 @@
 - `file.close()` 是同步清理，可用 `defer file.close()`；别名共享关闭，闲置时重复关闭成功。并行操作占用同一文件时返回 `IoErrorKind.Busy`；此时 `close` 抛 `std.io.Busy` 而不关闭，其他关闭失败抛 `std.io.CloseError`。I/O 都是同步的，服务端可以通过 `blocking` 隔离等待。
 
 ```lyra
-import std.io.File
-import std.io.IoError
+import std.io.{File}
+import std.io.{IoError}
 
 fn copyFile(source: String, destination: String): Result<Unit, IoError> {
     val input = File.openRead(source)?

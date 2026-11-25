@@ -3,7 +3,7 @@
 显式导入 `std.text.StringOps` 后可在 `String` 上使用文本操作。位置从零开始，按 Unicode 标量计数，不按 UTF-8 字节或字素计数；所有操作都保留内嵌 NUL，不做 Unicode 归一化。
 
 ```lyra
-import std.text.StringOps
+import std.text.{StringOps}
 
 fn main(): Unit {
     val fields = "  Ada,ff,  ".trim().split(",")

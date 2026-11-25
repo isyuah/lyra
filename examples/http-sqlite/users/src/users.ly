@@ -1,9 +1,5 @@
-import std.json.JsonCodec
-import std.sqlite.Connection
-import std.sqlite.DbError
-import std.sqlite.Statement
-import std.sqlite.open
-import std.sqlite.openReadOnly
+import std.json.{JsonCodec}
+import std.sqlite.{Connection, DbError, Statement, open, openReadOnly}
 
 #derive(Json)
 pub struct User(pub val id: Int, pub val name: String)

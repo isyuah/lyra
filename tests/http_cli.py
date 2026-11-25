@@ -21,10 +21,10 @@ SERVICE = Path(__file__).resolve().parents[1] / "examples/http-sqlite"
 CANCELLATION = Path(__file__).resolve().parent / "fixtures/http-cancel"
 
 HTTP_HELPERS = '''
-import std.http.HttpError
-import std.http.HttpErrorKind
-import std.http.listen
-import std.http.Response
+import std.http.{HttpError}
+import std.http.{HttpErrorKind}
+import std.http.{listen}
+import std.http.{Response}
 
 fn requireHttp<T>(result: Result<T, HttpError>): T {
     match result { Ok(value) => value, Err(error) => throw Exception(error.message()) }
@@ -144,11 +144,11 @@ class HTTP(unittest.TestCase):
   dependencies: { store: { name: 'example/users', version: '^0.1.0', path: '../users' } },
 }''', encoding='utf-8')
         (consumer / 'src/main.ly').write_text(r'''
-import store.findUser
-import store.newUserCodec
-import store.userCodec
-import std.os.args
-import std.sqlite.DbErrorKind
+import store.{findUser}
+import store.{newUserCodec}
+import store.{userCodec}
+import std.os.{args}
+import std.sqlite.{DbErrorKind}
 
 fn main(): Unit {
     val arguments = match args() { Ok(values) => values, Err(error) => throw Exception(error.message()) }
@@ -184,8 +184,8 @@ fn main(): Unit {
         (package / "src").mkdir(parents=True)
         (package / "lyra.json5").write_text("{name:'test/http-capacity',version:'1.0.0'}")
         (package / "src/main.ly").write_text(HTTP_HELPERS + '''
-import std.http.Request
-import std.http.Router
+import std.http.{Request}
+import std.http.{Router}
 async fn hold(request: Request): Response {
     print("entered")
     await blocking { request.waitDisconnect(15000); }
@@ -225,8 +225,8 @@ async fn main(): Unit {
         (package / "src").mkdir(parents=True)
         (package / "lyra.json5").write_text("{name:'test/http-methods',version:'1.0.0'}")
         (package / "src/main.ly").write_text(HTTP_HELPERS + '''
-import std.http.Request
-import std.http.Router
+import std.http.{Request}
+import std.http.{Router}
 
 async fn main(): Unit {
     #assert(failed(listen(-1), HttpErrorKind.Invalid), "invalid port")
@@ -279,9 +279,9 @@ async fn main(): Unit {
         (package / "src").mkdir(parents=True)
         (package / "lyra.json5").write_text("{name:'test/http-lifetimes',version:'1.0.0'}")
         (package / "src/main.ly").write_text(HTTP_HELPERS + '''
-import std.http.Busy
-import std.http.Listener
-import std.http.Request
+import std.http.{Busy}
+import std.http.{Listener}
+import std.http.{Request}
 
 fn tryClose(listener: Listener): Bool {
     try { listener.close(); true } catch busy: Busy { false }
@@ -338,8 +338,8 @@ async fn main(): Unit {
         (package / "src").mkdir(parents=True)
         (package / "lyra.json5").write_text("{name:'test/http-wait-disconnect',version:'1.0.0'}")
         (package / "src/main.ly").write_text(HTTP_HELPERS + '''
-import std.http.Request
-import std.io.readLine
+import std.http.{Request}
+import std.io.{readLine}
 
 async fn observe(work: Task<Unit>): Unit { await work }
 
@@ -413,7 +413,7 @@ async fn main(): Unit {
         (package / "src").mkdir(parents=True)
         (package / "lyra.json5").write_text("{name:'test/http',version:'1.0.0'}")
         (package / "src/main.ly").write_text(HTTP_HELPERS + r'''
-import std.io.readLine
+import std.io.{readLine}
 fn main(): Unit {
     val server = requireHttp(listen(0))
     print(server.port())

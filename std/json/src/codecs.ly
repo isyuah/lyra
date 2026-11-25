@@ -1,5 +1,4 @@
-import std.collections.HashMap
-import std.collections.stringMap
+import std.collections.{HashMap, stringMap}
 
 pub struct JsonCodec<T>(val encodeValue: (T) -> String, val readValue: (JsonValue, String) -> Result<T,String>) {
     pub fn encode(value: T): String { encodeValue(value) }

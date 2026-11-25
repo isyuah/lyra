@@ -58,7 +58,8 @@ public:
     }
 
     void bind(Type variable, const Identifier& bound, const Source& source) {
-        if (!valueConstraint(bound.text) && !traits.contains(bound.text)) throw at(source, bound.span, "LYG0005", "找不到结构约束 trait：" + bound.text);
+        if (!valueConstraint(bound.text) && !traits.contains(bound.text))
+            throw missingName(source, bound.span, "LYG0005", "找不到结构约束 trait：" + bound.text, MissingNameKind::Constraint, bound.text);
         auto& constraints = variables[variable.id];
         if (std::ranges::find(constraints, bound.text) != constraints.end())
             throw at(source, bound.span, "LYN0002", "结构约束重复：" + bound.text);

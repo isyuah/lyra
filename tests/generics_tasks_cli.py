@@ -18,7 +18,7 @@ class GenericTasks(unittest.TestCase):
             (root / 'src/model').mkdir(parents=True)
             (root / 'lyra.json5').write_text('{name: "app", version: "1.0.0"}')
             (root / 'src/model/cell.ly').write_text('pub class Cell(pub val value: Int)\n')
-            (root / 'src/main.ly').write_text('''import self.model.Cell as Box
+            (root / 'src/main.ly').write_text('''import self.model.{Cell as Box}
 async fn make(): Box { Box(17) }
 async fn nested(): Task<Box> { make() }
 async fn flatten<T>(work: Task<Task<T>>): T { await (await work) }

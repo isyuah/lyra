@@ -1,5 +1,5 @@
-import std.io.writeError
-import std.json.JsonCodec
+import std.io.{writeError}
+import std.json.{JsonCodec}
 
 extern fn lyraHttpListen(host: String, port: Int): CPtr;
 extern fn lyraHttpStatus(server: CPtr): Int;

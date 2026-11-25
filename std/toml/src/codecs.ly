@@ -1,5 +1,4 @@
-import std.collections.HashMap
-import std.collections.stringMap
+import std.collections.{HashMap, stringMap}
 
 pub struct TomlCodec<T>(val writeValue: (T, String, Bool) -> String, val readValue: (TomlValue, String) -> Result<T,String>) {
     pub fn write(value: T, path: String, inline: Bool): String { writeValue(value, path, inline) }

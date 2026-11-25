@@ -9,14 +9,14 @@ import unittest
 
 COMPILER = Path(sys.argv.pop(1)).resolve()
 
-IMPORTS = '''import std.json.jsonArray
-import std.json.jsonBool
-import std.json.jsonFloat
-import std.json.jsonInt
-import std.json.jsonNull
-import std.json.jsonObject
-import std.json.jsonString
-import std.json.parseJson
+IMPORTS = '''import std.json.{jsonArray}
+import std.json.{jsonBool}
+import std.json.{jsonFloat}
+import std.json.{jsonInt}
+import std.json.{jsonNull}
+import std.json.{jsonObject}
+import std.json.{jsonString}
+import std.json.{parseJson}
 '''
 
 

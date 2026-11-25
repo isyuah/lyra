@@ -295,7 +295,7 @@ struct CompletionScope {
     }
 
     void add(const Pattern& pattern) {
-        if (const auto* name = std::get_if<PatternName>(&pattern.node); name && !name->owner && !name->labels && (name->escaped || name->name.text != "None")) add(name->name);
+        if (const auto* name = std::get_if<PatternName>(&pattern.node); name && !name->owner && !name->module && !name->labels && (name->escaped || name->name.text != "None")) add(name->name);
         if (const auto* list = std::get_if<PatternList>(&pattern.node); list && list->rest) add(*list->rest);
         for (const auto& part : pattern.parts) add(part);
     }
@@ -414,21 +414,8 @@ private:
                 if (is("struct") || is("class")) prefix.kind = ExpansionTarget::Aggregate;
                 prefix.target = prefix.kind == ExpansionTarget::Aggregate ? module.aggregates.size() : module.functions.size();
             }
-            if (is("import")) {
-                consume();
-                auto kind = ImportKind::Runtime;
-                if ((is("macro") || is("decorator")) && text(next) != ".")
-                    kind = text(consume()) == "macro" ? ImportKind::Macro : ImportKind::Decorator;
-                importCompletion(kind, {});
-                std::vector<Identifier> path{identifier()};
-                while (is(".")) { consume(); importCompletion(kind, path); path.push_back(identifier()); }
-                auto alias = path.back();
-                if (is("as")) { consume(); alias = identifier(); }
-                else if (!token.newlineBefore) completeAt(CompletionPlace::ImportAlias);
-                module.imports.push_back({file, pub, std::move(path), std::move(alias), kind});
-                if (is(";")) consume();
-                else if (token.kind != Kind::End && !token.newlineBefore) throw at(source, token.span, "LYP0001", "导入后需要换行或分号");
-            } else if (is("struct") || is("class")) aggregate(module, pub);
+            if (is("import")) imports(module, pub);
+            else if (is("struct") || is("class")) aggregate(module, pub);
             else appendFunction(module, function({}, pub), firstPrefix);
     }
 
@@ -457,14 +444,73 @@ private:
         completion->result.place = place;
         completion->result.callOpen = callOpen;
         completion->result.asynchronous = completion->asynchronous;
+        completion->result.implicitReceiver = completion->receiver;
         throw CompletionReached{};
     }
 
-    void importCompletion(ImportKind kind, const std::vector<Identifier>& path) {
+    void importCompletion(ImportKind kind, const std::vector<Identifier>& path, CompletionPlace place = CompletionPlace::Import) {
         if (token.kind != Kind::Hole || !completion) return;
         completion->result.importKind = kind;
         completion->result.importPath = path;
-        completeAt(CompletionPlace::Import);
+        completeAt(place);
+    }
+
+    void imports(Module& module, bool pub) {
+        consume();
+        auto kind = ImportKind::Runtime;
+        if ((is("macro") || is("decorator")) && !next.newlineBefore &&
+            (next.kind == Kind::Name || next.kind == Kind::Escaped || next.kind == Kind::Hole))
+            kind = text(consume()) == "macro" ? ImportKind::Macro : ImportKind::Decorator;
+        importCompletion(kind, {});
+        std::vector<Identifier> path{identifier()};
+        std::vector<Import> items;
+        auto add = [&](std::optional<Identifier> member) {
+            auto alias = member ? *member : path.back();
+            if (is("as")) { consume(); alias = identifier(); }
+            else if (!token.newlineBefore) completeAt(CompletionPlace::ImportAlias);
+            items.push_back({file, pub, path, std::move(alias), kind, std::move(member)});
+        };
+        bool grouped = false;
+        while (is(".")) {
+            consume();
+            if (kind == ImportKind::Runtime && is("{")) { grouped = true; break; }
+            importCompletion(kind, path);
+            path.push_back(identifier());
+        }
+        if (grouped) {
+            consume();
+            do {
+                if (token.kind == Kind::Hole && completion) for (const auto& item : items) completion->result.selectedImports.push_back(*item.member);
+                importCompletion(kind, path, CompletionPlace::ImportMember);
+                add(identifier());
+                if (!is(",")) break;
+                consume();
+            } while (!is("}"));
+            require("}");
+        } else if (kind != ImportKind::Runtime) {
+            if (path.size() < 2) throw at(source, path.front().span, "LYP0001", "宏和装饰器导入需要包与声明名");
+            auto member = std::move(path.back());
+            path.pop_back();
+            add(std::move(member));
+        } else {
+            if (pub) throw at(source, path.back().span, "LYP0001", "pub import 需要用 .{名称} 显式重导出声明");
+            add({});
+        }
+        if (is(";")) consume();
+        else if (token.kind != Kind::End && !token.newlineBefore) throw at(source, token.span, "LYP0001", "导入后需要换行或分号");
+        for (auto& item : items) module.imports.push_back(std::move(item));
+    }
+
+    void qualifiedCompletion(CompletionPlace place, const Identifier* name = nullptr) {
+        if (token.kind != Kind::Hole || !completion) return;
+        if (name) {
+            auto bare = [](std::string_view word) { return word.starts_with('`') ? word.substr(1, word.size() - 2) : word; };
+            auto shadowed = std::ranges::any_of(completion->names, [&](const auto& entry) {
+                return bare(entry.first) == name->text && (entry.second.kind == EditorKind::TypeParameter) == (place != CompletionPlace::Member);
+            });
+            if (!shadowed) completion->result.qualifier = *name;
+        }
+        completeAt(place);
     }
 
     void recover(std::size_t start, bool topLevel) {
@@ -611,10 +657,11 @@ private:
             return typeSuffixes(std::move(name));
         }
         auto name = [&] {
-            if (!is("dyn") || next.newlineBefore || (next.kind != Kind::Name && next.kind != Kind::Escaped)) return identifier();
+            if (!is("dyn") || next.newlineBefore || (next.kind != Kind::Name && next.kind != Kind::Escaped && next.kind != Kind::Hole))
+                return typePath(CompletionPlace::TypeMember);
             auto start = consume().span.begin;
             completeAt(CompletionPlace::Constraint);
-            auto trait = identifier();
+            auto trait = typePath(CompletionPlace::ConstraintMember);
             if (is("<")) {
                 auto bindings = associatedBindings(trait.span.end);
                 std::ranges::sort(bindings, {}, [](const auto& binding) { return binding.member.text; });
@@ -633,8 +680,23 @@ private:
             while (is(",")) { consume(); name.text += ',' + type().text; }
             name.span.end = closeAngle().end;
             name.text += '>';
+        } else if (!name.text.starts_with("$dyn:")) {
+            if (auto dot = name.text.find('.'); dot != name.text.npos)
+                name.text = "$assoc:" + name.text.substr(dot + 1) + '<' + name.text.substr(0, dot) + '>';
         }
         return typeSuffixes(std::move(name));
+    }
+
+    Identifier typePath(CompletionPlace place) {
+        auto name = identifier();
+        if (is(".") && !token.newlineBefore) {
+            consume();
+            qualifiedCompletion(place, &name);
+            auto member = identifier();
+            name.text += '.' + member.text;
+            name.span.end = member.span.end;
+        }
+        return name;
     }
 
     Identifier typeSuffixes(Identifier name) {
@@ -740,7 +802,7 @@ private:
                 consume();
                 for (;;) {
                     completeAt(CompletionPlace::Constraint);
-                    Bound bound{parameters.size() - 1, identifier()};
+                    Bound bound{parameters.size() - 1, typePath(CompletionPlace::ConstraintMember)};
                     if (is("<")) {
                         std::size_t end;
                         bound.bindings = associatedBindings(end);
@@ -1290,13 +1352,15 @@ private:
             if (!is(".") && !is("?.")) break;
             bool safe = is("?.");
             auto site = consume().span;
-            completeAt(CompletionPlace::Member);
+            qualifiedCompletion(CompletionPlace::Member, safe ? nullptr : std::get_if<Identifier>(&nodes[value].node));
             auto name = identifier();
             auto begin = nodes[value].span.begin;
             auto subject = value;
             std::optional<Identifier> payload;
             if (safe) { payload = hidden("some", site); value = add(site, *payload); }
-            if (explicitTypes(name) || (is("(") && (inParens || !token.newlineBefore))) value = call(begin, std::move(name), value);
+            if (!safe && typeSuffix(name.span.end) == TypeSuffix::Qualifier)
+                value = typeMember(begin, std::move(name), inParens, trailingBlock, value);
+            else if (explicitTypes(name) || (is("(") && (inParens || !token.newlineBefore))) value = call(begin, std::move(name), value);
             else { auto end = name.span.end; value = add({begin, end}, Member{value, std::move(name)}); }
             value = tailArgument(value, trailingBlock);
             if (safe) {
@@ -1382,6 +1446,13 @@ private:
             name.owner = std::move(name.name);
             name.escaped = token.kind == Kind::Escaped;
             name.name = identifier();
+            if (is(".")) {
+                consume();
+                name.module = std::move(name.owner);
+                name.owner = std::move(name.name);
+                name.escaped = token.kind == Kind::Escaped;
+                name.name = identifier();
+            }
         }
         if (!name.owner && !name.escaped && name.name.text == "_") return {site, std::monostate{}};
         site.end = name.name.span.end;
@@ -1505,6 +1576,18 @@ private:
         }
         auto close = require(")").span;
         return add({begin, close.end}, std::move(node));
+    }
+
+    ExprId typeMember(std::size_t start, Identifier name, bool inParens, bool trailingBlock, std::optional<ExprId> moduleReceiver = {}) {
+        TypeQualifier owner{std::move(name), typeList(), moduleReceiver};
+        require(".");
+        completeAt(CompletionPlace::Member);
+        auto member = identifier();
+        if (explicitTypes(member) || (is("(") && (inParens || !token.newlineBefore))) return call(start, std::move(member), {}, {}, std::move(owner));
+        auto end = member.span.end;
+        if (trailingBlock && (is("{") || (is("async") && text(next) == "{" && !next.newlineBefore)) && !token.newlineBefore)
+            return add({start, end}, Call{std::move(member), {}, {}, {}, {}, std::move(owner)});
+        return add({start, end}, QualifiedMember{std::move(owner), std::move(member)});
     }
 
     ExprId macroExpression() {
@@ -1736,17 +1819,7 @@ private:
         if (token.kind == Kind::Name || token.kind == Kind::Escaped) {
             auto name = identifier();
             auto suffix = typeSuffix(name.span.end);
-            if (suffix == TypeSuffix::Qualifier) {
-                TypeQualifier owner{std::move(name), typeList()};
-                require(".");
-                completeAt(CompletionPlace::Member);
-                auto method = identifier();
-                if (explicitTypes(method) || (is("(") && (inParens || !token.newlineBefore))) return call(start, std::move(method), {}, {}, std::move(owner));
-                if (trailingBlock && (is("{") || (is("async") && text(next) == "{" && !next.newlineBefore)) && !token.newlineBefore)
-                    return add({start, method.span.end}, Call{std::move(method), {}, {}, {}, {}, std::move(owner)});
-                auto end = method.span.end;
-                return add({start, end}, QualifiedMember{std::move(owner), std::move(method)});
-            }
+            if (suffix == TypeSuffix::Qualifier) return typeMember(start, std::move(name), inParens, trailingBlock);
             if (suffix != TypeSuffix::Call && (!is("(") || (token.newlineBefore && !inParens))) { auto span = name.span; return add(span, std::move(name)); }
             return call(start, std::move(name), {});
         }
@@ -1915,6 +1988,11 @@ std::string editorSpelling(const Source& source, const Identifier& name) {
 std::string editorIdentifier(std::string_view name) {
     if (name.empty() || !isLetter(name.front()) || !std::ranges::all_of(name, [](auto letter) { return isLetter(letter) || isDigit(letter); })) return {};
     return std::ranges::find(keywords, name) == std::end(keywords) ? std::string(name) : "`" + std::string(name) + "`";
+}
+
+std::string editorModuleAlias(std::string_view name) {
+    if (name == "None" || name == "Self") return "`" + std::string(name) + '`';
+    return editorIdentifier(name);
 }
 
 std::string editorDocumentation(const Source& source, std::size_t start) {
