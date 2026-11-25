@@ -55,6 +55,12 @@ struct Article([jsonCodec("userFormat")] pub val authors: List<Author?>)
 
 手写格式可用 `std.json.jsonCodec<T>(encode, read)` 创建同一类型的编解码器。`encode` 的签名为 `(T) -> String`，`read` 的签名为 `(JsonValue, String) -> Result<T,String>`。字段标记指定的工厂须按零参数调用并返回该字段最内层元素的 `JsonCodec<T>`，编译时检查类型。
 
+### 组合编解码器
+
+直接组合现有 codec，不额外触发派生。例如 `jsonCodecList(userWire())` 处理 `List<User>`，`jsonCodecStringMap(userWire())` 处理 `HashMap<String,User>`。内置的 `jsonCodecString()`、`jsonCodecInt()` 等可充当叶子 codec。`jsonCodecResult(jsonCodecInt(), jsonCodecString())` 使用带 `tag` 和 `value` 的对象区分 `Ok` 与 `Err`。
+
+显式 `jsonCodecOption(element)` 使用 `{"tag":"None"}` 或 `{"tag":"Some","value":…}`。这样即使 `element` 自己可空，也能无损区分 `None` 和 `Some(None)`；它与 Struct 派生中省略字段／使用 `null` 的约定不同。列表路径使用 `[index]`，Map 路径使用键，标签载荷路径使用 `.value`。Map 不限制输入键集合，但会把严格/宽松策略传给每个值；编码含 NUL 的键会抛异常。
+
 ### 数值怎样映射
 
 | Lyra 字段类型 | 接受的 JSON 输入与失败行为 |

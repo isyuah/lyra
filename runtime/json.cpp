@@ -92,6 +92,9 @@ const void* lyraJsonKey(const Node* value, std::int64_t index) {
 const Node* lyraJsonIndex(const Node* value, std::int64_t index) {
     return value && value->kind == Kind::Array && index >= 0 && static_cast<std::size_t>(index) < value->size ? value->entries[index].value : nullptr;
 }
+const Node* lyraJsonFieldAt(const Node* value, std::int64_t index) {
+    return value && value->kind == Kind::Object && index >= 0 && static_cast<std::size_t>(index) < value->size ? value->entries[index].value : nullptr;
+}
 const Node* lyraJsonField(const Node* value, const void* key) {
     if (value && value->kind == Kind::Object) for (std::size_t index = 0; index < value->size; ++index) {
         if (lyraStringEqual(key, value->entries[index].key)) return value->entries[index].value;

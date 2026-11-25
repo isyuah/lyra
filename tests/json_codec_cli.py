@@ -91,6 +91,49 @@ fn main(): Unit {
         self.assertEqual(run.returncode, 0, run.stderr.decode())
         self.assertEqual(run.stdout.decode().splitlines(), ['{"labels":["A"]}', '0', '$.labels[1]: expected String'])
 
+    def test_composed_codecs_keep_paths_and_nested_sum_states(self):
+        self.main.write_text(r'''import model.wire as userWire
+import std.collections.stringMap
+import std.json.jsonCodecInt
+import std.json.jsonCodecString
+import std.json.jsonCodecList
+import std.json.jsonCodecOption
+import std.json.jsonCodecResult
+import std.json.jsonCodecStringMap
+
+fn main(): Unit {
+    val codec = jsonCodecStringMap(jsonCodecList(userWire()))
+    val unknown = r#"{"组.一":[{"display-name":"Ada","extra":1}]}"#
+    print(match codec.decode(unknown) { Ok(_) => "accepted", Err(error) => error })
+    print(match codec.decodeIgnoringUnknownFields(unknown) { Ok(value) => codec.encode(value), Err(error) => error })
+    print(match codec.decode(r#"{"users":[{"display-name":3}]}"#) { Ok(_) => "accepted", Err(error) => error })
+
+    val nested = jsonCodecOption(jsonCodecOption(jsonCodecInt()))
+    val someNone: Option<Option<Int>> = Some(None)
+    print(nested.encode(someNone))
+    print(match nested.decode(nested.encode(someNone)) { Ok(value) => value == someNone, Err(_) => false })
+    print(match nested.decode(r#"{"tag":"Some"}"#) { Ok(_) => "accepted", Err(error) => error })
+    print(match nested.decode(r#"{"tag":"None","value":0}"#) { Ok(_) => "accepted", Err(error) => error })
+
+    val resultCodec = jsonCodecResult(jsonCodecInt(), jsonCodecString())
+    val error: Result<Int,String> = Err("offline")
+    print(resultCodec.encode(error))
+    print(match resultCodec.decode(resultCodec.encode(error)) { Ok(value) => value == error, Err(_) => false })
+    print(match jsonCodecInt().decode("9223372036854775807") { Ok(value) => value.toString(), Err(error) => error })
+    val badKeys = stringMap<Int>()
+    badKeys.put("bad\0key", 1);
+    print(try { jsonCodecStringMap(jsonCodecInt()).encode(badKeys) } catch problem: Exception { problem.message })
+}''', encoding='utf-8')
+        expected = ['$["组.一"][0].extra: unknown field', '{"组.一":[{"display-name":"Ada"}]}',
+                    '$.users[0]["display-name"]: expected String', '{"tag":"Some","value":{"tag":"None"}}',
+                    'true', '$.value: missing field', '$.value: unknown field', '{"tag":"Err","value":"offline"}',
+                    'true', '9223372036854775807', 'JSON object keys cannot contain NUL: "bad\\u0000key"']
+        for flags in ([], ['--release', '--locked']):
+            with self.subTest(flags=flags):
+                run = self.command('run', *flags)
+                self.assertEqual(run.returncode, 0, run.stderr.decode())
+                self.assertEqual(run.stdout.decode().splitlines(), expected)
+
     def test_codec_type_and_export_are_checked(self):
         for source, code, reason in (
             ('import model.jsonCodecUser\nfn main(): Unit {}', 'LYN0003', 'jsonCodecUser'),

@@ -9,6 +9,7 @@ extern fn lyraJsonFloat64Text(value: Float64): String;
 extern fn lyraJsonText(value: CPtr): String;
 extern fn lyraJsonKey(value: CPtr, index: Int): String;
 extern fn lyraJsonIndex(value: CPtr, index: Int): CPtr;
+extern fn lyraJsonFieldAt(value: CPtr, index: Int): CPtr;
 extern fn lyraJsonField(value: CPtr, key: String): CPtr;
 extern fn lyraJsonQuote(text: String): String;
 extern fn lyraJsonSimpleKey(key: String): Bool;
@@ -24,6 +25,7 @@ pub struct JsonValue(val handle: CPtr, pub val rejectsUnknownFields: Bool) {
     pub fn ignoringUnknownFields(): JsonValue { JsonValue(handle, false) }
     pub fn item(index: Int): JsonValue { JsonValue(lyraJsonIndex(handle, index), rejectsUnknownFields) }
     pub fn field(name: String): JsonValue { JsonValue(lyraJsonField(handle, name), rejectsUnknownFields) }
+    pub fn fieldAt(index: Int): JsonValue { JsonValue(lyraJsonFieldAt(handle, index), rejectsUnknownFields) }
     pub fn readString(path: String): Result<String,String> {
         if lyraJsonKind(handle) == 4 { Ok(lyraJsonText(handle)) } else { Err(path + ": expected String") }
     }
@@ -91,3 +93,28 @@ pub fn float64Text(value: Float64): String {
     lyraJsonFloat64Text(value)
 }
 pub fn boolText(value: Bool): String { if value { "true" } else { "false" } }
+
+pub fn checkFields(value: JsonValue, keys: List<String>, path: String): Result<Unit,String> {
+    if !value.isObject() { return Err(path + ": expected object") }
+    if value.rejectsUnknownFields {
+        for index in 0..<value.size() {
+            val key = value.key(index)
+            var known = false
+            for allowed in keys { if allowed == key { known = true; break } }
+            if !known { return Err(path + keyPath(key) + ": unknown field") }
+        }
+    }
+    Ok({})
+}
+
+pub fn readTag(value: JsonValue, path: String): Result<String,String> {
+    if !value.isObject() { return Err(path + ": expected object") }
+    value.field("tag").readString(path + ".tag")
+}
+
+pub fn readTaggedValue(value: JsonValue, path: String): Result<JsonValue,String> {
+    checkFields(value, ["tag", "value"], path)?
+    val item = value.field("value")
+    if item.missing() { return Err(path + ".value: missing field") }
+    Ok(item)
+}

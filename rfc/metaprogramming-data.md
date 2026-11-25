@@ -103,6 +103,8 @@ val row = await query.fetchOptional(db)?
 
 **显式运行时反射。** `std.reflect` 提供 `typeName(value: Any)`、`fieldCount(value: Any)`、`fieldNames(value: Any)` 和 `field(value: Any, name: String)`。运行时保留的类型 token 指向类型描述符；Struct/Class 描述符只列出公开字段，字段读取以原生字段类型重新装箱为 `Any`，仍可通过 `as? T` 做检查转换。私有字段不可枚举或读取。首版不支持动态写入、动态构造、枚举载荷反射或 Class 身份图遍历。该 API 是显式动态查询能力，不作为 JSON/TOML 静态 API 的回退；`#derive(Json)` / `#derive(Toml)` 仍在编译期生成静态编解码代码。
 
+已有的 `JsonCodec<T>` 可通过 `jsonCodecList`、`jsonCodecOption`、`jsonCodecResult` 和 `jsonCodecStringMap` 组合。显式的 Option 和 Result codec 采用带 `tag` 的对象，带载荷的分支再加 `value`；多层 Option 因此可逆。组合保留嵌套路径和严格/宽松选项，不修改普通派生字段的 `null`/省略语义。
+
 TOML 同样显式写 `#derive(Toml)`；已有实现直接使用，多项可合写为 `#derive(Json, Toml)`。两种格式只自动映射公开字段；未知输入键默认报错，诊断包含字段路径，接口可显式改为忽略。编码普通可空字段的 `None` 默认省略键；若省略会在解码时得到非空默认值，JSON 写 `null`，TOML 需显式表示或报错。
 
 JSON 派生支持 `[jsonName("display-name")]`：编码和解码使用该键，源码中的字段名不变。别名不可为空或含 NUL；同一结构体有两个字段映射到同一键时编译报错。错误路径使用 JSON 键，而非源码中的字段名；非标识符键用方括号和 JSON 字符串表示，例如 `$.users[2]["display-name"]`。
