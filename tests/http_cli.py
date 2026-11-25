@@ -220,6 +220,31 @@ async fn main(): Unit {
                 response.begin()
                 self.assertEqual((response.status, response.read()), (200, b"ready"))
 
+    def test_handler_bounds_failure_does_not_stop_the_server(self):
+        package = self.root / "handler-error"
+        (package / "src").mkdir(parents=True)
+        (package / "lyra.json5").write_text("{name:'test/handler-error',version:'1.0.0'}")
+        (package / "src/main.ly").write_text(HTTP_HELPERS + '''
+import std.http.{Request}
+import std.http.{Router}
+async fn main(): Unit {
+    val listener = requireHttp(listen(0))
+    val router = Router()
+    router.get("/fail", async (request: Request) => {
+        defer print("handler cleanup")
+        Response.text(200, ["one"][1])
+    })
+    router.get("/ready", async (request: Request) => { Response.text(200, "ready") })
+    print(listener.port())
+    await router.serve(listener, 1)
+}
+''', encoding="utf-8")
+        for profile, app in self.profiles(package):
+            with self.subTest(profile=profile), server(app) as (port, _, output):
+                self.assertEqual(exchange(port, "GET", "/fail")[0], 500)
+                self.assertEqual(output.line().strip(), b"handler cleanup")
+                self.assertEqual(exchange(port, "GET", "/ready"), (200, "text/plain", b"ready"))
+
     def test_bind_methods_head_and_allow(self):
         package = self.root / "methods"
         (package / "src").mkdir(parents=True)

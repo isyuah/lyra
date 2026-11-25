@@ -26,7 +26,7 @@ void checkFailures(LyraTask* task, const LyraException* first, const LyraExcepti
     check(lyraTaskState(task) == LYRA_TASK_FAILED, "task group did not fail");
     auto* failures = lyraExceptionTaskFailures(lyraTaskException(task));
     check(lyraListSize(failures) == 2, "task group lost a child failure");
-    auto at = [&](int index) { return *static_cast<const LyraException* const*>(lyraListGet(failures, index, __FILE__, __LINE__, 1)); };
+    auto at = [&](int index) { return *static_cast<const LyraException* const*>(lyraFrozenListItem(failures, index)); };
     check(at(0) == first && at(1) == second, "task group failures were not in registration order");
 }
 

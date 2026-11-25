@@ -3,6 +3,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include "exceptions.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -20,8 +21,8 @@ size_t lyraStringScalarCount(const void* text);
 uint8_t lyraBytesUtf8(const void* bytes);
 uint32_t lyraStringAtByte(const void* text, size_t offset);
 uint8_t lyraBytesAtByte(const void* bytes, size_t offset);
-uint32_t lyraStringIndex(const void* text, int64_t index, const char* file, uint64_t line, uint64_t column);
-uint8_t lyraBytesIndex(const void* bytes, int64_t index, const char* file, uint64_t line, uint64_t column);
+uint32_t lyraStringIndex(const void* text, int64_t index, const void* errorType, const LyraException** error);
+uint8_t lyraBytesIndex(const void* bytes, int64_t index, const void* errorType, const LyraException** error);
 uint32_t lyraCharWidth(uint32_t codePoint);
 const void* lyraCharText(uint32_t codePoint);
 const void* lyraIntText(int64_t value);

@@ -1,6 +1,7 @@
 #include "lists.h"
 #include "locks.h"
 #include "managed.h"
+#include "strings.h"
 
 #include <algorithm>
 #include <cinttypes>
@@ -52,11 +53,8 @@ LyraList* copySlice(const LyraList* source, lyra::ListSliceBounds bounds) {
     return result;
 }
 
-void checkIndex(const LyraList* list, std::int64_t index, const char* file, std::uint64_t line, std::uint64_t column) {
-    if (index < 0 || static_cast<std::uint64_t>(index) >= list->count) {
-        std::fprintf(stderr, "%s:%" PRIu64 ":%" PRIu64 ": list index %" PRId64 " out of bounds (size %zu)\n", file, line, column, index, list->count);
-        std::exit(EXIT_FAILURE);
-    }
+const LyraException* checkIndex(const LyraList* list, std::int64_t index, const void* type) {
+    return index < 0 || static_cast<std::uint64_t>(index) >= list->count ? lyraIndexError(type, "list", index, list->count) : nullptr;
 }
 
 }
@@ -82,34 +80,37 @@ LyraList* lyraListSlice(const LyraList* source, std::int64_t start) {
 }
 
 LyraList* lyraListSliceRange(const LyraList* source, std::int64_t start, std::int64_t end, std::uint8_t inclusive,
-                            const char* file, std::uint64_t line, std::uint64_t column) {
+                            const void* errorType, const LyraException** error) {
     lyraRuntime::Lock guard(listLocks[stripe(source)]);
     auto bounds = lyra::listSliceBounds(source->count, start, end, inclusive);
     if (!bounds) {
-        std::fprintf(stderr, "%s:%" PRIu64 ":%" PRIu64 ": list slice %" PRId64 "%s%" PRId64 " out of bounds (size %zu)\n",
-                     file, line, column, start, inclusive ? ".." : "..<", end, source->count);
-        std::exit(EXIT_FAILURE);
+        char message[128];
+        auto length = std::snprintf(message, sizeof(message), "list slice %" PRId64 "%s%" PRId64 " out of bounds (size %zu)",
+                                    start, inclusive ? ".." : "..<", end, source->count);
+        *error = lyraExceptionCreateTyped(lyraStringFromBytes(message, length), errorType, "BoundsError");
+        return nullptr;
     }
+    *error = nullptr;
     return copySlice(source, *bounds);
 }
 
-const void* lyraListGet(const LyraList* list, std::int64_t index, const char* file, std::uint64_t line, std::uint64_t column) {
+const void* lyraListGet(const LyraList* list, std::int64_t index, const void* errorType, const LyraException** error) {
     lyraRuntime::Lock guard(listLocks[stripe(list)]);
-    checkIndex(list, index, file, line, column);
-    return list->items[index];
+    *error = checkIndex(list, index, errorType);
+    return *error ? nullptr : list->items[index];
 }
 
 const void* lyraFrozenListItem(const LyraList* list, std::uint64_t index) { return list->items[index]; }
 
-void lyraListSet(LyraList* list, std::int64_t index, const void* boxed, const char* file, std::uint64_t line, std::uint64_t column) {
+void lyraListSet(LyraList* list, std::int64_t index, const void* boxed, const void* errorType, const LyraException** error) {
     lyraRuntime::Lock guard(listLocks[stripe(list)]);
-    checkIndex(list, index, file, line, column);
-    list->items[index] = boxed;
+    *error = checkIndex(list, index, errorType);
+    if (!*error) list->items[index] = boxed;
 }
 
-const void* lyraListRemoveAt(LyraList* list, std::int64_t index, const char* file, std::uint64_t line, std::uint64_t column) {
+const void* lyraListRemoveAt(LyraList* list, std::int64_t index, const void* errorType, const LyraException** error) {
     lyraRuntime::Lock guard(listLocks[stripe(list)]);
-    checkIndex(list, index, file, line, column);
+    if ((*error = checkIndex(list, index, errorType))) return nullptr;
     auto slot = list->items + index;
     auto removed = *slot;
     --list->count;

@@ -123,7 +123,8 @@ fn main(): Unit { print("outer: ${#wrap("x=${pair(1, 2)}", r#"\prefix "#)}") }
                 self.assertEqual(build.returncode, 0, build.stderr.decode())
                 run = subprocess.run([app], capture_output=True, timeout=10)
                 self.assertNotEqual(run.returncode, 0)
-                self.assertIn(b':1:' + str(25 + len(value)).encode() + b':', run.stderr)
+                self.assertIn(b'main.ly:1:' + str(25 + len(value)).encode(), run.stderr)
+                self.assertIn(b'BoundsError: ', run.stderr)
                 self.assertIn(b'index 1 out of bounds (size 1)', run.stderr)
 
 

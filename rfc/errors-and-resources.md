@@ -26,6 +26,8 @@ fn startServer(): Result<Server, Error> {
 
 用 `exception MissingEntry` 声明 `Exception` 的具名子类型，通过 `MissingEntry("missing")` 创建；`pub` 允许导入此类型。这只引入异常类别，不引入普通 Class 继承。`catch reason: MissingEntry if condition { ... }` 先按类型匹配，再用绑定求布尔条件；条件为假继续匹配下一分支。无过滤的根类型捕获或 `catch { ... }` 须放在最后。未匹配的异常原样向外传递。见[异常传递、清理与可运行示例](../compiler/exception-unwinding.md)。
 
+运行时整数溢出、除零及非法移位抛出 `ArithmeticError`；列表、文本和字节的下标越界，以及列表切片、删除位置越界抛出 `BoundsError`。这两种内置异常定位到操作本身，沿普通异常路径清理和捕获。常量求值失败仍是编译诊断。
+
 函数可在返回类型后写 `throws MissingEntry, Exception`，IDE 的函数悬停显示此标注。`throws` 是上下文词，标注项必须是不同的异常类型；公开签名不能引用私有异常。标注不限制函数体实际抛出的异常，也不参与函数类型、重载及调用点检查。`extern` 不接受此标注。
 
 段错误、进程被操作系统终止及运行时损坏不是普通 `catch` 的恢复路径。**暂定的首版 OOM 策略**：只有显式可失败的分配 API 可以用 `Result` 报告本次分配失败；普通对象分配、字符串拼接、集合自动增长等隐式分配耗尽内存时终止。无可恢复 `panic`，需要强制终止时用标准库 `abort`。

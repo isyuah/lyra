@@ -15,6 +15,7 @@ module;
 #include <llvm/Support/SHA256.h>
 
 export module lyra.modules;
+import lyra.check;
 import lyra.generics;
 import lyra.packages;
 import lyra.macros;
@@ -596,7 +597,7 @@ struct DeclarationTypes {
                 return make(dynamic ? "dyn" : standard ? "standard" : "named", lookup.substr(separator + 2), std::move(module));
             }
             if (!dynamic) {
-                if (form.arguments.empty() && (numberType(name) || name == "Bool" || name == "String" || name == "Char" || name == "Bytes" || name == "Unit" || name == "Never" || name == "CPtr" || name == "CCallback" || name == "Exception" || name == "ChannelClosed" || name == "Any" || name == "Error"))
+                if (form.arguments.empty() && (numberType(name) || builtinException(name) || name == "Bool" || name == "String" || name == "Char" || name == "Bytes" || name == "Unit" || name == "Never" || name == "CPtr" || name == "CCallback" || name == "Any" || name == "Error"))
                     return make("builtin", name);
                 if (form.arguments.size() == 1 && (name == "List" || name == "FrozenList" || name == "Option" || name == "Range" || name == "Task" || name == "TaskLocal" || name == "Channel" || name == "TaskOutcome"))
                     return make("builtin", name);

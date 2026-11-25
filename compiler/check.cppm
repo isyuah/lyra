@@ -26,7 +26,15 @@ struct Type {
 inline constexpr Type rangeFields[] = {Type::Int, Type::Int, Type::Bool};
 inline constexpr const char* rangeFieldNames[] = {"start", "end", "inclusive"};
 inline constexpr Type channelClosed{Type::Exception, 1};
-inline constexpr std::size_t firstDeclaredException = channelClosed.id + 1;
+inline constexpr Type boundsError{Type::Exception, 2};
+inline constexpr Type arithmeticError{Type::Exception, 3};
+inline constexpr std::string_view builtinExceptionNames[] = {"Exception", "ChannelClosed", "BoundsError", "ArithmeticError"};
+inline constexpr std::size_t firstDeclaredException = sizeof(builtinExceptionNames) / sizeof(builtinExceptionNames[0]);
+inline std::optional<Type> builtinException(std::string_view name) {
+    for (std::size_t index = 0; index < firstDeclaredException; ++index)
+        if (builtinExceptionNames[index] == name) return Type{Type::Exception, index};
+    return std::nullopt;
+}
 struct ConstantUse { enum Kind { Global, Block, Uninstantiated }; Kind kind; std::size_t index{}; };
 struct Local { Type type; bool writable; std::optional<ExprId> worker{}; bool captured{}; std::optional<Span> declaration{}; std::string name{}; std::optional<ConstantUse> constant{}; bool parameter{}; };
 enum class Callee { Function, Constructor, Variant, Print, Collect, Sum, ListAdd, ListSlice, ListRemoveAt, FreezeList, TaskCancel, TaskCancelled, TaskCheckCancellation, AwaitOutcome, Exception, Indirect, ToReal, ToIntegerChecked, ToString, ToBytes, DecodeUtf8, Dynamic, BusinessError, ErrorSuppress, FailureInfo, LocalKey, LocalGet, WithLocal, ExtensionProperty, BoundMethod, ReflectTypeName, ReflectFieldCount, ReflectFieldName, ReflectField, Size, ValueEqual, ValueHash, ChannelCreate, ChannelIterator, ChannelSend, ChannelReceive, ChannelClose, Sleep, PtrAllocate, PtrNull, PtrIsNull, PtrFree, PtrOffset, PtrRead, PtrWrite, CallbackRegister, CallbackContext, CallbackFunction, CallbackClose, CallbackTakeError };

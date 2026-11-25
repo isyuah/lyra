@@ -55,7 +55,7 @@ extern "C" int lyraErrorReport(const Error* error) {
         lyraReportStringError(record->message);
         if (auto* suppressed = record->suppressed) {
             for (auto count = lyraListSize(suppressed); count > 0; --count) {
-                auto* boxed = lyraListGet(suppressed, count - 1, "<Error>", 0, 0);
+                auto* boxed = lyraFrozenListItem(suppressed, count - 1);
                 pending = push(*static_cast<const Error* const*>(boxed), "suppressed: ", pending);
             }
         }

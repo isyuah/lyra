@@ -2,6 +2,7 @@
 #define LYRA_RUNTIME_LISTS_H
 
 #include <stdint.h>
+#include "exceptions.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -11,11 +12,11 @@ typedef struct LyraList LyraList;
 LyraList* lyraListCreate(void);
 int64_t lyraListSize(const LyraList* list);
 LyraList* lyraListSlice(const LyraList* list, int64_t start);
-LyraList* lyraListSliceRange(const LyraList* list, int64_t start, int64_t end, uint8_t inclusive, const char* file, uint64_t line, uint64_t column);
-const void* lyraListGet(const LyraList* list, int64_t index, const char* file, uint64_t line, uint64_t column);
+LyraList* lyraListSliceRange(const LyraList* list, int64_t start, int64_t end, uint8_t inclusive, const void* errorType, const LyraException** error);
+const void* lyraListGet(const LyraList* list, int64_t index, const void* errorType, const LyraException** error);
 const void* lyraFrozenListItem(const LyraList* list, uint64_t index);
-void lyraListSet(LyraList* list, int64_t index, const void* boxed, const char* file, uint64_t line, uint64_t column);
-const void* lyraListRemoveAt(LyraList* list, int64_t index, const char* file, uint64_t line, uint64_t column);
+void lyraListSet(LyraList* list, int64_t index, const void* boxed, const void* errorType, const LyraException** error);
+const void* lyraListRemoveAt(LyraList* list, int64_t index, const void* errorType, const LyraException** error);
 void lyraListAdd(LyraList* list, const void* boxed);
 void lyraListExtend(LyraList* list, const LyraList* source);
 void lyraListExtendAny(LyraList* list, const LyraList* source, const void* type);

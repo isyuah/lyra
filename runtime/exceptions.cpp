@@ -75,6 +75,12 @@ const LyraException* lyraExceptionCreateTyped(const void* message, const void* t
     return error;
 }
 
+const LyraException* lyraIndexError(const void* type, const char* collection, std::int64_t index, std::size_t size) {
+    char message[128];
+    auto length = std::snprintf(message, sizeof(message), "%s index %" PRId64 " out of bounds (size %zu)", collection, index, size);
+    return lyraExceptionCreateTyped(lyraStringFromBytes(message, length), type, "BoundsError");
+}
+
 const void* lyraExceptionMessage(const LyraException* error) { return error->message; }
 const void* lyraExceptionType(const LyraException* error) { return error->type; }
 int lyraExceptionSame(const LyraException* left, const LyraException* right) { return left->identity == right->identity; }

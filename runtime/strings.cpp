@@ -118,26 +118,28 @@ std::uint8_t lyraBytesAtByte(const void* bytes, std::size_t offset) {
     return static_cast<std::uint8_t>(lyraStringBytes(bytes)[offset]);
 }
 
-[[noreturn]] static void indexError(const char* type, std::int64_t index, std::size_t size, const char* file, std::uint64_t line, std::uint64_t column) {
-    std::fprintf(stderr, "%s:%" PRIu64 ":%" PRIu64 ": %s index %" PRId64 " out of bounds (size %zu)\n", file, line, column, type, index, size);
-    std::exit(EXIT_FAILURE);
-}
-
-std::uint32_t lyraStringIndex(const void* text, std::int64_t index, const char* file, std::uint64_t line, std::uint64_t column) {
+std::uint32_t lyraStringIndex(const void* text, std::int64_t index, const void* errorType, const LyraException** error) {
     auto bytes = lyraStringBytes(text);
     auto length = lyraStringLength(text);
-    if (index < 0) indexError("String", index, lyraStringScalarCount(text), file, line, column);
     std::int64_t current = 0;
     for (std::size_t offset = 0; offset < length; ++current) {
-        if (current == index) return lyraStringAtByte(text, offset);
+        if (current == index) {
+            *error = nullptr;
+            return lyraStringAtByte(text, offset);
+        }
         offset += lyra::utf8::sequenceWidth(static_cast<unsigned char>(bytes[offset]));
     }
-    indexError("String", index, static_cast<std::size_t>(current), file, line, column);
+    *error = lyraIndexError(errorType, "String", index, static_cast<std::size_t>(current));
+    return 0;
 }
 
-std::uint8_t lyraBytesIndex(const void* bytes, std::int64_t index, const char* file, std::uint64_t line, std::uint64_t column) {
+std::uint8_t lyraBytesIndex(const void* bytes, std::int64_t index, const void* errorType, const LyraException** error) {
     auto size = lyraStringLength(bytes);
-    if (index < 0 || static_cast<std::uint64_t>(index) >= size) indexError("Bytes", index, size, file, line, column);
+    if (index < 0 || static_cast<std::uint64_t>(index) >= size) {
+        *error = lyraIndexError(errorType, "Bytes", index, size);
+        return 0;
+    }
+    *error = nullptr;
     return lyraBytesAtByte(bytes, static_cast<std::size_t>(index));
 }
 

@@ -18,7 +18,10 @@ const int* box(int value) {
 }
 
 int load(const LyraList* list, int index) {
-    return *static_cast<const int*>(lyraListGet(list, index, __FILE__, __LINE__, 1));
+    const LyraException* error;
+    auto* item = lyraListGet(list, index, nullptr, &error);
+    check(!error, "valid list index failed");
+    return *static_cast<const int*>(item);
 }
 
 }
@@ -28,7 +31,9 @@ int main() {
     auto* second = lyraListCreate();
     lyraListAdd(first, box(5));
     lyraListExtend(second, first);
-    lyraListSet(first, 0, box(9), __FILE__, __LINE__, 1);
+    const LyraException* error;
+    lyraListSet(first, 0, box(9), nullptr, &error);
+    check(!error, "valid list assignment failed");
     check(load(second, 0) == 5, "spreading aliased a replaceable source slot");
     lyraListExtend(second, second);
     check(lyraListSize(second) == 2 && load(second, 1) == 5, "self append failed");

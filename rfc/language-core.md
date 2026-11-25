@@ -139,7 +139,7 @@ implicit (user: User): Response { Response.json(user) }
 
 ## 文本与字节
 
-`String` 是不可变 UTF-8 文本，`Char` 是 Unicode 标量（不等同于用户感知的字素），`Bytes` 是不可变的原始字节。`String.size` 和 `text[index]` 按标量计数，`String.byteSize` 和 `Bytes.size` 按字节计数，`bytes[index]` 得到 `UInt8`。下标从零开始，越界在 `[` 处报错。`Char.codePoint` 为 `UInt32`；可用 `character.toString()` 得到文本。
+`String` 是不可变 UTF-8 文本，`Char` 是 Unicode 标量（不等同于用户感知的字素），`Bytes` 是不可变的原始字节。`String.size` 和 `text[index]` 按标量计数，`String.byteSize` 和 `Bytes.size` 按字节计数，`bytes[index]` 得到 `UInt8`。下标从零开始，越界抛出定位到 `[` 的 `BoundsError`。`Char.codePoint` 为 `UInt32`；可用 `character.toString()` 得到文本。
 
 `text.toBytes()` 保留所有 UTF-8 字节。`bytes.toString()` 完整检查 UTF-8，成功返回 `Some(text)`，非法序列返回 `None`，不做替换或丢弃。`==` 分别比较文本内容、字节内容或字符码点，不进行 Unicode 归一化。`for` 线性遍历文本或字节；文本按标量索引可能从头扫描，不适合用索引逐个遍历长文本。原生字节缓冲区接口另单独设计。
 
@@ -173,7 +173,7 @@ val loaded = FetchResult.Ok(body: "内容", status: 200)
 
 ## 算术与库表达
 
-- 提供 `Int8/16/32/64`、`UInt8/16/32/64`；`Int`、`UInt` 分别是 64 位别名。普通整数运算在 Debug 和 Release 下均检查溢出；除零也报错，不静默回绕。无符号值不可取负。字面量默认 `Int`，有明确数值目标时直接按目标类型解释；超出目标整数范围在编译时报错。
+- 提供 `Int8/16/32/64`、`UInt8/16/32/64`；`Int`、`UInt` 分别是 64 位别名。普通整数运算在 Debug 和 Release 下均检查溢出；溢出、除零和非法移位抛出 `ArithmeticError`，不静默回绕。无符号值不可取负。字面量默认 `Int`，有明确数值目标时直接按目标类型解释；超出目标整数范围在编译时报错。
 - `Float` 是 `Float64` 的别名。浮点字面量可写 `3.14`、`2.5e-3`、`3.14f32` 或 `3.14f64`；无后缀时按已知的浮点目标解释，缺少目标则是 `Float64`。浮点运算遵循 IEEE 754，除零可产生无穷大或 `NaN`；`NaN != NaN` 为真，其他与 `NaN` 的比较为假。`%` 为浮点余数。
 - 内置无损提升包括同符号整数扩宽、无符号到更宽的有符号整数、`Float32 → Float64`。普通混合整数运算选最窄共同整数类型；普通混合浮点运算选较宽类型。运行时整数值不隐式转浮点，可用 `toFloat()`、`toFloat32()`、`toFloat64()` 显式转换并按目标精度舍入。`toInt8Checked()` / `toUIntChecked()` 等整数目标方法返回 `Option`；越界、非有限浮点或需要丢弃小数时返回 `None`。
 - `~`、`&`、`^`、`|`、`<<`、`>>` 和对应的二元复合赋值只用于定宽整数。位移保持左操作数宽度，左移截去移出位，右移对有符号值补符号位、无符号值补零；位移量为负或不小于宽度时报错。编译期与原生执行使用相同规则。

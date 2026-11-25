@@ -81,7 +81,7 @@ using Overloads = std::unordered_map<std::string, std::vector<std::size_t>>;
 
 const std::string& linkedName(const Identifier& name) { return name.linked.empty() ? name.text : name.linked; }
 
-constexpr Type scalarTypes[] = {Type::Bool, Type::String, Type::Char, Type::Bytes, Type::Unit, Type::CPtr, Type::CCallback, Type::Exception, channelClosed, Type::Any, Type::Error};
+constexpr Type scalarTypes[] = {Type::Bool, Type::String, Type::Char, Type::Bytes, Type::Unit, Type::CPtr, Type::CCallback, Type::Any, Type::Error};
 
 bool builtInDisplay(Type type) { return numericType(type) || type == Type::Bool || type == Type::String || type == Type::Char; }
 
@@ -98,8 +98,7 @@ std::string typeName(const CheckedModule& module, Type type, bool canonical) {
         case Type::Char: return "Char";
         case Type::Bytes: return "Bytes";
         case Type::Exception: {
-            if (!type.id) return "Exception";
-            if (type == channelClosed) return "ChannelClosed";
+            if (type.id < firstDeclaredException) return std::string(builtinExceptionNames[type.id]);
             const auto& full = module.exceptions[type.id - firstDeclaredException].name.text;
             auto separator = full.rfind("::");
             return canonical || separator == full.npos ? full : full.substr(separator + 2);
@@ -172,6 +171,7 @@ std::vector<EditorSymbol> editorBuiltins(bool types, bool constraints) {
     if (types) {
         CheckedModule module;
         for (auto type : scalarTypes) symbols.push_back({typeName(module, type), EditorKind::TypeAlias});
+        for (auto name : builtinExceptionNames) symbols.push_back({std::string(name), EditorKind::TypeAlias});
         for (auto kind : {Type::Int, Type::UInt, Type::Real}) for (auto width : {8u, 16u, 32u, 64u})
             if (kind != Type::Real || width >= 32) {
                 auto prefix = kind == Type::Int ? "Int" : kind == Type::UInt ? "UInt" : "Float";
@@ -184,7 +184,8 @@ std::vector<EditorSymbol> editorBuiltins(bool types, bool constraints) {
             {"sleepMs", EditorKind::Function, {}, "fn sleepMs(milliseconds: Int): Task<Unit>"},
             {"gcCollect", EditorKind::Function, {}, "fn gcCollect(): Unit"}, {"awaitOutcome", EditorKind::Function},
             {"Some", EditorKind::EnumCase}, {"None", EditorKind::EnumCase}, {"Ok", EditorKind::EnumCase}, {"Err", EditorKind::EnumCase}};
-        for (auto name : {"Channel", "TaskLocal", "FrozenList", "Exception", "ChannelClosed", "Error"}) symbols.push_back({name, EditorKind::Constructor});
+        for (auto name : {"Channel", "TaskLocal", "FrozenList", "Error"}) symbols.push_back({name, EditorKind::Constructor});
+        for (auto name : builtinExceptionNames) symbols.push_back({std::string(name), EditorKind::Constructor});
         for (auto name : {"Task", "TaskOutcome", "CPtr", "CCallback"}) symbols.push_back({name, EditorKind::Class});
     }
     return symbols;
@@ -1118,6 +1119,7 @@ struct Symbols {
             if (auto type = numberType(form.name)) return type;
             if (form.name == "$never") return Type::Never;
             for (Type type : scalarTypes) if (form.name == typeName(module, type)) return type;
+            if (auto exception = builtinException(form.name)) return *exception;
             if (auto exception = exceptionTypes.find(form.name); exception != exceptionTypes.end()) return Type{Type::Exception, exception->second + firstDeclaredException};
         }
         auto alias = aliases.find(form.name);
@@ -3469,10 +3471,10 @@ struct Checker {
             if (type == Type::Error) throw at(source, fn.syntax.expressions[value].span, "LYE0003", "已有 Error 值无需再次包装");
             info.errorDisplay = displayError(type, fn.syntax.expressions[value].span, true);
             return Type::Error;
-        } else if (key == "Exception" || key == "ChannelClosed") {
+        } else if (auto exception = builtinException(key)) {
             noTypeArgs();
             info.callee = Callee::Exception;
-            return arguments(id, call, 1, [](auto) { return "message"; }, [](auto) { return Type{Type::String}; }) ? Type{Type::Never} : key == "ChannelClosed" ? channelClosed : Type::Exception;
+            return arguments(id, call, 1, [](auto) { return "message"; }, [](auto) { return Type{Type::String}; }) ? Type{Type::Never} : *exception;
         } else if (auto named = symbols.exceptionTypes.find(key); named != symbols.exceptionTypes.end()) {
             noTypeArgs();
             const auto& type = module.exceptions[named->second];
@@ -4023,7 +4025,7 @@ static CheckedModule checkProgram(Module module, const std::vector<Source>& sour
         const auto& declaration = decl.name.text;
         auto separator = declaration.rfind("::");
         auto name = std::string_view(declaration).substr(separator == declaration.npos ? 0 : separator + 2);
-        if (numberType(name)) throw at(sources[decl.file], decl.name.span, "LYN0002", "类型名与内置类型冲突：" + std::string(name));
+        if (numberType(name) || builtinException(name)) throw at(sources[decl.file], decl.name.span, "LYN0002", "类型名与内置类型冲突：" + std::string(name));
         for (Type builtin : scalarTypes) {
             if (name == typeName(checked, builtin)) throw at(sources[decl.file], decl.name.span, "LYN0002", "类型名与内置类型冲突：" + std::string(name));
         }

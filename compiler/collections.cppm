@@ -9,7 +9,6 @@ module;
 #include <vector>
 
 export module lyra.collections;
-import lyra.platform;
 import lyra.source;
 
 export namespace lyra {
@@ -90,15 +89,13 @@ struct NativeLists {
         return builder.CreateCall(module().getOrInsertFunction("lyraListSlice", builder.getPtrTy(), builder.getPtrTy(), builder.getInt64Ty()), {list, start});
     }
 
-    llvm::Value* sliceRange(llvm::Value* list, llvm::Value* range, const Source& source, Span span) const {
+    llvm::Value* sliceRange(llvm::Value* list, llvm::Value* range, llvm::Value* errorType, llvm::Value* errorSlot) const {
         auto pointer = builder.getPtrTy();
         auto integer = builder.getInt64Ty();
         auto flag = builder.getInt8Ty();
-        auto site = source.userSite(span);
-        auto slice = module().getOrInsertFunction("lyraListSliceRange", pointer, pointer, integer, integer, flag, pointer, integer, integer);
+        auto slice = module().getOrInsertFunction("lyraListSliceRange", pointer, pointer, integer, integer, flag, pointer, pointer);
         return builder.CreateCall(slice, {list, builder.CreateExtractValue(range, 0), builder.CreateExtractValue(range, 1),
-            builder.CreateZExt(builder.CreateExtractValue(range, 2), flag), builder.CreateGlobalStringPtr(site.file),
-            builder.getInt64(site.start.line), builder.getInt64(site.start.column)});
+            builder.CreateZExt(builder.CreateExtractValue(range, 2), flag), errorType, errorSlot});
     }
 
     llvm::Value* box(llvm::Value* value) const {
@@ -123,27 +120,30 @@ struct NativeLists {
         builder.CreateCall(module().getOrInsertFunction("lyraListExtendAny", builder.getVoidTy(), pointer, pointer, pointer), {list, values, type});
     }
 
-    llvm::Value* get(llvm::Value* list, llvm::Value* index, const Source& source, Span site) const {
+    llvm::Value* get(llvm::Value* list, llvm::Value* index, llvm::Value* errorType, llvm::Value* errorSlot) const {
         auto pointer = builder.getPtrTy(); auto integer = builder.getInt64Ty();
-        auto position = source.position(site.begin);
-        auto access = module().getOrInsertFunction("lyraListGet", pointer, pointer, integer, pointer, integer, integer);
-        return builder.CreateCall(access, {list, index, builder.CreateGlobalStringPtr(pathText(source.path)), builder.getInt64(position.line), builder.getInt64(position.column)});
+        auto access = module().getOrInsertFunction("lyraListGet", pointer, pointer, integer, pointer, pointer);
+        return builder.CreateCall(access, {list, index, errorType, errorSlot});
     }
 
-    void set(llvm::Value* list, llvm::Value* index, llvm::Value* value, const Source& source, Span span) const {
+    llvm::Value* item(llvm::Value* snapshot, llvm::Value* index) const {
         auto pointer = builder.getPtrTy();
-        auto integer = builder.getInt64Ty();
-        auto site = source.userSite(span);
-        builder.CreateCall(module().getOrInsertFunction("lyraListSet", builder.getVoidTy(), pointer, integer, pointer, pointer, integer, integer),
-            {list, index, box(value), builder.CreateGlobalStringPtr(site.file), builder.getInt64(site.start.line), builder.getInt64(site.start.column)});
+        auto access = module().getOrInsertFunction("lyraFrozenListItem", pointer, pointer, builder.getInt64Ty());
+        return builder.CreateCall(access, {snapshot, index});
     }
 
-    llvm::Value* removeAt(llvm::Value* list, llvm::Value* index, const Source& source, Span span) const {
+    void set(llvm::Value* list, llvm::Value* index, llvm::Value* value, llvm::Value* errorType, llvm::Value* errorSlot) const {
         auto pointer = builder.getPtrTy();
         auto integer = builder.getInt64Ty();
-        auto site = source.userSite(span);
-        return builder.CreateCall(module().getOrInsertFunction("lyraListRemoveAt", pointer, pointer, integer, pointer, integer, integer),
-            {list, index, builder.CreateGlobalStringPtr(site.file), builder.getInt64(site.start.line), builder.getInt64(site.start.column)});
+        builder.CreateCall(module().getOrInsertFunction("lyraListSet", builder.getVoidTy(), pointer, integer, pointer, pointer, pointer),
+            {list, index, box(value), errorType, errorSlot});
+    }
+
+    llvm::Value* removeAt(llvm::Value* list, llvm::Value* index, llvm::Value* errorType, llvm::Value* errorSlot) const {
+        auto pointer = builder.getPtrTy();
+        auto integer = builder.getInt64Ty();
+        return builder.CreateCall(module().getOrInsertFunction("lyraListRemoveAt", pointer, pointer, integer, pointer, pointer),
+            {list, index, errorType, errorSlot});
     }
 };
 

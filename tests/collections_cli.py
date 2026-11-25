@@ -33,7 +33,8 @@ class Collections(unittest.TestCase):
                     self.assertEqual((run.returncode, run.stderr), (0, b""))
                 else:
                     self.assertNotEqual(run.returncode, 0)
-                    self.assertIn(error, run.stderr)
+                    for fragment in (error,) if isinstance(error, bytes) else error:
+                        self.assertIn(fragment, run.stderr)
 
     def test_defaults_bind_after_explicit_arguments_in_declaration_order(self):
         self.native('''
@@ -344,7 +345,7 @@ fn main(): Unit {
     val items = [1, 2]
     items.slice(0..9223372036854775807);
 }
-''', b"", b"main.ly:3:11: list slice 0..9223372036854775807 out of bounds (size 2)")
+''', b"", (b"BoundsError: list slice 0..9223372036854775807 out of bounds (size 2)", b"main.ly:3:11"))
 
     def test_remove_at_returns_element_and_mutates_aliases(self):
         self.native('''

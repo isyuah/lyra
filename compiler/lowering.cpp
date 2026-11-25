@@ -90,8 +90,7 @@ struct Layouts {
             case Type::Any: return "Any";
             case Type::Error: return "Error";
             case Type::Exception:
-                if (type == Type::Exception) return "Exception";
-                if (type == channelClosed) return "ChannelClosed";
+                if (type.id < firstDeclaredException) return std::string(builtinExceptionNames[type.id]);
                 return program.exceptions[type.id - firstDeclaredException].name.text;
             case Type::Record: case Type::Enum: {
                 auto full = type.kind == Type::Record ? program.aggregates[type.id].syntax.name.text : program.enums[type.id].syntax.name.text;
@@ -378,8 +377,7 @@ struct NativeValues {
             builder.CreateCondBr(builder.CreateICmpULT(index, length), active, done);
             builder.SetInsertPoint(active);
             auto element = layouts.program.listElements[type.id];
-            auto getter = module.getOrInsertFunction("lyraFrozenListItem", builder.getPtrTy(), builder.getPtrTy(), builder.getInt64Ty());
-            auto load = [&](Value list) { return builder.CreateLoad(layouts.native(builder, element), builder.CreateCall(getter, {list, index})); };
+            auto load = [&](Value list) { return builder.CreateLoad(layouts.native(builder, element), lists.item(list, index)); };
             auto first = load(left);
             auto result = emit(builder, element, operation, first, equality ? load(right) : nullptr, error);
             if (result.mayThrow) {
@@ -688,13 +686,23 @@ struct Emitter {
         end();
     }
 
-    void guard(Value error, std::size_t depth, Span site = {}, const char* role = nullptr) {
+    void guard(Value error, std::size_t depth, std::optional<Span> site = {}, const char* role = nullptr) {
         auto failed = label("exception"), normal = label("no.exception");
         builder.CreateCondBr(builder.CreateIsNotNull(error), failed, normal);
         builder.SetInsertPoint(failed);
-        if (role) error = NativeExceptions{builder}.locate(error, source, site, role);
+        if (site) error = NativeExceptions{builder}.locate(error, source, *site, role);
         propagate(error, depth);
         builder.SetInsertPoint(normal);
+    }
+
+    void guardSlot(Span site, const char* role = nullptr) {
+        guard(builder.CreateLoad(builder.getPtrTy(), errorSlot), handlers.size(), site, role);
+    }
+
+    Value listItem(Value list, Value index, Span site) {
+        auto item = NativeLists{builder}.get(list, index, layouts.typeToken(builder, boundsError), errorSlot);
+        guardSlot(site);
+        return item;
     }
 
     void unwind(Value mark, std::size_t depth) {
@@ -1216,11 +1224,12 @@ struct Emitter {
         if (!live()) return unit();
         auto* result = layouts.native(builder, rawType(id));
         auto owner = fn.expressions[index.receiver].type;
-        if (owner.kind == Type::List || owner.kind == Type::FrozenList) return builder.CreateLoad(result, NativeLists{builder}.get(receiver, offset, source, index.site));
-        auto site = source.origin ? *source.origin : source.site(index.site);
+        if (owner.kind == Type::List || owner.kind == Type::FrozenList) return builder.CreateLoad(result, listItem(receiver, offset, index.site));
         auto pointer = builder.getPtrTy(); auto integer = builder.getInt64Ty();
-        auto access = module.getOrInsertFunction(owner == Type::String ? "lyraStringIndex" : "lyraBytesIndex", result, pointer, integer, pointer, integer, integer);
-        return builder.CreateCall(access, {receiver, offset, builder.CreateGlobalStringPtr(site.file), builder.getInt64(site.start.line), builder.getInt64(site.start.column)});
+        auto access = module.getOrInsertFunction(owner == Type::String ? "lyraStringIndex" : "lyraBytesIndex", result, pointer, integer, pointer, pointer);
+        auto item = builder.CreateCall(access, {receiver, offset, layouts.typeToken(builder, boundsError), errorSlot});
+        guardSlot(index.site);
+        return item;
     }
 
     Value emitNode(ExprId id, const Propagate& propagation) {
@@ -1347,7 +1356,7 @@ struct Emitter {
                 else {
                     matchTest(builder.CreateICmpSGT(count, builder.getInt64(0)), miss);
                     auto* elementType = layouts.native(builder, list->element);
-                    auto head = builder.CreateLoad(elementType, lists.get(snapshot, offset, source, site));
+                    auto head = builder.CreateLoad(elementType, lists.item(snapshot, offset));
                     emitPattern(pattern.parts[0], head, miss, bindings, site);
                     emitPattern(pattern.parts[1], snapshot, miss, bindings, site, snapshot, builder.CreateAdd(offset, builder.getInt64(1)));
                 }
@@ -1416,7 +1425,7 @@ struct Emitter {
             if (!live()) return {};
             auto offset = emit(indexed->offset);
             if (!live()) return {};
-            return {NativeLists{builder}.get(list, offset, source, indexed->site), list, offset, rawType(id), indexed->site};
+            return {listItem(list, offset, indexed->site), list, offset, rawType(id), indexed->site};
         }
         const auto& member = std::get<Member>(node);
         auto owner = fn.expressions[member.receiver].type;
@@ -1731,8 +1740,16 @@ struct Emitter {
                 builder.CreateCall(module.getOrInsertFunction("lyraTaskRequestCancel", builder.getVoidTy(), builder.getPtrTy()), args);
                 return unit();
             case Callee::ListAdd: lists.add(args[0], args[1]); return unit();
-            case Callee::ListSlice: return lists.sliceRange(receiver, args[1], source, call.name.span);
-            case Callee::ListRemoveAt: return builder.CreateLoad(layouts.native(builder, rawType(id)), lists.removeAt(receiver, args[1], source, call.name.span));
+            case Callee::ListSlice: {
+                auto slice = lists.sliceRange(receiver, args[1], layouts.typeToken(builder, boundsError), errorSlot);
+                guardSlot(call.name.span);
+                return slice;
+            }
+            case Callee::ListRemoveAt: {
+                auto removed = lists.removeAt(receiver, args[1], layouts.typeToken(builder, boundsError), errorSlot);
+                guardSlot(call.name.span);
+                return builder.CreateLoad(layouts.native(builder, rawType(id)), removed);
+            }
             case Callee::FreezeList: return lists.slice(args[0], builder.getInt64(0));
             case Callee::Size: return collectionSize(fn.expressions[*call.receiver].type, receiver);
             case Callee::ValueEqual: case Callee::ValueHash:
@@ -1789,17 +1806,13 @@ struct Emitter {
         llvm_unreachable("invalid Lyra callee");
     }
 
-    void trapIf(Value condition, Span site, llvm::StringRef message) {
+    void arithmeticCheck(Value condition, Span site, llvm::StringRef message) {
         auto failed = label("arithmetic.error"), next = label("arithmetic.ok");
         builder.CreateCondBr(condition, failed, next);
         builder.SetInsertPoint(failed);
-        auto pointer = builder.getPtrTy();
-        auto integer = builder.getInt64Ty();
-        auto error = module.getOrInsertFunction("lyraArithmeticError", builder.getVoidTy(), pointer, integer, integer, pointer);
-        auto position = source.position(site.begin);
-        builder.CreateCall(error, {builder.CreateGlobalStringPtr(pathText(source.path)), builder.getInt64(position.line),
-                                   builder.getInt64(position.column), builder.CreateGlobalStringPtr(message)});
-        builder.CreateUnreachable();
+        NativeExceptions exceptions{builder};
+        auto* error = exceptions.create(stringConstant(message), layouts.typeToken(builder, arithmeticError), builtinExceptionNames[arithmeticError.id]);
+        propagate(exceptions.locate(error, source, site), handlers.size());
         builder.SetInsertPoint(next);
     }
 
@@ -1809,7 +1822,7 @@ struct Emitter {
         if (op == Op::BitOr) return builder.CreateOr(left, right);
         if (shift(op)) {
             auto limit = llvm::ConstantInt::get(right->getType(), numberWidth(type));
-            trapIf(builder.CreateICmpUGE(right, limit), site, "shift count out of range");
+            arithmeticCheck(builder.CreateICmpUGE(right, limit), site, "shift count out of range");
             auto count = builder.CreateZExtOrTrunc(right, left->getType());
             if (op == Op::Shl) return builder.CreateShl(left, count);
             return type.kind == Type::Int ? builder.CreateAShr(left, count) : builder.CreateLShr(left, count);
@@ -1828,12 +1841,12 @@ struct Emitter {
         auto signedType = type.kind == Type::Int;
         auto name = numberName(type);
         if (op == Op::Div || op == Op::Rem) {
-            trapIf(builder.CreateIsNull(right), site, name + " division by zero");
+            arithmeticCheck(builder.CreateIsNull(right), site, name + " division by zero");
             if (!signedType) return op == Op::Div ? builder.CreateUDiv(left, right) : builder.CreateURem(left, right);
             auto minusOne = builder.CreateICmpEQ(right, llvm::Constant::getAllOnesValue(width));
             if (op == Op::Rem) return builder.CreateSRem(left, builder.CreateSelect(minusOne, llvm::ConstantInt::get(width, 1), right));
             auto minimum = llvm::ConstantInt::get(width, llvm::APInt::getSignedMinValue(numberWidth(type)));
-            trapIf(builder.CreateAnd(minusOne, builder.CreateICmpEQ(left, minimum)), site, name + " overflow (/)");
+            arithmeticCheck(builder.CreateAnd(minusOne, builder.CreateICmpEQ(left, minimum)), site, name + " overflow (/)");
             return builder.CreateSDiv(left, right);
         }
         auto intrinsic = op == Op::Add ? (signedType ? llvm::Intrinsic::sadd_with_overflow : llvm::Intrinsic::uadd_with_overflow)
@@ -1841,7 +1854,7 @@ struct Emitter {
                                        : (signedType ? llvm::Intrinsic::smul_with_overflow : llvm::Intrinsic::umul_with_overflow);
         auto checked = llvm::Intrinsic::getDeclaration(&module, intrinsic, {width});
         auto pair = builder.CreateCall(checked, {left, right});
-        trapIf(builder.CreateExtractValue(pair, 1), site, name + (op == Op::Add ? " overflow (+)" : op == Op::Sub ? " overflow (-)" : " overflow (*)"));
+        arithmeticCheck(builder.CreateExtractValue(pair, 1), site, name + (op == Op::Add ? " overflow (+)" : op == Op::Sub ? " overflow (-)" : " overflow (*)"));
         return builder.CreateExtractValue(pair, 0);
     }
 
@@ -1922,10 +1935,11 @@ struct Emitter {
             if (place.list) {
                 NativeLists lists{builder};
                 if (!place.path.empty()) {
-                    auto latest = lists.get(place.list, place.index, source, place.site);
+                    auto latest = listItem(place.list, place.index, place.site);
                     right = builder.CreateInsertValue(builder.CreateLoad(layouts.native(builder, place.element), latest), right, place.path);
                 }
-                lists.set(place.list, place.index, right, source, place.site);
+                lists.set(place.list, place.index, right, layouts.typeToken(builder, boundsError), errorSlot);
+                guardSlot(place.site);
             } else if (shared) sharedWrite(builder, right, place.pointer);
             else builder.CreateStore(right, place.pointer);
             return unit();
@@ -2107,7 +2121,7 @@ struct Emitter {
         NativeLists lists{builder};
         auto type = layouts.native(builder, iteration.element);
         return countedLoop(loop, pattern, builder.getInt64(0), lists.size(input), nullptr, [&](Value index) {
-            return builder.CreateLoad(type, lists.get(input, index, source, site));
+            return builder.CreateLoad(type, listItem(input, index, site));
         });
     }
 

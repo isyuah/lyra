@@ -162,6 +162,40 @@ async fn main(): Unit {
     try { await worker; } catch problem: Exception { print(problem.message) }
 }''', ['once', 'child', 'child', 'sibling', 'worker cleanup', 'worker'])
 
+    def test_checked_operations_unwind_and_leave_the_program_running(self):
+        self.executable(r'''fn divide(divisor: Int): Int { 1 / divisor }
+async fn outOfBounds(): Int {
+    defer print("async cleanup")
+    val frozen = FrozenList([1])
+    frozen[-1]
+}
+async fn main(): Unit {
+    try { defer print("local cleanup"); divide(0); }
+    catch error: ArithmeticError { print(error.message) }
+    try { await outOfBounds(); } catch error: BoundsError { print(error.message) }
+    try {
+        await blocking { defer print("worker cleanup"); b"\x00"[1] };
+    } catch error: BoundsError { print(error.message) }
+    val values = [10, 20]
+    try { values[1] = values.removeAt(0) } catch error: BoundsError { print(error.message) }
+    print(values[0])
+    try { values.removeAt(2); } catch error: BoundsError { print(error.message) }
+    try { values.slice(0..1); } catch error: BoundsError { print(error.message) }
+    try { "猫"[1]; } catch error: BoundsError { print(error.message) }
+    print(b"\x00"[0])
+    print("\u{0}"[0].codePoint)
+}''', ['local cleanup', 'Int division by zero', 'async cleanup', 'list index -1 out of bounds (size 1)',
+       'worker cleanup', 'Bytes index 1 out of bounds (size 1)', 'list index 1 out of bounds (size 1)', '20',
+       'list index 2 out of bounds (size 1)', 'list slice 0..1 out of bounds (size 1)',
+       'String index 1 out of bounds (size 1)', '0', '0'])
+
+    def test_checked_cleanup_failure_is_attached_after_the_primary_error(self):
+        self.executable('''fn main(): Unit {
+    defer { [1][1]; }
+    val result = 1 << 64
+}''', [], ['ArithmeticError: shift count out of range', 'main.ly:3:',
+           'suppressed BoundsError: list index 1 out of bounds (size 1)', 'main.ly:2:'])
+
     def test_unobserved_spawn_and_await_sites_reach_entry(self):
         self.executable('''async fn bad(): Unit { throw Exception("child") }
 async fn group(): Unit { await bad() }
