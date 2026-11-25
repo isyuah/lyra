@@ -37,6 +37,25 @@ class Constants(unittest.TestCase):
         self.assertIn(fragment, diagnostic['message'])
         return diagnostic
 
+    def test_bitwise_and_pattern_loops_have_native_ctfe_parity(self):
+        self.write('app/src/main.ly', '''struct Pair(val value: Int8)
+const fn bits(): Int8 {
+    var count: Int8 = 0
+    var next: Int8? = -2
+    while let Some(value) = next { count ^= value; next = None }
+    for Pair(value: input) in [Pair(7)] { count &= input }
+    count <<= 2
+    count >>= 1
+    ~count
+}
+const calculated: Int8 = bits()
+fn main(): Unit { print(calculated); print(bits()) }
+''')
+        result = self.cli('run', self.app, '--release')
+        self.assertEqual((result.returncode, result.stdout), (0, '-13\n-13\n'), result.stderr)
+        self.write('app/src/main.ly', 'const outside: Int = 1 >> -1\nfn main(): Unit {}')
+        self.diagnose(self.app, 'LYCT0003', '位移量')
+
     def test_values_are_typed_and_inlined_after_cross_package_reexport(self):
         self.write('app/lyra.json5', '{name:"app",version:"0.1.0",dependencies:{cfg:{name:"cfg",version:"^0.1.0",path:"../cfg"}}}')
         self.write('cfg/lyra.json5', '{name:"cfg",version:"0.1.0",kind:"lib"}')

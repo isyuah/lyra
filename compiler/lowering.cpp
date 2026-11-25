@@ -1293,6 +1293,13 @@ struct Emitter {
         for (auto [slot, payload] : bindings) initialize(slot, payload);
     }
 
+    void bindIrrefutable(const CheckedPattern& pattern, Value subject, Span site) {
+        auto miss = label("binding.impossible");
+        emitBindings(pattern, subject, miss, site);
+        if (miss->use_empty()) miss->eraseFromParent();
+        else Builder{miss}.CreateUnreachable();
+    }
+
     Value emitNode(ExprId id, const Match& match) {
         auto subject = emit(match.subject);
         if (!live()) return unit();
@@ -1361,6 +1368,13 @@ struct Emitter {
         if (fn.expressions[id].callee == Callee::Variant) return makeVariant(id);
         auto object = emit(member.receiver);
         if (!live()) return unit();
+        if (fn.expressions[id].callee == Callee::BoundMethod) {
+            auto target = *fn.expressions[id].functionRef;
+            const auto& shape = layouts.program.signatures[rawType(id).id];
+            auto receiver = NativeLists{builder}.box(object);
+            return NativeClosures{builder}.named(functions[target], signature(shape), shape.parameters.size(),
+                layouts.program.functions[target].syntax.isAsync, false, receiver);
+        }
         if (fn.expressions[id].callee == Callee::ExtensionProperty)
             return callFunction(fn.expressions[id].target, {object}, member.name.span);
         auto owner = fn.expressions[member.receiver].type;
@@ -1407,9 +1421,7 @@ struct Emitter {
     Value emitNode(ExprId id, const PatternBinding& binding) {
         auto value = emit(binding.value);
         if (!live()) return unit();
-        auto miss = label("binding.impossible");
-        Builder{miss}.CreateUnreachable();
-        emitBindings(fn.expressions[id].patterns.front(), value, miss, binding.pattern.span);
+        bindIrrefutable(fn.expressions[id].patterns.front(), value, binding.pattern.span);
         return unit();
     }
 
@@ -1492,7 +1504,7 @@ struct Emitter {
             args[slot] = callFunction(*defaults[slot], llvm::ArrayRef<Value>(args).take_front(slot), call.name.span);
         }
         switch (info.callee) {
-            case Callee::Indirect: llvm_unreachable("indirect call already emitted");
+            case Callee::BoundMethod: case Callee::Indirect: llvm_unreachable("invalid indirect call plan");
             case Callee::TaskCancelled: case Callee::TaskCheckCancellation: llvm_unreachable("static task call already emitted");
             case Callee::PtrAllocate: {
                 auto* pointer = builder.getPtrTy();
@@ -1715,6 +1727,16 @@ struct Emitter {
     }
 
     Value arithmetic(Op op, Value left, Value right, Type type, Span site) {
+        if (op == Op::BitAnd) return builder.CreateAnd(left, right);
+        if (op == Op::BitXor) return builder.CreateXor(left, right);
+        if (op == Op::BitOr) return builder.CreateOr(left, right);
+        if (shift(op)) {
+            auto limit = llvm::ConstantInt::get(right->getType(), numberWidth(type));
+            trapIf(builder.CreateICmpUGE(right, limit), site, "shift count out of range");
+            auto count = builder.CreateZExtOrTrunc(right, left->getType());
+            if (op == Op::Shl) return builder.CreateShl(left, count);
+            return type.kind == Type::Int ? builder.CreateAShr(left, count) : builder.CreateLShr(left, count);
+        }
         if (type.kind == Type::Real) {
             switch (op) {
                 case Op::Add: return builder.CreateFAdd(left, right);
@@ -1790,7 +1812,7 @@ struct Emitter {
     Value emitNode(ExprId, const Unary& unary) {
         auto value = emit(unary.operand);
         if (!live()) return unit();
-        if (unary.op == Op::Not) return builder.CreateNot(value);
+        if (unary.op == Op::Not || unary.op == Op::Complement) return builder.CreateNot(value);
         auto type = fn.expressions[unary.operand].type;
         if (type.kind == Type::Real) return builder.CreateFNeg(value);
         return arithmetic(Op::Sub, llvm::Constant::getNullValue(value->getType()), value, type, unary.site);
@@ -1808,7 +1830,7 @@ struct Emitter {
                 return op == Op::Eq ? builder.CreateNot(tag) : tag;
             }
         }
-        if (op <= Op::RemSet) {
+        if (assignment(op)) {
             if (fn.expressions[binary.left].type == Type::Never) return emit(binary.left);
             auto place = address(binary.left);
             if (!live()) return unit();
@@ -1817,9 +1839,8 @@ struct Emitter {
             auto left = op == Op::Set ? nullptr : shared ? sharedRead(builder, layouts.native(builder, type), place.pointer) : builder.CreateLoad(layouts.native(builder, type), place.pointer);
             auto right = emit(binary.right);
             if (!live()) return unit();
-            constexpr Op compound[] = {Op::Add, Op::Sub, Op::Mul, Op::Div, Op::Rem};
             if (op != Op::Set) {
-                right = type == Type::String ? concatenate(left, right) : arithmetic(compound[static_cast<int>(op) - 1], left, right, type, binary.site);
+                right = type == Type::String ? concatenate(left, right) : arithmetic(compoundOperator(op), left, right, type, binary.site);
             }
             if (place.list) {
                 NativeLists lists{builder};
@@ -1909,15 +1930,19 @@ struct Emitter {
         if (live()) builder.CreateBr(next);
     }
 
-    Value emitNode(ExprId, const While& loop) {
+    Value emitNode(ExprId id, const While& loop) {
         auto test = label("while.test");
         builder.CreateBr(test);
         builder.SetInsertPoint(test);
         auto condition = emit(loop.condition);
         if (!live()) return unit();
-        auto body = label("while.body"), done = label("while.end");
-        builder.CreateCondBr(condition, body, done);
-        builder.SetInsertPoint(body);
+        auto done = label("while.end");
+        if (loop.pattern) emitBindings(fn.expressions[id].patterns.front(), condition, done, loop.pattern->span);
+        else {
+            auto body = label("while.body");
+            builder.CreateCondBr(condition, body, done);
+            builder.SetInsertPoint(body);
+        }
         loopBody(loop.body, test, done);
         builder.SetInsertPoint(done);
         return unit();
@@ -1934,7 +1959,7 @@ struct Emitter {
     }
 
     template<class Element, class Advance>
-    Value countedLoop(const For& loop, std::size_t slot, Value first, Value last, Value inclusive, Element element, Advance advance) {
+    Value countedLoop(const For& loop, const CheckedPattern& pattern, Value first, Value last, Value inclusive, Element element, Advance advance) {
         auto entry = builder.GetInsertBlock();
         auto test = label("for.test"), body = label("for.body"), step = label("for.step"), done = label("for.end");
         builder.CreateBr(test);
@@ -1946,7 +1971,7 @@ struct Emitter {
         builder.CreateCondBr(within, body, done);
         builder.SetInsertPoint(body);
         auto current = element(index);
-        initialize(slot, current);
+        bindIrrefutable(pattern, current, loop.item.span);
         loopBody(loop.body, step, done);
         builder.SetInsertPoint(step);
         if (inclusive) {
@@ -1961,20 +1986,21 @@ struct Emitter {
     }
 
     template<class Element>
-    Value countedLoop(const For& loop, std::size_t slot, Value first, Value last, Value inclusive, Element element) {
-        return countedLoop(loop, slot, first, last, inclusive, element, [&](Value index, Value) { return builder.CreateAdd(index, builder.getInt64(1)); });
+    Value countedLoop(const For& loop, const CheckedPattern& pattern, Value first, Value last, Value inclusive, Element element) {
+        return countedLoop(loop, pattern, first, last, inclusive, element, [&](Value index, Value) { return builder.CreateAdd(index, builder.getInt64(1)); });
     }
 
     Value emitNode(ExprId id, const For& loop) {
         auto input = emit(loop.input);
         if (!live()) return unit();
-        auto slot = fn.expressions[id].target;
+        const auto& iteration = *fn.expressions[id].iteration;
+        const auto& pattern = fn.expressions[id].patterns.front();
         auto owner = fn.expressions[loop.input].type;
         if (owner == Type::IntRange)
-            return countedLoop(loop, slot, builder.CreateExtractValue(input, 0), builder.CreateExtractValue(input, 1),
+            return countedLoop(loop, pattern, builder.CreateExtractValue(input, 0), builder.CreateExtractValue(input, 1),
                 builder.CreateExtractValue(input, 2), [](Value index) { return index; });
         auto site = fn.syntax.expressions[loop.input].span;
-        if (const auto& plan = fn.expressions[id].iterator) {
+        if (const auto& plan = iteration.methods) {
             auto iterator = callFunction(plan->open, {input}, site);
             auto test = label("for.next"), body = label("for.body"), done = label("for.end");
             builder.CreateBr(test);
@@ -1982,7 +2008,7 @@ struct Emitter {
             auto next = callFunction(plan->next, {iterator}, site);
             builder.CreateCondBr(builder.CreateExtractValue(next, 0), body, done);
             builder.SetInsertPoint(body);
-            initialize(slot, builder.CreateExtractValue(next, 1));
+            bindIrrefutable(pattern, builder.CreateExtractValue(next, 1), loop.item.span);
             loopBody(loop.body, test, done);
             builder.SetInsertPoint(done);
             return unit();
@@ -1990,9 +2016,9 @@ struct Emitter {
         if (owner == Type::String || owner == Type::Bytes) {
             auto pointer = builder.getPtrTy(); auto integer = builder.getInt64Ty();
             auto size = builder.CreateCall(module.getOrInsertFunction("lyraStringLength", integer, pointer), {input});
-            auto element = layouts.native(builder, fn.locals[slot].type);
+            auto element = layouts.native(builder, iteration.element);
             auto get = module.getOrInsertFunction(owner == Type::String ? "lyraStringAtByte" : "lyraBytesAtByte", element, pointer, integer);
-            return countedLoop(loop, slot, builder.getInt64(0), size, nullptr, [&](Value index) {
+            return countedLoop(loop, pattern, builder.getInt64(0), size, nullptr, [&](Value index) {
                 return builder.CreateCall(get, {input, index});
             }, [&](Value index, Value value) {
                 if (owner == Type::Bytes) return builder.CreateAdd(index, builder.getInt64(1));
@@ -2001,8 +2027,8 @@ struct Emitter {
             });
         }
         NativeLists lists{builder};
-        auto type = layouts.native(builder, fn.locals[slot].type);
-        return countedLoop(loop, slot, builder.getInt64(0), lists.size(input), nullptr, [&](Value index) {
+        auto type = layouts.native(builder, iteration.element);
+        return countedLoop(loop, pattern, builder.getInt64(0), lists.size(input), nullptr, [&](Value index) {
             return builder.CreateLoad(type, lists.get(input, index, source, site));
         });
     }

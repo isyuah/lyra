@@ -91,6 +91,35 @@ fn main(): Unit {
     print(try { if fail() { 1 } else { 2 } } catch { 31 })
 }''', ['4', '8', 'callee', 'argument', '6', '7', '20', '31'])
 
+    def test_named_tail_parameters_and_bound_receivers(self):
+        self.executable('''struct Pair(val key: Int, val value: Int)
+fn visit(items: List<Pair>, show: (Int, Int) -> Unit): Unit {
+    for Pair(key: key, value: value) in items { show(key, value) }
+}
+async fn invoke(value: Int, next: (Int) -> Task<Int>): Int { await next(value) }
+class Handler<T>(var value: T) {
+    fn handle(input: Int): T { value }
+    fn handle(input: String): String { input }
+    async fn poll(): T { value }
+}
+struct Snapshot(var counter: Int) {
+    fn read(): Int { counter }
+}
+fn get(handler: Handler<Int>): Handler<Int> { print("receiver"); handler }
+async fn main(): Unit {
+    visit([Pair(2, 3), Pair(6, 7)]) { key, value => print(key * value) }
+    print(await invoke(20) async { input => await async { input + 22 } })
+    val handler = Handler(12)
+    val saved: (Int) -> Int = get(handler).handle
+    val asyncSaved = handler.poll
+    var snapshot = Snapshot(5)
+    val read = snapshot.read
+    snapshot.counter = 30
+    handler.value = 18
+    gcCollect()
+    print(saved(0)); print(await asyncSaved()); print(read())
+}''', ['6', '42', '42', 'receiver', '18', '18', '5'])
+
     def test_async_retains_mutable_capture_and_indirect_exceptions(self):
         self.executable('''class Box(val name: String)
 async fn checkpoint(): Unit { gcCollect() }

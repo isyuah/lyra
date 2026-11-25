@@ -1040,7 +1040,9 @@ Diagnostic mismatch(const CheckedModule& module, const Source& source, Span span
 }
 
 Diagnostic uncoveredPattern(const Source& source, Span site, PatternUse use, const std::string& missing) {
-    return at(source, site, "LYT0012", (use == PatternUse::Binding ? "val 解构必须匹配所有可能的值；例如不匹配 " : "match 未穷尽，缺少分支：") + missing);
+    auto detail = use == PatternUse::Binding ? "val 解构必须匹配所有可能的值；例如不匹配 " :
+        use == PatternUse::Loop ? "for 解构必须匹配所有可能的元素；例如不匹配 " : "match 未穷尽，缺少分支：";
+    return at(source, site, "LYT0012", detail + missing);
 }
 
 struct Checker {
@@ -1195,12 +1197,12 @@ struct Checker {
         return {};
     }
 
-    bool implicitMember(const Identifier& name, bool call = false) const {
+    bool implicitMember(const Identifier& name) const {
         if (!receiverSlot || source.hygieneAt(name.span)) return false;
         auto receiver = fn.locals[*receiverSlot].type;
         if (receiver.kind != Type::Record) return false;
         auto owner = module.aggregates[receiver.id].declaration;
-        return symbols.fields[owner].contains(name.text) || (call && symbols.methods[owner].contains(name.text));
+        return symbols.fields[owner].contains(name.text) || symbols.methods[owner].contains(name.text);
     }
 
     void prepareReceivers() {
@@ -1211,7 +1213,7 @@ struct Checker {
             const auto* name = std::get_if<Identifier>(&node);
             const auto* call = std::get_if<Call>(&node);
             if (call && !call->receiver && !call->function && !call->typeOwner) name = &call->name;
-            if (name && implicitMember(*name, call != nullptr)) {
+            if (name && implicitMember(*name)) {
                 auto site = name->span;
                 implicitReceivers[id] = fn.syntax.expressions.size();
                 fn.syntax.expressions.push_back({site, This{}});
@@ -1312,7 +1314,7 @@ struct Checker {
             values->nullable |= std::holds_alternative<EmptyOption>(node);
             return requireContext("LYT0010", "None/null 需要明确的 Option 目标类型");
         }
-        if (const auto* call = std::get_if<Call>(&node); call && !call->receiver && !call->function && !call->typeOwner && !lookupLocal(call->name) && !implicitMember(call->name, true)) {
+        if (const auto* call = std::get_if<Call>(&node); call && !call->receiver && !call->function && !call->typeOwner && !lookupLocal(call->name) && !implicitMember(call->name)) {
             auto name = linkedName(call->name);
             if (name == "Ok" || name == "Err") return requireContext("LYT0010", "Ok/Err 需要明确的 Result 目标类型");
         }
@@ -1673,7 +1675,7 @@ struct Checker {
         if (std::holds_alternative<EmptyOption>(node)) return true;
         const auto* call = std::get_if<Call>(&node);
         return call && !call->receiver && !call->function && !call->typeOwner && linkedName(call->name) == "Some" &&
-            !lookupLocal(call->name) && !implicitMember(call->name, true) && call->arguments.size() == 1 && untypedOption(call->arguments.front().value);
+            !lookupLocal(call->name) && !implicitMember(call->name) && call->arguments.size() == 1 && untypedOption(call->arguments.front().value);
     }
 
     bool needsArgumentHint(ExprId id) const {
@@ -2012,28 +2014,32 @@ struct Checker {
         return fn.locals[*receiverSlot].type;
     }
 
-    std::pair<Type, std::vector<Type>> functionValue(std::size_t index, const Identifier& name, std::optional<Type> expected) {
+    std::pair<Type, std::vector<Type>> functionValue(std::size_t index, const Identifier& name, std::optional<Type> expected,
+        std::span<const Type> ownerTypes = {}, std::size_t skip = 0) {
         const auto& item = symbols.callables[index];
         if (item.generic) {
-            if (!expected || expected->kind != Type::Closure) throw at(source, name.span, "LYG0002", "泛型函数值需要明确的函数类型：" + name.text);
-            const auto& shape = module.signatures[expected->id];
-            if (shape.parameters.size() != item.generic->parameters.size()) throw at(source, name.span, "LYT0015", "函数值的形参数量与目标类型不符");
-            std::vector<GenericArgument<Type>> inputs;
-            for (std::size_t slot = 0; slot < shape.parameters.size(); ++slot) {
-                auto type = shape.parameters[slot];
-                if (item.generic->parameters[slot].variadic) {
-                    if (type.kind != Type::List) throw at(source, name.span, "LYT0015", "变长函数作为函数值时，最后一个形参接收 List");
-                    type = module.listElements[type.id];
+            std::vector<Type> types(ownerTypes.begin(), ownerTypes.end());
+            if (types.size() != item.generic->typeParameters.size()) {
+                if (!expected || expected->kind != Type::Closure) throw at(source, name.span, "LYG0002", "泛型函数值需要明确的函数类型：" + name.text);
+                const auto& shape = module.signatures[expected->id];
+                if (shape.parameters.size() + skip != item.generic->parameters.size()) throw at(source, name.span, "LYT0015", "函数值的形参数量与目标类型不符");
+                std::vector<GenericArgument<Type>> inputs;
+                for (std::size_t slot = 0; slot < shape.parameters.size(); ++slot) {
+                    auto type = shape.parameters[slot];
+                    if (item.generic->parameters[slot + skip].variadic) {
+                        if (type.kind != Type::List) throw at(source, name.span, "LYT0015", "变长函数作为函数值时，最后一个形参接收 List");
+                        type = module.listElements[type.id];
+                    }
+                    inputs.push_back({slot + skip, type, name.span});
                 }
-                inputs.push_back({slot, type, name.span});
+                auto wanted = std::optional(shape.result);
+                if (item.generic->isAsync) wanted = shape.result.kind == Type::Task ? std::optional(module.taskResults[shape.result.id]) : std::nullopt;
+                types = inferGenericArguments<Type>(*item.generic, Call{name, {}}, name.span, ownerTypes, inputs, wanted, source, [&](Type value) { return typeName(module, value); },
+                        [&](Type value, const std::string& key, std::size_t slot) { return symbols.project(value, key, slot); }, [](Type, Type) -> std::optional<Type> { return std::nullopt; });
             }
-            auto wanted = std::optional(shape.result);
-            if (item.generic->isAsync) wanted = shape.result.kind == Type::Task ? std::optional(module.taskResults[shape.result.id]) : std::nullopt;
-            auto types = inferGenericArguments<Type>(*item.generic, Call{name, {}}, name.span, {}, inputs, wanted, source, [&](Type value) { return typeName(module, value); },
-                    [&](Type value, const std::string& key, std::size_t slot) { return symbols.project(value, key, slot); }, [](Type, Type) -> std::optional<Type> { return std::nullopt; });
             symbols.requireBounds(*item.generic, types, source, name.span);
             std::vector<Type> parameters;
-            for (const auto& param : item.generic->parameters) {
+            for (const auto& param : std::span(item.generic->parameters).subspan(skip)) {
                 auto type = symbols.resolve(*item.generic, param.type, types);
                 parameters.push_back(param.variadic ? symbols.list(type) : type);
             }
@@ -2042,24 +2048,25 @@ struct Checker {
         }
         const auto& target = module.functions[item.target];
         std::vector<Type> parameters;
-        for (std::size_t slot = 0; slot < target.syntax.parameters.size(); ++slot) parameters.push_back(target.locals[slot].type);
+        for (auto slot = skip; slot < target.syntax.parameters.size(); ++slot) parameters.push_back(target.locals[slot].type);
         auto result = target.syntax.result.text.empty() ? symbols.resolve(target.syntax, symbols.resultAnnotation(item, source, name.span), {}) : target.result;
         return {symbols.closure(std::move(parameters), target.syntax.isAsync ? symbols.task(result) : result), {}};
     }
 
-    std::size_t selectFunctionValue(const Identifier& name, std::span<const std::size_t> candidates, std::optional<Type> expected) {
+    std::size_t selectFunctionValue(const Identifier& name, std::span<const std::size_t> candidates, std::optional<Type> expected,
+        std::span<const Type> ownerTypes = {}, std::size_t skip = 0) {
         std::vector<std::size_t> matches;
         if (expected && expected->kind == Type::Closure) {
             for (auto candidate : candidates) {
                 Symbols::TypeTrial transaction{symbols};
                 try {
-                    if (functionValue(candidate, name, expected).first == *expected) matches.push_back(candidate);
+                    if (functionValue(candidate, name, expected, ownerTypes, skip).first == *expected) matches.push_back(candidate);
                 } catch (const Diagnostic&) {
                     continue;
                 }
             }
-            if (std::ranges::any_of(matches, [&](auto index) { return !symbols.callables[index].generic; }))
-                std::erase_if(matches, [&](auto index) { return symbols.callables[index].generic.has_value(); });
+            auto generic = [&](auto index) { return symbols.declaration(symbols.callables[index]).typeParameters.size() > ownerTypes.size(); };
+            if (std::ranges::any_of(matches, [&](auto index) { return !generic(index); })) std::erase_if(matches, generic);
         }
         if (matches.size() == 1) return matches.front();
         auto error = at(source, name.span, "LYT0019", !expected || expected->kind != Type::Closure ? "重载函数值需要明确的函数类型：" + name.text :
@@ -2085,6 +2092,25 @@ struct Checker {
         if (!item.generic) fn.expressions[id].functionRef = item.target;
         else if (materializing()) fn.expressions[id].functionRef = symbols.instantiate(index, types, source, name.span);
         fn.expressions[id].callableType = type;
+        return type;
+    }
+
+    std::optional<Type> boundMethodValue(ExprId id, const Identifier& name, std::optional<Type> expected, const Overloads& methods, std::span<const Type> ownerTypes) {
+        auto found = methods.find(name.text);
+        if (found == methods.end()) return {};
+        auto candidates = symbols.visibleCandidates(found->second, source);
+        if (candidates.empty()) throw at(source, name.span, "LYN0003", "实例方法不可见：" + name.text);
+        if (expected && expected->kind == Type::Option) expected = module.sumTypes[expected->id].success;
+        auto index = candidates.size() == 1 ? candidates.front() : selectFunctionValue(name, candidates, expected, ownerTypes, 1);
+        const auto& item = symbols.callables[index];
+        const auto& syntax = symbols.declaration(item);
+        refer(name, syntax.file, syntax.name.span);
+        auto [type, types] = functionValue(index, name, expected, ownerTypes, 1);
+        auto& info = fn.expressions[id];
+        info.callee = Callee::BoundMethod;
+        info.callableType = type;
+        if (!item.generic) info.functionRef = item.target;
+        else if (materializing()) info.functionRef = symbols.instantiate(index, types, source, name.span);
         return type;
     }
 
@@ -2328,6 +2354,10 @@ struct Checker {
             auto result = declaredCall(callable, id, getter, expected, types);
             fn.expressions[id].callee = Callee::ExtensionProperty;
             return result;
+        }
+        if (owner.kind == Type::Record) {
+            const auto& record = module.aggregates[owner.id];
+            if (auto method = boundMethodValue(id, member.name, expected, symbols.methods[record.declaration], record.arguments)) return *method;
         }
         throw at(source, member.name.span, "LYN0001", typeName(module, owner) + " 没有成员：" + member.name.text);
     }
@@ -2971,7 +3001,7 @@ struct Checker {
             return !info.callableType && !info.constantRef && fn.locals[info.target].writable;
         }
         if (auto member = std::get_if<Member>(&expr.node)) {
-            if (fn.expressions[id].callee == Callee::ExtensionProperty) return false;
+            if (fn.expressions[id].callee == Callee::ExtensionProperty || fn.expressions[id].callee == Callee::BoundMethod) return false;
             auto type = fn.expressions[member->receiver].type;
             if (type.kind != Type::Record) return false;
             const auto& owner = module.aggregates[type.id].syntax;
@@ -2982,11 +3012,21 @@ struct Checker {
 
     Type infer(ExprId, const Unary& unary, std::optional<Type> expected, bool) {
         if (unary.op == Op::Not) return visit(unary.operand, Type::Bool);
-        auto type = inspect(unary.operand, numericHint(expected));
+        auto hint = numericHint(expected);
+        auto type = inspect(unary.operand, unary.op == Op::Complement && hint && !integerType(*hint) ? std::nullopt : hint);
+        if (unary.op == Op::Complement) {
+            if (integerType(type) || type == Type::Never) return type;
+            throw at(source, unary.site, "LYT0006", "按位取反需要定宽整数");
+        }
         if (type == Type::Never || type.kind == Type::Int || type.kind == Type::Real) return type;
         if (type.kind == Type::UInt) throw at(source, unary.site, "LYT0006", "无符号整数不能取负");
-        auto hint = numericHint(expected);
         return fit(unary.operand, type, hint && hint->kind != Type::UInt ? *hint : Type{Type::Int});
+    }
+
+    Type shiftCount(ExprId id, Span site) {
+        auto count = visit(id);
+        if (!integerType(count) && count != Type::Never) throw at(source, site, "LYT0006", "位移量需要整数");
+        return count;
     }
 
     Type infer(ExprId, const RangeValue& range, auto, bool) {
@@ -2996,16 +3036,34 @@ struct Checker {
     }
 
     Type infer(ExprId, const Binary& binary, std::optional<Type> expected, bool) {
-        if (binary.op <= Op::RemSet) {
+        if (assignment(binary.op)) {
             const auto& place = fn.syntax.expressions[binary.left];
             auto type = visit(binary.left);
             if (type == Type::Never) { visit(binary.right); return type; }
             auto* member = std::get_if<Member>(&place.node);
             bool initialize = fn.syntax.initializer && workers.empty() && binary.op == Op::Set && member &&
+                fn.expressions[binary.left].callee != Callee::BoundMethod && fn.expressions[binary.left].callee != Callee::ExtensionProperty &&
                 std::holds_alternative<This>(fn.syntax.expressions[member->receiver].node);
             if (!initialize && !writable(binary.left)) throw at(source, place.span, "LYT0004", "不能给此位置赋值；需要 var 绑定或可写字段");
+            if (binary.op != Op::Set && bitwise(compoundOperator(binary.op))) {
+                if (!integerType(type)) throw at(source, binary.site, "LYT0006", "位运算需要定宽整数");
+                auto value = shift(compoundOperator(binary.op)) ? shiftCount(binary.right, binary.site) : inspect(binary.right, type);
+                if (value == Type::Never) return value;
+                if (!shift(compoundOperator(binary.op)) && !losslessNumber(value, type))
+                    throw mismatch(module, source, fn.syntax.expressions[binary.right].span, type, value);
+                if (!shift(compoundOperator(binary.op))) fit(binary.right, value, type);
+                return Type::Unit;
+            }
             if (binary.op != Op::Set && !numericType(type) && !(binary.op == Op::AddSet && type == Type::String)) throw mismatch(module, source, place.span, Type::Int, type);
             return visit(binary.right, type) == Type::Never ? Type::Never : Type::Unit;
+        }
+        if (shift(binary.op)) {
+            auto hint = numericHint(expected);
+            auto left = inspect(binary.left, hint && integerType(*hint) ? hint : std::nullopt);
+            auto right = shiftCount(binary.right, binary.site);
+            if (left == Type::Never || right == Type::Never) return Type::Never;
+            if (!integerType(left)) throw at(source, binary.site, "LYT0006", "位移需要定宽整数");
+            return left;
         }
         if (binary.op == Op::And || binary.op == Op::Or) {
             auto type = visit(binary.left, Type::Bool);
@@ -3027,6 +3085,7 @@ struct Checker {
             return Type::Bool;
         }
         auto hint = binary.op > Op::Ge ? numericHint(expected) : std::nullopt;
+        if (bitwise(binary.op) && hint && !integerType(*hint)) hint.reset();
         auto integerLiteral = [&](ExprId id) { return std::holds_alternative<IntegerLiteral>(fn.syntax.expressions[id].node); };
         auto realLiteral = [&](ExprId id) { return std::get_if<RealLiteral>(&fn.syntax.expressions[id].node); };
         auto contextual = [&](ExprId id) { auto* real = realLiteral(id); return integerLiteral(id) || (real && !real->width); };
@@ -3040,6 +3099,8 @@ struct Checker {
             right = inspect(binary.right, rightHint);
         }
         if (left == Type::Never || right == Type::Never) return Type::Never;
+        if (bitwise(binary.op) && (!integerType(left) || !integerType(right)))
+            throw at(source, binary.site, "LYT0006", "位运算需要定宽整数");
         if (numericType(left) || (numericType(right) && !equality)) {
             if (!numericType(left)) left = fit(binary.left, left, right);
             if (!numericType(right)) right = fit(binary.right, right, left);
@@ -3138,15 +3199,25 @@ struct Checker {
         return Type::Never;
     }
 
-    Type infer(ExprId, const While& loop, auto, bool) {
-        auto condition = visit(loop.condition, Type::Bool);
+    Type infer(ExprId id, const While& loop, auto, bool) {
+        auto condition = loop.pattern ? (optionPattern(*loop.pattern) ? inspectOption(loop.condition) : visit(loop.condition)) : visit(loop.condition, Type::Bool);
+        if (condition == Type::Never) return condition;
         auto entry = present;
-        present.merge(conditionFacts(loop.condition, true));
+        auto local = loop.pattern && condition.kind == Type::Option ? stableLocal(loop.condition, Type::Option) : std::nullopt;
+        scopes.emplace_back();
+        if (loop.pattern) {
+            auto& pattern = fn.expressions[id].patterns.emplace_back(checkPattern(*loop.pattern, condition));
+            if (local) {
+                auto some = matchesTag(pattern, SumTag::Some);
+                if (some != matchesTag(pattern, SumTag::None)) present[*local] = some ? std::optional(module.sumTypes[condition.id].success) : std::nullopt;
+            }
+        } else present.merge(conditionFacts(loop.condition, true));
         ++loops;
         visit(loop.body, {}, true);
         --loops;
         present = std::move(entry);
-        return condition == Type::Never ? Type::Never : Type::Unit;
+        scopes.pop_back();
+        return Type::Unit;
     }
 
     struct IterationMethod { Type result; std::optional<std::size_t> function; };
@@ -3172,7 +3243,8 @@ struct Checker {
     Type infer(ExprId id, const For& loop, auto, bool) {
         auto input = visit(loop.input);
         auto element = input;
-        bool exits = input == Type::Never;
+        if (input == Type::Never) return input;
+        std::optional<IteratorPlan> methods;
         if (input == Type::IntRange) {
             element = Type::Int;
         } else if (input.kind == Type::List) {
@@ -3181,27 +3253,26 @@ struct Checker {
             element = Type::Char;
         } else if (input == Type::Bytes) {
             element = number(Type::UInt, 8);
-        } else if (!exits) {
+        } else {
             auto site = fn.syntax.expressions[loop.input].span;
             auto iterator = iterationMethod(input, "iterator", site);
             auto next = iterationMethod(iterator.result, "next", site);
             if (next.result.kind != Type::Option)
                 throw at(source, site, "LYT0014", "for ... in 的 next() 必须返回 Option<T>，实际是 " + typeName(module, next.result));
             element = module.sumTypes[next.result.id].success;
-            if (iterator.function && next.function) fn.expressions[id].iterator = IteratorPlan{*iterator.function, *next.function};
+            if (iterator.function && next.function) methods = IteratorPlan{*iterator.function, *next.function};
         }
         scopes.emplace_back();
-        auto slot = fn.locals.size();
-        fn.locals.push_back({element, false, currentWorker()});
-        declare(loop.item, slot);
-        fn.expressions[id].target = slot;
+        fn.expressions[id].iteration = CheckedIteration{element, methods};
+        const CheckedPattern* pattern = &fn.expressions[id].patterns.emplace_back(checkPattern(loop.item, element));
+        checkExhaustiveness(element, loop.item.span, {&pattern, 1}, PatternUse::Loop);
         auto entry = present;
         ++loops;
         visit(loop.body, {}, true);
         --loops;
         present = std::move(entry);
         scopes.pop_back();
-        return exits ? Type::Never : Type::Unit;
+        return Type::Unit;
     }
 
     Type infer(ExprId id, Jump, auto, bool) {

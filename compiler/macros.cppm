@@ -523,6 +523,12 @@ struct Machine {
             case Op::Le: return first <= second;
             case Op::Gt: return first > second;
             case Op::Ge: return first >= second;
+            case Op::BitAnd: return first & second;
+            case Op::BitXor: return first ^ second;
+            case Op::BitOr: return first | second;
+            case Op::Shl: case Op::Shr:
+                if (second < 0 || second >= 64) error("宏中位移量超出范围");
+                return op == Op::Shl ? first << second : first >> second;
             default: error("此运算不能用于编译期宏");
         }
         error("宏中整数溢出或除零");
@@ -560,6 +566,7 @@ struct Machine {
             if (std::get<bool>(sub(branch->condition))) result = sub(branch->yes);
             else if (branch->no) result = sub(*branch->no);
         } else if (auto loop = std::get_if<While>(&node)) {
+            if (loop->pattern) error("宏中的 while 暂不支持模式");
             while (std::get<bool>(sub(loop->condition))) {
                 try { sub(loop->body); } catch (Jump jump) { if (jump == Jump::Break) break; }
             }
@@ -567,16 +574,17 @@ struct Machine {
         else if (auto ret = std::get_if<Return>(&node)) throw Returned{ret->value ? sub(*ret->value) : Value{}};
         else if (auto unary = std::get_if<Unary>(&node)) {
             auto operand = sub(unary->operand);
-            result = unary->op == Op::Not ? Value(!std::get<bool>(operand)) : math(Op::Sub, std::int64_t{0}, operand);
+            if (unary->op == Op::Not) result = !std::get<bool>(operand);
+            else if (unary->op == Op::Complement) result = ~std::get<std::int64_t>(operand);
+            else result = math(Op::Sub, std::int64_t{0}, operand);
         } else if (auto binary = std::get_if<Binary>(&node)) {
             auto op = binary->op;
-            if (op <= Op::RemSet) {
+            if (assignment(op)) {
                 if (!std::holds_alternative<Identifier>(fn.syntax.expressions[binary->left].node)) error("宏中只能写入局部绑定");
                 auto slot = fn.expressions[binary->left].target;
                 auto left = locals[slot];
                 auto right = sub(binary->right);
-                constexpr Op operations[] = {Op::Add, Op::Sub, Op::Mul, Op::Div, Op::Rem};
-                locals[slot] = op == Op::Set ? right : math(operations[static_cast<int>(op) - 1], left, right);
+                locals[slot] = op == Op::Set ? right : math(compoundOperator(op), left, right);
                 if (auto str = std::get_if<std::string>(&locals[slot])) budget(str->size());
             } else {
                 auto left = sub(binary->left);

@@ -61,7 +61,8 @@ struct Flow {
 
     bool walk(ExprId id, const Member& member, State& state, bool restricted) const {
         if (fn.expressions[id].callee == Callee::Variant) return true;
-        if (fn.expressions[id].callee == Callee::ExtensionProperty) return eval(member.receiver, state, restricted);
+        if (fn.expressions[id].callee == Callee::ExtensionProperty || fn.expressions[id].callee == Callee::BoundMethod)
+            return eval(member.receiver, state, restricted);
         if (!isReceiver(member.receiver)) return eval(member.receiver, state, restricted);
         auto field = fn.expressions[id].target;
         if (state[field] != FieldState::Ready) throw at(source, member.name.span, "LYT0017", "字段尚未在所有路径初始化：" + record.syntax.fields[field].name.text);

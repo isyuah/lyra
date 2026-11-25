@@ -73,9 +73,13 @@ struct SyntaxArena {
             } else if constexpr (std::is_same_v<Node, Conditional>) {
                 child(node.condition); child(node.yes); optional(node.no); return "if";
             } else if constexpr (std::is_same_v<Node, While>) {
+                if (node.pattern) children.push_back(input("pattern", node.pattern->span));
                 child(node.condition); child(node.body); return "while";
             } else if constexpr (std::is_same_v<Node, For>) {
-                named("name", node.item); child(node.input); child(node.body); return "for";
+                const auto* name = std::get_if<PatternName>(&node.item.node);
+                if (name && !name->owner && !name->labels) named("name", name->name);
+                else children.push_back(input("pattern", node.item.span));
+                child(node.input); child(node.body); return "for";
             } else if constexpr (std::is_same_v<Node, Member>) {
                 child(node.receiver); named("name", node.name); return "member";
             } else if constexpr (std::is_same_v<Node, QualifiedMember>) {

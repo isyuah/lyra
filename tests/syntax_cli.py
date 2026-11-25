@@ -45,6 +45,44 @@ class SyntaxCases(unittest.TestCase):
         self.assertEqual((location['start']['offset'], location['end']['offset']),
                          (start, start + len(marker)), issue)
 
+    def test_pattern_loops_preserve_fresh_bindings_and_cleanup(self):
+        self.native('''class Cursor(var count: Int) {
+    fn next(): Int? { count += 1; if count < 3 { count } else { None } }
+}
+fn main(): Unit {
+    val cursor = Cursor(0)
+    val saved: List<() -> Int> = []
+    while let Some(value) = cursor.next() {
+        defer { print(value) }
+        saved.add { value }
+        continue
+    }
+    gcCollect()
+    print(cursor.count); print(saved[0]()); print(saved[1]())
+}''', '1\n2\n3\n1\n2\n')
+        self.reject('fn main(): Unit { val items: List<Int?> = [1]; for Some(value) in items {} }', 'LYT0012', 'Some(value)')
+        self.reject('fn main(): Unit { val value: Int? = 1; while let Some(item) = value { break }; print(item) }', 'LYN0001', 'item')
+
+    def test_bitwise_precedence_width_and_generics(self):
+        self.native('''fn identity<T>(value: T): T { value }
+fn main(): Unit {
+    val values: List<List<Int>>=[[2]]
+    print(identity<List<List<Int>>>(values)[0][0] << 1 + 2)
+    var mask: UInt8 = 254
+    mask <<= 1; mask ^= 3; mask &= 15; mask |= 16; mask >>= 1
+    print(mask)
+    print(~mask)
+    val signed: Int8 = -16
+    print(signed >> 2)
+    print(3 & 1 == 1)
+    print(match 1 { 0 | 1 => 42, _ => 0 })
+}''', '16\n15\n240\n-4\ntrue\n42\n')
+        self.reject('fn main(): Unit { print(true & false) }', 'LYT0006', '&')
+        self.main.write_text('fn main(): Unit { val narrow: Int8 = 1; print(narrow << 8) }')
+        bad = self.cli('run')
+        self.assertNotEqual(bad.returncode, 0, bad.stdout)
+        self.assertIn(b'shift count out of range', bad.stderr)
+
     def test_escaped_keywords_and_contextual_names(self):
         self.native('''
 fn `if`(value: Int): Int { value + 1 }

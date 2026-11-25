@@ -164,10 +164,11 @@ public:
             kind = Kind::Escaped;
         } else {
             kind = Kind::Symbol;
-            constexpr std::string_view doubles[] = {"+=", "-=", "*=", "/=", "%=", "==", "!=", "<=", ">=", "&&", "||", "=>", "?.", "??", "->", ".."};
-            if (text.substr(start, 3) == "..." || text.substr(start, 3) == "..<") offset += 2;
+            constexpr std::string_view doubles[] = {"+=", "-=", "*=", "/=", "%=", "==", "!=", "<=", ">=", "&&", "||", "=>", "?.", "??", "->", "..", "&=", "^=", "|=", "<<", ">>"};
+            constexpr std::string_view triples[] = {"...", "..<", "<<=", ">>="};
+            if (std::ranges::find(triples, text.substr(start, 3)) != std::end(triples)) offset += 2;
             else if (std::ranges::find(doubles, text.substr(start, 2)) != std::end(doubles)) ++offset;
-            else if (std::string_view("()[]{},.:;+-*/%=<>!#@?|&").find(current) == text.npos) {
+            else if (std::string_view("()[]{},.:;+-*/%=<>!#@?|&^~").find(current) == text.npos) {
                 while (offset < text.size() && (static_cast<unsigned char>(text[offset]) & 0xc0) == 0x80) ++offset;
                 throw at(source, {start, offset}, "LYL0001", "此处不是受支持的 Lyra 记号");
             }
@@ -249,8 +250,10 @@ RealLiteral real(const Source& source, Span span, std::string_view text) {
 struct Infix { std::string_view text; int rank; Op op; };
 constexpr Infix infix[] = {
     {"=", 1, Op::Set}, {"+=", 1, Op::AddSet}, {"-=", 1, Op::SubSet}, {"*=", 1, Op::MulSet}, {"/=", 1, Op::DivSet}, {"%=", 1, Op::RemSet},
+    {"&=", 1, Op::BitAndSet}, {"^=", 1, Op::BitXorSet}, {"|=", 1, Op::BitOrSet}, {"<<=", 1, Op::ShlSet}, {">>=", 1, Op::ShrSet},
     {"||", 3, Op::Or}, {"&&", 4, Op::And}, {"==", 5, Op::Eq}, {"!=", 5, Op::Ne}, {"<", 5, Op::Lt}, {"<=", 5, Op::Le}, {">", 5, Op::Gt}, {">=", 5, Op::Ge},
-    {"+", 7, Op::Add}, {"-", 7, Op::Sub}, {"*", 8, Op::Mul}, {"/", 8, Op::Div}, {"%", 8, Op::Rem}
+    {"|", 6, Op::BitOr}, {"^", 7, Op::BitXor}, {"&", 8, Op::BitAnd}, {"<<", 10, Op::Shl}, {">>", 10, Op::Shr},
+    {"+", 11, Op::Add}, {"-", 11, Op::Sub}, {"*", 12, Op::Mul}, {"/", 12, Op::Div}, {"%", 12, Op::Rem}
 };
 
 class Parser {
@@ -482,7 +485,7 @@ private:
                     if (!is(",")) break;
                     consume();
                 }
-                trait.span.end = require(">").span.end;
+                trait.span.end = closeAngle().end;
                 std::ranges::sort(bindings);
                 trait.text += '<';
                 for (const auto& [member, value] : bindings) {
@@ -497,7 +500,7 @@ private:
             consume();
             name.text += '<' + type().text;
             while (is(",")) { consume(); name.text += ',' + type().text; }
-            name.span.end = require(">").span.end;
+            name.span.end = closeAngle().end;
             name.text += '>';
         }
         return typeSuffixes(std::move(name));
@@ -518,9 +521,18 @@ private:
         require("<");
         std::vector<Identifier> result{type()};
         while (is(",")) { consume(); result.push_back(type()); }
-        auto close = require(">").span.end;
+        auto close = closeAngle().end;
         if (end) *end = close;
         return result;
+    }
+
+    Span closeAngle() {
+        if (is(">>") || is(">>=") || is(">=")) {
+            auto begin = token.span.begin++;
+            token.newlineBefore = false;
+            return {begin, begin + 1};
+        }
+        return require(">").span;
     }
 
     Trait trait(bool pub) {
@@ -586,7 +598,7 @@ private:
             if (!is(",")) break;
             consume();
         }
-        require(">");
+        closeAngle();
     }
 
     Enumeration enumeration(bool pub) {
@@ -825,7 +837,10 @@ private:
     }
 
     ExprId block() {
-        auto start = require("{").span.begin;
+        return blockContents(require("{").span.begin);
+    }
+
+    ExprId blockContents(std::size_t start) {
         Block body;
         while (!is("}")) {
             if (token.kind == Kind::End) throw at(source, token.span, "LYP0001", "块缺少 }");
@@ -879,9 +894,15 @@ private:
         }
         if (is("while")) {
             consume();
+            std::optional<Pattern> matched;
+            if (is("let")) {
+                consume();
+                matched = pattern();
+                require("=");
+            }
             auto condition = expression(false, 1, false);
             auto body = block();
-            return add({start, nodes[body].span.end}, While{condition, body});
+            return add({start, nodes[body].span.end}, While{condition, body, std::move(matched)});
         }
         if (is("for")) return forLoop();
         return expression();
@@ -893,7 +914,8 @@ private:
 
     ExprId forLoop() {
         auto site = consume().span;
-        auto item = identifier();
+        auto item = pattern();
+        if (auto* name = std::get_if<PatternName>(&item.node); name && !name->owner && !name->labels) name->escaped = true;
         require("in");
         auto input = expression(false, 1, false);
         auto body = block();
@@ -933,7 +955,7 @@ private:
                 left = add(span, TypeOperation{operation, left, std::move(target), site});
                 continue;
             }
-            constexpr int rangeRank = 6;
+            constexpr int rangeRank = 9;
             if ((is("..") || is("..<")) && minRank <= rangeRank) {
                 if (previous == rangeRank) throw at(source, token.span, "LYP0001", "区间运算符不能连写");
                 previous = rangeRank;
@@ -954,7 +976,7 @@ private:
     }
 
     ExprId prefix(bool inParens, bool trailingBlock) {
-        if (is("-") || is("!")) {
+        if (is("-") || is("!") || is("~")) {
             auto op = consume();
             auto nextToken = token;
             auto operand = prefix(inParens, trailingBlock);
@@ -966,7 +988,7 @@ private:
                 value.span = span;
                 return operand;
             }
-            return add(span, Unary{text(op) == "!" ? Op::Not : Op::Sub, op.span, operand});
+            return add(span, Unary{text(op) == "!" ? Op::Not : text(op) == "~" ? Op::Complement : Op::Sub, op.span, operand});
         }
         auto value = taskOperand(inParens, trailingBlock);
         bool propagated = false;
@@ -1133,16 +1155,40 @@ private:
     }
 
     ExprId tailArgument(ExprId callee, bool allowed) {
-        if (!allowed || !is("{") || token.newlineBefore) return callee;
+        bool async = is("async") && text(next) == "{" && !next.newlineBefore;
+        if (!allowed || (!async && !is("{")) || token.newlineBefore) return callee;
         auto begin = nodes[callee].span.begin;
         if (auto name = std::get_if<Identifier>(&nodes[callee].node)) callee = add(nodes[callee].span, Call{*name, {}});
         else if (auto member = std::get_if<Member>(&nodes[callee].node)) callee = add(nodes[callee].span, Call{member->name, {}, member->receiver});
         else if (!std::holds_alternative<Call>(nodes[callee].node)) return callee;
-        auto brace = token.span;
-        auto body = block();
-        auto value = add(nodes[body].span, Lambda{{}, {}, body, true});
-        std::get<Call>(nodes[callee].node).arguments.push_back({{}, value, {}, brace});
-        nodes[callee].span = {begin, nodes[body].span.end};
+        Lambda literal{{}, {}, 0, true, async};
+        auto site = token.span;
+        if (async) consume();
+        auto open = require("{").span;
+        Parser look(*this, Lookahead{});
+        auto readHead = [&]() {
+            if (look.is("=>")) return true;
+            try {
+                for (;;) {
+                    LambdaParameter parameter{look.identifier(), {}};
+                    if (look.is(":")) { look.consume(); parameter.type = look.type(); }
+                    literal.parameters.push_back(std::move(parameter));
+                    if (!look.is(",")) break;
+                    look.consume();
+                }
+                return look.is("=>");
+            } catch (const Diagnostic&) { return false; }
+        };
+        if (readHead()) {
+            literal.implicit = false;
+            while (!is("=>")) consume();
+            consume();
+        } else literal.parameters.clear();
+        literal.body = blockContents(open.begin);
+        auto end = nodes[literal.body].span.end;
+        auto value = add({site.begin, end}, std::move(literal));
+        std::get<Call>(nodes[callee].node).arguments.push_back({{}, value, {}, site});
+        nodes[callee].span = {begin, end};
         return callee;
     }
 
@@ -1221,7 +1267,12 @@ private:
                         if (token.kind == Kind::TextTail) delimiters.pop_back();
                     }
                     else if (is("<") && ((!delimiters.empty() && delimiters.back() == '>') || (followsName && typeSuffix(end) != TypeSuffix::None))) delimiters.push_back('>');
-                    else if (is(">") && !delimiters.empty() && delimiters.back() == '>') delimiters.pop_back();
+                    else if (!delimiters.empty() && delimiters.back() == '>' && text(token).starts_with('>')) {
+                        delimiters.pop_back();
+                        end = closeAngle().end;
+                        followsName = false;
+                        continue;
+                    }
                     else if (is("(") || is("[") || is("{")) delimiters.push_back(is("(") ? ')' : is("[") ? ']' : '}');
                     else if (is(")") || is("]") || is("}")) {
                         if (delimiters.empty() || delimiters.back() != text(token).front()) throw at(source, token.span, "LYP0001", "宏实参括号不匹配");
@@ -1375,7 +1426,8 @@ private:
                 require(".");
                 auto method = identifier();
                 if (explicitTypes(method) || (is("(") && (inParens || !token.newlineBefore))) return call(start, std::move(method), {}, {}, std::move(owner));
-                if (trailingBlock && is("{") && !token.newlineBefore) return add({start, method.span.end}, Call{std::move(method), {}, {}, {}, {}, std::move(owner)});
+                if (trailingBlock && (is("{") || (is("async") && text(next) == "{" && !next.newlineBefore)) && !token.newlineBefore)
+                    return add({start, method.span.end}, Call{std::move(method), {}, {}, {}, {}, std::move(owner)});
                 auto end = method.span.end;
                 return add({start, end}, QualifiedMember{std::move(owner), std::move(method)});
             }

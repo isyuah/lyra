@@ -40,7 +40,14 @@ struct TextTemplate { std::vector<ExprId> parts; };
 struct IntegerLiteral { std::uint64_t magnitude{}; bool negative{}; };
 struct RealLiteral { std::string digits; std::optional<unsigned> width; };
 
-enum class Op { Set, AddSet, SubSet, MulSet, DivSet, RemSet, Or, And, Eq, Ne, Lt, Le, Gt, Ge, Add, Sub, Mul, Div, Rem, Not };
+enum class Op { Set, AddSet, SubSet, MulSet, DivSet, RemSet, BitAndSet, BitXorSet, BitOrSet, ShlSet, ShrSet,
+    Or, And, Eq, Ne, Lt, Le, Gt, Ge, Add, Sub, Mul, Div, Rem, BitAnd, BitXor, BitOr, Shl, Shr, Not, Complement };
+constexpr bool assignment(Op op) { return op <= Op::ShrSet; }
+constexpr bool bitwise(Op op) { return op >= Op::BitAnd && op <= Op::Shr; }
+constexpr bool shift(Op op) { return op == Op::Shl || op == Op::Shr; }
+constexpr Op compoundOperator(Op op) {
+    return static_cast<Op>(static_cast<int>(Op::Add) + static_cast<int>(op) - static_cast<int>(Op::AddSet));
+}
 struct Unary { Op op; Span site; ExprId operand; };
 struct Binary { Op op; Span site; ExprId left, right; };
 struct RangeValue { ExprId start, end; bool inclusive; };
@@ -50,8 +57,6 @@ struct Statement { ExprId expression; std::optional<Span> semicolon; };
 struct Block { std::vector<Statement> statements; Span end; };
 struct Binding { Identifier name; bool writable; std::optional<Identifier> annotation; ExprId value; };
 struct Conditional { ExprId condition, yes; std::optional<ExprId> no; };
-struct While { ExprId condition, body; };
-struct For { Identifier item; ExprId input, body; };
 struct Return { std::optional<ExprId> value; };
 struct Raise { Span site; std::optional<ExprId> value; };
 struct CatchBinding { Identifier name, type; };
@@ -80,6 +85,8 @@ struct Pattern {
     std::variant<std::monostate, PatternName, SumTag, IntegerLiteral, PatternIntegerRange, PatternAlternatives, PatternList, bool, StringLiteral, CharLiteral> node;
     std::vector<Pattern> parts{};
 };
+struct While { ExprId condition, body; std::optional<Pattern> pattern{}; };
+struct For { Pattern item; ExprId input, body; };
 struct PatternBinding { Pattern pattern; std::optional<Identifier> annotation; ExprId value; };
 struct MatchArm { Pattern pattern; ExprId value; std::optional<ExprId> guard{}; };
 enum class OptionalForm { None, Access, Default };

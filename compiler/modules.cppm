@@ -260,6 +260,8 @@ struct Linker {
                 if (auto* operation = std::get_if<TypeOperation>(&expr.node)) renameType(operation->type);
                 if (auto* attempt = std::get_if<Attempt>(&expr.node)) for (auto& arm : attempt->arms) if (arm.binding) renameType(arm.binding->type);
                 if (auto* match = std::get_if<Match>(&expr.node)) for (auto& arm : match->arms) renamePattern(renamePattern, arm.pattern);
+                if (auto* loop = std::get_if<For>(&expr.node)) renamePattern(renamePattern, loop->item);
+                if (auto* loop = std::get_if<While>(&expr.node); loop && loop->pattern) renamePattern(renamePattern, *loop->pattern);
                 if (auto* lambda = std::get_if<Lambda>(&expr.node)) {
                     for (auto& param : lambda->parameters) if (param.type) renameType(*param.type);
                     if (lambda->result) renameType(*lambda->result);

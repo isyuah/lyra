@@ -207,14 +207,14 @@ struct Validator {
                 if (node.no) descend(*node.no);
             } else if constexpr (std::is_same_v<Node, While>) {
                 descend(node.condition);
-                descend(node.body);
+                if (fn.expressions[node.condition].type != Type::Never) descend(node.body);
             } else if constexpr (std::is_same_v<Node, For>) {
                 descend(node.input);
-                if (info.iterator) {
-                    validateFunction(info.iterator->open, expr.span);
-                    validateFunction(info.iterator->next, expr.span);
+                if (info.iteration && info.iteration->methods) {
+                    validateFunction(info.iteration->methods->open, expr.span);
+                    validateFunction(info.iteration->methods->next, expr.span);
                 }
-                descend(node.body);
+                if (info.iteration) descend(node.body);
             } else if constexpr (std::is_same_v<Node, Match>) {
                 descend(node.subject);
                 for (const auto& arm : node.arms) {
@@ -258,6 +258,7 @@ struct Closure {
     const CheckedFunction& function;
     std::optional<ExprId> lambda{};
     std::vector<EvalValue*> captures{};
+    std::optional<EvalValue> receiver{};
 };
 
 struct Evaluation {
@@ -630,7 +631,14 @@ struct Evaluation {
             }
             return asDouble(first, type);
         }
-        auto first = integer(type, left), second = integer(type, right);
+        auto first = integer(type, left);
+        if (shift(op)) {
+            auto count = std::get<std::uint64_t>(right);
+            if (count >= numberWidth(type)) error(sources, fn, site, "LYCT0003", "编译期位移量超出范围");
+            auto offset = static_cast<unsigned>(count);
+            return (op == Op::Shl ? first.shl(offset) : type.kind == Type::Int ? first.ashr(offset) : first.lshr(offset)).getZExtValue();
+        }
+        auto second = integer(type, right);
         bool sign = type.kind == Type::Int, overflow = false;
         llvm::APInt result;
         switch (op) {
@@ -640,6 +648,9 @@ struct Evaluation {
             case Op::Le: return sign ? first.sle(second) : first.ule(second);
             case Op::Gt: return sign ? first.sgt(second) : first.ugt(second);
             case Op::Ge: return sign ? first.sge(second) : first.uge(second);
+            case Op::BitAnd: return (first & second).getZExtValue();
+            case Op::BitXor: return (first ^ second).getZExtValue();
+            case Op::BitOr: return (first | second).getZExtValue();
             case Op::Add: result = sign ? first.sadd_ov(second, overflow) : first.uadd_ov(second, overflow); break;
             case Op::Sub: result = sign ? first.ssub_ov(second, overflow) : first.usub_ov(second, overflow); break;
             case Op::Mul: result = sign ? first.smul_ov(second, overflow) : first.umul_ov(second, overflow); break;
@@ -778,6 +789,8 @@ struct Evaluation {
                 if (info.callee == Callee::Variant)
                     return makeComposite(fn, site, rawType(fn, id), VariantTag{rawType(fn, id).id, static_cast<unsigned>(info.target)});
                 auto receiver = sub(item.receiver);
+                if (info.callee == Callee::BoundMethod)
+                    return makeClosure(fn, site, rawType(fn, id), Closure{module.functions[*info.functionRef], {}, {}, std::move(receiver)});
                 if (info.callee == Callee::ExtensionProperty) return invoke(module.functions[info.target], {std::move(receiver)}, fn, site);
                 auto owner = fn.expressions[item.receiver].type;
                 if (owner.kind == Type::Record || owner == Type::IntRange) return composite(receiver).fields[info.target];
@@ -858,13 +871,22 @@ struct Evaluation {
                 }
                 error(sources, fn, site, "LYT0012", "match 未穷尽，编译期值未命中任何分支");
             } else if constexpr (std::is_same_v<Node, While>) {
-                while (std::get<bool>(scalarValue(sub(item.condition), fn, site))) {
+                for (;;) {
+                    auto condition = sub(item.condition);
+                    if (item.pattern) {
+                        PatternBindings bindings;
+                        if (!matches(fn, item.pattern->span, info.patterns.front(), condition, fn.expressions[item.condition].type, bindings)) break;
+                        for (auto& [slot, bound] : bindings) initialize(fn, site, frame, slot, std::move(bound));
+                    } else if (!std::get<bool>(scalarValue(condition, fn, site))) break;
                     try { sub(item.body); } catch (Jump jump) { if (jump == Jump::Break) break; }
                 }
             } else if constexpr (std::is_same_v<Node, For>) {
                 auto input = sub(item.input);
                 auto iterate = [&](EvalValue element) {
-                    initialize(fn, site, frame, info.target, std::move(element));
+                    PatternBindings bindings;
+                    if (!matches(fn, item.item.span, info.patterns.front(), element, info.iteration->element, bindings))
+                        error(sources, fn, item.item.span, "LYT0012", "for 解构必须匹配所有可能的元素");
+                    for (auto& [slot, bound] : bindings) initialize(fn, site, frame, slot, std::move(bound));
                     try { sub(item.body); } catch (Jump jump) { return jump != Jump::Break; }
                     return true;
                 };
@@ -873,10 +895,10 @@ struct Evaluation {
                     for (auto current = start; current < end || (inclusive && current == end); ++current) {
                         if (!iterate(static_cast<std::uint64_t>(current)) || current == end) break;
                     }
-                } else if (info.iterator) {
-                    auto cursor = invoke(module.functions[info.iterator->open], {input}, fn, site);
+                } else if (const auto& plan = info.iteration->methods) {
+                    auto cursor = invoke(module.functions[plan->open], {input}, fn, site);
                     for (;;) {
-                        auto next = invoke(module.functions[info.iterator->next], {cursor}, fn, site);
+                        auto next = invoke(module.functions[plan->next], {cursor}, fn, site);
                         auto& option = composite(next);
                         if (std::get<SumTag>(option.tag) == SumTag::None || !iterate(option.fields.front())) break;
                     }
@@ -901,12 +923,13 @@ struct Evaluation {
                 auto operand = sub(item.operand);
                 if (item.op == Op::Not) return !std::get<bool>(scalarValue(operand, fn, site));
                 auto type = fn.expressions[item.operand].type;
+                if (item.op == Op::Complement) return (~integer(type, scalarValue(operand, fn, site))).getZExtValue();
                 if (type.kind == Type::Real) return -std::get<double>(scalarValue(operand, fn, site));
                 return operation(fn, item.site, Op::Sub, type, std::uint64_t{0}, operand);
             } else if constexpr (std::is_same_v<Node, Binary>) {
                 auto op = item.op;
                 auto type = fn.expressions[item.left].type;
-                if (op <= Op::RemSet) {
+                if (assignment(op)) {
                     if (type == Type::Never) return sub(item.left);
                     auto place = address(fn, item.left, frame);
                     auto before = EvalValue{};
@@ -916,9 +939,8 @@ struct Evaluation {
                         before = *read;
                     }
                     auto after = sub(item.right);
-                    constexpr Op compound[] = {Op::Add, Op::Sub, Op::Mul, Op::Div, Op::Rem};
                     if (op != Op::Set) {
-                        after = operation(fn, item.site, compound[static_cast<int>(op) - 1], type, before, after);
+                        after = operation(fn, item.site, compoundOperator(op), type, before, after);
                         if (const auto* scalar = std::get_if<ConstScalar>(&after))
                             if (const auto* text = std::get_if<std::string>(scalar)) chargeText(fn, site, text->size());
                     }
@@ -937,9 +959,11 @@ struct Evaluation {
                     auto value = item.function ? sub(*item.function) : item.receiver ? composite(sub(*item.receiver)).fields[info.target] : frame.cell(info.target);
                     if (info.narrowed) value = composite(value).fields.front();
                     const auto& closure = closures.at(std::get<ConstRef>(value).index);
-                    std::vector<EvalValue> args(item.arguments.size());
+                    auto skip = static_cast<std::size_t>(closure.receiver.has_value());
+                    std::vector<EvalValue> args(item.arguments.size() + skip);
+                    if (closure.receiver) args.front() = *closure.receiver;
                     for (std::size_t index = 0; index < item.arguments.size(); ++index)
-                        args[info.argumentSlots[index]] = sub(item.arguments[index].value);
+                        args[info.argumentSlots[index] + skip] = sub(item.arguments[index].value);
                     return invoke(closure.function, std::move(args), fn, item.name.span, closure.lambda ? &closure : nullptr);
                 }
                 if (item.receiver && info.callee != Callee::Function && info.callee != Callee::Variant) {

@@ -59,18 +59,22 @@ struct NativeClosures {
         auto note = module().getOrInsertFunction("lyraTaskCreatedAt", at.getVoidTy(), pointer, pointer, integer, integer);
         at.CreateCall(note, {task, at.CreateLoad(pointer, location), at.CreateLoad(integer, at.CreateStructGEP(site, location, 1)), at.CreateLoad(integer, at.CreateStructGEP(site, location, 2))});
     }
-    Value named(llvm::Function* target, llvm::FunctionType* type, std::size_t count, bool async, bool foreign) const {
-        auto name = (target->getName() + ".as.value").str();
-        if (auto* record = module().getNamedGlobal(name + ".closure")) return record;
-        auto* adapter = function(type, name);
-        llvm::IRBuilder<> thunk(llvm::BasicBlock::Create(builder.getContext(), "entry", adapter));
-        std::vector<Value> inputs;
-        for (std::size_t index = 0; index < count; ++index) inputs.push_back(adapter->getArg(index + 1));
-        if (!async && !foreign) inputs.push_back(adapter->getArg(adapter->arg_size() - 1));
-        auto* result = thunk.CreateCall(target, inputs);
-        if (async) noteTask(thunk, result, adapter->getArg(count + 1));
-        thunk.CreateRet(result);
-        return close(adapter, {});
+    Value named(llvm::Function* target, llvm::FunctionType* type, std::size_t count, bool async, bool foreign, Value receiver = nullptr) const {
+        auto name = (target->getName() + (receiver ? ".as.method" : ".as.value")).str();
+        if (!receiver) if (auto* record = module().getNamedGlobal(name + ".closure")) return record;
+        auto* adapter = module().getFunction(name);
+        if (!adapter) {
+            adapter = function(type, name);
+            llvm::IRBuilder<> thunk(llvm::BasicBlock::Create(builder.getContext(), "entry", adapter));
+            std::vector<Value> inputs;
+            if (receiver) inputs.push_back(thunk.CreateLoad(target->getArg(0)->getType(), NativeClosures{thunk}.capture(adapter->getArg(0), 1, 0)));
+            for (std::size_t index = 0; index < count; ++index) inputs.push_back(adapter->getArg(index + 1));
+            if (!async && !foreign) inputs.push_back(adapter->getArg(adapter->arg_size() - 1));
+            auto* result = thunk.CreateCall(target, inputs);
+            if (async) noteTask(thunk, result, adapter->getArg(count + 1));
+            thunk.CreateRet(result);
+        }
+        return receiver ? close(adapter, {receiver}) : close(adapter, {});
     }
 };
 
