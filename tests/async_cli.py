@@ -309,6 +309,53 @@ async fn main(): Unit {
 '''
         self.run_source(source, '2\n2\n0\n', env={**os.environ, "LYRA_PARALLEL_WORKERS": "2", "UV_THREADPOOL_SIZE": "3"})
 
+    def test_cpu_loop_cooperatively_checks_cancellation(self):
+        (self.package / "lyra.json5").write_text("{name:'test/cooperative-cancel',version:'1.0.0'}")
+        self.run_source('''
+import std.sync.AtomicInt
+
+class State(val started: AtomicInt, val observed: AtomicInt, val afterCheck: AtomicInt, val cleaned: AtomicInt)
+async fn spin(state: State): Unit {
+    Task.checkCancellation()
+    print(Task.cancelled())
+    defer state.cleaned.fetchAdd(1)
+    state.started.store(1)
+    while !Task.cancelled() {}
+    state.observed.store(1)
+    try { Task.checkCancellation(); state.afterCheck.store(1) }
+    catch { state.afterCheck.store(2) }
+}
+async fn cancel(job: Task<Unit>, state: State): Unit {
+    await blocking { while state.started.load() == 0 {} }
+    job.cancel()
+}
+async fn main(): Unit {
+    val state = State(AtomicInt(), AtomicInt(), AtomicInt(), AtomicInt())
+    taskGroup {
+        val job = parallel { await spin(state) }
+        spawn cancel(job, state)
+    }
+    print(state.started.load() == 1)
+    print(state.observed.load() == 1)
+    print(state.afterCheck.load())
+    print(state.cleaned.load())
+}
+''', 'false\ntrue\ntrue\n0\n1\n', env={**os.environ, "LYRA_PARALLEL_WORKERS": "1"})
+
+    def test_cancellation_check_observes_deadline_without_await(self):
+        (self.package / "lyra.json5").write_text("{name:'test/cpu-deadline',version:'1.0.0'}")
+        self.run_source('''
+import std.task.withTimeout
+
+async fn spin(): Unit {
+    while true { Task.checkCancellation() }
+}
+async fn main(): Unit {
+    taskGroup { spawn withTimeout(50, spin()); }
+    print("finished")
+}
+''', 'finished\n')
+
     def test_typed_task_local_keeps_unset_and_stored_none_distinct(self):
         self.run_source('''
 async fn inspect(key: TaskLocal<String?>): String {
@@ -398,6 +445,8 @@ async fn main(): Unit {
                                ("fn main(): Unit { val bad = spawn work() } async fn work(): Unit {}", "spawn"),
                                ("async fn main(): Unit { val bad = await 4 }", "4"),
                                ("async fn main(): Unit { val bad = spawn 5 }", "5"),
+                               ("fn main(): Unit { print(Task.cancelled()) }", "cancelled"),
+                               ("async fn main(): Unit { defer Task.checkCancellation() }", "checkCancellation"),
                                ("async fn main(): Unit { val bad = blocking { await never() } }", "await")):
             with self.subTest(source=source):
                 self.main.write_text(source)

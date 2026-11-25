@@ -45,7 +45,7 @@ void lyraTaskBlock(LyraTask *task, LyraNativeWork work, void *nativeData);
 void lyraTaskComplete(LyraTask *task, void *value);
 void lyraTaskFail(LyraTask *task, const LyraException *error);
 void lyraTaskRequestCancel(LyraTask *task);
-int lyraTaskCancelRequested(const LyraTask *task);
+int lyraTaskCancelRequested(LyraTask *task);
 void lyraTaskFinishCancelled(LyraTask *task);
 LyraTaskState lyraTaskState(const LyraTask *task);
 void *lyraTaskOutcome(const LyraTask *task);

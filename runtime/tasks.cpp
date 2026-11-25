@@ -886,8 +886,9 @@ void lyraTaskRequestCancel(LyraTask *task) {
     requestCancel(task);
 }
 
-int lyraTaskCancelRequested(const LyraTask *task) {
+int lyraTaskCancelRequested(LyraTask *task) {
     TaskLock lock;
+    if (!task->cancelRequested && lyraContextRemaining(task->context) == 0) requestCancel(task);
     return task->cancelRequested;
 }
 

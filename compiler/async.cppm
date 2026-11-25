@@ -22,6 +22,11 @@ llvm::FunctionCallee runtime(Builder& builder, llvm::StringRef name, llvm::Type*
     return moduleAt(builder).getOrInsertFunction(name, llvm::FunctionType::get(result, inputs, false));
 }
 
+llvm::Value* cancellationRequested(Builder& builder, llvm::Value* task) {
+    auto* requested = builder.CreateCall(runtime(builder, "lyraTaskCancelRequested", builder.getInt32Ty(), {builder.getPtrTy()}), {task});
+    return builder.CreateIsNotNull(requested);
+}
+
 llvm::Value* allocate(Builder& builder, llvm::Type* type) {
     return builder.CreateCall(runtime(builder, "lyraGcAlloc", builder.getPtrTy(), {builder.getInt64Ty()}), {llvm::ConstantExpr::getSizeOf(type)});
 }
@@ -61,6 +66,14 @@ export llvm::Value* asyncAwait(llvm::IRBuilder<>& builder, llvm::Type* result, l
 
 export llvm::Value* asyncSpawn(llvm::IRBuilder<>& builder, llvm::Value* task, bool parallel = false) {
     return marker(builder, parallel ? "lyra.parallel" : "lyra.spawn", builder.getPtrTy(), {task});
+}
+
+export llvm::Value* asyncTaskCancelled(llvm::IRBuilder<>& builder) {
+    return marker(builder, "lyra.taskCancelled", builder.getInt1Ty(), {});
+}
+
+export void asyncCheckCancellation(llvm::IRBuilder<>& builder) {
+    marker(builder, "lyra.checkCancellation", builder.getVoidTy(), {});
 }
 
 export void asyncFailure(llvm::IRBuilder<>& builder, llvm::Value* error) {
@@ -195,7 +208,7 @@ export void lowerAsync(llvm::Function& factory, llvm::Function& body, llvm::Allo
     auto* pointer = builder.getPtrTy();
     auto* noResult = builder.getVoidTy();
     auto* integer = builder.getInt32Ty();
-    std::vector<llvm::CallInst*> waits, spawns, failures;
+    std::vector<llvm::CallInst*> waits, spawns, cancellationChecks, cancellationQueries, failures;
     std::vector<llvm::PHINode*> phis;
     std::vector<llvm::ReturnInst*> returns;
     for (auto& instruction : llvm::instructions(body)) {
@@ -205,6 +218,8 @@ export void lowerAsync(llvm::Function& factory, llvm::Function& body, llvm::Allo
                 auto name = callee->getFnAttribute("lyra.suspension").getValueAsString();
                 if (name == "lyra.await") waits.push_back(call);
                 else if (name == "lyra.spawn" || name == "lyra.parallel") spawns.push_back(call);
+                else if (name == "lyra.checkCancellation") cancellationChecks.push_back(call);
+                else if (name == "lyra.taskCancelled") cancellationQueries.push_back(call);
                 else failures.push_back(call);
             }
         } else if (auto* phi = llvm::dyn_cast<llvm::PHINode>(&instruction)) phis.push_back(phi);
@@ -267,8 +282,7 @@ export void lowerAsync(llvm::Function& factory, llvm::Function& body, llvm::Allo
         slot->replaceAllUsesWith(builder.CreateStructGEP(frameType, frame, field++));
         slot->eraseFromParent();
     }
-    auto* cancellation = builder.CreateCall(runtime(builder, "lyraTaskCancelRequested", integer, {pointer}), {task});
-    builder.CreateCondBr(builder.CreateIsNotNull(cancellation), cancelled, select);
+    builder.CreateCondBr(cancellationRequested(builder, task), cancelled, select);
     builder.SetInsertPoint(cancelled);
     builder.CreateCall(runtime(builder, "lyraTaskFinishCancelled", noResult, {pointer}), {task});
     builder.CreateRetVoid();
@@ -320,6 +334,19 @@ export void lowerAsync(llvm::Function& factory, llvm::Function& body, llvm::Allo
         auto start = runtime(builder, parallel ? "lyraTaskParallel" : "lyraTaskSpawn", pointer, {pointer, pointer});
         spawn->replaceAllUsesWith(builder.CreateCall(start, {task, spawn->getArgOperand(0)}));
         eraseMarker(spawn);
+    }
+    for (auto* query : cancellationQueries) {
+        builder.SetInsertPoint(query);
+        query->replaceAllUsesWith(cancellationRequested(builder, task));
+        eraseMarker(query);
+    }
+    for (auto* check : cancellationChecks) {
+        auto* checked = check->getParent();
+        auto* continuation = checked->splitBasicBlock(check->getNextNode(), "cancel.continue");
+        checked->getTerminator()->eraseFromParent();
+        eraseMarker(check);
+        builder.SetInsertPoint(checked);
+        builder.CreateCondBr(cancellationRequested(builder, task), cancelled, continuation);
     }
     for (auto* failure : failures) {
         builder.SetInsertPoint(failure);

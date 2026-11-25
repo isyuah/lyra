@@ -1154,6 +1154,8 @@ struct Emitter {
             if (shape.result == Type::Never) { builder.CreateUnreachable(); end(); }
             return value;
         }
+        if (info.callee == Callee::TaskCancelled) return asyncTaskCancelled(builder);
+        if (info.callee == Callee::TaskCheckCancellation) { asyncCheckCancellation(builder); return unit(); }
         auto skip = static_cast<std::size_t>(call.receiver && info.callee != Callee::Variant);
         Value receiver = nullptr;
         if (skip) {
@@ -1186,6 +1188,7 @@ struct Emitter {
         }
         switch (info.callee) {
             case Callee::Indirect: llvm_unreachable("indirect call already emitted");
+            case Callee::TaskCancelled: case Callee::TaskCheckCancellation: llvm_unreachable("static task call already emitted");
             case Callee::LocalKey: return asyncCell(builder, builder.getInt8Ty());
             case Callee::WithLocal: return NativeExceptions{builder}.created(pointerCall("lyraTaskWithLocal", {args[0], NativeLists{builder}.box(args[1]), args[2]}), source, call.name.span);
             case Callee::LocalGet: {

@@ -1929,6 +1929,17 @@ struct Checker {
         if (call.function) return invoke(visit(*call.function));
         const auto& key = call.name.linked.empty() ? call.name.text : call.name.linked;
         if (!call.receiver && !call.typeOwner) if (auto local = localSlot(call.name)) return invoke(readLocal(id, call.name, *local));
+        if (call.receiver && !call.typeOwner) {
+            const auto* qualifier = std::get_if<Identifier>(&fn.syntax.expressions[*call.receiver].node);
+            if (qualifier && linkedName(*qualifier) == "Task" && !lookupLocal(*qualifier) && !implicitMember(*qualifier) &&
+                (call.name.text == "cancelled" || call.name.text == "checkCancellation")) {
+                noTypeArgs();
+                if (!call.arguments.empty()) throw at(source, call.name.span, "LYT0002", "Task." + call.name.text + " 不接收实参");
+                if (!inAsync()) throw at(source, call.name.span, "LYT0008", "Task." + call.name.text + " 只能在异步执行体中调用");
+                info.callee = call.name.text == "cancelled" ? Callee::TaskCancelled : Callee::TaskCheckCancellation;
+                return call.name.text == "cancelled" ? Type{Type::Bool} : Type{Type::Unit};
+            }
+        }
         std::size_t declaration;
         std::span<const Type> ownerTypes;
         if (call.typeOwner) {
