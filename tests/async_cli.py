@@ -32,6 +32,45 @@ class Async(unittest.TestCase):
                 run = subprocess.run([app], capture_output=True, timeout=15, env=env)
                 self.assertEqual((run.returncode, run.stdout.decode(), run.stderr), (0, expected, b""))
 
+    def test_async_expressions_are_cold_and_preserve_scope(self):
+        self.run_source('''fn number(value: Int): Int { print(value); value }
+fn make(value: Int): Task<Int> {
+    async { defer { print("done") }; await sleepMs(0); value + 1 }
+}
+fn create(increment: Int): (Int) -> Task<Int> {
+    async (value) => { await sleepMs(0); return value + increment }
+}
+fn choose(value: Int?): Task<Int?> {
+    async { val item = value?; Some(item + 1) }
+}
+async fn main(): Unit {
+    var current = 1
+    val captured = async { current }
+    current = 8
+    val unused = async { print("must not run") }
+    val first = make(number(10))
+    val callback = create(12)
+    val second = callback(number(20))
+    val third = (async (value: Int): Int => { await sleepMs(0); value * 2 })(7)
+    print("constructed")
+    print(await first)
+    print(await first)
+    print(await second)
+    print(await third)
+    print(await captured)
+    print(await choose(None) == None)
+    print((await choose(Some(5))) ?? -1)
+    val boom = async (): Int => { throw Exception("callback failed") }
+    try { await boom(); } catch error: Exception { print(error.message) }
+}''', '10\n20\nconstructed\ndone\n11\n11\n32\n14\n8\ntrue\n6\ncallback failed\n')
+
+    def test_sync_lambda_in_async_body_still_rejects_await(self):
+        self.main.write_text('async fn main(): Unit { val sync = () => { await sleepMs(0) } }', encoding='utf-8')
+        result = subprocess.run([COMPILER, 'check', self.package, '--diagnostics=json'], capture_output=True, timeout=10)
+        error, = json.loads(result.stderr)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(error['code'], 'LYT0008', error)
+
     def test_channel_cold_tasks_cross_domains_and_preserve_nested_option(self):
         self.run_source('''class Entry(val number: Int)
 async fn publish<T>(values: Channel<T>, item: T): Unit {

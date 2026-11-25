@@ -1162,9 +1162,10 @@ private:
         return false;
     }
 
-    ExprId lambda() {
-        auto start = require("(").span.begin;
-        Lambda literal{{}, {}, 0, false};
+    ExprId lambda(std::optional<Span> async = {}) {
+        auto open = require("(").span;
+        auto start = async.value_or(open).begin;
+        Lambda literal{{}, {}, 0, false, async.has_value()};
         while (!is(")")) {
             LambdaParameter parameter{identifier(), {}};
             if (is(":")) { consume(); parameter.type = type(); }
@@ -1245,6 +1246,13 @@ private:
     ExprId atom(bool inParens, bool trailingBlock) {
         auto start = token.span.begin;
         if (is("#")) return macroExpression();
+        if (is("async")) {
+            auto site = consume().span;
+            if (token.newlineBefore || (!is("{") && !is("("))) throw at(source, site, "LYP0001", "异步表达式需要同行的块或 lambda");
+            if (is("(")) return lambda(site);
+            auto body = block();
+            return add({start, nodes[body].span.end}, AsyncBlock{AsyncBlock::Cold, body, site});
+        }
         if (is("[")) {
             consume();
             ListLiteral literal;

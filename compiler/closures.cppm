@@ -53,6 +53,12 @@ struct NativeClosures {
         inputs.push_back(error);
         return builder.CreateCall(type, builder.CreateLoad(builder.getPtrTy(), record), inputs);
     }
+    void noteTask(llvm::IRBuilder<>& at, Value task, Value location) const {
+        auto pointer = at.getPtrTy(); auto integer = at.getInt64Ty();
+        auto* site = llvm::StructType::get(at.getContext(), {pointer, integer, integer});
+        auto note = module().getOrInsertFunction("lyraTaskCreatedAt", at.getVoidTy(), pointer, pointer, integer, integer);
+        at.CreateCall(note, {task, at.CreateLoad(pointer, location), at.CreateLoad(integer, at.CreateStructGEP(site, location, 1)), at.CreateLoad(integer, at.CreateStructGEP(site, location, 2))});
+    }
     Value named(llvm::Function* target, llvm::FunctionType* type, std::size_t count, bool async, bool foreign) const {
         auto name = (target->getName() + ".as.value").str();
         if (auto* record = module().getNamedGlobal(name + ".closure")) return record;
@@ -62,13 +68,7 @@ struct NativeClosures {
         for (std::size_t index = 0; index < count; ++index) inputs.push_back(adapter->getArg(index + 1));
         if (!async && !foreign) inputs.push_back(adapter->getArg(adapter->arg_size() - 1));
         auto* result = thunk.CreateCall(target, inputs);
-        if (async) {
-            auto pointer = thunk.getPtrTy(); auto integer = thunk.getInt64Ty();
-            auto* site = llvm::StructType::get(builder.getContext(), {pointer, integer, integer});
-            auto* at = adapter->getArg(count + 1);
-            auto note = module().getOrInsertFunction("lyraTaskCreatedAt", thunk.getVoidTy(), pointer, pointer, integer, integer);
-            thunk.CreateCall(note, {result, thunk.CreateLoad(pointer, at), thunk.CreateLoad(integer, thunk.CreateStructGEP(site, at, 1)), thunk.CreateLoad(integer, thunk.CreateStructGEP(site, at, 2))});
-        }
+        if (async) noteTask(thunk, result, adapter->getArg(count + 1));
         thunk.CreateRet(result);
         return close(adapter, {});
     }

@@ -1077,7 +1077,12 @@ struct Checker {
     }
 
     std::optional<ExprId> currentWorker() const { return workers.empty() ? std::nullopt : std::optional(workers.back().id); }
-    bool inAsync() const { return workers.empty() ? fn.syntax.isAsync : std::holds_alternative<AsyncBlock>(fn.syntax.expressions[workers.back().id].node); }
+    bool inAsync() const {
+        if (workers.empty()) return fn.syntax.isAsync;
+        const auto& node = fn.syntax.expressions[workers.back().id].node;
+        if (auto lambda = std::get_if<Lambda>(&node)) return lambda->isAsync;
+        return std::holds_alternative<AsyncBlock>(node);
+    }
     std::optional<Type> returnType() const {
         if (!workers.empty()) return workers.back().result;
         return inferredReturn ? *inferredReturn : std::optional(fn.result);
@@ -1891,6 +1896,7 @@ struct Checker {
         auto count = lambda.implicit ? hints.size() - 1 : lambda.parameters.size();
         if (!hints.empty() && count + 1 != hints.size()) throw at(source, errorSite, "LYT0015", "lambda 的形参数量与目标函数类型不符");
         std::optional<Type> result = hints.empty() ? std::nullopt : hints.back();
+        if (lambda.isAsync && result) result = result->kind == Type::Task ? std::optional(module.taskResults[result->id]) : std::nullopt;
         if (lambda.result) result = symbols.resolve(fn.syntax, *lambda.result, variables);
         workers.push_back({id, fn.locals.size(), result});
         scopes.emplace_back();
@@ -1915,7 +1921,7 @@ struct Checker {
         workers.pop_back();
         present = std::move(entry);
         loops = previous;
-        return symbols.closure(std::move(parameters), *result);
+        return symbols.closure(std::move(parameters), lambda.isAsync ? symbols.task(*result) : *result);
     }
 
     Type infer(ExprId id, const Binding& binding, auto, bool) {
@@ -2666,7 +2672,7 @@ struct Checker {
     }
 
     Type infer(ExprId id, const AsyncBlock& block, std::optional<Type> expected, bool discard) {
-        if (!inAsync()) throw at(source, block.site, "LYT0008", "taskGroup 和 parallel 只能在异步执行体中使用");
+        if (block.kind != AsyncBlock::Cold && !inAsync()) throw at(source, block.site, "LYT0008", "taskGroup 和 parallel 只能在异步执行体中使用");
         if (block.kind == AsyncBlock::Group) return taskBlock(id, block.body, discard ? std::nullopt : expected);
         auto hint = expected && expected->kind == Type::Task ? std::optional(module.taskResults[expected->id]) : std::nullopt;
         return symbols.task(taskBlock(id, block.body, hint));

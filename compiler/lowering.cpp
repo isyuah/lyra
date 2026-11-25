@@ -604,7 +604,7 @@ struct Emitter {
     void end() { builder.ClearInsertionPoint(); }
 
     bool deferred() const { return worker && std::holds_alternative<Deferred>(fn.syntax.expressions[*worker].node); }
-    bool lambda() const { return worker && std::holds_alternative<Lambda>(fn.syntax.expressions[*worker].node); }
+    const Lambda* lambda() const { return worker ? std::get_if<Lambda>(&fn.syntax.expressions[*worker].node) : nullptr; }
     const AsyncBlock* asyncBlock() const { return worker ? std::get_if<AsyncBlock>(&fn.syntax.expressions[*worker].node) : nullptr; }
     ExprId bodyId() const {
         if (!worker) return fn.syntax.body;
@@ -616,12 +616,18 @@ struct Emitter {
     }
     Type completionType() const {
         if (!worker) return fn.result;
-        if (lambda()) return layouts.program.signatures[rawType(*worker).id].result;
+        if (auto literal = lambda()) {
+            auto result = layouts.program.signatures[rawType(*worker).id].result;
+            return literal->isAsync ? layouts.program.taskResults[result.id] : result;
+        }
         if (auto block = asyncBlock(); block && block->kind == AsyncBlock::Group) return rawType(*worker);
         return deferred() ? Type{Type::Unit} : layouts.program.taskResults[rawType(*worker).id];
     }
     Value cleanupMark() { return cleanupHead ? builder.CreateLoad(builder.getPtrTy(), cleanupHead) : nullptr; }
-    bool asyncBody() const { return worker ? asyncBlock() != nullptr : fn.syntax.isAsync; }
+    bool asyncBody() const {
+        if (auto literal = lambda()) return literal->isAsync;
+        return worker ? asyncBlock() != nullptr : fn.syntax.isAsync;
+    }
 
     void propagate(Value error, std::size_t depth) {
         if (depth) {
@@ -992,10 +998,24 @@ struct Emitter {
 
     Value emitNode(ExprId id, This) { return read(fn.expressions[id].target); }
 
-    Value emitNode(ExprId id, const Lambda&) {
+    Value emitNode(ExprId id, const Lambda& literal) {
         NativeClosures closures{builder};
-        auto* code = closures.function(signature(layouts.program.signatures[rawType(id).id]), native->getName() + ".lambda");
-        Emitter{fn, source, module, code, functions, layouts, debug}.run(id);
+        const auto& shape = layouts.program.signatures[rawType(id).id];
+        auto* call = signature(shape);
+        auto* code = closures.function(call, native->getName() + ".lambda");
+        if (literal.isAsync) {
+            auto* factory = closures.function(llvm::FunctionType::get(call->getReturnType(), call->params().drop_back(2), false), code->getName() + ".factory");
+            auto* body = lyra::asyncBody(*factory, layouts.native(builder, layouts.program.taskResults[shape.result.id]));
+            Emitter child{fn, source, module, body, functions, layouts, debug};
+            child.run(id);
+            lowerAsync(*factory, *body, child.cleanupHead);
+            Builder invoke(llvm::BasicBlock::Create(builder.getContext(), "entry", code));
+            std::vector<Value> arguments;
+            for (std::size_t index = 0; index < factory->arg_size(); ++index) arguments.push_back(code->getArg(index));
+            auto* task = invoke.CreateCall(factory, arguments);
+            closures.noteTask(invoke, task, code->getArg(arguments.size()));
+            invoke.CreateRet(task);
+        } else Emitter{fn, source, module, code, functions, layouts, debug}.run(id);
         std::vector<Value> cells;
         for (auto slot : fn.expressions[id].captures) cells.push_back(cell(slot));
         return closures.close(code, cells);
@@ -1072,11 +1092,12 @@ struct Emitter {
     Value emitNode(ExprId id, const AsyncBlock& block) {
         const auto& captures = fn.expressions[id].captures;
         auto parallel = block.kind == AsyncBlock::Parallel;
+        auto group = block.kind == AsyncBlock::Group;
         auto type = rawType(id);
-        if (parallel) type = layouts.program.taskResults[type.id];
+        if (!group) type = layouts.program.taskResults[type.id];
         auto* pointer = builder.getPtrTy();
         auto signature = llvm::FunctionType::get(pointer, std::vector<llvm::Type*>(captures.size(), pointer), false);
-        auto* factory = llvm::Function::Create(signature, llvm::Function::InternalLinkage, native->getName() + (parallel ? ".parallel" : ".group"), module);
+        auto* factory = llvm::Function::Create(signature, llvm::Function::InternalLinkage, native->getName() + (parallel ? ".parallel" : group ? ".group" : ".async"), module);
         auto* body = lyra::asyncBody(*factory, layouts.native(builder, type));
         Emitter child{fn, source, module, body, functions, layouts, debug};
         child.run(id);
@@ -1084,7 +1105,8 @@ struct Emitter {
         std::vector<Value> cells;
         for (auto slot : captures) cells.push_back(cell(slot));
         auto task = NativeExceptions{builder}.created(builder.CreateCall(factory, cells), source, block.site);
-        return parallel ? asyncSpawn(builder, task, true) : awaitValue(id, task, block.site);
+        if (parallel) return asyncSpawn(builder, task, true);
+        return group ? awaitValue(id, task, block.site) : task;
     }
 
     Value emitNode(ExprId id, const Deferred&) {

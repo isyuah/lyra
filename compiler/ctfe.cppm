@@ -187,7 +187,10 @@ struct Validator {
                 descend(node.value);
                 if (fn.expressions[node.value].type.kind == Type::Record) validateFunction(info.target, expr.span);
             } else if constexpr (std::is_same_v<Node, Binding> || std::is_same_v<Node, PatternBinding>) descend(node.value);
-            else if constexpr (std::is_same_v<Node, Lambda>) descend(node.body);
+            else if constexpr (std::is_same_v<Node, Lambda>) {
+                if (node.isAsync) reject(expr.span, "编译期计算不支持异步 lambda");
+                descend(node.body);
+            }
             else if constexpr (std::is_same_v<Node, Unary>) descend(node.operand);
             else if constexpr (std::is_same_v<Node, Member>) {
                 if (info.callee != Callee::Variant) descend(node.receiver);

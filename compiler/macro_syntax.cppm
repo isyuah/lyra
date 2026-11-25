@@ -99,7 +99,7 @@ struct SyntaxArena {
                 return "try";
             } else if constexpr (std::is_same_v<Node, Lambda>) {
                 for (const auto& parameter : node.parameters) named("name", parameter.name);
-                child(node.body); return "lambda";
+                child(node.body); return node.isAsync ? "asyncLambda" : "lambda";
             } else if constexpr (std::is_same_v<Node, TaskOp> || std::is_same_v<Node, Propagate>) {
                 child(node.operand);
                 if constexpr (std::is_same_v<Node, TaskOp>) return node.spawn ? "spawn" : "await";
@@ -108,7 +108,7 @@ struct SyntaxArena {
                 child(node.body);
                 if constexpr (std::is_same_v<Node, Blocking>) return "blocking";
                 else if constexpr (std::is_same_v<Node, Deferred>) return "defer";
-                else return node.kind == AsyncBlock::Group ? "taskGroup" : "parallel";
+                else return node.kind == AsyncBlock::Group ? "taskGroup" : node.kind == AsyncBlock::Parallel ? "parallel" : "async";
             } else if constexpr (std::is_same_v<Node, TypeOperation>) {
                 child(node.value); named("type", node.type); return "typeOperation";
             } else if constexpr (std::is_same_v<Node, TextTemplate>) {

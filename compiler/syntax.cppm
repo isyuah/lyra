@@ -59,10 +59,10 @@ struct CatchArm { Span site; std::optional<CatchBinding> binding; std::optional<
 struct Attempt { ExprId body; std::vector<CatchArm> arms; };
 struct TaskOp { bool spawn; Span site; ExprId operand; };
 struct Blocking { ExprId body; };
-struct AsyncBlock { enum Kind { Group, Parallel }; Kind kind; ExprId body; Span site; };
+struct AsyncBlock { enum Kind { Cold, Group, Parallel }; Kind kind; ExprId body; Span site; };
 struct Deferred { ExprId body; };
 struct LambdaParameter { Identifier name; std::optional<Identifier> type; };
-struct Lambda { std::vector<LambdaParameter> parameters; std::optional<Identifier> result; ExprId body; bool implicit; };
+struct Lambda { std::vector<LambdaParameter> parameters; std::optional<Identifier> result; ExprId body; bool implicit; bool isAsync{}; };
 struct EmptyOption {};
 struct Propagate { ExprId operand; Span site; };
 struct PatternName {
