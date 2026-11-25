@@ -14,7 +14,7 @@ fn banner(target: String, argument: String): Syntax {
 
 宏可用 `syntaxTarget()` 读取目标声明、`syntaxBody()` 读取未做类型检查的函数体、`syntaxArgument(i)` 读取实参；字段与形参仍可通过 `fieldCount()`、`fieldName(i)`、`fieldType(i)` 和字段标记查询 API 检查。通过 `syntaxChildCount(node)`、`syntaxChild(node, i)`、`syntaxKind(node)`、`syntaxText(node)` 遍历节点；`syntaxStart/End/Line/Column` 保留其原始源码位置。
 
-显式类型标注可传给 `syntaxResolvedType(annotation)`。返回的只读节点展开透明别名，跟随导入和重导出，保留类型形参。`syntaxKind` 区分 `builtin`、`standard`、`named`、`parameter`、`function`、`projection` 和 `dyn`，`syntaxText` 读节点名称，`syntaxTypeModule` 读所属模块，子节点表示类型实参。生成代码时使用原标注的 `syntaxText` 或语法拼接，不直接输出已解析的节点。`syntaxCodeAt(node, text)` 让生成片段的诊断定位到传入节点；名称节点可用 `syntaxIdentifier(node)` 读取去掉反引号的标识符。泛型声明的 `typeParameterDeclarations()` 保留约束，`typeParameterArguments()` 只列形参名。
+显式类型标注可传给 `syntaxResolvedType(annotation)`。返回的只读节点展开透明别名，跟随导入和重导出，保留类型形参。`syntaxKind` 区分 `builtin`、`standard`、`named`、`parameter`、`function`、`projection` 和 `dyn`，`syntaxText` 读节点名称，`syntaxTypeModule` 读所属模块，子节点表示类型实参。`dyn` 下的 `binding` 子节点名称是关联类型名，唯一子节点是绑定的类型。生成代码时使用原标注的 `syntaxText` 或语法拼接，不直接输出已解析的节点。`syntaxCodeAt(node, text)` 让生成片段的诊断定位到传入节点；名称节点可用 `syntaxIdentifier(node)` 读取去掉反引号的标识符。泛型声明的 `typeParameterDeclarations()` 保留约束，`typeParameterArguments()` 只列形参名。
 
 使用 `syntaxCode(text)` 创建可信的 Lyra 源码片段；使用 `syntaxName`、`syntaxString`、`syntaxInt`、`syntaxCall`、`syntaxMember`、`syntaxBlock`、`syntaxJoin`、`syntaxConcat` 和 `syntaxArgs` 从节点构造输出。`syntaxArgument` 代表一个安全的语法插槽：只有将它放进输出代码，该实参才会在对应位置求值；映射括号也保留实参的来源位置。`syntaxError(node, message)` 把自定义错误指向被选中的源节点。生成代码进入正常名称解析、可见性、类型和泛型检查，因此宏不能绕过语言规则。
 

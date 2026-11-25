@@ -470,6 +470,27 @@ private:
             if (!is("dyn") || next.newlineBefore || (next.kind != Kind::Name && next.kind != Kind::Escaped)) return identifier();
             auto start = consume().span.begin;
             auto trait = identifier();
+            if (is("<")) {
+                consume();
+                std::vector<std::pair<std::string, std::string>> bindings;
+                for (;;) {
+                    auto member = identifier();
+                    require("=");
+                    if (std::ranges::find(bindings, member.text, &std::pair<std::string, std::string>::first) != bindings.end())
+                        throw at(source, member.span, "LYG0007", "动态接口关联类型重复绑定：" + member.text);
+                    bindings.emplace_back(std::move(member.text), type().text);
+                    if (!is(",")) break;
+                    consume();
+                }
+                trait.span.end = require(">").span.end;
+                std::ranges::sort(bindings);
+                trait.text += '<';
+                for (const auto& [member, value] : bindings) {
+                    if (!trait.text.ends_with('<')) trait.text += ',';
+                    trait.text += "$bind:" + member + '<' + value + '>';
+                }
+                trait.text += '>';
+            }
             return Identifier{"$dyn:" + trait.text, {start, trait.span.end}};
         }();
         if (!name.text.starts_with("$dyn:") && is("<")) {

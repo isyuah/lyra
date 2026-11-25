@@ -309,7 +309,53 @@ pub fn readValue<T: Reader>(reader: T): T.Item { reader.read() }''')
             trait Reader { type Item; fn read(): Item }
             fn main(): Unit { val reader: dyn Reader = None }
         ''')
-        self.rejects('LYG0007', '静态约束', 'dyn Reader')
+        self.rejects('LYG0007', '全部关联类型', 'dyn Reader')
+
+    def test_bound_dynamic_interfaces_dispatch_and_preserve_type_identity(self):
+        (self.package / 'lyra.json5').write_text('{name:"demo",version:"0.1.0"}')
+        library = self.package / 'src/data'
+        library.mkdir(parents=True)
+        (library / 'reader.ly').write_text('''pub trait Reader { type Item; type Index; fn read(index: Index): Item }
+pub type TextReader = dyn Reader<Index=Int, Item=String>
+pub fn genericRead<T>(reader: dyn Reader<Item=T,Index=Int>): T { reader.read(0) }
+''')
+        self.program('''
+            import self.data.Reader as Input
+            import self.data.TextReader
+            import self.data.genericRead
+            trait View { type Item; fn read(index: Int): Item }
+            struct Label<T>(val text: T) { pub type Item = T; pub type Index = Int64; pub fn read(index: Int): T { text } }
+            class Words(val values: List<String>) { pub type Item = String; pub type Index = Int; pub fn read(index: Int): String { values[index] } }
+            fn throughConstraint<T: Input>(reader: T, index: T.Index): T.Item { reader.read(index) }
+            fn main(): Unit {
+                val first = Label("label") as dyn Input<Item=String,Index=Int>
+                val second = Words(["words"]) as dyn Input<Index=Int64,Item=String>
+                val items: List<TextReader> = [first, second]
+                for item in items { print(genericRead(item)) }
+                print(throughConstraint(second, 0))
+                print((first as dyn View<Item=String>).read(0))
+                val box: Any = second
+                print(box is TextReader)
+                print(box is dyn Input<Item=Int,Index=Int>)
+                print(match box as? TextReader { Some(item) => item.read(0), None => "wrong" })
+            }
+        ''')
+        self.run_native('label\nwords\nwords\nlabel\ntrue\nfalse\nwords\n')
+
+    def test_dynamic_associated_binding_rejections(self):
+        header = '''trait Reader { type Item; fn read(): Item }
+struct Number { pub type Item = Int; pub fn read(): Int { 7 } }
+'''
+        for body, code, message in (
+            ('val item = Number() as dyn Reader<Item=String>', 'LYG0007', '需要 String'),
+            ('val item = Number() as dyn Reader<Other=Int>', 'LYG0007', 'Other'),
+            ('val item = Number() as dyn Reader<Item=Int,Item=String>', 'LYG0007', '重复绑定'),
+        ):
+            with self.subTest(body=body):
+                self.program(header + 'fn main(): Unit { ' + body + ' }')
+                self.rejects(code, message)
+        self.program(header.replace('trait Reader', 'pub trait Reader') + 'struct Hidden()\npub type Leaking = dyn Reader<Item=Hidden>\nfn main(): Unit {}')
+        self.rejects('LYN0003', 'Hidden')
 
     def test_async_structural_method_preserves_cold_task(self):
         self.program('''trait Fetch { async fn read(): Int }

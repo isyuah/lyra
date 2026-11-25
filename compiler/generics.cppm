@@ -81,6 +81,18 @@ std::vector<Type> inferGenericArguments(const Function& declaration, const Call&
             }
             return;
         }
+        if (form.name.starts_with("$dyn:")) {
+            for (const auto& binding : form.arguments) {
+                auto associated = project(value, form.name + '=' + binding.name.substr(6), 0);
+                if (associated) self(self, binding.arguments.front(), *associated, span, fromResult, false);
+                else if (!fromResult) {
+                    auto annotation = mapTypeNames(form, [](const auto& part) { return part; });
+                    auto error = at(source, span, "LYT0001", "期望 " + annotation + "，实际是 " + name(value));
+                    error.expected = annotation; error.actual = name(value); throw error;
+                }
+            }
+            return;
+        }
         for (std::size_t slot = 0; slot < form.arguments.size(); ++slot) {
             auto element = project(value, form.name, slot);
             if (!element && !fromResult && form.name == "Option") element = value;

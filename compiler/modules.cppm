@@ -172,6 +172,8 @@ struct Linker {
                     auto name = std::string_view(text).substr(token.span.begin, token.span.end - token.span.begin);
                     if (name == ".") { projection = true; continue; }
                     if (std::exchange(projection, false) || token.kind != "name") continue;
+                    auto after = text.find_first_not_of(" \t\r\n", token.span.end);
+                    if (after != text.npos && text[after] == '=') continue;
                     if (name.starts_with('`')) name = name.substr(1, name.size() - 2);
                     if (std::ranges::any_of(parameters, [&](const auto& parameter) { return parameter.text == name; })) continue;
                     if (auto found = scope.find(std::string(name)); found != scope.end() && found->second.kind == SymbolKind::Type && found->second.targets.size() == 1)
@@ -270,15 +272,19 @@ struct Linker {
 struct DeclarationTypes {
     const Linker& linker;
     std::map<std::string, TypeAlias> aliases;
-    std::map<std::string, std::pair<std::size_t, bool>> shapes;
+    struct Shape { std::size_t arity; bool trait{}; std::set<std::string> members{}; };
+    std::map<std::string, Shape> shapes;
 
     DeclarationTypes(const Linker& linker, const Module& syntax) : linker(linker) {
         auto name = [&](const auto& item) { return linker.sources[item.file].moduleId + "::" + item.name.text; };
         for (const auto& alias : syntax.aliases) aliases.emplace(name(alias), alias);
-        for (const auto& item : syntax.aggregates) shapes.emplace(name(item), std::pair{item.typeParameters.size(), false});
-        for (const auto& item : syntax.enums) shapes.emplace(name(item), std::pair{item.typeParameters.size(), false});
-        for (const auto& item : syntax.exceptions) shapes.emplace(name(item), std::pair{0, false});
-        for (const auto& item : syntax.traits) shapes.emplace(name(item), std::pair{0, true});
+        for (const auto& item : syntax.aggregates) shapes.emplace(name(item), Shape{item.typeParameters.size()});
+        for (const auto& item : syntax.enums) shapes.emplace(name(item), Shape{item.typeParameters.size()});
+        for (const auto& item : syntax.exceptions) shapes.emplace(name(item), Shape{0});
+        for (const auto& item : syntax.traits) {
+            auto& shape = shapes.emplace(name(item), Shape{item.associated.size(), true}).first->second;
+            for (const auto& member : item.associated) shape.members.insert(member.text);
+        }
     }
 
     std::string fingerprint() const {
@@ -299,7 +305,10 @@ struct DeclarationTypes {
             }
         }
         for (const auto& [name, alias] : aliases) { text("alias"); text(name); text(alias.target.text); }
-        for (const auto& [name, shape] : shapes) { text("shape"); text(name); text(std::to_string(shape.first)); text(shape.second ? "trait" : "value"); }
+        for (const auto& [name, shape] : shapes) {
+            text("shape"); text(name); text(std::to_string(shape.arity)); text(shape.trait ? "trait" : "value");
+            for (const auto& member : shape.members) text(member);
+        }
         const auto digest = hash.final();
         return {reinterpret_cast<const char*>(digest.data()), digest.size()};
     }
@@ -318,6 +327,7 @@ struct DeclarationTypes {
             const auto& name = form.name;
             if (name == "$fn") return make("function", "");
             if (name.starts_with("$assoc:")) return make("projection", name.substr(7));
+            if (name.starts_with("$bind:")) return make("binding", name.substr(6));
             const bool dynamic = name.starts_with("$dyn:");
             auto lookup = dynamic ? name.substr(5) : name;
             if (!dynamic && form.arguments.empty() && std::ranges::find(generics, name, &Identifier::text) != generics.end()) return make("parameter", name);
@@ -339,8 +349,10 @@ struct DeclarationTypes {
                     return result;
                 }
                 auto shape = shapes.find(symbol->name);
-                if (shape == shapes.end() || shape->second.second != dynamic || shape->second.first != form.arguments.size())
+                if (shape == shapes.end() || shape->second.trait != dynamic || shape->second.arity != form.arguments.size())
                     throw at(source, span, "LYT0003", "找不到类型或类型实参数量不符：" + lookup);
+                if (dynamic) for (const auto& binding : form.arguments) if (!shape->second.members.contains(binding.name.substr(6)))
+                    throw at(source, span, "LYG0007", "动态接口没有关联类型：" + binding.name.substr(6));
                 auto module = symbol->name.substr(0, separator);
                 auto standard = module.starts_with("$std/");
                 if (standard) module = "std." + module.substr(5);

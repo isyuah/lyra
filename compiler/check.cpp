@@ -52,7 +52,10 @@ std::optional<Type> hiddenType(const CheckedModule& module, Type type) {
             if (auto hidden = hiddenType(module, sum.success)) return hidden;
             return hiddenType(module, sum.failure);
         }
-        case Type::Dyn: return module.traits[type.id].isPublic ? std::nullopt : std::optional(type);
+        case Type::Dyn: {
+            const auto& shape = module.dynamicTypes[type.id];
+            return module.traits[shape.trait].isPublic ? arguments(shape.bindings) : std::optional(type);
+        }
         case Type::Exception: return type.id < firstDeclaredException || module.exceptions[type.id - firstDeclaredException].isPublic ? std::nullopt : std::optional(type);
         case Type::Closure: {
             const auto& shape = module.signatures[type.id];
@@ -74,7 +77,9 @@ constexpr Type scalarTypes[] = {Type::Bool, Type::String, Type::Char, Type::Byte
 
 bool builtInDisplay(Type type) { return numericType(type) || type == Type::Bool || type == Type::String || type == Type::Char; }
 
-std::string typeName(const CheckedModule& module, Type type, bool canonical = false) {
+}
+
+std::string typeName(const CheckedModule& module, Type type, bool canonical) {
     auto name = [&](Type nested) { return typeName(module, nested, canonical); };
     switch (type.kind) {
         case Type::Bool: return "Bool";
@@ -95,10 +100,22 @@ std::string typeName(const CheckedModule& module, Type type, bool canonical = fa
         case Type::Any: return "Any";
         case Type::Error: return "Error";
         case Type::Dyn: {
-            const auto& full = module.traits[type.id].name.text;
-            if (canonical) return "$dyn:" + full;
+            const auto& shape = module.dynamicTypes[type.id];
+            const auto& trait = module.traits[shape.trait];
+            const auto& full = trait.name.text;
             auto separator = full.rfind("::");
-            return "dyn " + (separator == full.npos ? full : full.substr(separator + 2));
+            auto text = canonical ? "$dyn:" + full : "dyn " + (separator == full.npos ? full : full.substr(separator + 2));
+            if (shape.bindings.empty()) return text;
+            std::vector<std::size_t> order;
+            for (std::size_t slot = 0; slot < shape.bindings.size(); ++slot) order.push_back(slot);
+            if (canonical) std::ranges::sort(order, {}, [&](auto slot) -> const auto& { return trait.associated[slot].text; });
+            text += '<';
+            for (auto slot : order) {
+                if (slot != order.front()) text += canonical ? "," : ", ";
+                const auto& member = trait.associated[slot].text;
+                text += canonical ? "$bind:" + member + '<' + name(shape.bindings[slot]) + '>' : member + '=' + name(shape.bindings[slot]);
+            }
+            return text + '>';
         }
         case Type::Record: case Type::Enum: {
             const auto& full = type.kind == Type::Record ? module.aggregates[type.id].syntax.name.text : module.enums[type.id].syntax.name.text;
@@ -138,6 +155,8 @@ std::string typeName(const CheckedModule& module, Type type, bool canonical = fa
     }
     throw std::logic_error("invalid Lyra type");
 }
+
+namespace {
 
 struct Callable {
     std::size_t target;
@@ -287,7 +306,7 @@ struct Symbols {
         std::size_t aggregates = symbols.module.aggregates.size(), enums = symbols.module.enums.size(), tasks = symbols.module.taskResults.size(),
             sums = symbols.module.sumTypes.size(), lists = symbols.module.listElements.size(), signatures = symbols.module.signatures.size(),
             taskLocals = symbols.module.taskLocalValues.size(), channels = symbols.module.channelElements.size(), projections = symbols.module.projections.size(),
-            deferredPatterns = symbols.module.deferredPatternChecks.size();
+            deferredPatterns = symbols.module.deferredPatternChecks.size(), dynamicTypes = symbols.module.dynamicTypes.size();
         unsigned expanding = symbols.expandingNominal;
         std::size_t nominal = symbols.nominalChecks.size(), nextNominal = symbols.nextNominalCheck;
 
@@ -310,6 +329,7 @@ struct Symbols {
             symbols.module.listElements.resize(lists);
             symbols.module.signatures.resize(signatures);
             symbols.module.projections.resize(projections);
+            symbols.module.dynamicTypes.resize(dynamicTypes);
             symbols.module.deferredPatternChecks.resize(deferredPatterns);
         }
     };
@@ -643,7 +663,7 @@ struct Symbols {
                 if (actual.kind == Type::Variable) {
                     if (std::ranges::any_of(contracts.constraints(actual), [&](const auto& available) { return !valueConstraint(available) && candidate(contracts.declaration(available)); })) continue;
                 } else if (actual.kind == Type::Dyn) {
-                    if (candidate(module.traits[actual.id])) continue;
+                    if (candidate(module.traits[module.dynamicTypes[actual.id].trait])) continue;
                 } else {
                     if (auto builtin = builtinMember(actual, name)) {
                         if (builtin->shape == expected) continue;
@@ -686,6 +706,14 @@ struct Symbols {
     Type channel(Type element) const { return unaryType(Type::Channel, module.channelElements, element); }
     Type list(Type element) const { return unaryType(Type::List, module.listElements, element); }
 
+    Type dynamicType(std::size_t trait, std::vector<Type> bindings) const {
+        DynamicType shape{trait, std::move(bindings)};
+        auto found = std::ranges::find(module.dynamicTypes, shape);
+        auto index = static_cast<std::size_t>(found - module.dynamicTypes.begin());
+        if (found == module.dynamicTypes.end()) module.dynamicTypes.push_back(std::move(shape));
+        return {Type::Dyn, index};
+    }
+
     Type closure(std::vector<Type> parameters, Type result) const {
         FunctionShape shape{std::move(parameters), result};
         auto& types = module.signatures;
@@ -711,6 +739,15 @@ struct Symbols {
         };
         if (value.kind == Type::Record) return argument(module.aggregates[value.id]);
         if (value.kind == Type::Enum) return argument(module.enums[value.id]);
+        if (value.kind == Type::Dyn && name.starts_with("$dyn:") && slot == 0) {
+            const auto& shape = module.dynamicTypes[value.id];
+            const auto& trait = module.traits[shape.trait];
+            auto equal = name.find('=');
+            if (equal != name.npos && std::string_view(name).substr(5, equal - 5) == trait.name.text) {
+                auto member = std::ranges::find(trait.associated, name.substr(equal + 1), &Identifier::text);
+                if (member != trait.associated.end()) return shape.bindings[member - trait.associated.begin()];
+            }
+        }
         if (name == "$fn" && value.kind == Type::Closure) {
             const auto& shape = module.signatures[value.id];
             if (slot < shape.parameters.size()) return shape.parameters[slot];
@@ -761,6 +798,7 @@ struct Symbols {
             case Type::List: return abstract(module.listElements[type.id]);
             case Type::Option: return abstract(module.sumTypes[type.id].success);
             case Type::Result: return abstract(module.sumTypes[type.id].success) || abstract(module.sumTypes[type.id].failure);
+            case Type::Dyn: return std::ranges::any_of(module.dynamicTypes[type.id].bindings, [&](Type binding) { return abstract(binding); });
             case Type::Closure: {
                 const auto& shape = module.signatures[type.id];
                 return abstract(shape.result) || std::ranges::any_of(shape.parameters, [&](Type parameter) { return abstract(parameter); });
@@ -770,6 +808,12 @@ struct Symbols {
     }
 
     std::optional<Type> associatedType(Type owner, const std::string& member, const Source& source, Span site) {
+        if (owner.kind == Type::Dyn) {
+            const auto& shape = module.dynamicTypes[owner.id];
+            const auto& associated = module.traits[shape.trait].associated;
+            auto found = std::ranges::find(associated, member, &Identifier::text);
+            return found == associated.end() ? std::nullopt : std::optional(shape.bindings[found - associated.begin()]);
+        }
         if (owner.kind == Type::Variable) {
             for (const auto& bound : contracts.constraints(owner)) {
                 if (valueConstraint(bound)) continue;
@@ -862,18 +906,29 @@ struct Symbols {
 
     template<class Lookup>
     std::optional<Type> resolveWith(const TypeForm& form, const Source& source, Span span, std::span<const Identifier> parameters, const Lookup& lookup) {
+        if (form.name.starts_with("$dyn:")) {
+            auto name = form.name.substr(5);
+            auto found = traitNames.find(name);
+            if (found == traitNames.end()) throw at(source, span, "LYG0005", "找不到动态接口 trait：" + name);
+            const auto& associated = module.traits[found->second].associated;
+            if (form.arguments.size() != associated.size())
+                throw at(source, span, "LYG0007", "动态接口必须绑定 trait 的全部关联类型：" + name);
+            std::vector<Type> bindings(associated.size());
+            for (const auto& binding : form.arguments) {
+                auto member = binding.name.substr(6);
+                auto atMember = std::ranges::find(associated, member, &Identifier::text);
+                if (atMember == associated.end()) throw at(source, span, "LYG0007", "动态接口没有关联类型：" + member);
+                auto value = resolveWith(binding.arguments.front(), source, span, parameters, lookup);
+                if (!value) return {};
+                bindings[atMember - associated.begin()] = *value;
+            }
+            return dynamicType(found->second, std::move(bindings));
+        }
         if (form.arguments.empty()) {
             auto found = std::ranges::find(parameters, form.name, &Identifier::text);
             if (found != parameters.end()) return lookup(static_cast<std::size_t>(found - parameters.begin()));
             if (auto type = numberType(form.name)) return type;
             if (form.name == "$never") return Type::Never;
-            if (form.name.starts_with("$dyn:")) {
-                auto trait = traitNames.find(form.name.substr(5));
-                if (trait == traitNames.end()) throw at(source, span, "LYG0005", "找不到动态接口 trait：" + form.name.substr(5));
-                if (!module.traits[trait->second].associated.empty())
-                    throw at(source, span, "LYG0007", "含关联类型的 trait 只能用作静态约束：" + form.name.substr(5));
-                return Type{Type::Dyn, trait->second};
-            }
             for (Type type : scalarTypes) if (form.name == typeName(module, type)) return type;
             if (auto exception = exceptionTypes.find(form.name); exception != exceptionTypes.end()) return Type{Type::Exception, exception->second + firstDeclaredException};
             if (auto alias = aliases.find(form.name); alias != aliases.end()) {
@@ -1234,31 +1289,37 @@ struct Checker {
         auto actual = visit(operation.value);
         if (actual == Type::Never) return actual;
         fn.expressions[id].testedType = target;
-        if (target.kind == Type::Dyn) {
-            const auto& trait = module.traits[target.id];
-            refer(operation.type, trait.file, trait.name.span);
-        }
         if (operation.op == TypeOperator::InterfaceCast) {
             if (target.kind != Type::Dyn) throw at(source, operation.type.span, "LYT0021", "as dyn 需要一个非可空的接口类型");
             if (actual == target) return target;
-            const auto& trait = module.traits[target.id];
+            const auto shape = module.dynamicTypes[target.id];
+            const auto& trait = module.traits[shape.trait];
+            for (std::size_t slot = 0; slot < shape.bindings.size(); ++slot) {
+                const auto& member = trait.associated[slot].text;
+                auto provided = symbols.associatedType(actual, member, source, operation.site);
+                if (!provided || *provided != shape.bindings[slot]) {
+                    auto expected = typeName(module, shape.bindings[slot]);
+                    auto reason = provided ? "实际是 " + typeName(module, *provided) : "没有可见的关联类型";
+                    throw at(source, operation.type.span, "LYG0007", "关联类型 " + member + " 需要 " + expected + "，" + reason);
+                }
+            }
             Bound bound{0, trait.name};
             symbols.requireBounds({&bound, 1}, fn.syntax.file, {&actual, 1}, source, operation.site);
             if (materializing()) for (const auto& method : trait.methods) {
                 auto& implementations = fn.expressions[id].interfaceMethods;
                 if (actual.kind == Type::Dyn) {
-                    const auto& available = module.traits[actual.id].methods;
+                    const auto& available = module.traits[module.dynamicTypes[actual.id].trait].methods;
                     auto found = std::ranges::find(available, method.name.text, [](const TraitMethod& item) { return item.name.text; });
                     implementations.push_back(found - available.begin());
                 } else {
-                    auto expected = symbols.requiredShape(actual, trait, method, source, operation.site);
+                    auto expected = symbols.requiredShape(target, trait, method, source, operation.site);
                     if (auto builtin = symbols.builtinMember(actual, method.name.text)) {
-                        if (builtin->shape != expected)
-                            throw at(source, operation.site, "LYT0021", "内置成员签名与动态接口要求不匹配：" + method.name.text);
-                        implementations.push_back(symbols.builtinImplementation(actual, method.name.text, *builtin, fn.syntax.file, operation.site));
-                        continue;
+                        if (builtin->shape == expected) {
+                            implementations.push_back(symbols.builtinImplementation(actual, method.name.text, *builtin, fn.syntax.file, operation.site));
+                            continue;
+                        }
                     }
-                    auto selected = symbols.shapedMethod(actual, method.name.text, source, [&](const auto& shape) { return shape == expected; }).value().first;
+                    auto selected = symbols.shapedMethod(actual, method.name.text, source, [&](const auto& methodShape) { return methodShape == expected; }).value().first;
                     const auto& entry = symbols.callables[selected];
                     auto function = entry.generic ? symbols.instantiate(selected, module.aggregates[actual.id].arguments, source, operation.site) : entry.target;
                     implementations.push_back(function);
@@ -2071,6 +2132,11 @@ struct Checker {
                 else if (widen && *param >= known.size()) if (auto common = commonInteger(*inferred[*param], type)) inferred[*param] = *common;
                 return;
             }
+            if (key.name.starts_with("$dyn:")) {
+                for (const auto& binding : key.arguments) if (auto associated = symbols.project(type, key.name + '=' + binding.name.substr(6), 0))
+                    self(self, binding.arguments.front(), *associated, false);
+                return;
+            }
             for (std::size_t part = 0; part < key.arguments.size(); ++part) if (auto value = symbols.project(type, key.name, part)) self(self, key.arguments[part], *value, false);
         };
         auto skip = static_cast<std::size_t>(call.receiver.has_value());
@@ -2357,7 +2423,7 @@ struct Checker {
                 }
             }
             if (owner.kind == Type::Dyn) {
-                const auto& trait = module.traits[owner.id];
+                const auto& trait = module.traits[module.dynamicTypes[owner.id].trait];
                 auto declaration = std::ranges::find(trait.methods, call.name.text, [](const TraitMethod& candidate) { return candidate.name.text; });
                 if (declaration != trait.methods.end()) {
                     noTypeArgs();
@@ -2917,12 +2983,6 @@ CheckedModule check(Module module, const std::vector<Source>& sources, bool requ
         reserveType(decl, symbols.aliases, symbols.aliasDeclarations.size());
         symbols.aliasDeclarations.push_back(std::move(decl));
     }
-    for (std::size_t index = 0; index < symbols.aliasDeclarations.size(); ++index) {
-        const auto& alias = symbols.aliasDeclarations[index];
-        const auto& source = sources[alias.file];
-        auto target = symbols.resolve(source, alias.target);
-        if (alias.isPublic) expose(target, source, alias.target.span);
-    }
     symbols.fields.resize(symbols.recordDeclarations.size());
     symbols.methods.resize(symbols.recordDeclarations.size());
     symbols.staticMethods.resize(symbols.recordDeclarations.size());
@@ -2955,6 +3015,11 @@ CheckedModule check(Module module, const std::vector<Source>& sources, bool requ
         symbols.contracts.declare(trait, source);
         symbols.traitNames.emplace(trait.name.text, checked.traits.size());
         checked.traits.push_back(trait);
+    }
+    for (const auto& alias : symbols.aliasDeclarations) {
+        const auto& source = sources[alias.file];
+        auto target = symbols.resolve(source, alias.target);
+        if (alias.isPublic) expose(target, source, alias.target.span);
     }
     auto typeVariables = [&](const auto& syntax) {
         std::set<std::string> seen;

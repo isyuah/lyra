@@ -110,7 +110,7 @@ struct Layouts {
             case Type::IntRange: return "Range<Int>";
             case Type::Option: return "Option<" + nested(program.sumTypes[type.id].success) + ">";
             case Type::Result: return "Result<" + nested(program.sumTypes[type.id].success) + ", " + nested(program.sumTypes[type.id].failure) + ">";
-            case Type::Dyn: return "dyn " + program.traits[type.id].name.text;
+            case Type::Dyn: return lyra::typeName(program, type);
             case Type::Closure: {
                 const auto& shape = program.signatures[type.id];
                 std::string name = "(";
