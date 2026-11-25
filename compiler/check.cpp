@@ -560,12 +560,14 @@ struct Symbols {
         auto candidates = members.find(name);
         if (candidates == members.end()) return {};
         for (auto index : candidates->second) {
-            const auto& candidate = declaration(callables[index]);
-            if (candidate.result.text.empty() || candidate.isAsync || candidate.typeParameters.size() != arguments.size()) continue;
+            const auto& callable = callables[index];
+            const auto& candidate = declaration(callable);
+            if (candidate.isAsync || candidate.typeParameters.size() != arguments.size()) continue;
             bool equality = operation == ValueOperation::Equal;
             if (candidate.parameters.size() != (equality ? 2u : 1u)) continue;
             if (equality && (candidate.parameters[1].variadic || resolve(candidate, candidate.parameters[1].type, arguments) != type)) continue;
-            if (resolve(candidate, candidate.result, arguments) == (equality ? Type::Bool : Type::Int)) return index;
+            const auto& result = resultAnnotation(callable, sources[candidate.file], candidate.name.span);
+            if (resolve(candidate, result, arguments) == (equality ? Type::Bool : Type::Int)) return index;
         }
         return {};
     }
@@ -597,6 +599,8 @@ struct Symbols {
                 result.overrides.emplace_back(type, *implementation);
                 return true;
             }
+            if (!equality && valueOverride(type, ValueOperation::Equal))
+                return reject(typeName(module, type) + " 手写了 equals，需要配套的 hashCode 才能满足 Hash");
             switch (type.kind) {
                 case Type::Int: case Type::UInt: case Type::Real: case Type::Bool: case Type::Char:
                 case Type::String: case Type::Bytes: case Type::Unit: case Type::IntRange: return true;
@@ -608,8 +612,6 @@ struct Symbols {
                     if (record.syntax.reference) {
                         return equality || reject(typeName(module, type) + " 按身份比较，但没有默认 Hash；请使用显式哈希回调");
                     }
-                    if (!equality && valueOverride(type, ValueOperation::Equal))
-                        return reject(typeName(module, type) + " 手写了 equals，需要配套的 hashCode 才能满足 Hash");
                     for (std::size_t slot = 0; slot < record.fields.size(); ++slot) {
                         if (!child(record.fields[slot], record.syntax.fields[slot].name.text)) return false;
                     }

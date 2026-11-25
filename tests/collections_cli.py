@@ -143,6 +143,34 @@ fn main(): Unit {
 }
 ''', b'true\ntrue\ntrue\nfalse\ntrue\ntrue\ntrue\nfalse\n1\ntrue\nfalse\ntrue\nfalse\n')
 
+    def test_inferred_overrides_match_direct_calls_constraints_and_ctfe(self):
+        (self.package / 'lyra.json5').write_text('{name:"test/hash-inferred",version:"0.1.0"}')
+        self.native('''import std.collections.{hashSet}
+struct Key<T>(val id: Int, val label: T) {
+    fn equals(other: Key<T>) { id == other.id }
+    fn hashCode() { id + 20 }
+}
+enum Choice {
+    First, Second;
+    fn equals(other: Choice) { true }
+    fn hashCode() { 9 }
+}
+fn equalValue<T: Eq>(left: T, right: T): Bool { left.equals(right) }
+fn hashValue<T: Hash>(value: T): Int { value.hashCode() }
+const equalKeys: Bool = Key(6, "left") == Key(6, "right")
+const hashKey: Int = hashValue(Key(6, "left"))
+fn main(): Unit {
+    val first = Key(6, "left")
+    val second = Key(6, "right")
+    print(first.equals(second) && first == second && equalValue(first, second) && equalKeys)
+    print(first.hashCode() == 26 && hashValue(second) == hashKey && hashKey == 26)
+    val keys = hashSet<Key<String>>()
+    print(keys.add(first) && !keys.add(second) && keys.contains(second))
+    print(Choice.First.equals(Choice.Second) && equalValue(Choice.First, Choice.Second) && Choice.First == Choice.Second)
+    print(hashValue(Choice.First) == Choice.Second.hashCode())
+}
+''', b'true\ntrue\ntrue\ntrue\ntrue\n')
+
     def test_hash_capability_rejects_non_hashable_struct_fields(self):
         cases = [
             ('struct Key(val value: Any)\nfn main(): Unit { val items = hashSet<Key>() }', 'value'),
@@ -167,9 +195,22 @@ fn main(): Unit {
                 self.assertEqual(error['code'], 'LYT0019', error)
                 self.assertIn(fragment, error['message'])
 
+    def test_inferred_equals_requires_explicit_hash_for_structs_and_enums(self):
+        for declaration, value in (
+            ('struct Key(val id: Int) { fn equals(other: Key) { true } }', 'Key(1)'),
+            ('enum Key { First, Second; fn equals(other: Key) { true } }', 'Key.First'),
+        ):
+            with self.subTest(declaration=declaration):
+                self.main.write_text(declaration + '\nfn main(): Unit { print(' + value + '.hashCode()) }')
+                check = subprocess.run([COMPILER, 'check', self.package, '--diagnostics=json'], capture_output=True, text=True, timeout=10)
+                self.assertNotEqual(check.returncode, 0)
+                error, = json.loads(check.stderr)
+                self.assertEqual(error['code'], 'LYT0006', error)
+                self.assertIn('hashCode', error['message'])
+
     def test_explicit_hash_is_independent_of_eq(self):
         self.native('''struct Key(val id: Int, val callback: () -> Int) {
-    fn hashCode(): Int { id }
+    fn hashCode() { id }
 }
 fn hash<T: Hash>(value: T): Int { value.hashCode() }
 fn main(): Unit {

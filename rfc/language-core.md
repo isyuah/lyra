@@ -55,9 +55,9 @@ first.owner.name = "Ada"   // 通过 Class 引用修改对象
 
 Struct 默认按全部字段递归比较；Enum 按活动分支和载荷比较；`Option` 按空/非空标签及值比较，`Result` 按 `Ok` / `Err` 及对应载荷比较。比较 `Result` 时忽略仅用于传播与诊断的 `cause` 元数据。嵌套字段必须自身满足 Eq；含 `Any`、`dyn` 或闭包字段的 Struct 因而不能默认比较，除非提供手写实现。类字段按 Class 身份参与 Struct 相等。
 
-类型可提供同步实例方法 `fn equals(other: Self): Bool` 覆盖该类型的默认 Eq；自定义 Eq 与 `==`/`!=` 使用同一实现。泛型算法可以声明内置结构约束 `T: Eq`；编译器检查并静态绑定该能力，不需要 `implements` 声明。Class 的 `==` / `!=` 始终是身份比较，不可被方法覆盖。
+类型可提供同步实例方法 `fn equals(other: Self): Bool` 覆盖该类型的默认 Eq；自定义 Eq 与 `==`/`!=` 使用同一实现。`equals` 和 `hashCode` 都以实际返回类型匹配，允许私有方法省略可推断的返回类型。泛型算法可以声明内置结构约束 `T: Eq`；编译器检查并静态绑定该能力，不需要 `implements` 声明。Class 的 `==` / `!=` 始终是身份比较，不可被方法覆盖。
 
-Hash 与 Eq 分开推导，不能仅因某个值支持 `==` 就用于哈希键。标量、String/Bytes、Enum、Option、Result 和只含可哈希字段的 Struct 可获得默认 `hashCode(): Int`；复合值按分支/字段顺序组合哈希，浮点哈希遵守相等值哈希一致（`+0` 与 `-0` 相同）。Class 固定按身份比较，但没有默认 Hash；文件句柄、List、Task、闭包、`Any`、`dyn`、`CPtr`、`CCallback` 等引用/动态字段也不会让包含它们的 Struct 自动获得 Hash。字段中的 Class 身份比较仍可用于 Eq，但该 Struct 需要手写 Hash，或在集合构造时提供显式哈希/相等回调。若 Struct 只自定义 `equals`，仍可单独用于相等比较，但不获得默认 Hash；若只自定义 `hashCode`，只有 Hash 能力而不自动保证能与 Eq 组合。一个类型同时满足 `Eq` 与 `Hash`（例如作为默认 HashMap/HashSet 键）时，编译器要求这两个自定义覆盖同时存在，避免自定义 Eq 静默搭配不匹配的结构哈希。相等键必须有相同哈希；修改已存入集合的键所依赖状态会破坏集合查找契约。
+Hash 与 Eq 分开推导，不能仅因某个值支持 `==` 就用于哈希键。标量、String/Bytes、Enum、Option、Result 和只含可哈希字段的 Struct 可获得默认 `hashCode(): Int`；复合值按分支/字段顺序组合哈希，浮点哈希遵守相等值哈希一致（`+0` 与 `-0` 相同）。Class 固定按身份比较，但没有默认 Hash；文件句柄、List、Task、闭包、`Any`、`dyn`、`CPtr`、`CCallback` 等引用/动态字段也不会让包含它们的 Struct 自动获得 Hash。字段中的 Class 身份比较仍可用于 Eq，但该 Struct 需要手写 Hash，或在集合构造时提供显式哈希/相等回调。若 Struct 或 Enum 只自定义 `equals`，仍可单独用于相等比较，但不获得默认 Hash；若只自定义 `hashCode`，只有 Hash 能力而不自动保证能与 Eq 组合。一个类型同时满足 `Eq` 与 `Hash`（例如作为默认 HashMap/HashSet 键）时，编译器要求这两个自定义覆盖同时存在，避免自定义 Eq 静默搭配不匹配的结构哈希。相等键必须有相同哈希；修改已存入集合的键所依赖状态会破坏集合查找契约。
 
 ### 实例方法与静态方法
 
