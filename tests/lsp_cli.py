@@ -21,6 +21,16 @@ def uri(path):
     return 'file://' + quote(value, safe='/:')
 
 
+def position_at(text, offset):
+    before = text[:offset]
+    return {'line': before.count('\n'), 'character': len(before.rsplit('\n', 1)[-1].encode('utf-16-le')) // 2}
+
+
+def document_request(number, path, operation, **params):
+    return {'jsonrpc': '2.0', 'id': number, 'method': 'textDocument/' + operation,
+            'params': {'textDocument': {'uri': uri(path)}, **params}}
+
+
 def message(value):
     body = json.dumps(value, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
     return b'Content-Length: ' + str(len(body)).encode() + b'\r\n\r\n' + body
@@ -102,6 +112,120 @@ def interactive_server(root):
 
 
 class LanguageServer(unittest.TestCase):
+    def test_incomplete_source_completes_keywords_imports_and_only_visible_names(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / 'src/main.ly'
+            source.parent.mkdir()
+            (root / 'lyra.json5').write_text('{name:"app",version:"0.1.0"}', encoding='utf-8')
+            (source.parent / 'sibling.ly').write_text('fn rowOutsideFile(): Int { 1 }\n', encoding='utf-8')
+            text = ('import std.http.Router as WebRouter\n'
+                    'fn unrelated(): Unit { val rogue = 0; }\n'
+                    'fn serve(route: String): Unit {\n'
+                    '    val router = WebRouter()\n'
+                    '    if true { val rotten = 42; }\n'
+                    '    val _ = "中文🙂"; roSuffix\n'
+                    '    Web\n'
+                    '    v // router\n'
+                    '    val roomy =\n'
+                    '}\n')
+            source.write_text(text, encoding='utf-8')
+            keyword = text.index('v //')
+            local = text.index('roSuffix')
+            output = run_server([(source, text)], [
+                document_request(2, source, 'completion', position=position_at(text, keyword + 1)),
+                document_request(3, source, 'completion', position=position_at(text, local + 2)),
+                document_request(4, source, 'completion', position=position_at(text, text.index('    Web\n') + len('    Web'))),
+                document_request(5, source, 'completion', position=position_at(text, keyword + len('v // roo'))),
+            ])
+            results = {item['id']: item['result'] for item in output if item.get('id') in range(2, 6)}
+            self.assertEqual({(item['label'], item['kind']) for item in results[2]['items']}, {('val', 14), ('var', 14)})
+            self.assertEqual({item['label'] for item in results[3]['items']}, {'route', 'router'})
+            router = next(item for item in results[3]['items'] if item['label'] == 'router')
+            self.assertEqual(router['textEdit'], {'newText': 'router', 'range': {
+                'start': position_at(text, local), 'end': position_at(text, local + len('roSuffix')),
+            }})
+            self.assertEqual([item['label'] for item in results[4]['items']], ['WebRouter'])
+            self.assertEqual(results[5]['items'], [])
+            diagnostics = next(item['params']['diagnostics'] for item in output if item.get('method') == 'textDocument/publishDiagnostics')
+            self.assertEqual([item['code'] for item in diagnostics], ['LYP0001'])
+
+    def test_unsaved_prefix_preserves_checked_navigation_and_hints_without_request_errors(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / 'src/main.ly'
+            source.parent.mkdir()
+            (root / 'lyra.json5').write_text('{name:"app",version:"0.1.0"}', encoding='utf-8')
+            text = 'fn main(): Int {\n    val _ = "中文🙂"; val router = [1, 2]\n    print(router.size)\n    0\n}\n'
+            source.write_text(text, encoding='utf-8')
+            router_start = text.index('router =')
+            use = position_at(text, text.index('router.size') + 1)
+            inserted = text.index('    0')
+            prior = position_at(text, inserted)
+            broken = text[:inserted] + '    v\n' + text[inserted:]
+            prefix = position_at(broken, inserted + len('    v'))
+            key = {'uri': uri(source)}
+            change = {'jsonrpc': '2.0', 'method': 'textDocument/didChange', 'params': {
+                'textDocument': {**key, 'version': 2},
+                'contentChanges': [{'range': {'start': prior, 'end': prior}, 'text': '    v\n'}],
+            }}
+            clear = {'jsonrpc': '2.0', 'method': 'textDocument/didChange', 'params': {
+                'textDocument': {**key, 'version': 3}, 'contentChanges': [{'text': text}],
+            }}
+            visible = {'start': {'line': 0, 'character': 0}, 'end': position_at(text, inserted)}
+            messages = [document_request(2, source, 'inlayHint', range=visible), change,
+                        document_request(3, source, 'completion', position=prefix),
+                        document_request(4, source, 'inlayHint', range=visible),
+                        document_request(5, source, 'hover', position=use),
+                        document_request(6, source, 'definition', position=use),
+                        document_request(7, source, 'hover', position={**prefix, 'character': prefix['character'] - 1}),
+                        document_request(8, source, 'definition', position={**prefix, 'character': prefix['character'] - 1}),
+                        document_request(9, source, 'definition', position={**prefix, 'character': prefix['character'] - 1}),
+                        document_request(10, source, 'rename', position=use, newName='items'), clear,
+                        document_request(11, source, 'rename', position=use, newName='items')]
+            output = run_server([(source, text)], messages)
+            results = {item['id']: item['result'] for item in output if item.get('id') in range(1, 12)}
+            self.assertTrue(results[1]['capabilities']['inlayHintProvider'])
+            self.assertEqual({item['label'] for item in results[3]['items']}, {'val', 'var'})
+            hints = [{'position': position_at(text, router_start + len('router')), 'label': ': List<Int>', 'kind': 1}]
+            self.assertEqual(results[2], hints)
+            self.assertEqual(results[4], hints)
+            self.assertIn('val router', results[5]['contents']['value'])
+            self.assertEqual(results[6][0]['range']['start'], position_at(text, router_start))
+            self.assertEqual([results[number] for number in range(7, 11)], [None] * 4)
+            self.assertEqual(len(results[11]['changes'][uri(source)]), 2)
+            diagnostics = [item['params']['diagnostics'] for item in output if item.get('method') == 'textDocument/publishDiagnostics']
+            self.assertEqual([[item['code'] for item in listing] for listing in diagnostics], [[], ['LYN0001'], []])
+            self.assertEqual(diagnostics[1][0]['range']['end'], prefix)
+
+    def test_inlay_hints_use_inferred_function_method_and_generic_binding_types(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / 'src/main.ly'
+            source.parent.mkdir()
+            text = ('class Box<Value>(val item: Value) { fn get() { item } }\n'
+                    'fn generic<Value>(value: Value) { val copy = value; copy }\n'
+                    'fn main(): Unit {\n'
+                    '    print("中文🙂"); val inferred = Box("text").get()\n'
+                    '    val explicit: Int = 7\n'
+                    '    var `as` = generic(7)\n'
+                    '    val _ = generic(true)\n'
+                    '}\n')
+            source.write_text(text, encoding='utf-8')
+            whole = {'start': position_at(text, 0), 'end': position_at(text, len(text))}
+            literals = {'start': position_at(text, text.index('    print')), 'end': position_at(text, text.index('    var'))}
+            output = run_server([(source, text)], [
+                document_request(2, source, 'inlayHint', range=whole),
+                document_request(3, source, 'inlayHint', range=literals),
+            ])
+            results = {item['id']: item['result'] for item in output if item.get('id') in (2, 3)}
+            expected = [{'position': position_at(text, text.index(anchor) + len(anchor)), 'label': ': ' + label, 'kind': 1}
+                        for anchor, label in [('fn get()', 'Value'), ('fn generic<Value>(value: Value)', 'Value'),
+                                              ('val copy', 'Value'), ('val inferred', 'String'), ('var `as`', 'Int')]]
+            self.assertEqual(results[2], expected)
+            self.assertEqual(results[3], [expected[3]])
+            diagnostics = next(item['params']['diagnostics'] for item in output if item.get('method') == 'textDocument/publishDiagnostics')
+            self.assertEqual(diagnostics, [])
+
     def test_hover_includes_a_multiline_throws_clause(self):
         with tempfile.TemporaryDirectory() as temporary:
             source = Path(temporary) / 'src/main.ly'
@@ -148,7 +272,7 @@ class LanguageServer(unittest.TestCase):
                 {'jsonrpc': '2.0', 'id': 2, 'method': 'textDocument/definition', 'params': {'textDocument': {'uri': uri(source)}, 'position': {'line': 2, 'character': utf16 + 2}}},
                 {'jsonrpc': '2.0', 'id': 3, 'method': 'textDocument/references', 'params': {'textDocument': {'uri': uri(source)}, 'position': {'line': 2, 'character': utf16 + 2}, 'context': {'includeDeclaration': True}}},
                 {'jsonrpc': '2.0', 'id': 4, 'method': 'textDocument/hover', 'params': {'textDocument': {'uri': uri(source)}, 'position': {'line': 2, 'character': utf16 + 2}}},
-                {'jsonrpc': '2.0', 'id': 5, 'method': 'textDocument/completion', 'params': {'textDocument': {'uri': uri(source)}, 'position': {'line': 2, 'character': utf16 + call + 3}}},
+                {'jsonrpc': '2.0', 'id': 5, 'method': 'textDocument/completion', 'params': {'textDocument': {'uri': uri(source)}, 'position': {'line': 2, 'character': utf16 + 3}}},
                 {'jsonrpc': '2.0', 'id': 6, 'method': 'textDocument/formatting', 'params': {'textDocument': {'uri': uri(source)}, 'options': {'tabSize': 4, 'insertSpaces': True}}},
                 {'jsonrpc': '2.0', 'id': 7, 'method': 'textDocument/rename', 'params': {'textDocument': {'uri': uri(source)}, 'position': {'line': 2, 'character': utf16 + 2}, 'newName': 'welcome'}},
             ]
@@ -418,8 +542,8 @@ class LanguageServer(unittest.TestCase):
             macro = package / 'src/.expressions/marker.ly'
             macro.parent.mkdir(parents=True)
             (package / 'lyra.json5').write_text('{name:"app",version:"0.1.0"}', encoding='utf-8')
-            macro.write_text('fn marker(target: String, raw: String): Syntax { syntaxCode("0") }', encoding='utf-8')
-            text = 'fn target(value: Int): Int { value }\nfn main(): Unit { val prefix = #marker(); print("你好 😀"); print(target(42)) }\n'
+            macro.write_text('fn marker(target: String, raw: String): Syntax { syntaxCode("{ val macroOnly = 0; macroOnly }") }', encoding='utf-8')
+            text = 'fn target(value: Int): Int { value }\nfn main(): Unit { val prefix = #marker(); print("你好 😀"); val result = target(42) }\n'
             source.write_text(text, encoding='utf-8')
             line = text.splitlines()[1]
             character = len(line[:line.index('target(')].encode('utf-16-le')) // 2
@@ -427,12 +551,16 @@ class LanguageServer(unittest.TestCase):
             output = run_server([(source, text)], [
                 {'jsonrpc': '2.0', 'id': 2, 'method': 'textDocument/definition', 'params': params},
                 {'jsonrpc': '2.0', 'id': 3, 'method': 'textDocument/references', 'params': {**params, 'context': {'includeDeclaration': True}}},
+                document_request(4, source, 'inlayHint', range={'start': position_at(text, 0), 'end': position_at(text, len(text))}),
             ])
             definition = next(item for item in output if item.get('id') == 2)['result'][0]
             self.assertEqual(definition['range']['start'], {'line': 0, 'character': 3})
             references = next(item for item in output if item.get('id') == 3)['result']
             self.assertEqual(len(references), 2)
             self.assertEqual(references[1]['range']['start'], {'line': 1, 'character': character})
+            hints = next(item['result'] for item in output if item.get('id') == 4)
+            self.assertEqual(hints, [{'position': position_at(text, text.index(anchor) + len(anchor)), 'label': ': Int', 'kind': 1}
+                                     for anchor in ('val prefix', 'val result')])
 
     def test_editing_a_nested_imported_macro_refreshes_the_callers_diagnostics(self):
         with tempfile.TemporaryDirectory() as temporary:

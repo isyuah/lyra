@@ -10,7 +10,7 @@ import zipfile
 
 TESTS = Path(__file__).resolve().parent
 EXTENSION = TESTS.parent
-EXAMPLE = EXTENSION.parents[1] / 'examples' / 'jsonlines'
+EXAMPLES = EXTENSION.parents[1] / 'examples'
 
 
 def main():
@@ -33,7 +33,10 @@ def main():
         if not (extension / 'node_modules' / 'vscode-languageclient' / 'package.json').is_file():
             parser.error('VSIX is missing vscode-languageclient' if options.vsix else 'run npm ci in editors/vscode first')
         project = root / 'JSONL workspace'
-        shutil.copytree(EXAMPLE, project, ignore=shutil.ignore_patterns('build', '.lyra', '.lyra-cache'))
+        http = root / 'HTTP workspace'
+        ignores = shutil.ignore_patterns('build', '.lyra', '.lyra-cache')
+        shutil.copytree(EXAMPLES / 'jsonlines', project, ignore=ignores)
+        shutil.copytree(EXAMPLES / 'http-sqlite', http, ignore=ignores)
         macro = project / 'stats' / 'src' / '.expressions' / 'identitySyntax.ly'
         macro.parent.mkdir()
         macro.write_text('fn identitySyntax(target: String, raw: String): Syntax { syntaxArgument(0) }\n', encoding='utf-8')
@@ -51,7 +54,8 @@ def main():
             'workbench.startupEditor': 'none',
         }), encoding='utf-8')
         report, log = root / 'result.txt', root / 'vscode.log'
-        environment = {**os.environ, 'LYRA_CACHE': str(root / 'cache'), 'LYRA_SMOKE_RESULT': str(report)}
+        environment = {**os.environ, 'LYRA_CACHE': str(root / 'cache'), 'LYRA_SMOKE_RESULT': str(report),
+                       'LYRA_SMOKE_HTTP': str(http / 'src' / 'main.ly')}
         for key in ('ELECTRON_RUN_AS_NODE', 'VSCODE_IPC_HOOK_CLI', 'VSCODE_PORTABLE'):
             environment.pop(key, None)
         arguments = [
@@ -68,9 +72,11 @@ def main():
             except (OSError, subprocess.TimeoutExpired) as error:
                 failure = str(error)
         result = report.read_text(encoding='utf-8') if report.is_file() else ''
+        channels = '\n'.join(path.read_text(encoding='utf-8', errors='replace') for path in profile.rglob('*Lyra Language Server.log'))
+        if any(f'Request textDocument/{method} failed.' in channels for method in ('definition', 'hover', 'completion', 'inlayHint')):
+            failure = 'An editing request reported an error instead of using diagnostics'
         if failure or not result.startswith('PASS '):
             output = '\n'.join(log.read_text(encoding='utf-8', errors='replace').splitlines()[-50:])
-            channels = '\n'.join(path.read_text(encoding='utf-8', errors='replace') for path in profile.rglob('*Lyra Language Server.log'))
             parser.exit(1, f'{failure or "VS Code test did not report success"}\n{result}\n{channels}\n{output}\n')
         print(result.rstrip())
 

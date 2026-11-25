@@ -4,6 +4,7 @@ module;
 #include <cstdint>
 #include <lyra/utf8.hpp>
 #include <optional>
+#include <set>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -16,6 +17,7 @@ namespace lyra {
 namespace {
 
 enum class Kind { Name, Keyword, Escaped, Number, String, Bytes, Char, TextHead, TextMiddle, TextTail, Symbol, End };
+constexpr std::string_view keywords[] = {"fn", "val", "var", "const", "if", "else", "while", "for", "in", "return", "break", "continue", "true", "false", "struct", "class", "enum", "trait", "pub", "import", "as", "is", "async", "await", "spawn", "extern", "match", "null", "implicit", "defer", "throw", "try", "catch", "this", "static"};
 
 struct Token {
     Kind kind;
@@ -153,7 +155,6 @@ public:
             while (offset < text.size() && (isLetter(text[offset]) || isDigit(text[offset]))) ++offset;
         } else if (isLetter(current)) {
             while (offset < text.size() && (isLetter(text[offset]) || isDigit(text[offset]))) ++offset;
-            constexpr std::string_view keywords[] = {"fn", "val", "var", "const", "if", "else", "while", "for", "in", "return", "break", "continue", "true", "false", "struct", "class", "enum", "trait", "pub", "import", "as", "is", "async", "await", "spawn", "extern", "match", "null", "implicit", "defer", "throw", "try", "catch", "this", "static"};
             auto word = text.substr(start, offset - start);
             kind = std::ranges::find(keywords, word) == std::end(keywords) ? Kind::Name : Kind::Keyword;
         } else if (current == '`') {
@@ -256,10 +257,30 @@ constexpr Infix infix[] = {
     {"+", 11, Op::Add}, {"-", 11, Op::Sub}, {"*", 12, Op::Mul}, {"/", 12, Op::Div}, {"%", 12, Op::Rem}
 };
 
+struct CompletionScope {
+    std::string_view text;
+    std::size_t offset;
+    std::vector<std::size_t> blocks{};
+    std::set<std::string> names{};
+
+    bool contains(std::size_t block) const { return std::ranges::find(blocks, block) != blocks.end(); }
+
+    void add(const Identifier& name) {
+        if (name.text != "_" && !name.text.starts_with('$') && name.span.begin < name.span.end)
+            names.emplace(text.substr(name.span.begin, name.span.end - name.span.begin));
+    }
+
+    void add(const Pattern& pattern) {
+        if (const auto* name = std::get_if<PatternName>(&pattern.node); name && !name->owner && !name->labels && (name->escaped || name->name.text != "None")) add(name->name);
+        if (const auto* list = std::get_if<PatternList>(&pattern.node); list && list->rest) add(*list->rest);
+        for (const auto& part : pattern.parts) add(part);
+    }
+};
+
 class Parser {
 public:
-    Parser(const Source& source, std::size_t file, std::vector<ExpressionExpansion>* expressions = nullptr, bool macroImplementation = false)
-        : source(source), file(file), lexer(source), token(lexer.next()), next(lexer.next()), macros(expressions), macroImplementation(macroImplementation) {}
+    Parser(const Source& source, std::size_t file, std::vector<ExpressionExpansion>* expressions = nullptr, bool macroImplementation = false, CompletionScope* completion = nullptr)
+        : source(source), file(file), lexer(source), token(lexer.next()), next(lexer.next()), macros(expressions), macroImplementation(macroImplementation), completion(completion) {}
 
     void appendTo(Module& module) {
         while (token.kind != Kind::End) {
@@ -367,12 +388,15 @@ private:
     Token token, next;
     std::vector<ExpressionExpansion>* macros;
     bool macroImplementation;
+    CompletionScope* completion{};
     std::vector<Expr> nodes;
     std::optional<Span> pendingExpansion;
     std::string selfType;
 
     struct Lookahead {};
     Parser(const Parser& parser, Lookahead) : source(parser.source), file(parser.file), lexer(parser.lexer), token(parser.token), next(parser.next), macros(nullptr), macroImplementation(parser.macroImplementation), selfType(parser.selfType) {}
+
+    bool completingBlock() const { return completion && is("{") && completion->contains(token.span.begin); }
 
     std::size_t prefixes(Module& module, bool method = false) {
         auto first = module.expansions.size();
@@ -883,9 +907,9 @@ private:
             if (!is(",")) break;
             consume();
         }
-        require(")");
+        auto parametersEnd = require(")").span.end;
         if (conversion && (!generics.empty() || parameters.size() != 1 || parameters.front().defaultValue || parameters.front().variadic)) throw at(source, keyword.span, "LYV0001", "implicit 需要一个无默认值的普通形参");
-        auto result = Identifier{"", token.span};
+        auto result = Identifier{"", {parametersEnd, parametersEnd}};
         if (initializer) result = std::move(ownerType);
         else if (is(":")) { consume(); result = type(); }
         else if (pub || foreign || conversion || (!owner && !extension && name.text == "main"))
@@ -901,6 +925,11 @@ private:
             require(";");
             auto symbol = name;
             return {file, std::move(name), std::move(parameters), std::move(result), {}, 0, {}, pub, {}, false, std::move(symbol)};
+        }
+        if (completion && !owner && !extension) completion->add(name);
+        if (completingBlock()) {
+            for (const auto& parameter : parameters) completion->add(parameter.name);
+            for (const auto& generic : generics) completion->add(generic);
         }
         auto body = block();
         Function decl{file, std::move(name), std::move(parameters), std::move(result), std::exchange(nodes, {}), body, std::move(owner), pub, std::move(generics), isAsync, {}, conversion, std::move(bounds), initializer, hasReceiver, extension ? std::optional(extension->name) : std::nullopt};
@@ -922,6 +951,10 @@ private:
             if (is(";")) semi = consume().span;
             else if (!is("}") && token.kind != Kind::End && !token.newlineBefore) {
                 throw at(source, token.span, "LYP0001", "表达式之间需要换行或分号");
+            }
+            if (completion && completion->contains(start) && semi.value_or(nodes[value].span).end < completion->offset) {
+                if (const auto* binding = std::get_if<Binding>(&nodes[value].node)) completion->add(binding->name);
+                if (const auto* binding = std::get_if<PatternBinding>(&nodes[value].node)) completion->add(binding->pattern);
             }
             body.statements.push_back({value, semi});
         }
@@ -983,6 +1016,7 @@ private:
                 require("=");
             }
             auto condition = expression(false, 1, false);
+            if (matched && completingBlock()) completion->add(*matched);
             auto body = block();
             return add({start, nodes[body].span.end}, While{condition, body, std::move(matched)});
         }
@@ -1002,6 +1036,7 @@ private:
         if (auto* name = std::get_if<PatternName>(&item.node); name && !name->owner && !name->labels) name->escaped = true;
         require("in");
         auto input = expression(false, 1, false);
+        if (completingBlock()) completion->add(item);
         auto body = block();
         return add({site.begin, nodes[body].span.end}, For{std::move(item), input, body, awaitSite});
     }
@@ -1103,7 +1138,10 @@ private:
             if (is("val")) { consume(); binding = identifier(); require("="); }
             auto operation = expression(false, 1, false);
             require("=>");
-            selection.arms.push_back({std::move(binding), operation, statement()});
+            if (binding && completingBlock()) completion->add(*binding);
+            auto value = statement();
+            if (binding && completion && nodes[value].span.begin <= completion->offset && completion->offset <= nodes[value].span.end) completion->add(*binding);
+            selection.arms.push_back({std::move(binding), operation, value});
             if (is(",")) consume();
             else if (!is("}") && !token.newlineBefore) throw at(source, token.span, "LYP0001", "select 分支之间需要换行或逗号");
         }
@@ -1268,6 +1306,7 @@ private:
             while (!is("=>")) consume();
             consume();
         } else literal.parameters.clear();
+        if (completion && completion->contains(open.begin)) for (const auto& parameter : literal.parameters) completion->add(parameter.name);
         literal.body = blockContents(open.begin);
         auto end = nodes[literal.body].span.end;
         auto value = add({site.begin, end}, std::move(literal));
@@ -1306,6 +1345,7 @@ private:
         require(")");
         if (is(":")) { consume(); literal.result = type(); }
         require("=>");
+        if (completingBlock()) for (const auto& parameter : literal.parameters) completion->add(parameter.name);
         literal.body = block();
         auto end = nodes[literal.body].span.end;
         return add({start, end}, std::move(literal));
@@ -1476,6 +1516,8 @@ private:
                     binding = CatchBinding{std::move(name), type()};
                     if (is("if")) { consume(); guard = expression(false, 1, false); }
                 }
+                if (binding && (completingBlock() || (completion && guard && nodes[*guard].span.begin <= completion->offset && completion->offset <= nodes[*guard].span.end)))
+                    completion->add(binding->name);
                 attempt.arms.push_back({site, std::move(binding), guard, block()});
             } while (is("catch"));
             auto end = nodes[attempt.arms.back().body].span.end;
@@ -1490,7 +1532,11 @@ private:
                 std::optional<ExprId> guard;
                 if (is("if")) { consume(); guard = expression(false, 1, false); }
                 require("=>");
-                match.arms.push_back({std::move(branch), statement(), guard});
+                if (completingBlock() || (completion && guard && nodes[*guard].span.begin <= completion->offset && completion->offset <= nodes[*guard].span.end))
+                    completion->add(branch);
+                auto value = statement();
+                if (completion && nodes[value].span.begin <= completion->offset && completion->offset <= nodes[value].span.end) completion->add(branch);
+                match.arms.push_back({std::move(branch), value, guard});
                 if (!is(",")) break;
                 consume();
             }
@@ -1504,6 +1550,7 @@ private:
                 auto matched = pattern();
                 require("=");
                 auto subject = expression(false, 1, false);
+                if (completingBlock()) completion->add(matched);
                 auto yes = block();
                 std::optional<ExprId> no;
                 if (is("else")) { consume(); no = is("if") ? atom(false, trailingBlock) : block(); }
@@ -1599,6 +1646,78 @@ std::vector<SyntaxToken> syntaxTokens(const Source& source, bool comments, bool 
         }
     } catch (const Diagnostic&) { if (!partial) throw; }
     return tokens;
+}
+
+SyntaxCompletion completeSyntax(const Source& source, std::size_t offset) {
+    SyntaxCompletion result{{offset, offset}};
+    CompletionScope scope{source.text, offset};
+    const auto text = scope.text;
+    std::vector<SyntaxToken> comments;
+    std::optional<Token> previous;
+    Lexer lexer(source, &comments);
+    try {
+        for (auto token = lexer.next(); token.kind != Kind::End && token.span.begin <= offset; token = lexer.next()) {
+            auto spelling = text.substr(token.span.begin, token.span.end - token.span.begin);
+            if (token.kind == Kind::Symbol && token.span.end <= offset) {
+                if (spelling == "{") scope.blocks.push_back(token.span.begin);
+                else if (spelling == "}" && !scope.blocks.empty()) scope.blocks.pop_back();
+            }
+            if (token.span.begin <= offset && offset <= token.span.end && (token.kind == Kind::Name || token.kind == Kind::Keyword || token.kind == Kind::Escaped)) {
+                result.replacement = token.span;
+                break;
+            }
+            if (token.span.end > offset) {
+                if (token.kind != Kind::Symbol) return result;
+                break;
+            }
+            previous = token;
+        }
+    } catch (const Diagnostic& error) {
+        result.incomplete = true;
+        if (error.site && error.site->start.offset < offset) {
+            auto from = text.substr(error.site->start.offset);
+            if (from.starts_with("/*") || (error.code == "LYL0003" && !from.starts_with("${") &&
+                (offset <= error.site->end.offset || from.starts_with('r') || from.starts_with("br")))) return result;
+        }
+        auto wordByte = [](char value) { return isLetter(value) || isDigit(value); };
+        while (result.replacement.begin && wordByte(text[result.replacement.begin - 1])) --result.replacement.begin;
+        while (result.replacement.end < text.size() && wordByte(text[result.replacement.end])) ++result.replacement.end;
+        if (result.replacement.begin && text[result.replacement.begin - 1] == '`') --result.replacement.begin;
+    }
+    for (const auto& comment : comments) if (comment.span.begin <= offset &&
+        (offset < comment.span.end || (offset == comment.span.end && text.substr(comment.span.begin).starts_with("//")))) return result;
+    auto family = ImportKind::Runtime;
+    if (previous) {
+        const auto span = previous->span;
+        if (span.end <= result.replacement.begin && text.substr(span.end, result.replacement.begin - span.end).find_first_of("\r\n") == text.npos) {
+            auto separator = text.substr(span.begin, span.end - span.begin);
+            if (separator == "." || separator == "?.") return result;
+            if (separator == "#") family = ImportKind::Macro;
+            if (separator == "@") family = ImportKind::Decorator;
+        }
+    }
+    Module module;
+    std::vector<ExpressionExpansion> expansions;
+    auto directory = source.path.parent_path().filename();
+    bool macroImplementation = directory == ".expressions" || directory == ".macros" || directory == ".decorators";
+    try { Parser(source, 0, &expansions, macroImplementation, family == ImportKind::Runtime ? &scope : nullptr).appendTo(module); }
+    catch (const Diagnostic&) { result.incomplete = true; }
+    for (const auto& imported : module.imports) if (imported.kind == family) scope.add(imported.alias);
+    if (family == ImportKind::Runtime) {
+        auto declarations = [&](const auto& entries) { for (const auto& entry : entries) scope.add(entry.name); };
+        for (const auto& function : module.functions) if (!function.owner && !function.extensionGroup && !function.property) scope.add(function.name);
+        declarations(module.aggregates);
+        declarations(module.enums);
+        declarations(module.traits);
+        declarations(module.aliases);
+        declarations(module.exceptions);
+        declarations(module.extensions);
+    }
+    auto prefix = text.substr(result.replacement.begin, offset - result.replacement.begin);
+    if (family == ImportKind::Runtime) for (auto keyword : keywords)
+        if (keyword.starts_with(prefix)) result.suggestions.push_back({std::string(keyword), true});
+    for (const auto& name : scope.names) if (name.starts_with(prefix)) result.suggestions.push_back({name});
+    return result;
 }
 
 }

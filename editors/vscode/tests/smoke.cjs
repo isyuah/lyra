@@ -35,9 +35,10 @@ async function checkSmoke() {
     const editor = await vscode.window.showTextDocument(document);
     const original = await vscode.workspace.fs.readFile(source);
 
-    const call = document.getText().indexOf('parseLine(line.value)');
+    const callPrefix = 'jsonlReader(input, ';
+    const call = document.getText().indexOf(callPrefix + 'parseLine)');
     assert.notEqual(call, -1);
-    const callPosition = document.positionAt(call + 2);
+    const callPosition = document.positionAt(call + callPrefix.length + 2);
     const definitions = await vscode.commands.executeCommand('vscode.executeDefinitionProvider', source, callPosition);
     assert.ok(definitions.length > 0, 'definition provider did not index parseLine');
     assert.ok(!vscode.workspace.textDocuments.some(open => open.uri.toString() === library.toString()));
@@ -90,11 +91,59 @@ async function checkSmoke() {
     assert.ok(!document.isDirty);
 }
 
+async function checkTyping() {
+    const source = vscode.Uri.file(process.env.LYRA_SMOKE_HTTP);
+    const document = await vscode.workspace.openTextDocument(source);
+    const editor = await vscode.window.showTextDocument(document);
+    const original = document.getText();
+    const serveOffset = original.indexOf('await router.serve(listener)');
+    assert.notEqual(serveOffset, -1);
+    const inserted = document.lineAt(document.positionAt(serveOffset)).rangeIncludingLineBreak.end;
+    const use = document.positionAt(serveOffset + 'await ro'.length);
+    const logger = document.positionAt(original.indexOf('val logger') + 'val logger'.length);
+    const router = document.positionAt(original.indexOf('val router') + 'val router'.length);
+    const available = new vscode.Range(new vscode.Position(0, 0), inserted);
+    const inlays = () => vscode.commands.executeCommand('vscode.executeInlayHintProvider', source, available);
+    const expectTypes = hints => {
+        assert.ok(hints.some(hint => hint.position.isEqual(logger) && hint.label === ': Logger'));
+        assert.ok(hints.some(hint => hint.position.isEqual(router) && hint.label === ': Router'));
+    };
+    const complete = position => vscode.commands.executeCommand('vscode.executeCompletionItemProvider', source, position);
+    const endOfLine = document.eol === vscode.EndOfLine.CRLF ? '\r\n' : '\n';
+    expectTypes(await inlays());
+    const start = inserted.translate(0, 4);
+    assert.ok(await editor.edit(edit => edit.insert(inserted, '    ' + endOfLine)));
+    try {
+        editor.selection = new vscode.Selection(start, start);
+        await vscode.commands.executeCommand('default:type', { text: 'v' });
+        await waitForDiagnostics(source, listing => listing.some(item => item.code === 'LYN0001'), 'missing unfinished-name diagnostic');
+        const keywords = (await complete(start.translate(0, 1))).items.map(item => item.label);
+        assert.ok(keywords.includes('val') && keywords.includes('var'), `keyword completions: ${JSON.stringify(keywords)}`);
+        expectTypes(await inlays());
+        const known = await vscode.commands.executeCommand('vscode.executeDefinitionProvider', source, use);
+        assert.ok(known.some(item => item.range.end.isEqual(router)));
+        for (const method of ['Definition', 'Hover', 'Definition']) {
+            const result = await vscode.commands.executeCommand(`vscode.execute${method}Provider`, source, start);
+            assert.equal(result?.length ?? 0, 0);
+        }
+        assert.ok(await editor.edit(edit => edit.replace(new vscode.Range(start, start.translate(0, 1)), 'ro')));
+        const names = (await complete(start.translate(0, 2))).items.map(item => item.label);
+        assert.ok(names.includes('router'), `visible name completions: ${JSON.stringify(names)}`);
+        assert.ok(document.isDirty);
+        assert.ok(document.getText().includes('val router = Router()'));
+    } finally {
+        await vscode.commands.executeCommand('workbench.action.files.revert');
+    }
+    await waitForDiagnostics(source, listing => listing.length === 0, 'unfinished-name diagnostic did not clear after reverting');
+    assert.equal(document.getText(), original);
+}
+
 async function run() {
     const report = process.env.LYRA_SMOKE_RESULT;
     try {
         await checkSmoke();
-        await writeFile(report, `PASS VS Code ${vscode.version}: cross-package definition and disk updates, unsaved Unicode macro diagnostic, diagnostics cleared\n`);
+        await checkTyping();
+        await writeFile(report, `PASS VS Code ${vscode.version}: cross-package definitions, Unicode macro diagnostics, HTTP example completions and inlay hints on unsaved edits\n`);
     } catch (error) {
         await writeFile(report, `${error.stack}\n`);
         throw error;

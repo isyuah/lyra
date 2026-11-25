@@ -160,10 +160,13 @@ struct MacroArgument { Span span; std::optional<std::string> literal; };
 struct ExpressionExpansion { Identifier name; Span span, argumentsSpan; std::vector<MacroArgument> arguments; };
 struct SyntaxRef { std::size_t index; };
 struct SyntaxToken { Span span; std::string kind; };
+struct SyntaxSuggestion { std::string label; bool keyword{}; };
+struct SyntaxCompletion { Span replacement; std::vector<SyntaxSuggestion> suggestions{}; bool incomplete{}; };
 struct Module { std::vector<Function> functions; std::vector<Aggregate> aggregates; std::vector<Import> imports; std::vector<Expansion> expansions; std::vector<Trait> traits{}; std::vector<Enumeration> enums{}; std::vector<Extension> extensions{}; std::vector<std::vector<std::string>> importedExtensions{}; std::vector<ExceptionType> exceptions{}; std::vector<TypeAlias> aliases{}; };
 Module parse(const std::vector<Source>& sources);
 void parseFile(Module& module, const Source& source, std::size_t file, std::vector<ExpressionExpansion>* expressions = nullptr, bool macroImplementation = false);
 void validateMacroExpression(const Source& generated);
 std::vector<SyntaxToken> syntaxTokens(const Source& source, bool comments = false, bool partial = false);
+SyntaxCompletion completeSyntax(const Source& source, std::size_t offset);
 
 }

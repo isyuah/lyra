@@ -38,9 +38,9 @@ namespace json = llvm::json;
 struct Document { fs::path path; std::string uri, text; std::int64_t version{}; };
 struct Workspace {
     std::vector<Source> sources;
-    std::vector<NameReference> references;
+    EditorIndex editor;
     std::vector<Diagnostic> warnings;
-    std::set<std::string> names;
+    std::optional<Diagnostic> error;
     std::map<std::pair<std::size_t, std::size_t>, std::size_t> throwsEnds;
 };
 
@@ -173,35 +173,23 @@ fs::path packageRoot(fs::path file) {
 
 Workspace loadWorkspace(const fs::path& root, const SourceOverlay& overlays, const std::optional<PackageGraph>& graph, ParseCache& parseCache) {
     Workspace workspace;
-    auto rememberThrows = [&](const Module& syntax, const std::vector<Source>& sources) {
-        for (const auto& function : syntax.functions) if (!function.throwsTypes.empty() && !sources[function.file].origin)
+    try {
+        Module syntax;
+        if (graph) {
+            auto program = loadProgram(*graph, graph->entry, {}, &overlays, &parseCache);
+            syntax = std::move(program.syntax);
+            workspace.sources = std::move(program.sources);
+            workspace.editor.references = std::move(program.references);
+        } else {
+            workspace.sources = loadSources(root);
+            for (auto& source : workspace.sources) if (auto found = overlays.find(source.path); found != overlays.end()) source = sourceText(source.path, found->second, {});
+            syntax = parse(workspace.sources);
+        }
+        for (const auto& function : syntax.functions) if (!function.throwsTypes.empty() && !workspace.sources[function.file].origin)
             workspace.throwsEnds.emplace(std::pair{function.file, function.name.span.begin}, function.throwsTypes.back().span.end);
-    };
-    if (graph) {
-        if (graph->entry.empty()) throw Diagnostic{"LYK0001", "workspace 根没有可分析的 Lyra 包"};
-        auto program = loadProgram(*graph, graph->entry, {}, &overlays, &parseCache);
-        rememberThrows(program.syntax, program.sources);
-        auto checked = check(program.syntax, program.sources, false);
+        auto checked = check(std::move(syntax), workspace.sources, false, nullptr, &workspace.editor);
         workspace.warnings = std::move(checked.warnings);
-        workspace.sources = std::move(program.sources);
-        workspace.references = std::move(program.references);
-        workspace.references.insert(workspace.references.end(), checked.references.begin(), checked.references.end());
-    } else {
-        auto sources = loadSources(root);
-        for (auto& source : sources) if (auto found = overlays.find(source.path); found != overlays.end()) source = sourceText(source.path, found->second, {});
-        auto syntax = parse(sources);
-        rememberThrows(syntax, sources);
-        auto checked = check(std::move(syntax), sources, false);
-        workspace.warnings = std::move(checked.warnings);
-        workspace.sources = std::move(sources);
-        workspace.references = std::move(checked.references);
-    }
-    for (const auto& source : workspace.sources) for (const auto& token : syntaxTokens(source, false, true)) {
-        if (token.kind != "name" && token.kind != "keyword") continue;
-        auto value = source.text.substr(token.span.begin, token.span.end - token.span.begin);
-        if (!value.empty() && value.front() == '`') value = value.substr(1, value.size() - 2);
-        workspace.names.insert(std::move(value));
-    }
+    } catch (const Diagnostic& error) { workspace.error = error; }
     return workspace;
 }
 
@@ -338,20 +326,14 @@ bool watchesPath(const AnalysisInputs& inputs, const fs::path& path) {
 struct Snapshot {
     AnalysisInputs inputs;
     SourceOverlay overlays;
-    std::optional<Workspace> workspace;
-    std::optional<Diagnostic> error;
-
-    const Workspace& result() const {
-        if (error) throw *error;
-        return *workspace;
-    }
+    Workspace workspace;
 };
 
 std::optional<std::vector<std::pair<std::size_t, Source>>> triviaOnlyUpdates(
     const Snapshot& previous, const AnalysisInputs& inputs, const SourceOverlay& overlays) {
-    if (previous.inputs != inputs || previous.overlays == overlays || !previous.workspace || previous.error)
+    if (previous.inputs != inputs || previous.overlays == overlays || previous.workspace.error)
         return {};
-    for (const auto& source : previous.workspace->sources)
+    for (const auto& source : previous.workspace.sources)
         if (source.text.find_first_of("#@") != std::string::npos) return {};
 
     std::map<std::string, fs::path> oldOverlays, newOverlays;
@@ -370,9 +352,9 @@ std::optional<std::vector<std::pair<std::size_t, Source>>> triviaOnlyUpdates(
 
     std::vector<std::pair<std::size_t, Source>> updates;
     for (const auto& key : changed) {
-        auto found = std::ranges::find_if(previous.workspace->sources, [&](const Source& source) { return pathKey(source.path) == key; });
-        if (found == previous.workspace->sources.end()) return {};
-        auto index = static_cast<std::size_t>(found - previous.workspace->sources.begin());
+        auto found = std::ranges::find_if(previous.workspace.sources, [&](const Source& source) { return pathKey(source.path) == key; });
+        if (found == previous.workspace.sources.end()) return {};
+        auto index = static_cast<std::size_t>(found - previous.workspace.sources.begin());
         auto overlay = std::ranges::find_if(overlays, [&](const auto& entry) { return pathKey(entry.first) == key; });
         Source current;
         try {
@@ -412,8 +394,8 @@ const NameReference* referenceAt(const Workspace& workspace, const fs::path& pat
         auto site = source.userSite(anchor.span);
         return pathKey(fromUtf8(site.file)) == pathKey(path) && site.start.offset <= offset && (offset < site.end.offset || site.start.offset == site.end.offset);
     };
-    for (const auto& reference : workspace.references) if (matches(reference.use)) return &reference;
-    for (const auto& reference : workspace.references) if (matches(reference.declaration)) return &reference;
+    for (const auto& reference : workspace.editor.references) if (matches(reference.use)) return &reference;
+    for (const auto& reference : workspace.editor.references) if (matches(reference.declaration)) return &reference;
     return nullptr;
 }
 
@@ -431,17 +413,29 @@ json::Array locationsFor(const Workspace& workspace, SourceAnchor target, bool i
         if (seen.insert(key).second) locations.push_back(jsonLocation(workspace, anchor));
     };
     if (includeDeclaration) append(target);
-    for (const auto& reference : workspace.references) if (renameAnchor(reference) == target) append(reference.use);
+    for (const auto& reference : workspace.editor.references) if (renameAnchor(reference) == target) append(reference.use);
     return locations;
 }
 
-std::string nameAt(std::string_view text, std::size_t offset, std::size_t& begin, std::size_t& end) {
-    begin = std::min(offset, text.size());
-    end = begin;
-    auto nameByte = [](unsigned char ch) { return std::isalnum(ch) || ch == '_' || ch >= 0x80; };
-    while (begin && nameByte(static_cast<unsigned char>(text[begin - 1]))) --begin;
-    while (end < text.size() && nameByte(static_cast<unsigned char>(text[end]))) ++end;
-    return std::string(text.substr(begin, end - begin));
+std::size_t requestOffset(const Source& source, const json::Object* position) {
+    if (!position) throw Diagnostic{"LYLSP0001", "缺少 position"};
+    auto line = position->getInteger("line"), character = position->getInteger("character");
+    if (!line || !character || *line < 0 || *character < 0) throw Diagnostic{"LYLSP0001", "无效的 position"};
+    return byteOffset(source, static_cast<std::size_t>(*line), static_cast<std::size_t>(*character));
+}
+
+json::Array inlayHints(const Workspace& workspace, const Source& source, Span range) {
+    std::map<std::size_t, std::string_view> labels;
+    for (const auto& hint : workspace.editor.inferredTypes) {
+        const auto& authored = workspace.sources[hint.anchor.file];
+        if (authored.path != source.path) continue;
+        auto offset = authored.site(hint.anchor.span).end.offset;
+        if (range.begin <= offset && offset < range.end) labels.try_emplace(offset, hint.type);
+    }
+    json::Array hints;
+    for (const auto& [offset, type] : labels)
+        hints.push_back(json::Object{{"position", jsonLspPosition(source, offset)}, {"label", ": " + std::string(type)}, {"kind", 1}});
+    return hints;
 }
 
 json::Value errorResponse(const json::Value& id, int code, std::string message) {
@@ -567,20 +561,18 @@ private:
             auto& previous = found->second;
             if (previous.overlays == overlays) {
                 trace("Lyra analysis: reused package analysis for " + pathText(root));
-                return previous.result();
+                return previous.workspace;
             }
             if (auto updates = triviaOnlyUpdates(previous, inputs, overlays)) {
-                for (auto& [index, source] : *updates) previous.workspace->sources[index] = std::move(source);
+                for (auto& [index, source] : *updates) previous.workspace.sources[index] = std::move(source);
                 previous.overlays = std::move(overlays);
                 trace("Lyra analysis: reused checked workspace after trivia-only document edits for " + pathText(root));
-                return *previous.workspace;
+                return previous.workspace;
             }
         }
         trace("Lyra analysis: rebuilt workspace and reran semantic checks for " + pathText(root));
-        Snapshot fresh{std::move(inputs), std::move(overlays), {}, {}};
-        try { fresh.workspace = loadWorkspace(root, fresh.overlays, graph, parseCache); }
-        catch (const Diagnostic& error) { fresh.error = error; }
-        return snapshots.insert_or_assign(root, std::move(fresh)).first->second.result();
+        auto workspace = loadWorkspace(root, overlays, graph, parseCache);
+        return snapshots.insert_or_assign(root, Snapshot{std::move(inputs), std::move(overlays), std::move(workspace)}).first->second.workspace;
     }
 
     static void send(const json::Value& value) {
@@ -637,7 +629,7 @@ private:
             {"positionEncoding", "utf-16"}, {"textDocumentSync", json::Object{{"openClose", true}, {"change", 2}}},
             {"completionProvider", json::Object{{"triggerCharacters", json::Array{".", "@", "#"}}}},
             {"hoverProvider", true}, {"definitionProvider", true}, {"referencesProvider", true},
-            {"renameProvider", true}, {"documentFormattingProvider", true}}}};
+            {"renameProvider", true}, {"documentFormattingProvider", true}, {"inlayHintProvider", true}}}};
         }
         if (method == "initialized" || method == "$/cancelRequest") return {};
         if (method == "$/setTrace") {
@@ -733,18 +725,29 @@ private:
         return decodeUri(*uri);
     }
 
-    std::pair<const Document&, const Source&> documentSource(const fs::path& path, const Workspace& workspace) const {
-        auto doc = documents.find(pathKey(path));
-        auto source = sourceFor(workspace, path);
-        if (doc == documents.end() || !source) throw Diagnostic{"LYLSP0001", "文档没有打开或不属于当前 Lyra 包"};
-        return {doc->second, *source};
-    }
-
     std::optional<json::Value> documentRequest(std::string_view method, const json::Object& params) {
+        auto unavailable = [&]() -> json::Value {
+            if (method == "textDocument/completion") return json::Object{{"isIncomplete", false}, {"items", json::Array{}}};
+            if (method == "textDocument/references" || method == "textDocument/inlayHint" || method == "textDocument/formatting") return json::Array{};
+            return nullptr;
+        };
         auto path = requestPath(params);
         auto key = pathKey(path);
         auto opened = documents.find(key);
-        if (opened == documents.end()) throw Diagnostic{"LYLSP0001", "文档没有打开"};
+        if (opened == documents.end()) return unavailable();
+        const auto& document = opened->second;
+        if (method == "textDocument/completion") {
+            auto source = sourceText(document.path, document.text, {});
+            auto completion = completeSyntax(source, requestOffset(source, params.getObject("position")));
+            auto range = json::Value(jsonRange(source, completion.replacement));
+            json::Array items;
+            for (const auto& suggestion : completion.suggestions) {
+                json::Object item{{"label", suggestion.label}, {"textEdit", json::Object{{"range", range}, {"newText", suggestion.label}}}};
+                if (suggestion.keyword) item["kind"] = 14;
+                items.push_back(std::move(item));
+            }
+            return json::Object{{"isIncomplete", completion.incomplete}, {"items", std::move(items)}};
+        }
         if (method == "textDocument/formatting") {
             FormatOptions options;
             if (const auto* requested = params.getObject("options")) {
@@ -752,21 +755,27 @@ private:
                 if (tabSize >= 1 && tabSize <= 32) options.tabSize = static_cast<unsigned>(tabSize);
                 options.insertSpaces = requested->getBoolean("insertSpaces").value_or(options.insertSpaces);
             }
-            auto source = sourceText(opened->second.path, opened->second.text, {});
+            auto source = sourceText(document.path, document.text, {});
             auto output = formatSource(source, options);
             if (output == source.text) return json::Array{};
             return json::Array{json::Object{{"range", jsonRange(source, {0, source.text.size()})}, {"newText", std::move(output)}}};
         }
-        auto root = packageRoot(fromUtf8(key));
+        if (method != "textDocument/inlayHint" && method != "textDocument/definition" && method != "textDocument/references" &&
+            method != "textDocument/rename" && method != "textDocument/hover") return unavailable();
         const Workspace* analysis;
-        try { analysis = &analyze(root); }
-        catch (const Diagnostic& error) { if (method == "textDocument/completion") return json::Object{{"isIncomplete", false}, {"items", json::Array{}}}; throw error; }
+        try { analysis = &analyze(packageRoot(fromUtf8(key))); }
+        catch (const Diagnostic&) { return unavailable(); }
+        catch (const PackageError&) { return unavailable(); }
+        catch (const fs::filesystem_error&) { return unavailable(); }
         const auto& workspace = *analysis;
-        const auto& [document, source] = documentSource(path, workspace);
-        auto position = params.getObject("position");
-        if (!position) throw Diagnostic{"LYLSP0001", "缺少 position"};
-        auto line = position->getInteger("line").value_or(0), character = position->getInteger("character").value_or(0);
-        auto offset = byteOffset(source, static_cast<std::size_t>(line), static_cast<std::size_t>(character));
+        auto source = sourceFor(workspace, path);
+        if (!source || source->text != document.text) return unavailable();
+        if (method == "textDocument/inlayHint") {
+            auto range = params.getObject("range");
+            if (!range) throw Diagnostic{"LYLSP0001", "缺少 range"};
+            return inlayHints(workspace, *source, {requestOffset(*source, range->getObject("start")), requestOffset(*source, range->getObject("end"))});
+        }
+        auto offset = requestOffset(*source, params.getObject("position"));
         auto reference = referenceAt(workspace, path, offset);
         if (method == "textDocument/definition") {
             if (!reference || reference->declaration.file >= workspace.sources.size()) return json::Value(nullptr);
@@ -779,7 +788,7 @@ private:
             return locationsFor(workspace, renameAnchor(*reference), include);
         }
         if (method == "textDocument/rename") {
-            if (!reference) throw Diagnostic{"LYLSP0002", "游标处没有已绑定的 Lyra 符号"};
+            if (workspace.error || !reference) return unavailable();
             auto newName = params.getString("newName");
             if (!newName || newName->empty() || (!std::isalpha(static_cast<unsigned char>((*newName)[0])) && (*newName)[0] != '_')) throw Diagnostic{"LYLSP0001", "新名称必须是有效 Lyra 标识符"};
             if (!std::all_of(newName->begin() + 1, newName->end(), [](unsigned char ch) { return std::isalnum(ch) || ch == '_'; })) throw Diagnostic{"LYLSP0001", "新名称必须是有效 Lyra 标识符"};
@@ -815,21 +824,11 @@ private:
             auto start = definition.lineStarts[site.start.line - 1];
             auto end = definition.text.find_first_of("\r\n", start);
             if (end == std::string::npos) end = definition.text.size();
-            auto file = static_cast<std::size_t>(&definition - workspace.sources.data());
-            if (auto annotation = workspace.throwsEnds.find({file, resolved->second.begin}); annotation != workspace.throwsEnds.end())
-                end = annotation->second;
+            auto [file, span] = reference->declaration;
+            if (auto annotation = workspace.throwsEnds.find({file, span.begin}); annotation != workspace.throwsEnds.end())
+                end = workspace.sources[file].site({annotation->second, annotation->second}).end.offset;
             auto signature = std::string_view(definition.text).substr(start, end - start);
             return json::Object{{"contents", json::Object{{"kind", "markdown"}, {"value", "```lyra\n" + std::string(signature) + "\n```"}}}};
-        }
-        if (method == "textDocument/completion") {
-            std::size_t begin, end;
-            auto prefix = nameAt(document.text, offset, begin, end);
-            auto candidates = workspace.names;
-            static constexpr std::string_view keywords[] = {"async", "await", "break", "catch", "class", "continue", "defer", "else", "enum", "false", "for", "fn", "if", "import", "in", "is", "match", "null", "pub", "return", "spawn", "static", "struct", "this", "throw", "true", "try", "val", "var", "while"};
-            for (auto keyword : keywords) candidates.emplace(keyword);
-            json::Array items;
-            for (const auto& candidate : candidates) if (prefix.empty() || candidate.starts_with(prefix)) items.push_back(json::Object{{"label", candidate}});
-            return json::Object{{"isIncomplete", false}, {"items", std::move(items)}};
         }
         return json::Value(nullptr);
     }
@@ -874,7 +873,9 @@ private:
         };
         for (const auto& [root, owner] : roots) {
             try {
-                for (const auto& warning : analyze(root).warnings) append(warning, *owner, 2);
+                const auto& workspace = analyze(root);
+                for (const auto& warning : workspace.warnings) append(warning, *owner, 2);
+                if (workspace.error) append(*workspace.error, *owner);
             }
             catch (const Diagnostic& error) { append(error, *owner); }
             catch (const PackageError& error) { append({error.code, error.message}, *owner); }

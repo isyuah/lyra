@@ -1154,6 +1154,8 @@ struct Checker {
     std::optional<std::pair<ExprId, ValueJoin*>> collectingTail{};
     bool reachable{true};
     std::optional<std::size_t> functionIndex{};
+    EditorIndex* editor{};
+    std::size_t indexedReferences{};
 
     Checker trial(CheckedFunction& body) const {
         return {body, source, module, symbols, scopes, variables, loops, workers,
@@ -1210,6 +1212,18 @@ struct Checker {
 
     void referLocal(const Identifier& name, std::size_t slot) {
         if (auto declaration = fn.locals[slot].declaration) fn.references.push_back({{fn.syntax.file, name.span}, {fn.syntax.file, *declaration}, {}});
+    }
+
+    void indexReferences() {
+        if (!editor || indexedReferences == fn.references.size()) return;
+        auto references = std::span(fn.references).subspan(indexedReferences);
+        editor->references.insert(editor->references.end(), references.begin(), references.end());
+        indexedReferences = fn.references.size();
+    }
+
+    void indexType(Span span, std::string_view name, Type type) {
+        if (!editor || source.origin || name == "_" || name.starts_with('$') || source.hygieneAt(span)) return;
+        editor->inferredTypes.push_back({{fn.syntax.file, span}, typeName(module, type)});
     }
 
     Type readLocal(ExprId id, const Identifier& name, std::size_t slot) {
@@ -1343,6 +1357,7 @@ struct Checker {
             visit(fn.syntax.body, {}, true);
             checkInitialization(fn, module.aggregates[fn.result.id], source);
         } else visit(fn.syntax.body, fn.result);
+        indexReferences();
     }
 
     Type inferResult() {
@@ -2282,6 +2297,7 @@ struct Checker {
         fn.locals.push_back({annotation.value_or(value), binding.writable, currentWorker()});
         declare(binding.name, slot);
         fn.expressions[id].target = slot;
+        if (!annotation && value != Type::Never) indexType(binding.name.span, binding.name.text, value);
         return value == Type::Never ? Type::Never : Type::Unit;
     }
 
@@ -2289,10 +2305,13 @@ struct Checker {
         auto annotation = binding.annotation ? std::optional(symbols.resolve(fn.syntax, *binding.annotation, variables)) : std::nullopt;
         auto value = visit(binding.value, annotation);
         if (value == Type::Never) return value;
+        auto firstLocal = fn.locals.size();
         auto& checked = fn.expressions[id].patterns;
         checked.push_back(checkPattern(binding.pattern, value));
         const CheckedPattern* pattern = &checked.front();
         checkExhaustiveness(value, binding.pattern.span, {&pattern, 1}, PatternUse::Binding);
+        if (editor && !annotation) for (const auto& local : std::span(fn.locals).subspan(firstLocal))
+            if (local.declaration) indexType(*local.declaration, local.name, local.type);
         return Type::Unit;
     }
 
@@ -3297,6 +3316,7 @@ struct Checker {
             bool tail = !discard && &statement == &block.statements.back() && !statement.semicolon && live;
             reachable = entered && live;
             auto value = yield(statement.expression, tail ? expected : std::nullopt, !tail, tail ? values : nullptr);
+            if (id == fn.syntax.body) indexReferences();
             live &= value != Type::Never;
             type = statement.semicolon ? Type::Unit : value;
             site = statement.semicolon.value_or(fn.syntax.expressions[statement.expression].span);
@@ -3479,7 +3499,7 @@ const Identifier& Symbols::resultAnnotation(const Callable& candidate, const Sou
 
 }
 
-CheckedModule check(Module module, const std::vector<Source>& sources, bool requireEntry, MacroExecution* macro) {
+CheckedModule check(Module module, const std::vector<Source>& sources, bool requireEntry, MacroExecution* macro, EditorIndex* editor) {
     if (!module.expansions.empty()) {
         auto& use = module.expansions.front();
         throw at(sources[use.file], use.name.span, "LYM0001", "声明前缀未展开：" + use.name.text);
@@ -3773,10 +3793,10 @@ CheckedModule check(Module module, const std::vector<Source>& sources, bool requ
     for (std::size_t index = 0; index < checked.functions.size(); ++index) if (checked.functions[index].syntax.conversion) registerConversion(symbols.conversions, checked, sources, index);
     symbols.boundsReady = true;
     symbols.validateNominalBounds();
+    const auto declaredFunctions = checked.functions.size();
     using FunctionSite = std::pair<std::size_t, std::size_t>;
     std::map<FunctionSite, std::vector<FunctionSite>> dependencies;
-    auto rememberReferences = [&](const CheckedFunction& fn) {
-        checked.references.insert(checked.references.end(), fn.references.begin(), fn.references.end());
+    auto rememberCalls = [&](const CheckedFunction& fn) {
         auto& calls = dependencies[{fn.syntax.file, fn.syntax.name.span.begin}];
         for (const auto& call : fn.calls) calls.emplace_back(call.file, call.span.begin);
     };
@@ -3798,17 +3818,22 @@ CheckedModule check(Module module, const std::vector<Source>& sources, bool requ
         };
         for (std::size_t slot = 0; slot < callable.generic->parameters.size(); ++slot) if (callable.generic->parameters[slot].defaultValue) {
             auto helper = symbols.prepare(defaultFunction(*callable.generic, slot), callable.variables);
-            Checker{helper, sources[helper.syntax.file], checked, symbols, {}, callable.variables}.run();
+            auto checker = Checker{helper, sources[helper.syntax.file], checked, symbols, {}, callable.variables};
+            checker.editor = editor;
+            checker.run();
             rememberContracts(helper);
-            rememberReferences(helper);
+            rememberCalls(helper);
         }
         auto syntax = *callable.generic;
         syntax.result = symbols.resultAnnotation(callable, sources[syntax.file], syntax.name.span);
         auto body = symbols.prepare(std::move(syntax), callable.variables);
         exposeFunction(body, callable.variables);
-        Checker{body, sources[body.syntax.file], checked, symbols, {}, callable.variables}.run();
+        auto checker = Checker{body, sources[body.syntax.file], checked, symbols, {}, callable.variables};
+        checker.editor = editor;
+        checker.run();
+        if (callable.generic->result.text.empty()) checker.indexType(body.syntax.result.span, body.syntax.name.text, body.result);
         rememberContracts(body);
-        rememberReferences(body);
+        rememberCalls(body);
     };
     if (macro) symbols.checkGeneric = checkGeneric;
     else for (std::size_t index = 0; index < symbols.callables.size(); ++index) checkGeneric(index);
@@ -3821,8 +3846,10 @@ CheckedModule check(Module module, const std::vector<Source>& sources, bool requ
         }
         auto checker = Checker{fn, sources[fn.syntax.file], checked, symbols, {}};
         checker.functionIndex = index;
+        if (index < declaredFunctions) checker.editor = editor;
         checker.run();
-        rememberReferences(fn);
+        if (fn.syntax.result.text.empty()) checker.indexType(fn.syntax.result.span, fn.syntax.name.text, fn.result);
+        rememberCalls(fn);
     };
     if (macro) {
         auto entry = symbols.callables[symbols.functionCallables[macro->declaration]].target;

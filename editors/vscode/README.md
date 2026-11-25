@@ -1,6 +1,6 @@
 # Lyra Language for VS Code
 
-为 `.ly` 提供高亮、注释与括号配对。诊断、补全、悬停、定义、引用、重命名和格式化由原生 SDK 的 `lyra lsp --stdio` 提供。扩展不下载 SDK 或包依赖，不编译或运行项目，也不启动准备脚本。
+为 `.ly` 提供高亮、注释与括号配对。诊断、补全、悬停、定义、引用、重命名、行内类型提示和格式化由原生 SDK 的 `lyra lsp --stdio` 提供。扩展不下载 SDK 或包依赖，不编译或运行项目，也不启动准备脚本。
 
 ## 本地打包和安装
 
@@ -31,6 +31,10 @@ code --install-extension lyra-language.vsix
 
 语言服务按入口包和可达依赖缓存语义分析。修改无关包不会重检当前包；修改相关包时会重跑模块链接和类型检查，并复用未变且未展开宏的文件的解析结果。VS Code 会监听这些包的源码、相关清单和锁文件，以及显式授权的宏输入；即使依赖文件未打开，磁盘修改也会刷新诊断。
 
+补全从当前缓冲区读取关键字、声明、导入及作用域内的局部名称。输入 `v` 可补全 `val`、`var`；语法还没写完整时，也能补全已识别的名称。自动弹出遵循 VS Code 的 `editor.quickSuggestions`，也可按 `Ctrl+Space` 手动触发。源码错误显示在编辑器和 Problems 中，不作为悬停或跳转请求错误弹窗。
+
+省略类型的 `val`、`var` 和函数／方法返回值会显示淡色的原生 Inlay Hints，例如 `val router: Router = Router()` 中的 `: Router`。提示不写入源码，可用 `editor.inlayHints.enabled` 控制显示。
+
 **Format Document** 使用和 `lyra fmt` 一样的词法规则，处理编辑器缓冲区并遵循缩进设置，不要求类型检查通过。
 
 ## 真实编辑器验收
@@ -41,6 +45,6 @@ code --install-extension lyra-language.vsix
 python editors/vscode/tests/smoke.py <VS-Code-桌面程序路径> <Lyra-SDK-程序路径>
 ```
 
-第一个路径在 Windows 填 `Code.exe`，Linux 填桌面程序 `code`，不是同发行包里的 `bin/code` 启动脚本。测试使用独立配置和临时项目，检查双包定义跳转、外部修改依赖后的诊断刷新，以及未保存的中文和 emoji 后宏报错的精确范围。
+第一个路径在 Windows 填 `Code.exe`，Linux 填桌面程序 `code`，不是同发行包里的 `bin/code` 启动脚本。测试使用独立配置和临时项目，检查跨包定义跳转、磁盘依赖更新、未保存的 Unicode 宏报错，以及在 HTTP/SQLite 示例中输入一半时的补全、诊断和行内类型提示。
 
 打包后可加 `--vsix <扩展包路径>`，改为加载从 VSIX 解包的扩展和依赖；验收该包时不读取源码目录的 `node_modules`。第二个参数可以直接指向解包后 SDK 的 `bin/lyra` 或 `bin/lyra.exe`。
