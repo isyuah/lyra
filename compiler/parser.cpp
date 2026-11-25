@@ -316,6 +316,9 @@ public:
                 if (firstPrefix != module.expansions.size()) throw at(source, module.expansions[firstPrefix].name.span, "LYM0001", "不能修饰类型别名");
                 consume();
                 TypeAlias alias{file, identifier(), {}, pub};
+                std::vector<Bound> bounds;
+                typeParameters(alias.typeParameters, bounds);
+                if (!bounds.empty()) throw at(source, bounds.front().trait.span, "LYG0001", "透明类型别名自身不声明约束");
                 require("=");
                 alias.target = type();
                 if (is(";")) consume();
@@ -330,7 +333,7 @@ public:
                     prefix.kind = ExpansionTarget::Enumeration;
                     prefix.target = module.enums.size();
                 }
-                module.enums.push_back(enumeration(pub));
+                module.enums.push_back(enumeration(module, pub));
                 continue;
             }
             if (is("extension")) {
@@ -378,9 +381,10 @@ private:
     Token token, next;
     std::vector<ExpressionExpansion>* macros;
     std::vector<Expr> nodes;
+    std::string selfType;
 
     struct Lookahead {};
-    Parser(const Parser& parser, Lookahead) : source(parser.source), file(parser.file), lexer(parser.lexer), token(parser.token), next(parser.next), macros(nullptr) {}
+    Parser(const Parser& parser, Lookahead) : source(parser.source), file(parser.file), lexer(parser.lexer), token(parser.token), next(parser.next), macros(nullptr), selfType(parser.selfType) {}
 
     Token consume() {
         auto previous = token;
@@ -469,28 +473,22 @@ private:
             name.span = {start, end};
             return typeSuffixes(std::move(name));
         }
+        if (is("Self")) {
+            Identifier name{selfType.empty() ? "$Self" : selfType, consume().span};
+            if (is("<")) throw at(source, token.span, "LYG0001", "Self 不接收类型实参");
+            return typeSuffixes(std::move(name));
+        }
         auto name = [&] {
             if (!is("dyn") || next.newlineBefore || (next.kind != Kind::Name && next.kind != Kind::Escaped)) return identifier();
             auto start = consume().span.begin;
             auto trait = identifier();
             if (is("<")) {
-                consume();
-                std::vector<std::pair<std::string, std::string>> bindings;
-                for (;;) {
-                    auto member = identifier();
-                    require("=");
-                    if (std::ranges::find(bindings, member.text, &std::pair<std::string, std::string>::first) != bindings.end())
-                        throw at(source, member.span, "LYG0007", "动态接口关联类型重复绑定：" + member.text);
-                    bindings.emplace_back(std::move(member.text), type().text);
-                    if (!is(",")) break;
-                    consume();
-                }
-                trait.span.end = closeAngle().end;
-                std::ranges::sort(bindings);
+                auto bindings = associatedBindings(trait.span.end);
+                std::ranges::sort(bindings, {}, [](const auto& binding) { return binding.member.text; });
                 trait.text += '<';
                 for (const auto& [member, value] : bindings) {
                     if (!trait.text.ends_with('<')) trait.text += ',';
-                    trait.text += "$bind:" + member + '<' + value + '>';
+                    trait.text += "$bind:" + member.text + '<' + value.text + '>';
                 }
                 trait.text += '>';
             }
@@ -533,6 +531,22 @@ private:
             return {begin, begin + 1};
         }
         return require(">").span;
+    }
+
+    std::vector<AssociatedBinding> associatedBindings(std::size_t& end) {
+        require("<");
+        std::vector<AssociatedBinding> bindings;
+        for (;;) {
+            auto member = identifier();
+            require("=");
+            if (std::ranges::any_of(bindings, [&](const auto& binding) { return binding.member.text == member.text; }))
+                throw at(source, member.span, "LYG0007", "关联类型重复绑定：" + member.text);
+            bindings.push_back({std::move(member), type()});
+            if (!is(",")) break;
+            consume();
+        }
+        end = closeAngle().end;
+        return bindings;
     }
 
     Trait trait(bool pub) {
@@ -590,7 +604,12 @@ private:
             if (is(":")) {
                 consume();
                 for (;;) {
-                    bounds.push_back({parameters.size() - 1, identifier()});
+                    Bound bound{parameters.size() - 1, identifier()};
+                    if (is("<")) {
+                        std::size_t end;
+                        bound.bindings = associatedBindings(end);
+                    }
+                    bounds.push_back(std::move(bound));
                     if (!is("&")) break;
                     consume();
                 }
@@ -601,13 +620,14 @@ private:
         closeAngle();
     }
 
-    Enumeration enumeration(bool pub) {
+    Enumeration enumeration(Module& module, bool pub) {
         auto start = require("enum").span.begin;
         Enumeration result{file, identifier(), {}, pub};
         typeParameters(result.typeParameters, result.bounds);
+        selfType = nominalAnnotation(result).text;
         require("{");
-        if (is("}")) throw at(source, token.span, "LYP0001", "enum 至少声明一个分支");
-        while (!is("}")) {
+        if (is("}") || is(";")) throw at(source, token.span, "LYP0001", "enum 至少声明一个分支");
+        while (!is("}") && !is(";")) {
             EnumCase entry{identifier(), {}};
             if (is("(")) {
                 consume();
@@ -624,7 +644,18 @@ private:
             if (is(",")) consume();
             else if (!token.newlineBefore) break;
         }
+        if (is(";")) {
+            consume();
+            while (!is("}")) {
+                auto publicMember = visibility();
+                if (!is("fn") && !is("async")) throw at(source, token.span, "LYP0001", "enum 分支之后只允许实例方法");
+                module.functions.push_back(function(result.name, publicMember, result.typeParameters, false, false, result.bounds));
+                if (is(";")) consume();
+                else if (!is("}") && !token.newlineBefore) throw at(source, token.span, "LYP0001", "成员之间需要换行或分号");
+            }
+        }
         result.span = {start, require("}").span.end};
+        selfType.clear();
         return result;
     }
 
@@ -634,6 +665,12 @@ private:
         auto name = identifier();
         require(":");
         Field member{std::move(name), type(), writable, pub, std::move(marks)};
+        if (!inParens && is("get")) {
+            if (writable || !member.attributes.empty()) throw at(source, member.name.span, "LYP0001", "计算属性只能使用没有标记的 val");
+            module.functions.push_back(propertyGetter(std::move(member.name), std::move(member.type), nominalAnnotation(record), pub,
+                record.typeParameters, record.bounds, record.name));
+            return;
+        }
         if (is("=")) {
             consume();
             auto body = expression(inParens);
@@ -675,6 +712,7 @@ private:
         bool reference = text(start) == "class";
         Aggregate decl{file, identifier(), reference, {}, pub};
         typeParameters(decl.typeParameters, decl.bounds);
+        selfType = nominalAnnotation(decl).text;
         bool primary = is("(");
         std::optional<std::size_t> initializer;
         if (primary) {
@@ -717,7 +755,22 @@ private:
         }
         bindFieldDefaults(module, decl, initializer ? &module.functions[*initializer] : nullptr);
         decl.span = {start.span.begin, token.span.begin};
+        selfType.clear();
         module.aggregates.push_back(std::move(decl));
+    }
+
+    Function propertyGetter(Identifier name, Identifier result, Identifier receiver, bool pub,
+        const std::vector<Identifier>& generics, const std::vector<Bound>& bounds, std::optional<Identifier> owner = {}) {
+        require("get");
+        require("(");
+        require(")");
+        auto body = block();
+        std::vector<Parameter> parameters{{{"$this", name.span}, std::move(receiver)}};
+        Function function{file, std::move(name), std::move(parameters), std::move(result), std::exchange(nodes, {}), body, std::move(owner), pub,
+            generics, false, {}, false, bounds};
+        function.hasReceiver = true;
+        function.property = true;
+        return function;
     }
 
     void extension(Module& module, bool pub) {
@@ -736,17 +789,9 @@ private:
                     throw at(source, name.span, "LYN0002", "扩展属性重复：" + name.text);
                 require(":");
                 auto result = type();
-                require("get");
-                require("(");
-                require(")");
-                auto body = block();
                 auto getter = module.functions.size();
-                std::vector<Parameter> parameters{{{"$this", name.span}, decl.receiver}};
-                Function function{file, name, std::move(parameters), std::move(result), std::exchange(nodes, {}), body, {}, pub,
-                    decl.typeParameters, false, {}, false, decl.bounds};
-                function.hasReceiver = true;
+                auto function = propertyGetter(name, std::move(result), decl.receiver, pub, decl.typeParameters, decl.bounds);
                 function.extensionGroup = decl.name;
-                function.extensionProperty = true;
                 module.functions.push_back(std::move(function));
                 decl.properties.push_back({std::move(name), module.functions.back().result, getter});
             } else {

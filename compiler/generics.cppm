@@ -1,4 +1,5 @@
 module;
+#include <algorithm>
 #include <compare>
 #include <cstddef>
 #include <optional>
@@ -58,12 +59,21 @@ template<class Rename> std::string mapTypeNames(const TypeForm& form, const Rena
     return result;
 }
 
+TypeForm substituteTypeParameters(TypeForm form, std::span<const Identifier> parameters, std::span<const TypeForm> arguments) {
+    if (form.arguments.empty()) {
+        auto found = std::ranges::find(parameters, form.name, &Identifier::text);
+        if (found != parameters.end()) return arguments[found - parameters.begin()];
+    }
+    for (auto& argument : form.arguments) argument = substituteTypeParameters(std::move(argument), parameters, arguments);
+    return form;
+}
+
 template<class Type> struct GenericArgument { std::size_t slot; Type type; Span span; };
 
-template<class Type, class TypeName, class Project, class Common>
+template<class Type, class TypeName, class Project, class Common, class Expand>
 std::vector<Type> inferGenericArguments(const Function& declaration, const Call& call, Span site,
         std::span<const Type> explicitTypes, std::span<const GenericArgument<Type>> arguments,
-        std::optional<Type> expected, const Source& source, TypeName name, Project project, Common common) {
+        std::optional<Type> expected, const Source& source, TypeName name, Project project, Common common, Expand expand) {
     const auto& parameters = declaration.typeParameters;
     std::vector<std::optional<Type>> bound(parameters.size());
     for (std::size_t index = 0; index < explicitTypes.size(); ++index) bound[index] = explicitTypes[index];
@@ -106,9 +116,9 @@ std::vector<Type> inferGenericArguments(const Function& declaration, const Call&
     };
     for (const auto& argument : arguments) {
         if (argument.type == Type::Never) continue;
-        unify(unify, typeForm(declaration.parameters[argument.slot].type.text), argument.type, argument.span, false, true);
+        unify(unify, expand(declaration.parameters[argument.slot].type), argument.type, argument.span, false, true);
     }
-    if (expected && *expected != Type::Never && !declaration.result.text.empty()) unify(unify, typeForm(declaration.result.text), *expected, site, true, false);
+    if (expected && *expected != Type::Never && !declaration.result.text.empty()) unify(unify, expand(declaration.result), *expected, site, true, false);
     std::vector<Type> types;
     for (std::size_t index = 0; index < bound.size(); ++index) {
         if (!bound[index]) {

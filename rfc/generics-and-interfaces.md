@@ -74,6 +74,10 @@ val length = cell.map { it.size }
 
 `enum Load<T> { Pending, Ready(T), Failed(String) }` 的每个实例共享分支集合，载荷按类型实参具体化。`Load.Ready(42)` 从载荷推断 `T`；`Load.Pending` 需要明确的目标类型，否则写 `Load<Int>.Pending`。模式仍写 `Load.Pending` 或 `Ready(value)`，由被匹配值决定类型实参；跨包导入别名不产生新的枚举身份。
 
+静态约束可以绑定部分或全部关联类型：`T: Reader<Item=String>` 使 `T.Item` 等于 `String`，`T: Reader<Item=U>` 使它等于同签名的类型形参 `U`。实参提供的类型必须精确匹配，别名先展开；调用仍从实参和明确的结果类型推断 `T`、`U`，不从关联类型绑定反推缺失的实参。泛型之间可转发已经满足的绑定；同一类型形参的同名关联类型不能绑定成不同类型。
+
+trait 方法签名中的 `Self` 指满足约束的类型，例如 `trait Duplicate { fn duplicate(): Self }`。这些 trait 可用于静态结构匹配，不能用于 `dyn`，因为动态接口值不公开其底层具体类型。
+
 结构约束解决“这个具体类型能否传给某个泛型函数”。它本身不解决“如何在同一集合中保存不同具体类型，然后通过共同接口动态调用”。
 
 ```text

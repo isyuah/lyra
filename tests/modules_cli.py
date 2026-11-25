@@ -94,6 +94,31 @@ fn main(): Unit {
 ''', encoding='utf-8')
         self.assertEqual(self.command('run', self.app).stdout, 'full\nfree 7\n')
 
+    def test_generic_aliases_through_reexports_and_inference(self):
+        (self.lib / 'src/net/types.ly').write_text('''
+pub struct Entry<T>(pub val value: T)
+pub type Page<T> = List<Entry<T>>
+pub type Visit<T> = (T) -> String
+pub fn first<T>(page: Page<T>): T { page[0].value }
+pub fn visit<T>(item: T, format: Visit<T>): String { format(item) }
+''')
+        (self.lib / 'src/lib.ly').write_text('pub import self.net.Page as Entries\n')
+        self.source.write_text('''
+import cfg.Entries as Page
+import cfg.net.Entry
+import cfg.net.first
+import cfg.net.visit
+type Id<T> = T
+fn forward<T>(items: Page<T>): T { first(items) }
+fn main(): Unit {
+    val page: Id<Id<Page<Int>>> = [Entry(42)]
+    val boxed: Any = page
+    print(boxed is List<Entry<Int>>)
+    print(visit(forward(page)) { it.toString() })
+}
+''')
+        self.assertEqual(self.command('run', self.app).stdout, 'true\n42\n')
+
     def test_enum_variants_and_implicit_conversion_across_modules(self):
         (self.lib / 'src/net/status.ly').write_text('''
 enum Internal { Wait }

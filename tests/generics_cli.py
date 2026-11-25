@@ -85,6 +85,42 @@ class Generics(unittest.TestCase):
         self.program('enum Loop<T> { Next(Loop<List<T>>) }\nfn main(): Unit {}')
         self.rejects('LYG0004', '改变了类型实参')
 
+    def test_static_associated_bindings_and_forwarding(self):
+        declarations = '''
+            trait Reader { type Item; fn read(): Item }
+            struct Value<T>(val item: T) { type Item = T; fn read(): T { item } }
+            fn fixed<T: Reader<Item=String>>(reader: T): T.Item { reader.read() }
+            fn relay<T: Reader<Item=String>>(reader: T): String { fixed(reader) }
+            fn typed<T: Reader<Item=U>, U>(reader: T, fallback: U): U { reader.read() }
+        '''
+        self.program(declarations + '''
+            fn main(): Unit {
+                print(relay(Value("text")))
+                print(typed(Value(42), 0))
+            }
+        ''')
+        self.run_native('text\n42\n')
+        self.program(declarations + 'fn main(): Unit { print(fixed(Value(7))) }')
+        self.rejects('LYG0005', '关联类型 Item')
+        self.program(declarations + '''
+            fn noGuess<T: Reader<Item=U>, U>(reader: T): U { reader.read() }
+            fn main(): Unit { print(noGuess(Value("text"))) }
+        ''')
+        self.rejects('LYG0002', 'U')
+        self.program(declarations + 'fn wrong<T: Reader<Missing=Int>>(reader: T): Unit {}\nfn main(): Unit {}')
+        self.rejects('LYG0007', 'Missing', 'Missing')
+
+    def test_generic_aliases_reject_cycles_arity_and_duplicate_overloads(self):
+        for program, code, message in [
+            ('type Loop<T> = List<Loop<T>>', 'LYT0003', '循环'),
+            ('type Id<T> = T\nfn take(item: Id): Unit {}', 'LYT0003', '类型实参数量'),
+            ('struct Hidden<T>(val value: T)\npub type Visible<T> = Hidden<T>', 'LYN0003', '私有类型'),
+            ('type Items<T> = List<T>\nfn pick<T>(items: Items<T>): Unit {}\nfn pick<U>(items: List<U>): Unit {}', 'LYN0002', '形参类型重复'),
+        ]:
+            with self.subTest(program=program):
+                self.program(program + '\nfn main(): Unit {}')
+                self.rejects(code, message)
+
     def test_two_parameters_named_arguments_and_nominal_aggregate(self):
         self.program('''
             struct Point(val x: Int)

@@ -57,6 +57,49 @@ fn main(): Unit {
 }
 """, "原稿\n修订\nAda\n1\n2\n".encode())
 
+    def test_self_computed_properties_and_enum_method_values(self):
+        self.run_source('''
+trait Duplicate { fn duplicate(): Self }
+fn duplicate<T: Duplicate>(item: T): T { item.duplicate() }
+struct Box<T>(val data: T) {
+    val contents: T get() { data }
+    fn duplicate(): Self { this }
+    fn value(): T { contents }
+}
+enum Load<T> { Wait, Ready(T);
+    fn duplicate(): Self { this }
+    fn value(fallback: T): T { match this { Wait => fallback, Ready(item) => item } }
+    fn label(): String { "ready" }
+    fn label(prefix: String): String { prefix + label() }
+    fn equals(other: Self): Bool { label() == other.label() }
+    fn hashCode(): Int { 7 }
+}
+fn main(): Unit {
+    val box = duplicate(Box(42))
+    print(box.contents)
+    print(box == Box(42))
+    val load = duplicate(Load.Ready(box.value()))
+    val read: (Int) -> Int = load.value
+    val format: (String) -> String = load.label
+    print(read(0))
+    print(format("is "))
+    print(Load<Int>.Wait == Load.Ready(0))
+}
+''', b'42\ntrue\n42\nis ready\ntrue\n')
+
+    def test_self_trait_is_static_and_getter_is_read_only(self):
+        for program, code in [
+            ('trait Duplicate { fn duplicate(): Self }\nfn use(value: dyn Duplicate): Unit {}', 'LYG0007'),
+            ('class Box { val item: Int get() { 7 } }\nfn use(box: Box): Unit { box.item = 10 }', 'LYT0004'),
+            ('class Box { val item: Int; val item: Int get() { 7 } }', 'LYN0002'),
+        ]:
+            with self.subTest(program=program):
+                self.main.write_text(program + '\nfn main(): Unit {}', encoding='utf-8')
+                result = subprocess.run([COMPILER, 'check', self.package, '--diagnostics=json'], capture_output=True, timeout=25)
+                self.assertNotEqual(result.returncode, 0)
+                diagnostic, = json.loads(result.stderr)
+                self.assertEqual(diagnostic['code'], code, diagnostic)
+
     def test_heap_roots_strings_and_inline_data(self):
         self.run_source(GC_FIXTURE.read_text(encoding="utf-8"), "持有\nA\0B\n1\n2\n".encode())
 

@@ -168,20 +168,16 @@ struct Callable {
     mutable bool inferring{};
 };
 
-struct NoTypeLookup {
-    std::optional<Type> operator()(std::size_t) const { return {}; }
-};
-
 struct OverloadKey {
     std::size_t typeParameters;
     std::vector<std::pair<std::string, bool>> parameters;
     bool operator==(const OverloadKey&) const = default;
 };
 
-OverloadKey overloadKey(const Function& syntax) {
+OverloadKey overloadKey(const Function& syntax, const auto& expand) {
     OverloadKey key{syntax.typeParameters.size(), {}};
     for (const auto& parameter : syntax.parameters) {
-        auto normalized = mapTypeNames(typeForm(parameter.type.text), [&](const std::string& name) {
+        auto normalized = mapTypeNames(expand(parameter.type), [&](const std::string& name) {
             if (auto slot = genericParameter(syntax, name)) return "$" + std::to_string(*slot);
             if (auto type = numberType(name)) return numberName(*type);
             return name;
@@ -247,21 +243,22 @@ Function defaultFunction(const Function& original, std::size_t slot) {
     return syntax;
 }
 
-Identifier nominalAnnotation(const auto& declaration) {
-    auto result = declaration.name;
-    if (!declaration.typeParameters.empty()) result.text += '<';
-    for (std::size_t index = 0; index < declaration.typeParameters.size(); ++index) {
-        if (index) result.text += ',';
-        result.text += declaration.typeParameters[index].text;
-    }
-    if (!declaration.typeParameters.empty()) result.text += '>';
-    return result;
-}
-
 Function constructorSignature(const Aggregate& record) {
     std::vector<Parameter> parameters;
     for (const auto& field : record.fields) parameters.push_back({field.name, field.type});
     return {record.file, record.name, std::move(parameters), nominalAnnotation(record), {}, 0, {}, record.isPublic, record.typeParameters, false, {}, false, record.bounds};
+}
+
+bool traitUsesSelf(const Trait& trait) {
+    auto usesSelf = [](const Identifier& annotation) {
+        auto contains = [](auto&& self, const TypeForm& form) -> bool {
+            return form.name == "$Self" || std::ranges::any_of(form.arguments, [&](const auto& part) { return self(self, part); });
+        };
+        return contains(contains, typeForm(annotation.text));
+    };
+    return std::ranges::any_of(trait.methods, [&](const auto& method) {
+        return usesSelf(method.result) || std::ranges::any_of(method.parameters, [&](const auto& parameter) { return usesSelf(parameter.type); });
+    });
 }
 
 struct Symbols {
@@ -271,6 +268,8 @@ struct Symbols {
     Overloads functions;
     std::vector<Names> fields;
     std::vector<Overloads> methods;
+    std::vector<Overloads> enumMethods{};
+    std::vector<Names> properties{};
     std::vector<Callable> callables;
     std::map<GenericInstanceKey, std::size_t> specializations;
     std::map<std::pair<Type, std::string>, std::size_t> builtinImplementations{};
@@ -299,6 +298,8 @@ struct Symbols {
     std::size_t nextNominalCheck{};
     bool boundsReady{};
     std::vector<std::pair<Type, std::string>> resolvingAssociated{};
+    struct BindingContext { std::size_t file; Identifier type; std::vector<Identifier> parameters; std::vector<Type> variables; };
+    std::map<std::pair<Type, std::string>, std::vector<BindingContext>> boundAssociations{};
     Names aliases{};
     std::vector<TypeAlias> aliasDeclarations{};
     std::vector<std::string> resolvingAliases{};
@@ -361,7 +362,17 @@ struct Symbols {
 
     std::size_t enclosingParameters(const Function& syntax) const {
         if (syntax.extensionGroup) return extensionDeclarations[extensions.at(syntax.extensionGroup->text)].typeParameters.size();
-        return syntax.owner ? recordDeclarations[records.at(syntax.owner->text)].typeParameters.size() : 0;
+        if (!syntax.owner) return 0;
+        if (auto item = enums.find(syntax.owner->text); item != enums.end()) return enumDeclarations[item->second].typeParameters.size();
+        return recordDeclarations[records.at(syntax.owner->text)].typeParameters.size();
+    }
+
+    const Overloads& instanceMethods(Type owner) const {
+        return owner.kind == Type::Enum ? enumMethods[module.enums[owner.id].declaration] : methods[module.aggregates[owner.id].declaration];
+    }
+
+    const std::vector<Type>& instanceArguments(Type owner) const {
+        return owner.kind == Type::Enum ? module.enums[owner.id].arguments : module.aggregates[owner.id].arguments;
     }
 
     std::string signature(std::size_t index, const std::string& spelling) const {
@@ -399,10 +410,10 @@ struct Symbols {
     }
 
     std::optional<RequiredMethod> methodShape(Type receiver, const Callable& candidate, const Source& use) {
-        const auto& record = module.aggregates[receiver.id];
+        const auto& arguments = instanceArguments(receiver);
         const auto& actual = declaration(candidate);
-        if ((!actual.isPublic && sources[actual.file].moduleId != use.moduleId) || actual.typeParameters.size() != record.arguments.size()) return {};
-        auto type = [&](const Identifier& annotation) { return resolve(actual, annotation, record.arguments); };
+        if ((!actual.isPublic && sources[actual.file].moduleId != use.moduleId) || actual.typeParameters.size() != arguments.size()) return {};
+        auto type = [&](const Identifier& annotation) { return resolve(actual, annotation, arguments); };
         RequiredMethod result{{}, {}, type(resultAnnotation(candidate, use, actual.name.span)), actual.isAsync};
         for (std::size_t slot = 1; slot < actual.parameters.size(); ++slot) {
             const auto& parameter = actual.parameters[slot];
@@ -414,8 +425,8 @@ struct Symbols {
     }
 
     std::optional<std::pair<std::size_t, RequiredMethod>> shapedMethod(Type receiver, const std::string& name, const Source& use, const auto& accept) {
-        if (receiver.kind != Type::Record) return {};
-        const auto& members = methods[module.aggregates[receiver.id].declaration];
+        if (receiver.kind != Type::Record && receiver.kind != Type::Enum) return {};
+        const auto& members = instanceMethods(receiver);
         auto found = members.find(name);
         if (found == members.end()) return {};
         for (auto index : found->second) {
@@ -426,19 +437,19 @@ struct Symbols {
     }
 
     std::optional<std::size_t> valueOverride(Type type, ValueOperation operation) {
-        if (type.kind != Type::Record || module.aggregates[type.id].syntax.reference) return {};
-        const auto& record = module.aggregates[type.id];
+        if (type.kind != Type::Enum && (type.kind != Type::Record || module.aggregates[type.id].syntax.reference)) return {};
+        const auto& arguments = instanceArguments(type);
         auto name = operation == ValueOperation::Equal ? "equals" : "hashCode";
-        const auto& members = methods[record.declaration];
+        const auto& members = instanceMethods(type);
         auto candidates = members.find(name);
         if (candidates == members.end()) return {};
         for (auto index : candidates->second) {
             const auto& candidate = declaration(callables[index]);
-            if (candidate.result.text.empty() || candidate.isAsync || candidate.typeParameters.size() != record.arguments.size()) continue;
+            if (candidate.result.text.empty() || candidate.isAsync || candidate.typeParameters.size() != arguments.size()) continue;
             bool equality = operation == ValueOperation::Equal;
             if (candidate.parameters.size() != (equality ? 2u : 1u)) continue;
-            if (equality && (candidate.parameters[1].variadic || resolve(candidate, candidate.parameters[1].type, record.arguments) != type)) continue;
-            if (resolve(candidate, candidate.result, record.arguments) == (equality ? Type::Bool : Type::Int)) return index;
+            if (equality && (candidate.parameters[1].variadic || resolve(candidate, candidate.parameters[1].type, arguments) != type)) continue;
+            if (resolve(candidate, candidate.result, arguments) == (equality ? Type::Bool : Type::Int)) return index;
         }
         return {};
     }
@@ -522,14 +533,15 @@ struct Symbols {
             auto type = pending.back();
             pending.pop_back();
             if (!seen.insert(type).second) continue;
-            if (type.kind == Type::Record) {
-                const auto& record = module.aggregates[type.id];
+            if (type.kind == Type::Record || type.kind == Type::Enum) {
                 auto equality = valueOverride(type, ValueOperation::Equal).has_value();
                 auto hashing = valueOverride(type, ValueOperation::Hash).has_value();
                 if (equality != hashing) return typeName(module, type) + " 的 equals 与 hashCode 必须同时提供，才能用于要求 Eq + Hash 的键";
-                if (!equality) pending.insert(pending.end(), record.fields.begin(), record.fields.end());
-            } else if (type.kind == Type::Enum) {
-                for (const auto& fields : module.enums[type.id].payloads) pending.insert(pending.end(), fields.begin(), fields.end());
+                if (!equality) {
+                    auto append = [&](const auto& fields) { pending.insert(pending.end(), fields.begin(), fields.end()); };
+                    if (type.kind == Type::Record) append(module.aggregates[type.id].fields);
+                    else for (const auto& fields : module.enums[type.id].payloads) append(fields);
+                }
             } else if (type.kind == Type::Option || type.kind == Type::Result) {
                 const auto& shape = module.sumTypes[type.id];
                 pending.push_back(shape.success);
@@ -544,7 +556,7 @@ struct Symbols {
             auto key = std::pair{type, operation};
             if (module.valueOverrides.contains(key)) continue;
             const auto& target = callables[index];
-            auto function = target.generic ? instantiate(index, module.aggregates[type.id].arguments, use, site) : target.target;
+            auto function = target.generic ? instantiate(index, instanceArguments(type), use, site) : target.target;
             module.valueOverrides.emplace(key, function);
         }
     }
@@ -598,9 +610,11 @@ struct Symbols {
     }
 
     RequiredMethod requiredShape(Type owner, const Trait& trait, const TraitMethod& method, const Source& use, Span site) {
+        auto types = trait.associated;
+        types.push_back({"$Self", {}});
         auto resolve = [&](const Identifier& annotation) {
-            return resolveWith(typeForm(annotation.text), sources[trait.file], annotation.span, trait.associated, [&](std::size_t slot) {
-                return projectionType(owner, trait.associated[slot].text, use, site);
+            return resolveWith(typeForm(annotation.text), sources[trait.file], annotation.span, types, [&](std::size_t slot) {
+                return slot == trait.associated.size() ? owner : projectionType(owner, trait.associated[slot].text, use, site);
             }).value();
         };
         RequiredMethod shape{{}, {}, resolve(method.result), method.asynchronous};
@@ -628,7 +642,8 @@ struct Symbols {
         return result;
     }
 
-    void requireBounds(std::span<const Bound> bounds, std::size_t file, std::span<const Type> types, const Source& use, Span site) {
+    void requireBounds(std::span<const Bound> bounds, std::size_t file, std::span<const Type> types, const Source& use, Span site,
+        std::span<const Identifier> parameters = {}) {
         const auto& definition = sources[file];
         auto nameOf = [&](Type type) { return typeName(module, type); };
         for (const auto& bound : bounds) {
@@ -648,6 +663,11 @@ struct Symbols {
             auto fail = [&](const std::string& reason) { return at(use, site, "LYG0005", nameOf(actual) + " 不满足 " + trait.name.text + "：" + reason); };
             for (const auto& member : trait.associated)
                 if (!associatedType(actual, member.text, definition, site)) throw fail("缺少可见关联类型 " + member.text);
+            for (const auto& binding : bound.bindings) {
+                auto provided = projectionType(actual, binding.member.text, definition, site);
+                auto required = resolveWith(typeForm(binding.type.text), definition, binding.type.span, parameters, [&](auto slot) { return types[slot]; }).value();
+                if (provided != required) throw fail("关联类型 " + binding.member.text + " 需要 " + nameOf(required) + "，实际为 " + nameOf(provided));
+            }
             for (const auto& method : trait.methods) {
                 const auto& name = method.name.text;
                 auto expected = requiredShape(actual, trait, method, definition, site);
@@ -679,7 +699,7 @@ struct Symbols {
     }
 
     void requireBounds(const Function& target, std::span<const Type> types, const Source& use, Span site) {
-        requireBounds(target.bounds, target.file, types, use, site);
+        requireBounds(target.bounds, target.file, types, use, site, target.typeParameters);
     }
 
     void validateNominalBounds() {
@@ -687,7 +707,7 @@ struct Symbols {
         while (nextNominalCheck < nominalChecks.size()) {
             const auto pending = nominalChecks[nextNominalCheck++];
             auto validate = [&](const auto& instance) {
-                requireBounds(instance.syntax.bounds, instance.syntax.file, instance.arguments, *pending.source, pending.site);
+                requireBounds(instance.syntax.bounds, instance.syntax.file, instance.arguments, *pending.source, pending.site, instance.syntax.typeParameters);
             };
             if (pending.type.kind == Type::Record) validate(module.aggregates[pending.type.id]);
             else validate(module.enums[pending.type.id]);
@@ -781,7 +801,7 @@ struct Symbols {
             }
             return true;
         };
-        if (!match(match, typeForm(group.receiver.text), receiver)) return {};
+        if (!match(match, expandAliases(group.receiver, sources[group.file]), receiver)) return {};
         std::vector<Type> result;
         for (auto type : inferred) result.push_back(type.value());
         return result;
@@ -808,6 +828,14 @@ struct Symbols {
     }
 
     std::optional<Type> associatedType(Type owner, const std::string& member, const Source& source, Span site) {
+        auto makeKey = [&] { return std::pair(owner, member); };
+        auto enter = [&](const auto& key) {
+            if (std::ranges::find(resolvingAssociated, key) != resolvingAssociated.end())
+                throw at(source, site, "LYG0007", "关联类型形成循环：" + typeName(module, owner) + '.' + member);
+            if (resolvingAssociated.size() >= 128) throw at(source, site, "LYG0004", "关联类型展开过深：" + member);
+            resolvingAssociated.push_back(key);
+        };
+        struct PopAssociation { decltype(resolvingAssociated)& stack; ~PopAssociation() { stack.pop_back(); } };
         if (owner.kind == Type::Dyn) {
             const auto& shape = module.dynamicTypes[owner.id];
             const auto& associated = module.traits[shape.trait].associated;
@@ -815,6 +843,20 @@ struct Symbols {
             return found == associated.end() ? std::nullopt : std::optional(shape.bindings[found - associated.begin()]);
         }
         if (owner.kind == Type::Variable) {
+            auto key = makeKey();
+            if (auto bound = boundAssociations.find(key); bound != boundAssociations.end()) {
+                enter(key);
+                PopAssociation restore{resolvingAssociated};
+                std::optional<Type> result;
+                for (const auto& binding : bound->second) {
+                    const auto& definition = sources[binding.file];
+                    auto type = resolveWith(typeForm(binding.type.text), definition, binding.type.span, binding.parameters,
+                        [&](auto slot) { return binding.variables[slot]; }).value();
+                    if (result && result != type) throw at(definition, binding.type.span, "LYG0007", "关联类型绑定冲突：" + member);
+                    result = type;
+                }
+                return result;
+            }
             for (const auto& bound : contracts.constraints(owner)) {
                 if (valueConstraint(bound)) continue;
                 const auto& members = contracts.declaration(bound).associated;
@@ -832,12 +874,8 @@ struct Symbols {
         const auto& definition = sources[record.syntax.file];
         auto found = std::ranges::find_if(record.syntax.associated, [&](const auto& entry) { return entry.name.text == member; });
         if (found == record.syntax.associated.end() || (!found->isPublic && source.moduleId != definition.moduleId)) return {};
-        auto key = std::pair(owner, member);
-        if (std::ranges::find(resolvingAssociated, key) != resolvingAssociated.end())
-            throw at(source, site, "LYG0007", "关联类型形成循环：" + typeName(module, owner) + '.' + member);
-        if (resolvingAssociated.size() >= 128) throw at(source, site, "LYG0004", "关联类型展开过深：" + member);
-        resolvingAssociated.push_back(std::move(key));
-        struct Pop { decltype(resolvingAssociated)& stack; ~Pop() { stack.pop_back(); } } restore{resolvingAssociated};
+        enter(makeKey());
+        PopAssociation restore{resolvingAssociated};
         return resolveWith(typeForm(found->type.text), definition, found->type.span, record.syntax.typeParameters,
             [&](std::size_t slot) { return record.arguments[slot]; });
     }
@@ -872,6 +910,35 @@ struct Symbols {
         if (!syntax.bounds.empty()) nominalChecks.push_back({type, &source, span});
         validateNominalBounds();
         return type;
+    }
+
+    TypeForm expandAliases(const Identifier& annotation, const Source& source) const {
+        std::set<std::string> active;
+        unsigned nodes{};
+        auto expand = [&](auto&& self, TypeForm form, unsigned depth) -> TypeForm {
+            if (depth >= 128 || ++nodes > 4096) throw at(source, annotation.span, "LYG0004", "类型别名展开超过深度或节点预算");
+            for (auto& part : form.arguments) part = self(self, std::move(part), depth + 1);
+            auto found = aliases.find(form.name);
+            if (found == aliases.end()) return form;
+            const auto& alias = aliasDeclarations[found->second];
+            if (form.arguments.size() != alias.typeParameters.size()) throw at(source, annotation.span, "LYT0003", "类型别名的类型实参数量不符：" + form.name);
+            if (!active.insert(form.name).second) throw at(source, annotation.span, "LYT0003", "透明类型别名形成循环：" + form.name);
+            auto target = substituteTypeParameters(typeForm(alias.target.text), alias.typeParameters, form.arguments);
+            auto result = self(self, std::move(target), depth + 1);
+            active.erase(form.name);
+            return result;
+        };
+        return expand(expand, typeForm(annotation.text), 0);
+    }
+
+    std::optional<Type> resolveAlias(const TypeAlias& alias, std::span<const Type> arguments, const Source& source, Span span) {
+        if (std::ranges::contains(resolvingAliases, alias.name.text))
+            throw at(source, span, "LYT0003", "透明类型别名形成循环：" + alias.name.text);
+        if (resolvingAliases.size() >= 128) throw at(source, span, "LYG0004", "类型别名展开过深：" + alias.name.text);
+        resolvingAliases.push_back(alias.name.text);
+        struct Pop { std::vector<std::string>& stack; ~Pop() { stack.pop_back(); } } restore{resolvingAliases};
+        return resolveWith(typeForm(alias.target.text), sources[alias.file], alias.target.span, alias.typeParameters,
+            [&](auto slot) { return arguments[slot]; });
     }
 
     Type enumType(std::size_t declaration, std::vector<Type> arguments, const Source& source, Span span) {
@@ -910,6 +977,7 @@ struct Symbols {
             auto name = form.name.substr(5);
             auto found = traitNames.find(name);
             if (found == traitNames.end()) throw at(source, span, "LYG0005", "找不到动态接口 trait：" + name);
+            if (traitUsesSelf(module.traits[found->second])) throw at(source, span, "LYG0007", "签名使用 Self 的 trait 只能用于静态约束：" + name);
             const auto& associated = module.traits[found->second].associated;
             if (form.arguments.size() != associated.size())
                 throw at(source, span, "LYG0007", "动态接口必须绑定 trait 的全部关联类型：" + name);
@@ -931,21 +999,17 @@ struct Symbols {
             if (form.name == "$never") return Type::Never;
             for (Type type : scalarTypes) if (form.name == typeName(module, type)) return type;
             if (auto exception = exceptionTypes.find(form.name); exception != exceptionTypes.end()) return Type{Type::Exception, exception->second + firstDeclaredException};
-            if (auto alias = aliases.find(form.name); alias != aliases.end()) {
-                if (std::ranges::find(resolvingAliases, form.name) != resolvingAliases.end())
-                    throw at(source, span, "LYT0003", "透明类型别名形成循环：" + form.name);
-                const auto& declaration = aliasDeclarations[alias->second];
-                resolvingAliases.push_back(form.name);
-                struct Pop { std::vector<std::string>& stack; ~Pop() { stack.pop_back(); } } restore{resolvingAliases};
-                return resolveWith(typeForm(declaration.target.text), sources[declaration.file], declaration.target.span, {}, NoTypeLookup{});
-            }
         }
+        auto alias = aliases.find(form.name);
+        if (alias != aliases.end() && form.arguments.size() != aliasDeclarations[alias->second].typeParameters.size())
+            throw at(source, span, "LYT0003", "类型别名的类型实参数量不符：" + form.name);
         std::vector<Type> arguments;
         for (const auto& part : form.arguments) {
             auto value = resolveWith(part, source, span, parameters, lookup);
             if (!value) return std::nullopt;
             arguments.push_back(*value);
         }
+        if (alias != aliases.end()) return resolveAlias(aliasDeclarations[alias->second], arguments, source, span);
         if (form.name.starts_with("$assoc:")) return projectionType(arguments.front(), form.name.substr(7), source, span);
         if (form.name == "$fn") {
             auto result = arguments.back();
@@ -1200,9 +1264,10 @@ struct Checker {
     bool implicitMember(const Identifier& name) const {
         if (!receiverSlot || source.hygieneAt(name.span)) return false;
         auto receiver = fn.locals[*receiverSlot].type;
+        if (receiver.kind == Type::Enum) return symbols.instanceMethods(receiver).contains(name.text);
         if (receiver.kind != Type::Record) return false;
         auto owner = module.aggregates[receiver.id].declaration;
-        return symbols.fields[owner].contains(name.text) || symbols.methods[owner].contains(name.text);
+        return symbols.fields[owner].contains(name.text) || symbols.methods[owner].contains(name.text) || symbols.properties[owner].contains(name.text);
     }
 
     void prepareReceivers() {
@@ -2035,7 +2100,8 @@ struct Checker {
                 auto wanted = std::optional(shape.result);
                 if (item.generic->isAsync) wanted = shape.result.kind == Type::Task ? std::optional(module.taskResults[shape.result.id]) : std::nullopt;
                 types = inferGenericArguments<Type>(*item.generic, Call{name, {}}, name.span, ownerTypes, inputs, wanted, source, [&](Type value) { return typeName(module, value); },
-                        [&](Type value, const std::string& key, std::size_t slot) { return symbols.project(value, key, slot); }, [](Type, Type) -> std::optional<Type> { return std::nullopt; });
+                        [&](Type value, const std::string& key, std::size_t slot) { return symbols.project(value, key, slot); }, [](Type, Type) -> std::optional<Type> { return std::nullopt; },
+                        [&](const Identifier& annotation) { return symbols.expandAliases(annotation, symbols.sources[item.generic->file]); });
             }
             symbols.requireBounds(*item.generic, types, source, name.span);
             std::vector<Type> parameters;
@@ -2215,7 +2281,8 @@ struct Checker {
             auto defaulted = fields.empty() ? parameter.defaultValue.has_value() : fields[slot].defaultValue.has_value();
             parameters.push_back({parameter.name.text, defaulted, parameter.variadic});
         }
-        auto arguments = argumentShapes(call, !parameters.empty() && !parameters.back().variadic && target.parameters.back().type.text.starts_with("$fn<"));
+        auto arguments = argumentShapes(call, !call.arguments.empty() && call.arguments.back().trailing && !parameters.empty() && !parameters.back().variadic &&
+            symbols.expandAliases(target.parameters.back().type, symbols.sources[target.file]).name == "$fn");
         auto plan = bindArguments(parameters, arguments, source, call.name.span, call.name.text);
         auto& info = fn.expressions[id];
         for (auto slot : plan.defaults) info.omittedDefaults.push_back(slot + skip);
@@ -2337,6 +2404,13 @@ struct Checker {
                 refer(member.name, record.syntax.file, record.syntax.fields[field->second].name.span);
                 return record.fields[field->second];
             }
+            if (auto property = symbols.properties[declaration].find(member.name.text); property != symbols.properties[declaration].end()) {
+                const auto& getter = symbols.declaration(symbols.callables[property->second]);
+                visible(getter.file, getter.isPublic, member.name);
+                auto result = declaredCall(property->second, id, Call{member.name, {}, member.receiver}, expected, symbols.instanceArguments(owner));
+                fn.expressions[id].callee = Callee::ExtensionProperty;
+                return result;
+            }
         }
         std::vector<std::pair<std::size_t, std::vector<Type>>> properties;
         for (auto extension : symbols.visibleExtensions[fn.syntax.file]) {
@@ -2355,9 +2429,8 @@ struct Checker {
             fn.expressions[id].callee = Callee::ExtensionProperty;
             return result;
         }
-        if (owner.kind == Type::Record) {
-            const auto& record = module.aggregates[owner.id];
-            if (auto method = boundMethodValue(id, member.name, expected, symbols.methods[record.declaration], record.arguments)) return *method;
+        if (owner.kind == Type::Record || owner.kind == Type::Enum) {
+            if (auto method = boundMethodValue(id, member.name, expected, symbols.instanceMethods(owner), symbols.instanceArguments(owner))) return *method;
         }
         throw at(source, member.name.span, "LYN0001", typeName(module, owner) + " 没有成员：" + member.name.text);
     }
@@ -2385,9 +2458,9 @@ struct Checker {
             auto type = fn.expressions[call.arguments[prior].value].type;
             if (type == Type::Never) continue;
             if (call.arguments[prior].spread) type = fn.expressions[call.arguments[prior].value].boxedSpread ? Type{Type::Any} : module.listElements[type.id];
-            learn(learn, typeForm(target.parameters[fn.expressions[id].argumentSlots[prior] + skip].type.text), type, true);
+            learn(learn, symbols.expandAliases(target.parameters[fn.expressions[id].argumentSlots[prior] + skip].type, symbols.sources[target.file]), type, true);
         }
-        if (expected && !target.result.text.empty()) learn(learn, typeForm(target.result.text), *expected, false);
+        if (expected && !target.result.text.empty()) learn(learn, symbols.expandAliases(target.result, symbols.sources[target.file]), *expected, false);
         return inferred;
     }
 
@@ -2410,9 +2483,10 @@ struct Checker {
                     if (!resolved && needsArgumentHint(expr)) {
                         auto known = argumentHints(id, call, target, checked, explicitTypes, expected);
                         auto hint = [&](const TypeForm& item) { return symbols.resolveWith(item, symbols.sources[target.file], annotation.span, target.typeParameters, [&](std::size_t param) { return known[param]; }); };
-                        if (std::holds_alternative<Lambda>(fn.syntax.expressions[expr].node) && form.name == "$fn") {
+                        const auto structural = symbols.expandAliases(annotation, symbols.sources[target.file]);
+                        if (std::holds_alternative<Lambda>(fn.syntax.expressions[expr].node) && structural.name == "$fn") {
                             auto& hints = lambdaHints[expr];
-                            for (const auto& part : form.arguments) hints.push_back(hint(part));
+                            for (const auto& part : structural.arguments) hints.push_back(hint(part));
                         } else resolved = hint(form);
                     }
                     return resolved;
@@ -2426,7 +2500,8 @@ struct Checker {
             actuals.push_back({info.argumentSlots[index] + skip, type, fn.syntax.expressions[expr].span});
         }
         auto types = inferGenericArguments<Type>(target, call, fn.syntax.expressions[id].span, explicitTypes, actuals, expected, source, [&](Type type) { return typeName(module, type); },
-                [&](Type value, const std::string& name, std::size_t slot) { return symbols.project(value, name, slot); }, commonInteger);
+                [&](Type value, const std::string& name, std::size_t slot) { return symbols.project(value, name, slot); }, commonInteger,
+                [&](const Identifier& annotation) { return symbols.expandAliases(annotation, symbols.sources[target.file]); });
         symbols.requireBounds(target, types, source, call.name.span);
         for (std::size_t index = 0; index < actuals.size(); ++index) {
             const auto& argument = actuals[index];
@@ -2741,9 +2816,8 @@ struct Checker {
                 }
             }
             if (call.boundTrait) if (auto operation = valueConstraint(*call.boundTrait)) return valueMember(*operation);
-            if (owner.kind == Type::Record) {
-                const auto& decl = module.aggregates[owner.id];
-                ownerTypes = decl.arguments;
+            if (owner.kind == Type::Record || owner.kind == Type::Enum) {
+                ownerTypes = symbols.instanceArguments(owner);
                 if (call.boundTrait) {
                     const auto& trait = symbols.contracts.declaration(*call.boundTrait);
                     const auto& method = *std::ranges::find_if(trait.methods, [&](const auto& entry) { return entry.name.text == call.name.text; });
@@ -2751,20 +2825,25 @@ struct Checker {
                     auto chosen = symbols.shapedMethod(owner, call.name.text, source, [&](const auto& shape) { return shape == required; });
                     return declaredCall(chosen.value().first, id, call, expected, ownerTypes);
                 }
-                const auto& fields = symbols.fields[decl.declaration];
-                if (auto field = fields.find(call.name.text); field != fields.end()) {
-                    visible(decl.syntax.file, decl.syntax.fields[field->second].isPublic, call.name);
-                    refer(call.name, decl.syntax.file, decl.syntax.fields[field->second].name.span);
-                    info.target = field->second;
-                    return invoke(decl.fields[info.target]);
+                if (owner.kind == Type::Record) {
+                    const auto& decl = module.aggregates[owner.id];
+                    const auto& fields = symbols.fields[decl.declaration];
+                    if (auto field = fields.find(call.name.text); field != fields.end()) {
+                        visible(decl.syntax.file, decl.syntax.fields[field->second].isPublic, call.name);
+                        refer(call.name, decl.syntax.file, decl.syntax.fields[field->second].name.span);
+                        info.target = field->second;
+                        return invoke(decl.fields[info.target]);
+                    }
+                    if (symbols.properties[decl.declaration].contains(call.name.text))
+                        throw at(source, call.name.span, "LYT0018", "只读属性不使用调用括号：" + call.name.text);
+                    staticMember = symbols.staticMethods[decl.declaration].contains(call.name.text);
                 }
-                const auto& methods = symbols.methods[decl.declaration];
+                const auto& methods = symbols.instanceMethods(owner);
                 if (auto member = methods.find(call.name.text); member != methods.end()) {
                     auto candidates = symbols.visibleCandidates(member->second, source);
                     if (!candidates.empty()) return declaredCall(selectOverload(id, call, expected, candidates, ownerTypes), id, call, expected, ownerTypes);
                     privateMember = true;
                 }
-                staticMember = symbols.staticMethods[decl.declaration].contains(call.name.text);
             }
             if (call.name.text == "equals" || call.name.text == "hashCode") {
                 if (!privateMember && !staticMember) return valueMember(call.name.text == "equals" ? ValueOperation::Equal : ValueOperation::Hash);
@@ -3307,15 +3386,20 @@ CheckedModule check(Module module, const std::vector<Source>& sources, bool requ
         throw at(sources[use.file], use.name.span, "LYM0001", "声明前缀未展开：" + use.name.text);
     }
     CheckedModule checked{};
-    Symbols symbols{checked, sources, {}, {}, {}, {}, {}, {}};
+    Symbols symbols{checked, sources, {}, {}, {}, {}, {}, {}, {}, {}};
     auto expose = [&](Type type, const Source& source, Span site) {
         if (auto hidden = hiddenType(checked, type)) throw at(source, site, "LYN0003", "公开签名不能暴露模块私有类型：" + typeName(checked, *hidden));
     };
-    auto exposeBounds = [&](const auto& syntax) {
+    auto exposeBounds = [&](const auto& syntax, std::span<const Type> variables) {
         for (const auto& bound : syntax.bounds) {
             if (valueConstraint(bound.trait.text)) continue;
             const auto& trait = *std::ranges::find(module.traits, bound.trait.text, [](const Trait& item) { return item.name.text; });
             if (!trait.isPublic) throw at(sources[syntax.file], bound.trait.span, "LYN0003", "公开签名不能暴露模块私有约束：" + bound.trait.text);
+            for (const auto& binding : bound.bindings) {
+                auto type = symbols.resolveWith(typeForm(binding.type.text), sources[syntax.file], binding.type.span, syntax.typeParameters,
+                    [&](auto slot) { return variables[slot]; }).value();
+                expose(type, sources[syntax.file], binding.type.span);
+            }
         }
     };
     auto reserveType = [&](const auto& decl, Names& names, std::size_t index) {
@@ -3350,6 +3434,8 @@ CheckedModule check(Module module, const std::vector<Source>& sources, bool requ
     }
     symbols.fields.resize(symbols.recordDeclarations.size());
     symbols.methods.resize(symbols.recordDeclarations.size());
+    symbols.properties.resize(symbols.recordDeclarations.size());
+    symbols.enumMethods.resize(symbols.enumDeclarations.size());
     symbols.staticMethods.resize(symbols.recordDeclarations.size());
     symbols.initializers.resize(symbols.recordDeclarations.size());
     symbols.variants.resize(symbols.enumDeclarations.size());
@@ -3381,11 +3467,6 @@ CheckedModule check(Module module, const std::vector<Source>& sources, bool requ
         symbols.traitNames.emplace(trait.name.text, checked.traits.size());
         checked.traits.push_back(trait);
     }
-    for (const auto& alias : symbols.aliasDeclarations) {
-        const auto& source = sources[alias.file];
-        auto target = symbols.resolve(source, alias.target);
-        if (alias.isPublic) expose(target, source, alias.target.span);
-    }
     auto typeVariables = [&](const auto& syntax) {
         std::set<std::string> seen;
         std::vector<Type> variables;
@@ -3394,9 +3475,28 @@ CheckedModule check(Module module, const std::vector<Source>& sources, bool requ
             variables.emplace_back(Type::Variable, checked.variableNames.size());
             checked.variableNames.push_back(parameter.text);
         }
-        for (const auto& bound : syntax.bounds) symbols.contracts.bind(variables[bound.parameter], bound.trait, sources[syntax.file]);
+        if constexpr (requires { syntax.bounds; }) {
+            const auto& source = sources[syntax.file];
+            for (const auto& bound : syntax.bounds) {
+                auto variable = variables[bound.parameter];
+                symbols.contracts.bind(variable, bound.trait, source);
+                for (const auto& binding : bound.bindings) {
+                    if (valueConstraint(bound.trait.text) || !std::ranges::contains(symbols.contracts.declaration(bound.trait.text).associated, binding.member.text, &Identifier::text))
+                        throw at(source, binding.member.span, "LYG0007", "约束没有此关联类型：" + binding.member.text);
+                    symbols.boundAssociations[{variable, binding.member.text}].push_back({syntax.file, binding.type, syntax.typeParameters, variables});
+                }
+            }
+            for (const auto& bound : syntax.bounds) for (const auto& binding : bound.bindings)
+                symbols.projectionType(variables[bound.parameter], binding.member.text, source, binding.member.span);
+        }
         return variables;
     };
+    for (const auto& alias : symbols.aliasDeclarations) {
+        const auto& source = sources[alias.file];
+        auto variables = typeVariables(alias);
+        auto target = symbols.resolveAlias(alias, variables, source, alias.target.span).value();
+        if (alias.isPublic) expose(target, source, alias.target.span);
+    }
     for (std::size_t id = 0; id < symbols.recordDeclarations.size(); ++id) {
         const auto& syntax = symbols.recordDeclarations[id];
         const auto& source = sources[syntax.file];
@@ -3413,7 +3513,7 @@ CheckedModule check(Module module, const std::vector<Source>& sources, bool requ
             if (syntax.isPublic && member.isPublic) expose(resolved, source, member.type.span);
         }
         if (syntax.isPublic) {
-            exposeBounds(syntax);
+            exposeBounds(syntax, checked.aggregates[type.id].arguments);
             for (std::size_t slot = 0; slot < syntax.fields.size(); ++slot) if (syntax.fields[slot].isPublic)
                 expose(checked.aggregates[type.id].fields[slot], source, syntax.fields[slot].type.span);
         }
@@ -3421,7 +3521,7 @@ CheckedModule check(Module module, const std::vector<Source>& sources, bool requ
     for (const auto& trait : module.traits) {
         const auto& source = sources[trait.file];
         Type owner{Type::Unit};
-        if (!trait.associated.empty()) {
+        if (!trait.associated.empty() || traitUsesSelf(trait)) {
             owner = {Type::Variable, checked.variableNames.size()};
             checked.variableNames.push_back("Self");
             symbols.contracts.bind(owner, trait.name, source);
@@ -3447,7 +3547,7 @@ CheckedModule check(Module module, const std::vector<Source>& sources, bool requ
         }
         auto type = symbols.enumType(id, typeVariables(syntax), source, syntax.name.span);
         if (syntax.isPublic) {
-            exposeBounds(syntax);
+            exposeBounds(syntax, checked.enums[type.id].arguments);
             for (std::size_t index = 0; index < syntax.cases.size(); ++index)
                 for (std::size_t slot = 0; slot < syntax.cases[index].fields.size(); ++slot)
                     expose(checked.enums[type.id].payloads[index][slot], source, syntax.cases[index].fields[slot].type.span);
@@ -3455,7 +3555,7 @@ CheckedModule check(Module module, const std::vector<Source>& sources, bool requ
     }
     for (const auto& group : symbols.extensionDeclarations) {
         const auto& source = sources[group.file];
-        auto form = typeForm(group.receiver.text);
+        auto form = symbols.expandAliases(group.receiver, source);
         std::set<std::string> used;
         auto scan = [&](auto&& self, const TypeForm& nested) -> void {
             if (nested.arguments.empty()) used.insert(nested.name);
@@ -3467,16 +3567,21 @@ CheckedModule check(Module module, const std::vector<Source>& sources, bool requ
         auto variables = typeVariables(group);
         auto receiver = symbols.resolveWith(form, source, group.receiver.span, group.typeParameters, [&](auto slot) { return variables[slot]; }).value();
         if (group.isPublic) {
-            exposeBounds(group);
+            exposeBounds(group, variables);
             expose(receiver, source, group.receiver.span);
         }
     }
-    auto exposeFunction = [&](const CheckedFunction& function) {
+    auto exposeFunction = [&](const CheckedFunction& function, std::span<const Type> variables = {}) {
         const auto& syntax = function.syntax;
         if (!syntax.isPublic || syntax.conversion) return;
-        if (syntax.owner && !symbols.recordDeclarations[symbols.records.at(syntax.owner->text)].isPublic) return;
+        if (syntax.owner) {
+            const auto& name = syntax.owner->text;
+            if (auto item = symbols.enums.find(name); item != symbols.enums.end()) {
+                if (!symbols.enumDeclarations[item->second].isPublic) return;
+            } else if (!symbols.recordDeclarations[symbols.records.at(name)].isPublic) return;
+        }
         const auto& source = sources[syntax.file];
-        exposeBounds(syntax);
+        exposeBounds(syntax, variables);
         expose(function.result, source, syntax.result.span);
         for (std::size_t index = 0; index < function.throwsTypes.size(); ++index)
             expose(function.throwsTypes[index], source, syntax.throwsTypes[index].span);
@@ -3484,34 +3589,41 @@ CheckedModule check(Module module, const std::vector<Source>& sources, bool requ
             expose(function.locals[slot].type, source, syntax.parameters[slot].type.span);
     };
     auto addOverload = [&](std::vector<std::size_t>& candidates, const Function& function, const Source& source) {
-        auto signature = overloadKey(function);
+        auto key = [&](const Function& syntax) { return overloadKey(syntax, [&](const Identifier& annotation) { return symbols.expandAliases(annotation, sources[syntax.file]); }); };
+        auto signature = key(function);
         for (auto index : candidates) {
             const auto& prior = symbols.declaration(symbols.callables[index]);
-            if (overloadKey(prior) == signature) throw at(source, function.name.span, "LYN0002", "函数重载的形参类型重复：" + symbols.declarationSite(prior));
+            if (key(prior) == signature) throw at(source, function.name.span, "LYN0002", "函数重载的形参类型重复：" + symbols.declarationSite(prior));
         }
         candidates.push_back(symbols.callables.size());
     };
     for (std::size_t functionIndex = 0; functionIndex < module.functions.size(); ++functionIndex) {
         auto& function = module.functions[functionIndex];
         const auto& source = sources[function.file];
-        auto owner = function.owner ? std::optional(symbols.records.at(function.owner->text)) : std::nullopt;
+        auto enumOwner = function.owner ? symbols.enums.find(function.owner->text) : symbols.enums.end();
+        auto owner = function.owner && enumOwner == symbols.enums.end() ? std::optional(symbols.records.at(function.owner->text)) : std::nullopt;
         auto group = function.extensionGroup ? std::optional(symbols.extensions.at(function.extensionGroup->text)) : std::nullopt;
         if (function.initializer) {
             if (symbols.initializers[*owner]) throw at(source, function.name.span, "LYN0002", "class 只允许一个 init");
             symbols.initializers[*owner] = symbols.callables.size();
         }
         else if (group) {
-            if (!function.extensionProperty) {
+            if (!function.property) {
                 if (symbols.extensionProperties[*group].contains(function.name.text))
                     throw at(source, function.name.span, "LYN0002", "扩展成员名称重复：" + function.name.text);
                 addOverload(symbols.extensionMethods[*group][function.name.text], function, source);
             }
         }
+        else if (enumOwner != symbols.enums.end()) {
+            addOverload(symbols.enumMethods[enumOwner->second][function.name.text], function, source);
+        }
         else if (owner) {
+            const auto& name = function.name.text;
             auto& names = function.hasReceiver ? symbols.methods[*owner] : symbols.staticMethods[*owner];
-            if (function.hasReceiver && symbols.fields[*owner].contains(function.name.text))
-                throw at(source, function.name.span, "LYN0002", "函数名已声明：" + function.name.text);
-            addOverload(names[function.name.text], function, source);
+            if (function.hasReceiver && (symbols.fields[*owner].contains(name) || symbols.properties[*owner].contains(name) || (function.property && names.contains(name))))
+                throw at(source, function.name.span, "LYN0002", "实例成员名已声明：" + name);
+            if (function.property) symbols.properties[*owner].emplace(name, symbols.callables.size());
+            else addOverload(names[name], function, source);
         } else {
             const auto& name = function.name.text;
             if (symbols.records.contains(name) || symbols.enums.contains(name) || symbols.aliases.contains(name) || symbols.exceptionTypes.contains(name) || name == "print" || name == "gcCollect")
@@ -3523,7 +3635,7 @@ CheckedModule check(Module module, const std::vector<Source>& sources, bool requ
             addOverload(candidates, function, source);
         }
         if (!function.typeParameters.empty()) {
-            if (!owner && !group && requireEntry && function.name.text == "main") throw at(source, function.name.span, "LYG0001", "main 不能声明类型形参");
+            if (!function.owner && !group && requireEntry && function.name.text == "main") throw at(source, function.name.span, "LYG0001", "main 不能声明类型形参");
             auto variables = typeVariables(function);
             symbols.functionCallables[functionIndex] = symbols.callables.size();
             symbols.callables.push_back({0, std::move(function), std::move(variables)});
@@ -3532,7 +3644,7 @@ CheckedModule check(Module module, const std::vector<Source>& sources, bool requ
         auto concrete = symbols.prepare(std::move(function));
         exposeFunction(concrete);
         const auto& syntax = concrete.syntax;
-        if (!owner && !group && requireEntry && syntax.name.text == "main") {
+        if (!syntax.owner && !group && requireEntry && syntax.name.text == "main") {
             if (!syntax.parameters.empty()) throw at(source, syntax.name.span, "LYT0002", "main 不能接收形参");
             if (syntax.isAsync && concrete.result != Type::Unit) {
                 auto expected = symbols.sum(Type::Result, Type::Unit, Type::String);
@@ -3577,7 +3689,7 @@ CheckedModule check(Module module, const std::vector<Source>& sources, bool requ
         auto syntax = *callable.generic;
         syntax.result = symbols.resultAnnotation(callable, sources[syntax.file], syntax.name.span);
         auto body = symbols.prepare(std::move(syntax), callable.variables);
-        exposeFunction(body);
+        exposeFunction(body, callable.variables);
         Checker{body, sources[body.syntax.file], checked, symbols, {}, callable.variables}.run();
         rememberContracts(body);
         rememberReferences(body);

@@ -191,20 +191,26 @@ struct Linker {
             for (const auto& [alias, symbol] : scopeOf(file)) if (symbol.imported && symbol.kind == SymbolKind::Extension) groups.insert(symbol.name);
             syntax.importedExtensions[file].assign(groups.begin(), groups.end());
         }
+        auto renameBounds = [&](const auto& declaration, auto& bounds) {
+            for (auto& bound : bounds) {
+                renameTypeIn(declaration.file, bound.trait);
+                for (auto& binding : bound.bindings) renameTypeIn(declaration.file, binding.type, declaration.typeParameters);
+            }
+        };
         for (auto& extension : syntax.extensions) {
             renameTypeIn(extension.file, extension.receiver, extension.typeParameters);
-            for (auto& bound : extension.bounds) renameTypeIn(extension.file, bound.trait);
+            renameBounds(extension, extension.bounds);
         }
         for (auto& record : syntax.aggregates) {
-            for (auto& bound : record.bounds) renameTypeIn(record.file, bound.trait);
+            renameBounds(record, record.bounds);
             for (auto& field : record.fields) renameTypeIn(record.file, field.type, record.typeParameters);
             for (auto& member : record.associated) renameTypeIn(record.file, member.type, record.typeParameters);
         }
         for (auto& item : syntax.enums) {
-            for (auto& bound : item.bounds) renameTypeIn(item.file, bound.trait);
+            renameBounds(item, item.bounds);
             for (auto& entry : item.cases) for (auto& field : entry.fields) renameTypeIn(item.file, field.type, item.typeParameters);
         }
-        for (auto& alias : syntax.aliases) renameTypeIn(alias.file, alias.target);
+        for (auto& alias : syntax.aliases) renameTypeIn(alias.file, alias.target, alias.typeParameters);
         for (auto& trait : syntax.traits) for (auto& method : trait.methods) {
             renameTypeIn(trait.file, method.result, trait.associated);
             for (auto& parameter : method.parameters) renameTypeIn(trait.file, parameter.type, trait.associated);
@@ -219,7 +225,7 @@ struct Linker {
             };
             if (fn.owner) rename(*fn.owner);
             if (fn.extensionGroup) rename(*fn.extensionGroup);
-            for (auto& bound : fn.bounds) rename(bound.trait);
+            renameBounds(fn, fn.bounds);
             if (!fn.result.text.empty()) renameType(fn.result);
             for (auto& type : fn.throwsTypes) renameType(type);
             for (auto& param : fn.parameters) renameType(param.type);
@@ -306,7 +312,10 @@ struct DeclarationTypes {
                 for (const auto& part : use.path) text(part.text);
             }
         }
-        for (const auto& [name, alias] : aliases) { text("alias"); text(name); text(alias.target.text); }
+        for (const auto& [name, alias] : aliases) {
+            text("alias"); text(name); text(alias.target.text); text(std::to_string(alias.typeParameters.size()));
+            for (const auto& parameter : alias.typeParameters) text(parameter.text);
+        }
         for (const auto& [name, shape] : shapes) {
             text("shape"); text(name); text(std::to_string(shape.arity)); text(shape.trait ? "trait" : "value");
             for (const auto& member : shape.members) text(member);
@@ -318,7 +327,8 @@ struct DeclarationTypes {
     MacroType resolve(std::size_t file, const Identifier& annotation, std::span<const Identifier> parameters) const {
         std::vector<std::string> active;
         std::size_t visited = 0;
-        auto visit = [&](auto&& self, const TypeForm& form, std::size_t from, Span span, std::span<const Identifier> generics, unsigned depth) -> MacroType {
+        using Bindings = std::map<std::string, MacroType>;
+        auto visit = [&](auto&& self, const TypeForm& form, std::size_t from, Span span, const Bindings& generics, unsigned depth) -> MacroType {
             const auto& source = linker.sources[from];
             if (depth >= 128 || ++visited > 4096) throw at(source, span, "LYM0002", "声明类型查询超过嵌套或节点预算");
             auto make = [&](std::string kind, std::string name, std::string module = {}) {
@@ -332,7 +342,7 @@ struct DeclarationTypes {
             if (name.starts_with("$bind:")) return make("binding", name.substr(6));
             const bool dynamic = name.starts_with("$dyn:");
             auto lookup = dynamic ? name.substr(5) : name;
-            if (!dynamic && form.arguments.empty() && std::ranges::find(generics, name, &Identifier::text) != generics.end()) return make("parameter", name);
+            if (!dynamic && form.arguments.empty()) if (auto parameter = generics.find(name); parameter != generics.end()) return parameter->second;
             const auto& scope = linker.spaces.at(source.moduleId);
             std::optional<Symbol> symbol;
             if (auto found = scope.definitions.find(lookup); found != scope.definitions.end()) symbol = found->second;
@@ -342,11 +352,15 @@ struct DeclarationTypes {
             }
             if (symbol && symbol->kind == SymbolKind::Type) {
                 auto separator = symbol->name.rfind("::");
-                if (!dynamic && form.arguments.empty()) if (auto alias = aliases.find(symbol->name); alias != aliases.end()) {
+                if (!dynamic) if (auto alias = aliases.find(symbol->name); alias != aliases.end()) {
+                    const auto& target = alias->second;
+                    if (form.arguments.size() != target.typeParameters.size()) throw at(source, span, "LYT0003", "类型别名的类型实参数量不符：" + lookup);
+                    Bindings mapped;
+                    for (std::size_t slot = 0; slot < form.arguments.size(); ++slot)
+                        mapped.emplace(target.typeParameters[slot].text, self(self, form.arguments[slot], from, span, generics, depth + 1));
                     if (std::ranges::contains(active, symbol->name)) throw at(source, span, "LYT0003", "透明类型别名形成循环：" + lookup);
                     active.push_back(symbol->name);
-                    const auto& target = alias->second;
-                    auto result = self(self, typeForm(target.target.text), target.file, target.target.span, std::span<const Identifier>{}, depth + 1);
+                    auto result = self(self, typeForm(target.target.text), target.file, target.target.span, mapped, depth + 1);
                     active.pop_back();
                     return result;
                 }
@@ -375,7 +389,9 @@ struct DeclarationTypes {
             }
             throw at(source, span, "LYT0003", "找不到类型或类型实参数量不符：" + lookup);
         };
-        return visit(visit, typeForm(annotation.text), file, annotation.span, parameters, 0);
+        Bindings generics;
+        for (const auto& param : parameters) generics.emplace(param.text, MacroType{"parameter", param.text, {}});
+        return visit(visit, typeForm(annotation.text), file, annotation.span, generics, 0);
     }
 };
 

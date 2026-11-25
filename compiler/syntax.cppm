@@ -101,7 +101,8 @@ struct Expr {
 };
 
 struct Parameter { Identifier name, type; bool variadic{}; std::optional<ExprId> defaultValue{}; std::vector<Attribute> attributes{}; };
-struct Bound { std::size_t parameter; Identifier trait; };
+struct AssociatedBinding { Identifier member, type; };
+struct Bound { std::size_t parameter; Identifier trait; std::vector<AssociatedBinding> bindings{}; };
 struct ExtensionProperty { Identifier name, type; std::size_t getter; };
 struct Extension { std::size_t file; Identifier name, receiver; bool isPublic; std::vector<Identifier> typeParameters{}; std::vector<Bound> bounds{}; std::vector<ExtensionProperty> properties{}; };
 struct TraitMethod { Identifier name; std::vector<Parameter> parameters; Identifier result; bool asynchronous; };
@@ -125,7 +126,7 @@ struct Function {
     bool hasReceiver{};
     std::optional<Identifier> extensionGroup{};
     ConstKind constant{};
-    bool extensionProperty{};
+    bool property{};
     std::vector<Identifier> throwsTypes{};
 };
 
@@ -138,7 +139,18 @@ struct EnumField { std::optional<Identifier> name; Identifier type; };
 struct EnumCase { Identifier name; std::vector<EnumField> fields; };
 struct Enumeration { std::size_t file; Identifier name; std::vector<EnumCase> cases; bool isPublic; std::vector<Identifier> typeParameters{}; std::vector<Bound> bounds{}; Span span{}; };
 struct ExceptionType { std::size_t file; Identifier name; bool isPublic; };
-struct TypeAlias { std::size_t file; Identifier name, target; bool isPublic; };
+struct TypeAlias { std::size_t file; Identifier name, target; bool isPublic; std::vector<Identifier> typeParameters{}; };
+Identifier nominalAnnotation(const auto& declaration) {
+    auto result = declaration.name;
+    if (declaration.typeParameters.empty()) return result;
+    result.text += '<';
+    for (const auto& parameter : declaration.typeParameters) {
+        if (!result.text.ends_with('<')) result.text += ',';
+        result.text += parameter.text;
+    }
+    result.text += '>';
+    return result;
+}
 struct Import { std::size_t file; bool isPublic; std::vector<Identifier> path; Identifier alias; };
 enum class ExpansionTarget { Function, Aggregate, Enumeration };
 struct Expansion { std::size_t file; Identifier name; std::optional<Identifier> argument; bool decorator; ExpansionTarget kind; std::size_t target; std::vector<Identifier> exports{}; };
