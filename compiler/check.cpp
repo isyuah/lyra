@@ -192,12 +192,15 @@ std::vector<EditorSymbol> editorBuiltins(bool types, bool constraints) {
 
 namespace {
 
+struct BlockedAnalysis {};
+
 struct Callable {
     std::size_t target;
     std::optional<Function> generic;
     std::vector<Type> variables;
     mutable std::optional<Identifier> inferredResult{};
     mutable bool inferring{};
+    mutable bool failedInference{};
 };
 
 struct OverloadKey {
@@ -337,6 +340,39 @@ struct Symbols {
     std::vector<std::string> resolvingAliases{};
     std::function<void(std::size_t)> checkGeneric{};
     EditorIndex* editor{};
+    AnalysisDiagnostics* diagnostics{};
+
+    std::optional<SourceAnchor> typeDeclaration(Type type) const {
+        auto anchor = [](const auto& syntax) -> std::optional<SourceAnchor> {
+            if (syntax.name.span.begin == syntax.name.span.end) return {};
+            return SourceAnchor{syntax.file, syntax.name.span};
+        };
+        if (type.kind == Type::Record) return anchor(module.aggregates[type.id].syntax);
+        if (type.kind == Type::Enum) return anchor(module.enums[type.id].syntax);
+        if (type.kind == Type::Exception && type.id >= firstDeclaredException) return anchor(module.exceptions[type.id - firstDeclaredException]);
+        if (type.kind == Type::Dyn) return anchor(module.traits[module.dynamicTypes[type.id].trait]);
+        return {};
+    }
+
+    void indexBinding(std::size_t file, const Identifier& name, EditorKind kind, std::optional<Type> type = {}, unsigned modifiers = 0) const {
+        if (!editor || editor->probe || name.span.begin == name.span.end || name.text == "_") return;
+        auto definition = type ? typeDeclaration(*type) : std::nullopt;
+        editor->bindings.try_emplace({file, name.span}, EditorBinding{kind, definition, modifiers});
+    }
+
+    void indexSignature(const CheckedFunction& fn) const {
+        if (!editor || editor->probe) return;
+        const auto& syntax = fn.syntax;
+        if (!syntax.initializer && syntax.name.text.contains('$')) return;
+        auto kind = syntax.constant == ConstKind::Value ? EditorKind::Constant : syntax.initializer ? EditorKind::Constructor :
+            syntax.property ? EditorKind::Property : syntax.owner || syntax.extensionGroup ? EditorKind::Method : EditorKind::Function;
+        unsigned modifiers = syntax.isAsync ? AsyncFunction : 0u;
+        if (syntax.owner && !syntax.hasReceiver && !syntax.initializer) modifiers |= StaticMember;
+        if (syntax.constant == ConstKind::Value || syntax.property) modifiers |= Readonly;
+        indexBinding(syntax.file, syntax.name, kind, fn.result, modifiers);
+        for (auto slot = static_cast<std::size_t>(syntax.hasReceiver); slot < syntax.parameters.size(); ++slot)
+            indexBinding(syntax.file, syntax.parameters[slot].name, EditorKind::Parameter, fn.locals[slot].type, Readonly);
+    }
 
     struct TypeTrial {
         Symbols& symbols;
@@ -346,8 +382,10 @@ struct Symbols {
             deferredPatterns = symbols.module.deferredPatternChecks.size(), dynamicTypes = symbols.module.dynamicTypes.size();
         unsigned expanding = symbols.expandingNominal;
         std::size_t nominal = symbols.nominalChecks.size(), nextNominal = symbols.nextNominalCheck;
+        bool committed{};
 
         ~TypeTrial() {
+            if (committed) return;
             if (symbols.module.aggregates.size() != aggregates) {
                 std::erase_if(symbols.recordInstances, [&](const auto& entry) { return entry.second.id >= aggregates; });
                 symbols.module.aggregates.resize(aggregates);
@@ -368,6 +406,33 @@ struct Symbols {
             symbols.module.projections.resize(projections);
             symbols.module.dynamicTypes.resize(dynamicTypes);
             symbols.module.deferredPatternChecks.resize(deferredPatterns);
+        }
+    };
+
+    struct BodyTrial {
+        Symbols& symbols;
+        TypeTrial types{symbols};
+        std::size_t functions = symbols.module.functions.size(), coverage = symbols.module.matchCoverage.size(),
+            constants = symbols.module.blockConstants.size(), warnings = symbols.module.warnings.size();
+
+        ~BodyTrial() {
+            if (types.committed) return;
+            auto& module = symbols.module;
+            std::erase_if(symbols.builtinImplementations, [&](const auto& entry) { return entry.second >= functions; });
+            if (module.functions.size() != functions) {
+                std::erase_if(symbols.specializations, [&](const auto& entry) { return entry.second >= functions; });
+                for (auto& aggregate : module.aggregates)
+                    for (auto& target : aggregate.defaultFunctions) if (target && *target >= functions) target.reset();
+                module.functions.resize(functions);
+            }
+            std::erase_if(module.valueOverrides, [&](const auto& entry) {
+                auto type = entry.first.first;
+                return entry.second >= functions || (type.kind == Type::Record && type.id >= types.aggregates) ||
+                    (type.kind == Type::Enum && type.id >= types.enums);
+            });
+            module.matchCoverage.resize(coverage);
+            module.blockConstants.resize(constants);
+            module.warnings.resize(warnings);
         }
     };
 
@@ -1197,6 +1262,7 @@ struct Checker {
     std::optional<std::size_t> functionIndex{};
     EditorIndex* editor{};
     std::size_t indexedReferences{};
+    std::size_t indexedLocals{};
 
     Checker trial(CheckedFunction& body) const {
         Checker trial{body, source, module, symbols, scopes, variables, loops, workers,
@@ -1241,16 +1307,17 @@ struct Checker {
         return mark ? "$macro" + std::to_string(mark) + ":" + name.text : name.text;
     }
 
-    void declare(const Identifier& name, std::size_t slot) {
+    void declare(const Identifier& name, std::size_t slot, bool parameter = false) {
         if (!scopes.back().emplace(localKey(name), slot).second) throw at(source, name.span, "LYN0002", "名称已在此作用域声明：" + name.text);
         if (!name.text.starts_with('$')) {
             fn.locals[slot].declaration = name.span;
             fn.locals[slot].name = name.text;
+            fn.locals[slot].parameter = parameter;
         }
     }
 
-    void refer(const Identifier& name, std::size_t file, Span span) {
-        if (span.begin != span.end && !name.text.starts_with('$')) fn.references.push_back({{fn.syntax.file, name.span}, {file, span}, name.renameTarget});
+    void refer(const Identifier& name, std::size_t file, Span span, std::optional<EditorKind> kind = {}) {
+        if (span.begin != span.end && !name.text.starts_with('$')) fn.references.push_back({{fn.syntax.file, name.span}, {file, span}, name.renameTarget, kind});
     }
 
     void referLocal(const Identifier& name, std::size_t slot) {
@@ -1258,10 +1325,15 @@ struct Checker {
     }
 
     void indexReferences() {
-        if (!editor || editor->probe || indexedReferences == fn.references.size()) return;
+        if (!editor || editor->probe) return;
         auto references = std::span(fn.references).subspan(indexedReferences);
         editor->references.insert(editor->references.end(), references.begin(), references.end());
         indexedReferences = fn.references.size();
+        for (const auto& local : std::span(fn.locals).subspan(indexedLocals)) if (local.declaration) {
+            auto kind = local.parameter ? EditorKind::Parameter : local.constant ? EditorKind::Constant : EditorKind::Variable;
+            symbols.indexBinding(fn.syntax.file, {local.name, *local.declaration}, kind, local.type, local.writable ? 0u : Readonly);
+        }
+        indexedLocals = fn.locals.size();
     }
 
     void indexType(Span span, std::string_view name, Type type) {
@@ -1373,7 +1445,7 @@ struct Checker {
 
     void referNamespace(const Identifier& name) {
         const auto anchor = *name.moduleAlias;
-        refer(name, anchor.file, anchor.span);
+        refer(name, anchor.file, anchor.span, EditorKind::Module);
     }
 
     void requireExport(const Identifier& alias, const Identifier& member) {
@@ -1434,7 +1506,7 @@ struct Checker {
 
     void enterFunction() {
         scopes.emplace_back();
-        for (std::size_t index = fn.syntax.hasReceiver; index < fn.syntax.parameters.size(); ++index) declare(fn.syntax.parameters[index].name, index);
+        for (std::size_t index = fn.syntax.hasReceiver; index < fn.syntax.parameters.size(); ++index) declare(fn.syntax.parameters[index].name, index, true);
         if (fn.syntax.foreignSymbol) return;
         if (fn.syntax.hasReceiver) receiverSlot = 0;
         if (fn.syntax.initializer) {
@@ -2352,7 +2424,7 @@ struct Checker {
             parameters.push_back(*type);
             auto slot = fn.locals.size();
             fn.locals.push_back({*type, false, id});
-            declare(name, slot);
+            declare(name, slot, true);
             fn.expressions[id].argumentSlots.push_back(slot);
         }
         if (!result) result = probeJoin(lambda.body, true).value_or(Type::Never);
@@ -3052,11 +3124,14 @@ struct Checker {
         if (best.size() == 1) return best.front()->declaration;
         auto error = at(source, site, "LYT0019", "调用存在重载歧义：" + call.name.text);
         for (const auto* match : best) {
-            error.message += "\n  " + symbols.signature(match->declaration, call.name.text);
+            auto signature = symbols.signature(match->declaration, call.name.text);
+            error.message += "\n  " + signature;
             std::string conversions;
             for (std::size_t index = 0; index < match->arguments.size(); ++index) if (match->arguments[index].kind != MatchKind::Exact)
                 conversions += (conversions.empty() ? "" : "、") + std::to_string(index + 1);
             if (!conversions.empty()) error.message += "，需适配的实参：" + conversions;
+            const auto& declaration = symbols.declaration(symbols.callables[match->declaration]);
+            error.notes.push_back({symbols.sources[declaration.file].userSite(declaration.name.span), std::move(signature)});
         }
         throw error;
     }
@@ -3727,7 +3802,10 @@ struct Checker {
         if (values && (block.statements.empty() || block.statements.back().semicolon)) values->types.emplace_back(Type::Unit, site);
         if (expected && *expected != type) {
             auto error = mismatch(module, source, site, *expected, type);
-            if (semiFix) error.hint = "去掉末尾分号，让最后的表达式成为返回值。";
+            if (semiFix) {
+                error.hint = "去掉末尾分号，让最后的表达式成为返回值。";
+                error.removeTailSemicolon = !error.generated;
+            }
             throw error;
         }
         return discard ? Type::Unit : type;
@@ -3880,16 +3958,30 @@ struct Checker {
 const Identifier& Symbols::resultAnnotation(const Callable& candidate, const Source& use, Span site) {
     const auto& syntax = declaration(candidate);
     if (!syntax.result.text.empty()) return syntax.result;
+    if (diagnostics && (syntax.incompleteBody || candidate.failedInference)) throw BlockedAnalysis{};
     if (syntax.pendingExpansion) throw at(use, site, "LYM0004", "编译期阶段环：宏依赖的函数需要展开后才能推断返回类型：" + syntax.name.text);
     if (candidate.inferredResult) return *candidate.inferredResult;
     if (candidate.inferring) throw at(use, site, "LYT0020", "递归函数需要标注返回类型：" + declarationSite(syntax));
     candidate.inferring = true;
+    std::optional<TypeTrial> transaction;
+    if (diagnostics) transaction.emplace(*this);
     try {
         auto body = prepare(syntax, candidate.variables);
         auto checker = Checker{body, sources[syntax.file], module, *this, {}, candidate.variables};
         if (editor && editor->probe) checker.editor = editor;
         auto type = checker.inferResult();
         candidate.inferredResult = Identifier{typeName(module, type, true), syntax.result.span};
+        if (transaction) transaction->committed = true;
+    } catch (const Diagnostic& error) {
+        candidate.inferring = false;
+        if (!diagnostics) throw;
+        candidate.failedInference = true;
+        diagnostics->add(error);
+        throw BlockedAnalysis{};
+    } catch (const BlockedAnalysis&) {
+        candidate.inferring = false;
+        candidate.failedInference = true;
+        throw;
     } catch (...) {
         candidate.inferring = false;
         throw;
@@ -3900,14 +3992,18 @@ const Identifier& Symbols::resultAnnotation(const Callable& candidate, const Sou
 
 }
 
-CheckedModule check(Module module, const std::vector<Source>& sources, bool requireEntry, MacroExecution* macro, EditorIndex* editor) {
+static CheckedModule checkProgram(Module module, const std::vector<Source>& sources, bool requireEntry, MacroExecution* macro, EditorIndex* editor,
+    AnalysisDiagnostics* diagnostics) {
     if (!module.expansions.empty()) {
         auto& use = module.expansions.front();
         throw at(sources[use.file], use.name.span, "LYM0001", "声明前缀未展开：" + use.name.text);
     }
     CheckedModule checked{};
+    if (!diagnostics) for (const auto& fn : module.functions)
+        if (fn.incompleteBody) throw at(sources[fn.file], fn.name.span, "LYM0004", "编译期依赖的函数体未完整解析");
     Symbols symbols{checked, sources, {}, {}, {}, {}, {}, {}, {}, {}};
     symbols.editor = editor;
+    symbols.diagnostics = diagnostics;
     auto expose = [&](Type type, const Source& source, Span site) {
         if (auto hidden = hiddenType(checked, type)) throw at(source, site, "LYN0003", "公开签名不能暴露模块私有类型：" + typeName(checked, *hidden));
     };
@@ -3954,6 +4050,8 @@ CheckedModule check(Module module, const std::vector<Source>& sources, bool requ
     for (auto& decl : module.exceptions) {
         reserveType(decl, symbols.exceptionTypes, checked.exceptions.size());
         checked.exceptions.push_back(std::move(decl));
+        const auto& syntax = checked.exceptions.back();
+        symbols.indexBinding(syntax.file, syntax.name, EditorKind::Class, Type{Type::Exception, checked.exceptions.size() - 1 + firstDeclaredException});
     }
     for (auto& decl : module.aliases) {
         if (symbols.records.contains(decl.name.text) || symbols.enums.contains(decl.name.text) || symbols.exceptionTypes.contains(decl.name.text))
@@ -3995,6 +4093,7 @@ CheckedModule check(Module module, const std::vector<Source>& sources, bool requ
         symbols.contracts.declare(trait, source);
         symbols.traitNames.emplace(trait.name.text, checked.traits.size());
         checked.traits.push_back(trait);
+        symbols.indexBinding(trait.file, trait.name, EditorKind::Trait);
     }
     auto typeVariables = [&](const auto& syntax) {
         std::set<std::string> seen;
@@ -4003,6 +4102,7 @@ CheckedModule check(Module module, const std::vector<Source>& sources, bool requ
             if (!seen.insert(parameter.text).second) throw at(sources[syntax.file], parameter.span, "LYN0002", "类型形参重复：" + parameter.text);
             variables.emplace_back(Type::Variable, checked.variableNames.size());
             checked.variableNames.push_back(parameter.text);
+            symbols.indexBinding(syntax.file, parameter, EditorKind::TypeParameter);
         }
         if constexpr (requires { syntax.bounds; }) {
             const auto& source = sources[syntax.file];
@@ -4030,6 +4130,7 @@ CheckedModule check(Module module, const std::vector<Source>& sources, bool requ
         auto variables = typeVariables(alias);
         auto target = symbols.resolveAlias(alias, variables, source, alias.target.span).value();
         if (alias.isPublic) expose(target, source, alias.target.span);
+        symbols.indexBinding(alias.file, alias.name, EditorKind::TypeAlias, target);
     }
     for (std::size_t id = 0; id < symbols.recordDeclarations.size(); ++id) {
         const auto& syntax = symbols.recordDeclarations[id];
@@ -4042,9 +4143,15 @@ CheckedModule check(Module module, const std::vector<Source>& sources, bool requ
             if (!symbols.fields[id].emplace(field.name.text, slot).second) throw at(source, field.name.span, "LYN0002", "字段重复：" + field.name.text);
         }
         auto type = symbols.recordType(id, typeVariables(syntax), source, syntax.name.span);
+        symbols.indexBinding(syntax.file, syntax.name, syntax.reference ? EditorKind::Class : EditorKind::Struct, type);
+        for (std::size_t slot = 0; slot < syntax.fields.size(); ++slot) {
+            const auto& field = syntax.fields[slot];
+            symbols.indexBinding(syntax.file, field.name, EditorKind::Field, checked.aggregates[type.id].fields[slot], field.writable ? 0u : Readonly);
+        }
         for (const auto& member : syntax.associated) {
             auto resolved = symbols.projectionType(type, member.name.text, source, member.type.span);
             if (syntax.isPublic && member.isPublic) expose(resolved, source, member.type.span);
+            symbols.indexBinding(syntax.file, member.name, EditorKind::TypeAlias, resolved);
         }
         if (syntax.isPublic) {
             exposeBounds(syntax, checked.aggregates[type.id].arguments);
@@ -4054,6 +4161,7 @@ CheckedModule check(Module module, const std::vector<Source>& sources, bool requ
     }
     for (const auto& trait : module.traits) {
         const auto& source = sources[trait.file];
+        for (const auto& item : trait.associated) symbols.indexBinding(trait.file, item, EditorKind::TypeAlias);
         Type owner{Type::Unit};
         if (!trait.associated.empty() || traitUsesSelf(trait)) {
             owner = {Type::Variable, checked.variableNames.size()};
@@ -4062,6 +4170,9 @@ CheckedModule check(Module module, const std::vector<Source>& sources, bool requ
         }
         for (const auto& method : trait.methods) {
             auto shape = symbols.requiredShape(owner, trait, method, source, method.name.span);
+            symbols.indexBinding(trait.file, method.name, EditorKind::Method, shape.result, method.asynchronous ? AsyncFunction : 0u);
+            for (std::size_t slot = 0; slot < method.parameters.size(); ++slot)
+                symbols.indexBinding(trait.file, method.parameters[slot].name, EditorKind::Parameter, shape.parameters[slot], Readonly);
             if (!trait.isPublic) continue;
             expose(shape.result, source, method.result.span);
             for (std::size_t slot = 0; slot < method.parameters.size(); ++slot)
@@ -4080,6 +4191,8 @@ CheckedModule check(Module module, const std::vector<Source>& sources, bool requ
             }
         }
         auto type = symbols.enumType(id, typeVariables(syntax), source, syntax.name.span);
+        symbols.indexBinding(syntax.file, syntax.name, EditorKind::Enum, type);
+        for (const auto& entry : syntax.cases) symbols.indexBinding(syntax.file, entry.name, EditorKind::EnumCase, type);
         if (syntax.isPublic) {
             exposeBounds(syntax, checked.enums[type.id].arguments);
             for (std::size_t index = 0; index < syntax.cases.size(); ++index)
@@ -4100,6 +4213,7 @@ CheckedModule check(Module module, const std::vector<Source>& sources, bool requ
             throw at(source, parameter.span, "LYG0002", "扩展组类型形参必须出现在接收者类型中：" + parameter.text);
         auto variables = typeVariables(group);
         auto receiver = symbols.resolveWith(form, source, group.receiver.span, group.typeParameters, [&](auto slot) { return variables[slot]; }).value();
+        symbols.indexBinding(group.file, group.name, EditorKind::Extension);
         if (group.isPublic) {
             exposeBounds(group, variables);
             expose(receiver, source, group.receiver.span);
@@ -4216,18 +4330,37 @@ CheckedModule check(Module module, const std::vector<Source>& sources, bool requ
     const auto declaredFunctions = checked.functions.size();
     using FunctionSite = std::pair<std::size_t, std::size_t>;
     std::map<FunctionSite, std::vector<FunctionSite>> dependencies;
+    std::set<std::size_t> failedInferences;
     auto rememberCalls = [&](const CheckedFunction& fn) {
         auto& calls = dependencies[{fn.syntax.file, fn.syntax.name.span.begin}];
         for (const auto& call : fn.calls) calls.emplace_back(call.file, call.span.begin);
     };
+    auto analyzeBody = [&](auto&& analyze) -> bool {
+        if (!diagnostics) { analyze(); return true; }
+        if (diagnostics->full()) return false;
+        Symbols::BodyTrial transaction{symbols};
+        try {
+            analyze();
+            transaction.types.committed = true;
+            return true;
+        } catch (const Diagnostic& error) { diagnostics->add(error); }
+        catch (const BlockedAnalysis&) {}
+        return false;
+    };
     if (!macro) for (const auto& callable : symbols.callables) {
         const auto& syntax = symbols.declaration(callable);
         if (!syntax.result.text.empty() || syntax.pendingExpansion) continue;
-        const auto& annotation = symbols.resultAnnotation(callable, sources[syntax.file], syntax.name.span);
-        if (!callable.generic) checked.functions[callable.target].result = symbols.resolve(syntax, annotation, {});
+        if (!analyzeBody([&] {
+            const auto& annotation = symbols.resultAnnotation(callable, sources[syntax.file], syntax.name.span);
+            if (!callable.generic) checked.functions[callable.target].result = symbols.resolve(syntax, annotation, {});
+        })) {
+            callable.failedInference = true;
+            if (!callable.generic) failedInferences.insert(callable.target);
+        }
     }
     if (editor) for (const auto& callable : symbols.callables) {
         const auto& syntax = symbols.declaration(callable);
+        if (!callable.generic) symbols.indexSignature(checked.functions[callable.target]);
         const auto& source = sources[syntax.file];
         auto name = editorSpelling(source, syntax.name);
         auto separator = syntax.name.text.rfind("::");
@@ -4237,13 +4370,14 @@ CheckedModule check(Module module, const std::vector<Source>& sources, bool requ
             editor->descriptions.push_back({{syntax.file, syntax.name.span}, "const " + name + ": " + editorSpelling(source, syntax.result),
                 editorDocumentation(source, syntax.name.span.begin)});
         } else {
-            auto inferred = callable.inferredResult
+            auto inferred = callable.inferredResult && !callable.failedInference
                 ? typeName(checked, symbols.resolve(syntax, *callable.inferredResult, callable.variables)) : std::string{};
             auto signature = symbols.editorSignature(syntax, name, {}, inferred);
             editor->descriptions.push_back({{syntax.file, syntax.name.span}, std::move(signature.label), std::move(signature.documentation)});
         }
     }
     std::set<std::size_t> checkedGenerics;
+    std::set<FunctionSite> failedGenerics;
     auto checkGeneric = [&](std::size_t declaration) {
         auto& callable = symbols.callables[declaration];
         if (!callable.generic || (macro && callable.generic->pendingExpansion) || !checkedGenerics.insert(declaration).second) return;
@@ -4265,6 +4399,7 @@ CheckedModule check(Module module, const std::vector<Source>& sources, bool requ
         syntax.result = symbols.resultAnnotation(callable, sources[syntax.file], syntax.name.span);
         auto body = symbols.prepare(std::move(syntax), callable.variables);
         exposeFunction(body, callable.variables);
+        symbols.indexSignature(body);
         auto checker = Checker{body, sources[body.syntax.file], checked, symbols, {}, callable.variables};
         checker.editor = editor;
         checker.run();
@@ -4273,7 +4408,13 @@ CheckedModule check(Module module, const std::vector<Source>& sources, bool requ
         rememberCalls(body);
     };
     if (macro) symbols.checkGeneric = checkGeneric;
-    else for (std::size_t index = 0; index < symbols.callables.size(); ++index) checkGeneric(index);
+    else for (std::size_t index = 0; index < symbols.callables.size(); ++index) {
+        const auto& callable = symbols.callables[index];
+        if (!callable.generic) continue;
+        const auto& syntax = *callable.generic;
+        if (syntax.incompleteBody || !analyzeBody([&] { checkGeneric(index); }))
+            failedGenerics.emplace(syntax.file, syntax.name.span.begin);
+    }
     auto checkBody = [&](std::size_t index) {
         auto& fn = checked.functions[index];
         if (macro && fn.syntax.result.text.empty() && !fn.syntax.pendingExpansion) {
@@ -4281,17 +4422,30 @@ CheckedModule check(Module module, const std::vector<Source>& sources, bool requ
             const auto& result = symbols.resultAnnotation(callable, sources[fn.syntax.file], fn.syntax.name.span);
             fn.result = symbols.resolve(fn.syntax, result, {});
         }
-        auto checker = Checker{fn, sources[fn.syntax.file], checked, symbols, {}};
-        checker.functionIndex = index;
-        if (index < declaredFunctions) checker.editor = editor;
-        checker.run();
-        if (fn.syntax.result.text.empty()) checker.indexType(fn.syntax.result.span, fn.syntax.name.text, fn.result);
-        rememberCalls(fn);
+        auto visit = [&](CheckedFunction& body) {
+            auto checker = Checker{body, sources[body.syntax.file], checked, symbols, {}};
+            checker.functionIndex = index;
+            if (index < declaredFunctions) checker.editor = editor;
+            checker.run();
+            if (body.syntax.result.text.empty()) checker.indexType(body.syntax.result.span, body.syntax.name.text, body.result);
+            rememberCalls(body);
+        };
+        if (!diagnostics) { visit(fn); return; }
+        if (fn.syntax.incompleteBody || failedInferences.contains(index) || failedGenerics.contains({fn.syntax.file, fn.syntax.name.span.begin})) return;
+        analyzeBody([&] {
+            auto body = fn;
+            visit(body);
+            fn = std::move(body);
+        });
     };
     if (macro) {
         auto entry = symbols.callables[symbols.functionCallables[macro->declaration]].target;
         evaluateMacro(checked, sources, *macro, entry, checkBody);
     } else for (std::size_t index = 0; index < checked.functions.size(); ++index) checkBody(index);
+    if (diagnostics) {
+        diagnostics->warnings = checked.warnings;
+        if (!diagnostics->errors.empty()) return checked;
+    }
     for (const auto& callable : symbols.callables) if (callable.inferredResult) {
         const auto& syntax = symbols.declaration(callable);
         FunctionSite root{syntax.file, syntax.name.span.begin};
@@ -4345,7 +4499,18 @@ CheckedModule check(Module module, const std::vector<Source>& sources, bool requ
     auto duplicates = std::ranges::unique(checked.warnings, {}, warningKey);
     checked.warnings.erase(duplicates.begin(), duplicates.end());
     checked.matchCoverage.clear();
+    if (diagnostics) diagnostics->warnings = std::move(checked.warnings);
     return checked;
+}
+
+CheckedModule check(Module module, const std::vector<Source>& sources, bool requireEntry, MacroExecution* macro, EditorIndex* editor) {
+    return checkProgram(std::move(module), sources, requireEntry, macro, editor, nullptr);
+}
+
+void checkForDiagnostics(Module module, const std::vector<Source>& sources, bool requireEntry, AnalysisDiagnostics& diagnostics, EditorIndex* editor) {
+    try { checkProgram(std::move(module), sources, requireEntry, nullptr, editor, &diagnostics); }
+    catch (const Diagnostic& error) { diagnostics.add(error); }
+    catch (const BlockedAnalysis&) {}
 }
 
 }

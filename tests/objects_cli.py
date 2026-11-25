@@ -193,7 +193,7 @@ fn main(): Unit {
         self.main.write_text('''
 extension View for Item { val label: String get() { "item" } }
 class Item { val value: Int; init() { print(this.label); value = 1 } }
-fn main(): Unit { Item() }
+fn main(): Unit { Item(); }
 ''', encoding='utf-8')
         result = subprocess.run([COMPILER, 'check', self.package, '--diagnostics=json'],
                                 capture_output=True, timeout=10)

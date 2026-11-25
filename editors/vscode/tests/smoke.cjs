@@ -41,6 +41,13 @@ async function checkSmoke() {
     const callPosition = document.positionAt(call + callPrefix.length + 2);
     const definitions = await vscode.commands.executeCommand('vscode.executeDefinitionProvider', source, callPosition);
     assert.ok(definitions.length > 0, 'definition provider did not index parseLine');
+    const outline = await vscode.commands.executeCommand('vscode.executeDocumentSymbolProvider', source);
+    assert.ok(outline.some(item => item.name === 'aggregate') && outline.some(item => item.name === 'main'));
+    const symbols = await vscode.commands.executeCommand('vscode.executeWorkspaceSymbolProvider', 'parseLine');
+    assert.ok(symbols.some(item => item.name === 'parseLine' && item.location.uri.toString() === library.toString()));
+    const field = document.positionAt(document.getText().indexOf('reading.delta') + 2);
+    const types = await vscode.commands.executeCommand('vscode.executeTypeDefinitionProvider', source, field);
+    assert.ok(types.some(item => (item.targetUri ?? item.uri).toString() === library.toString()));
     assert.ok(!vscode.workspace.textDocuments.some(open => open.uri.toString() === library.toString()));
     const originalLibrary = await vscode.workspace.fs.readFile(library);
     const libraryText = new TextDecoder('utf-8', { fatal: true }).decode(originalLibrary);
@@ -113,6 +120,28 @@ async function checkSmoke() {
     }
 }
 
+async function checkManifest() {
+    const [project] = vscode.workspace.workspaceFolders;
+    const uri = vscode.Uri.joinPath(project.uri, 'stats', 'lyra.json5');
+    const document = await vscode.workspace.openTextDocument(uri);
+    assert.equal(document.languageId, 'lyra-manifest');
+    const editor = await vscode.window.showTextDocument(document);
+    const original = await vscode.workspace.fs.readFile(uri);
+    const modified = "{name: 'example/stats', version: '0.1.0', kind: 'l'}";
+    assert.ok(await editor.edit(edit => edit.replace(new vscode.Range(document.positionAt(0), document.positionAt(document.getText().length)), modified)));
+    try {
+        const issues = await waitForDiagnostics(uri, listing => listing.some(item => item.code === 'LYK0001'), 'missing manifest kind diagnostic');
+        assert.equal(document.getText(issues.find(item => item.code === 'LYK0001').range), "'l'");
+        const cursor = document.positionAt(modified.indexOf("'l'") + 2);
+        const result = await vscode.commands.executeCommand('vscode.executeCompletionItemProvider', uri, cursor);
+        assert.ok(result.items.some(item => item.label === 'lib' && item.kind === vscode.CompletionItemKind.EnumMember));
+        assert.deepEqual(await vscode.workspace.fs.readFile(uri), original);
+    } finally {
+        await vscode.commands.executeCommand('workbench.action.files.revert');
+    }
+    await waitForDiagnostics(uri, listing => listing.length === 0, 'manifest diagnostic did not clear after reverting');
+}
+
 async function checkTyping() {
     const source = vscode.Uri.file(process.env.LYRA_SMOKE_HTTP);
     const document = await vscode.workspace.openTextDocument(source);
@@ -182,8 +211,9 @@ async function run() {
     const report = process.env.LYRA_SMOKE_RESULT;
     try {
         await checkSmoke();
+        await checkManifest();
         await checkTyping();
-        await writeFile(report, `PASS VS Code ${vscode.version}: cross-package definitions, module completion and import Quick Fix, Unicode macro diagnostics, signatures and inlay hints\n`);
+        await writeFile(report, `PASS VS Code ${vscode.version}: cross-package navigation and outline, unsaved manifest editing, module completion and import Quick Fix, Unicode macro diagnostics, signatures and inlay hints\n`);
     } catch (error) {
         await writeFile(report, `${error.stack}\n`);
         throw error;

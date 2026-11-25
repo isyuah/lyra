@@ -28,7 +28,7 @@ inline constexpr const char* rangeFieldNames[] = {"start", "end", "inclusive"};
 inline constexpr Type channelClosed{Type::Exception, 1};
 inline constexpr std::size_t firstDeclaredException = channelClosed.id + 1;
 struct ConstantUse { enum Kind { Global, Block, Uninstantiated }; Kind kind; std::size_t index{}; };
-struct Local { Type type; bool writable; std::optional<ExprId> worker{}; bool captured{}; std::optional<Span> declaration{}; std::string name{}; std::optional<ConstantUse> constant{}; };
+struct Local { Type type; bool writable; std::optional<ExprId> worker{}; bool captured{}; std::optional<Span> declaration{}; std::string name{}; std::optional<ConstantUse> constant{}; bool parameter{}; };
 enum class Callee { Function, Constructor, Variant, Print, Collect, Sum, ListAdd, ListSlice, ListRemoveAt, FreezeList, TaskCancel, TaskCancelled, TaskCheckCancellation, AwaitOutcome, Exception, Indirect, ToReal, ToIntegerChecked, ToString, ToBytes, DecodeUtf8, Dynamic, BusinessError, ErrorSuppress, FailureInfo, LocalKey, LocalGet, WithLocal, ExtensionProperty, BoundMethod, ReflectTypeName, ReflectFieldCount, ReflectFieldName, ReflectField, Size, ValueEqual, ValueHash, ChannelCreate, ChannelIterator, ChannelSend, ChannelReceive, ChannelClose, Sleep, PtrAllocate, PtrNull, PtrIsNull, PtrFree, PtrOffset, PtrRead, PtrWrite, CallbackRegister, CallbackContext, CallbackFunction, CallbackClose, CallbackTakeError };
 enum class ValueOperation { Equal, Hash };
 struct PatternSlot { std::size_t local; };
@@ -86,6 +86,8 @@ struct CheckedModule { std::deque<CheckedFunction> functions; std::optional<std:
 
 struct InferredTypeHint { SourceAnchor anchor; std::string type; };
 struct EditorDescription { SourceAnchor anchor; std::string detail, documentation; };
+enum EditorModifier : unsigned { Declaration = 1, Readonly = 2, StaticMember = 4, AsyncFunction = 8 };
+struct EditorBinding { EditorKind kind; std::optional<SourceAnchor> typeDefinition{}; unsigned modifiers{}; };
 struct EditorProbe {
     std::filesystem::path path;
     std::string marker;
@@ -99,6 +101,7 @@ struct EditorIndex {
     std::vector<NameReference> references;
     std::vector<InferredTypeHint> inferredTypes;
     std::vector<EditorDescription> descriptions;
+    std::map<SourceAnchor, EditorBinding> bindings;
     EditorProbe* probe{};
 };
 std::vector<EditorSymbol> editorBuiltins(bool types, bool constraints = false);
@@ -106,4 +109,5 @@ const std::optional<ConstValue>& constantValue(const CheckedModule& module, Cons
 std::string typeName(const CheckedModule& module, Type type, bool canonical = false);
 std::optional<Type> hiddenType(const CheckedModule& module, Type type);
 CheckedModule check(Module module, const std::vector<Source>& sources, bool requireEntry = true, MacroExecution* macro = nullptr, EditorIndex* editor = nullptr);
+void checkForDiagnostics(Module module, const std::vector<Source>& sources, bool requireEntry, AnalysisDiagnostics& diagnostics, EditorIndex* editor = nullptr);
 }

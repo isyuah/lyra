@@ -48,6 +48,62 @@ class PackageTest(unittest.TestCase):
 
 
 class Frontend(PackageTest):
+    def test_check_recovers_across_files_without_cascading_from_a_failed_inference(self):
+        self.main.write_text('''fn broken() { missingValue }
+fn dependent(): Int { broken() }
+fn main(): Unit {}
+''', encoding='utf-8')
+        other = self.src / 'other.ly'
+        other.write_text('''fn syntax(): Int { val incomplete = ; 0 }
+fn callSyntax(): Int { syntax() }
+fn independent(): Int { false }
+''', encoding='utf-8')
+        result = self.cli('check', '--diagnostics=json')
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual([(Path(error['file']).name, error['code'], error['range']['start']['line'])
+                          for error in json.loads(result.stderr)],
+                         [('main.ly', 'LYN0001', 1), ('other.ly', 'LYP0001', 1), ('other.ly', 'LYT0001', 3)])
+        built = self.cli('build', '--diagnostics=json')
+        self.assertEqual(built.returncode, 1)
+        self.assertFalse((self.package / 'build').exists())
+
+    def test_check_lists_overload_declarations_as_notes(self):
+        self.main.write_text('''fn choose(value: Int8): Int { 1 }
+fn choose(value: UInt8): Int { 2 }
+fn main(): Unit { print(choose(1)) }
+''', encoding='utf-8')
+        result = self.cli('check', '--diagnostics=json')
+        self.assertEqual(result.returncode, 1)
+        error, = json.loads(result.stderr)
+        self.assertEqual(error['code'], 'LYT0019')
+        self.assertEqual({(Path(note['file']), note['range']['start']['line']) for note in error['notes']},
+                         {(self.main.resolve(), 1), (self.main.resolve(), 2)})
+
+    def test_check_retains_signature_after_missing_closing_brace(self):
+        self.main.write_text('''fn type(): Unit {}
+fn before(): Unit {
+    type()
+}
+fn broken(): Int {
+    1
+fn independent(): Int { false }
+fn main(): Unit { print(broken()) }
+''', encoding='utf-8')
+        result = self.cli('check', '--diagnostics=json')
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual([error['code'] for error in json.loads(result.stderr)], ['LYP0001', 'LYT0001'])
+
+    def test_check_recovers_qualified_type_errors_in_function_bodies(self):
+        (self.package / 'lyra.json5').write_text('{name:"app",version:"0.1.0"}', encoding='utf-8')
+        self.main.write_text('''import std.time
+fn broken(): Unit { val value: time.Bad = "" }
+fn independent(): Int { false }
+fn main(): Unit { broken() }
+''', encoding='utf-8')
+        result = self.cli('check', '--diagnostics=json')
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual([error['code'] for error in json.loads(result.stderr)], ['LYN0003', 'LYT0001'])
+
     def test_numeric_literals_and_conversions_reject_lossy_contexts(self):
         for declaration, code, fragment in (
             ('fn value(): Int8 { 128 }', 'LYL0002', 'Int8'),

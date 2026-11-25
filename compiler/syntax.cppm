@@ -114,9 +114,9 @@ struct Parameter { Identifier name, type; bool variadic{}; std::optional<ExprId>
 struct AssociatedBinding { Identifier member, type; };
 struct Bound { std::size_t parameter; Identifier trait; std::vector<AssociatedBinding> bindings{}; };
 struct ExtensionProperty { Identifier name, type; std::size_t getter; };
-struct Extension { std::size_t file; Identifier name, receiver; bool isPublic; std::vector<Identifier> typeParameters{}; std::vector<Bound> bounds{}; std::vector<ExtensionProperty> properties{}; };
-struct TraitMethod { Identifier name; std::vector<Parameter> parameters; Identifier result; bool asynchronous; };
-struct Trait { std::size_t file; Identifier name; std::vector<TraitMethod> methods; bool isPublic; std::vector<Identifier> associated{}; };
+struct Extension { std::size_t file; Identifier name, receiver; bool isPublic; std::vector<Identifier> typeParameters{}; std::vector<Bound> bounds{}; std::vector<ExtensionProperty> properties{}; Span span{}; };
+struct TraitMethod { Identifier name; std::vector<Parameter> parameters; Identifier result; bool asynchronous; Span span{}; };
+struct Trait { std::size_t file; Identifier name; std::vector<TraitMethod> methods; bool isPublic; std::vector<Identifier> associated{}; Span span{}; };
 enum class ConstKind { None, Value, Function };
 struct Function {
     std::size_t file;
@@ -140,18 +140,19 @@ struct Function {
     std::vector<Identifier> throwsTypes{};
     std::optional<Span> pendingExpansion{};
     Span header{};
+    bool incompleteBody{};
 };
 
 struct FieldDefault { std::size_t function; bool emptyOption; };
-struct Field { Identifier name, type; bool writable; bool isPublic{}; std::vector<Attribute> attributes{}; std::optional<FieldDefault> defaultValue{}; };
+struct Field { Identifier name, type; bool writable; bool isPublic{}; std::vector<Attribute> attributes{}; std::optional<FieldDefault> defaultValue{}; Span span{}; };
 std::string fieldDefaultName(const std::string& record, const std::string& field) { return record + "$fieldDefault$" + field; }
 struct TypeMember { Identifier name, type; bool isPublic; };
 struct Aggregate { std::size_t file; Identifier name; bool reference; std::vector<Field> fields; bool isPublic{}; std::vector<Identifier> typeParameters{}; std::vector<Bound> bounds{}; Span span{}; std::vector<TypeMember> associated{}; };
 struct EnumField { std::optional<Identifier> name; Identifier type; };
-struct EnumCase { Identifier name; std::vector<EnumField> fields; };
+struct EnumCase { Identifier name; std::vector<EnumField> fields; Span span{}; };
 struct Enumeration { std::size_t file; Identifier name; std::vector<EnumCase> cases; bool isPublic; std::vector<Identifier> typeParameters{}; std::vector<Bound> bounds{}; Span span{}; };
-struct ExceptionType { std::size_t file; Identifier name; bool isPublic; };
-struct TypeAlias { std::size_t file; Identifier name, target; bool isPublic; std::vector<Identifier> typeParameters{}; };
+struct ExceptionType { std::size_t file; Identifier name; bool isPublic; Span span{}; };
+struct TypeAlias { std::size_t file; Identifier name, target; bool isPublic; std::vector<Identifier> typeParameters{}; Span span{}; };
 Identifier nominalAnnotation(const auto& declaration) {
     auto result = declaration.name;
     if (declaration.typeParameters.empty()) return result;
@@ -180,7 +181,9 @@ struct SyntaxRef { std::size_t index; };
 struct SyntaxToken { Span span; std::string kind; };
 enum class EditorKind { Keyword, Function, Method, Constructor, Variable, Parameter, Field, Property, Constant, Class, Struct,
     Enum, EnumCase, Trait, TypeAlias, TypeParameter, Module, Macro, Decorator, Extension };
+struct NameReference { SourceAnchor use, declaration; std::optional<SourceAnchor> renameTarget{}; std::optional<EditorKind> kind{}; };
 struct EditorSymbol { std::string label; EditorKind kind; Span name{}; std::string detail{}, documentation{}, insertion{}; };
+struct OutlineSymbol { std::string name; EditorKind kind; Span selection, extent; std::vector<OutlineSymbol> children{}; };
 struct EditorParameter { std::string name, label; bool variadic{}; };
 struct EditorSignature { std::string label, documentation; std::vector<EditorParameter> parameters; std::optional<std::size_t> active{}; };
 enum class CompletionPlace { None, TopLevel, MemberDeclaration, FieldDeclaration, TraitDeclaration, ExtensionDeclaration, EnumMethod, FunctionModifier,
@@ -199,11 +202,14 @@ struct SyntaxCompletion {
 };
 struct Module { std::vector<Function> functions; std::vector<Aggregate> aggregates; std::vector<Import> imports; std::vector<Expansion> expansions; std::vector<Trait> traits{}; std::vector<Enumeration> enums{}; std::vector<Extension> extensions{}; std::vector<std::vector<std::string>> importedExtensions{}; std::vector<ExceptionType> exceptions{}; std::vector<TypeAlias> aliases{}; };
 Module parse(const std::vector<Source>& sources);
+struct RecoveredSyntax { Module syntax; std::vector<Diagnostic> errors{}; bool incompleteDeclaration{}; };
 void parseFile(Module& module, const Source& source, std::size_t file, std::vector<ExpressionExpansion>* expressions = nullptr, bool macroImplementation = false);
 void validateMacroExpression(const Source& generated);
 std::vector<SyntaxToken> syntaxTokens(const Source& source, bool comments = false, bool partial = false);
 SyntaxCompletion completeSyntax(const Source& source, std::size_t offset);
 Module indexFileSyntax(const Source& source, std::vector<ExpressionExpansion>* expressions = nullptr);
+std::vector<OutlineSymbol> editorOutline(const Source& source, const Module& syntax);
+RecoveredSyntax recoverFileSyntax(const Source& source, std::vector<ExpressionExpansion>* expressions = nullptr);
 std::string editorDocumentation(const Source& source, std::size_t declarationStart);
 std::string editorSpelling(const Source& source, const Identifier& name);
 std::string editorModuleAlias(std::string_view name);

@@ -23,10 +23,12 @@ import lyra.platform;
 import lyra.syntax;
 
 export namespace lyra {
-struct Compilation { std::vector<Source> sources; Module syntax; std::vector<std::filesystem::path> macroInputs{}; std::vector<NameReference> references{}; };
-struct ParsedFileSyntax { std::string text; Module syntax; };
+struct Compilation { std::vector<Source> sources; Module syntax; std::vector<std::filesystem::path> macroInputs{}; std::vector<NameReference> references{}; bool incompleteDeclaration{}; };
+struct ParsedFileSyntax { std::string text; RecoveredSyntax parsed; };
 struct ParseCache { std::map<std::string, ParsedFileSyntax> files; };
-Compilation loadProgram(const PackageGraph& graph, const std::string& entry, const std::optional<std::filesystem::path>& testFile = {}, const SourceOverlay* overlays = nullptr, ParseCache* parseCache = nullptr, bool editorProbe = false);
+Compilation loadProgram(const PackageGraph& graph, const std::string& entry, const std::optional<std::filesystem::path>& testFile = {}, const SourceOverlay* overlays = nullptr,
+    ParseCache* parseCache = nullptr, bool editorProbe = false, AnalysisDiagnostics* diagnostics = nullptr);
+Compilation loadLooseProgram(std::vector<Source> sources, AnalysisDiagnostics& diagnostics, ParseCache* parseCache = nullptr);
 struct EditorFileSyntax { std::string text; Module syntax; std::vector<ExpressionExpansion> expressions; };
 struct EditorParseCache { std::map<std::filesystem::path, EditorFileSyntax> files; };
 struct EditorDeclaration { std::size_t file; std::string name; EditorSymbol symbol; bool visible; };
@@ -43,6 +45,7 @@ struct EditorModuleIndex {
     std::map<std::string, EditorNamespace> namespaces;
 };
 std::vector<EditorDeclaration> editorDeclarations(const Module& syntax, std::span<const Source> sources, bool generatedOnly = false);
+const Module& editorFileSyntax(const Source& source, EditorParseCache& cache);
 EditorModuleIndex indexModule(const PackageGraph& graph, const std::filesystem::path& path, const SourceOverlay& overlays, EditorParseCache& cache);
 }
 
@@ -201,7 +204,7 @@ struct Linker {
         }();
         if (indexing && result.kind == SymbolKind::Module) {
             auto anchor = *result.renameTarget;
-            references.push_back({anchor, anchor, anchor});
+            references.push_back({anchor, anchor, anchor, EditorKind::Module});
         } else if (indexing && result.targets.size() == 1) {
             auto target = result.targets.front().anchor;
             references.push_back({{use.file, use.member->span}, target, result.renameTarget});
@@ -294,11 +297,14 @@ struct Linker {
             if (tokens[index].kind != "name" || (index > 0 && spelling(index - 1) == ".") ||
                 (index + 1 < tokens.size() && spelling(index + 1) == "=")) continue;
             auto name = identifier(index);
-            if (std::ranges::find(parameters, name, &Identifier::text) != parameters.end()) continue;
+            if (auto parameter = std::ranges::find(parameters, name, &Identifier::text); parameter != parameters.end()) {
+                references.push_back({anchor(index), {file, parameter->span}, {}, EditorKind::TypeParameter});
+                continue;
+            }
             auto symbol = lookup(file, name);
             if (!symbol) continue;
             if (symbol->kind == SymbolKind::Module && index + 2 < tokens.size() && spelling(index + 1) == "." && tokens[index + 2].kind == "name") {
-                references.push_back({anchor(index), *symbol->renameTarget, symbol->renameTarget});
+                references.push_back({anchor(index), *symbol->renameTarget, symbol->renameTarget, EditorKind::Module});
                 if (auto member = exported(symbol->name, identifier(index + 2))) indexSymbol(index + 2, *member);
             } else indexSymbol(index, *symbol);
         }
@@ -317,7 +323,7 @@ struct Linker {
             if (use.kind == ImportKind::Runtime && use.isPublic == shared) addImport(use);
     }
 
-    void rewrite(Module& syntax, SymbolDependencies* dependencies = nullptr) {
+    void rewrite(Module& syntax, SymbolDependencies* dependencies = nullptr, AnalysisDiagnostics* diagnostics = nullptr) {
         collect(syntax, true);
         if (macroPhase) {
             auto& scope = spaces.at("$macroImplementation");
@@ -443,7 +449,7 @@ struct Linker {
                 }
                 for (auto& part : pattern.parts) self(self, part);
             };
-            for (auto& expr : fn.expressions) {
+            auto rewriteExpression = [&](Expr& expr) {
                 if (auto* name = std::get_if<Identifier>(&expr.node)) reference(*name);
                 auto renameQualifier = [&](TypeQualifier& owner) {
                     if (owner.moduleReceiver) qualifyReceiver(*owner.moduleReceiver, owner.name, SymbolKind::Type);
@@ -471,6 +477,16 @@ struct Linker {
                 if (auto* lambda = std::get_if<Lambda>(&expr.node)) {
                     for (auto& param : lambda->parameters) if (param.type) renameType(*param.type);
                     if (lambda->result) renameType(*lambda->result);
+                }
+            };
+            for (auto& expr : fn.expressions) {
+                bool inBody = expr.span.begin >= fn.header.end;
+                if (fn.incompleteBody && inBody) continue;
+                try { rewriteExpression(expr); }
+                catch (Diagnostic& error) {
+                    if (!diagnostics || !inBody) throw;
+                    diagnostics->add(std::move(error));
+                    fn.incompleteBody = true;
                 }
             }
         }
@@ -601,15 +617,12 @@ std::string parsedFileKey(const fs::path& path) {
     return pathText(error ? fs::absolute(path).lexically_normal() : canonical);
 }
 
-const Module& cachedFileSyntax(const Source& source, ParseCache& cache) {
+const RecoveredSyntax& cachedFileSyntax(const Source& source, ParseCache& cache) {
     auto key = parsedFileKey(source.path);
     auto found = cache.files.find(key);
-    if (found != cache.files.end() && found->second.text == source.text) return found->second.syntax;
+    if (found != cache.files.end() && found->second.text == source.text) return found->second.parsed;
     if (cache.files.size() >= 4096) cache.files.clear();
-    Module syntax;
-    parseFile(syntax, source, 0);
-    auto [entry, inserted] = cache.files.insert_or_assign(std::move(key), ParsedFileSyntax{source.text, std::move(syntax)});
-    return entry->second.syntax;
+    return cache.files.insert_or_assign(std::move(key), ParsedFileSyntax{source.text, recoverFileSyntax(source)}).first->second.parsed;
 }
 
 void appendCachedSyntax(Module& target, const Module& cached, std::size_t file) {
@@ -1230,7 +1243,29 @@ EditorModuleIndex indexModule(const PackageGraph& graph, const fs::path& path, c
     return std::move(catalog.index);
 }
 
-Compilation loadProgram(const PackageGraph& graph, const std::string& entry, const std::optional<fs::path>& testFile, const SourceOverlay* overlays, ParseCache* parseCache, bool editorProbe) {
+const Module& editorFileSyntax(const Source& source, EditorParseCache& cache) {
+    if (cache.files.size() >= 4096) cache.files.clear();
+    return indexedFile(source, cache).syntax;
+}
+
+Compilation loadLooseProgram(std::vector<Source> sources, AnalysisDiagnostics& diagnostics, ParseCache* parseCache) {
+    Compilation program{std::move(sources), {}};
+    for (std::size_t file = 0; file < program.sources.size(); ++file) {
+        const auto& source = program.sources[file];
+        auto parsed = parseCache ? cachedFileSyntax(source, *parseCache) : recoverFileSyntax(source);
+        for (auto& error : parsed.errors) diagnostics.add(std::move(error));
+        program.incompleteDeclaration |= parsed.incompleteDeclaration;
+        for (const auto& use : parsed.syntax.imports) {
+            diagnostics.add(at(source, use.path.front().span, "LYN0003", "使用 import 需要包清单 lyra.json5"));
+            program.incompleteDeclaration = true;
+        }
+        appendCachedSyntax(program.syntax, parsed.syntax, file);
+    }
+    return program;
+}
+
+Compilation loadProgram(const PackageGraph& graph, const std::string& entry, const std::optional<fs::path>& testFile, const SourceOverlay* overlays,
+    ParseCache* parseCache, bool editorProbe, AnalysisDiagnostics* diagnostics) {
     std::map<std::string, const ResolvedPackage*> packages;
     std::map<std::string, std::string> prefixes;
     for (const auto& package : graph.packages) {
@@ -1264,12 +1299,19 @@ Compilation loadProgram(const PackageGraph& graph, const std::string& entry, con
     Module authored;
     std::vector<Module> fileSyntax;
     std::vector<bool> expressionMacros;
+    auto parseRecovering = [&](const Source& source, std::vector<ExpressionExpansion>* calls) {
+        auto parsed = parseCache && !source.previous && source.text.find_first_of("#@") == std::string::npos
+            ? cachedFileSyntax(source, *parseCache) : recoverFileSyntax(source, calls);
+        for (auto& error : parsed.errors) diagnostics->add(std::move(error));
+        program.incompleteDeclaration |= parsed.incompleteDeclaration;
+        return std::move(parsed.syntax);
+    };
     auto parseAuthored = [&](std::size_t file) {
         const auto& source = program.sources[file];
         std::vector<ExpressionExpansion> calls;
         Module syntax;
         if (editorProbe) syntax = indexFileSyntax(source, &calls);
-        else if (parseCache && source.text.find_first_of("#@") == std::string::npos) syntax = cachedFileSyntax(source, *parseCache);
+        else if (diagnostics) syntax = parseRecovering(source, &calls);
         else parseFile(syntax, source, file, &calls);
         appendCachedSyntax(authored, syntax, file);
         fileSyntax.push_back(std::move(syntax));
@@ -1299,17 +1341,22 @@ Compilation loadProgram(const PackageGraph& graph, const std::string& entry, con
                 program.sources.push_back(std::move(source));
                 auto file = program.sources.size() - 1;
                 if (handwritten) parseAuthored(file);
-                else if (parseCache && program.sources.back().text.find_first_of("#@") == std::string::npos)
-                    appendCachedSyntax(program.syntax, cachedFileSyntax(program.sources.back(), *parseCache), file);
+                else if (diagnostics) appendCachedSyntax(program.syntax, parseRecovering(program.sources.back(), nullptr), file);
                 else parseFile(program.syntax, program.sources.back(), file);
             }
         }
     };
     loadBundled(authored, true);
+    if (diagnostics && (program.incompleteDeclaration || std::ranges::any_of(authored.expansions, [&](const Expansion& prefix) {
+        return prefix.kind == ExpansionTarget::Function && authored.functions[prefix.target].incompleteBody;
+    }))) {
+        program.incompleteDeclaration = true;
+        return program;
+    }
     auto hasExpressions = std::ranges::any_of(expressionMacros, [](bool present) { return present; });
     if (!hasExpressions && authored.expansions.empty() && std::ranges::none_of(authored.imports, [](const auto& use) { return use.kind != ImportKind::Runtime; })) {
         program.syntax = std::move(authored);
-        Linker{program.sources, spaces, prefixes, root, program.references, overlays != nullptr}.rewrite(program.syntax);
+        Linker{program.sources, spaces, prefixes, root, program.references, overlays != nullptr}.rewrite(program.syntax, nullptr, diagnostics);
         return program;
     }
     const auto authoredSources = program.sources;
@@ -1326,8 +1373,12 @@ Compilation loadProgram(const PackageGraph& graph, const std::string& entry, con
     for (std::size_t file = 0; file < program.sources.size(); ++file) {
         auto& source = program.sources[file];
         if (expressionMacros[file]) {
-            expandExpressions(source, file, macroPackages.at(source.moduleId), program.macroInputs, environment);
+            expandExpressions(source, file, macroPackages.at(source.moduleId), program.macroInputs, environment, diagnostics && !diagnostics->errors.empty());
             if (editorProbe) appendCachedSyntax(program.syntax, indexFileSyntax(source), file);
+            else if (diagnostics && !diagnostics->errors.empty()) {
+                std::vector<ExpressionExpansion> remaining;
+                appendCachedSyntax(program.syntax, parseRecovering(source, &remaining), file);
+            }
             else parseFile(program.syntax, source, file);
         } else appendCachedSyntax(program.syntax, fileSyntax[file], file);
     }
@@ -1340,7 +1391,8 @@ Compilation loadProgram(const PackageGraph& graph, const std::string& entry, con
             [&](auto file, const auto& annotation, auto parameters) { return types.resolve(file, annotation, parameters); }, types.fingerprint(), environment);
         loadBundled(program.syntax, false);
     }
-    Linker{program.sources, spaces, prefixes, root, program.references, overlays != nullptr}.rewrite(program.syntax);
+    if (program.incompleteDeclaration) return program;
+    Linker{program.sources, spaces, prefixes, root, program.references, overlays != nullptr}.rewrite(program.syntax, nullptr, diagnostics);
     return program;
 }
 

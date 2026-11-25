@@ -1,6 +1,6 @@
 # Lyra Language for VS Code
 
-为 `.ly` 提供高亮、注释与括号配对。诊断、补全、悬停、定义、引用、重命名、行内类型提示和格式化由原生 SDK 的 `lyra lsp --stdio` 提供。扩展不下载 SDK 或包依赖，不编译或运行项目，也不启动准备脚本。
+为 `.ly` 和 `lyra.json5` 提供编辑支持。诊断、补全、语义高亮、导航和格式化由原生 SDK 的 `lyra lsp --stdio` 提供。扩展不下载 SDK 或包依赖，不编译或运行项目，也不启动准备脚本。
 
 ## 本地打包和安装
 
@@ -10,10 +10,10 @@
 npm ci
 npm run check
 npm exec --yes --package=@vscode/vsce@4.1.1 -- vsce package --allow-missing-repository --skip-license -o lyra-language.vsix
-code --install-extension lyra-language.vsix
+code --install-extension lyra-language.vsix --force
 ```
 
-也可用 VS Code 的 **Extensions: Install from VSIX...** 选择生成的文件。需要 VS Code 1.100 或更新版本和支持 `lsp --stdio` 的 Lyra SDK。复制 SDK 时保留 `bin`、`lib` 和 `share` 的相对位置。
+也可用 VS Code 的 **Extensions: Install from VSIX...** 选择生成的文件。需要 VS Code 1.100 或更新版本。更新时同时使用包含相应语言服务的新 SDK，并执行 **Developer: Reload Window**。复制 SDK 时保留 `bin`、`lib` 和 `share` 的相对位置。
 
 ## 配置 SDK
 
@@ -25,7 +25,7 @@ code --install-extension lyra-language.vsix
 }
 ```
 
-在 Linux 上可改为 `/home/me/lyra-sdk/bin/lyra`。配置值只填路径，不添加额外引号或命令行参数。使用 WSL 或 SSH 时，在远程扩展宿主安装扩展，并配置远程的路径或 `PATH`。修改设置后执行 **Developer: Reload Window**。在受信任的工作区打开 `.ly` 文件即可启动语言服务；启动报错可在 **Output → Lyra Language Server** 看日志。
+在 Linux 上可改为 `/home/me/lyra-sdk/bin/lyra`。配置值只填路径，不添加额外引号或命令行参数。使用 WSL 或 SSH 时，在远程扩展宿主安装扩展，并配置远程的路径或 `PATH`。修改设置后执行 **Developer: Reload Window**。在受信任的工作区打开 `.ly` 或 `lyra.json5` 即可启动语言服务；启动报错可在 **Output → Lyra Language Server** 看日志。
 
 打开包含 `lyra.json5` 的包目录或其 workspace；对已有锁的外部依赖，先在终端执行 `lyra fetch <包目录> --locked`，让语言服务使用已下载的源码。多根工作区使用同一个语言进程，由服务端按当前文件所属的包分析。
 
@@ -35,9 +35,15 @@ code --install-extension lyra-language.vsix
 
 输入 `import std.`、`import self.` 或 `import <依赖简称>.` 选择模块。输入 `import std.http.{` 可选公开声明；只写 `import std.http` 时，输入 `http.` 才补全该模块的公开成员，普通名称补全不会混入全部依赖的 API。`pub import std.http.{…}`、`import macro` 和 `import decorator` 也支持补全。
 
-普通名称报未解析时，按 `Ctrl+.` 打开 Quick Fix。编辑器优先复用现有模块别名，否则可添加模块导入并把当前用处改成限定名。同名声明分来源列出；默认别名冲突时，建议一个未占用的别名。扩展组仍需显式选入，语言服务不下载依赖。
+普通名称报未解析时，按 `Ctrl+.` 打开 Quick Fix。编辑器优先复用现有模块别名，否则可添加模块导入并把当前用处改成限定名。同名声明分来源列出；默认别名冲突时，建议一个未占用的别名。块尾分号使返回值误变成 `Unit` 时可直接删掉它；**Fix All** 批量修复当前文件中确定多余的分号，不替用户选择导入来源。
 
 输入 `http.listen(8080, ho` 会提示 `host:`；参数提示会列出匹配已输入实参的重载。声明前的 `///` 文档显示在补全、悬停和签名提示里。可从宏、装饰器调用或导入跳到实现。重命名默认模块别名会补 `as`，保留导入路径。诊断在后台合并连续编辑，只发布当前版本，源码错误不会变成悬停或跳转失败弹窗。
+
+同一次分析可在 Problems 中显示多个独立函数的错误。重载歧义列出候选声明位置，宏生成代码出错时可查看宏定义作为关联位置。普通定义跟随源码绑定（包括类型别名）；**Go to Type Definition** 跳到检查器确认的实际用户类型。光标下的同一符号在当前文件内一起高亮，同名但被遮蔽的符号不混在一起。
+
+语义高亮把解析出的参数、变量、字段、方法、模块等交给当前主题着色，尚未绑定的名字沿用 TextMate 高亮。**Outline** 和面包屑显示手写声明和成员，即使函数体有语法错误也可查看。编辑器可折叠块、连续导入和多行注释。**Go to Symbol in Workspace** 可搜索未打开的本地包，不搜索 SDK 和包缓存。
+
+编辑 `lyra.json5` 时，补全按包、workspace、依赖和脚本对象区分字段，`kind` 提示 `app` / `lib`。校验支持单引号、注释和尾逗号，问题指向对应的字段值或语法位置。未保存的清单只用于编辑器提示；依赖解析和宏输入授权仍以磁盘文件为准。
 
 省略类型的 `val`、`var` 和函数／方法返回值会显示淡色的原生 Inlay Hints，例如 `val router: Router = http.Router()` 中的 `: Router`。提示不写入源码，可用 `editor.inlayHints.enabled` 控制显示。
 
@@ -51,6 +57,6 @@ code --install-extension lyra-language.vsix
 python editors/vscode/tests/smoke.py <VS-Code-桌面程序路径> <Lyra-SDK-程序路径>
 ```
 
-第一个路径在 Windows 填 `Code.exe`，Linux 填桌面程序 `code`，不是同发行包里的 `bin/code` 启动脚本。测试使用独立配置和临时项目，检查跨包定义、导入 Quick Fix、磁盘依赖更新、未保存的 Unicode 宏报错，以及在 HTTP/SQLite 示例中输入一半时的补全、签名提示、诊断和行内类型提示。
+第一个路径在 Windows 填 `Code.exe`，Linux 填桌面程序 `code`，不是同发行包里的 `bin/code` 启动脚本。测试使用独立配置和临时项目，覆盖跨包定义与类型定义、大纲、未打开包的符号搜索、导入 Quick Fix、磁盘依赖更新、未保存的 Unicode 宏报错和清单补全，以及 HTTP/SQLite 示例中的输入补全、签名提示、诊断和行内类型提示。
 
 打包后可加 `--vsix <扩展包路径>`，改为加载从 VSIX 解包的扩展和依赖；验收该包时不读取源码目录的 `node_modules`。第二个参数可以直接指向解包后 SDK 的 `bin/lyra` 或 `bin/lyra.exe`。

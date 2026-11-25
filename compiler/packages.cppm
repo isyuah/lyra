@@ -1,5 +1,6 @@
 module;
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <charconv>
 #include <compare>
@@ -10,6 +11,7 @@ module;
 #include <map>
 #include <optional>
 #include <set>
+#include <span>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -24,11 +26,12 @@ module;
 
 export module lyra.packages;
 import lyra.platform;
+import lyra.source;
 
 export namespace lyra {
 
 struct PackageOptions { bool locked = false, offline = false, update = false, readOnly = false; };
-struct PackageError { std::string code, message; };
+struct PackageError { std::string code, message; std::optional<Span> span{}; };
 struct ResolvedPackage {
     std::string id, name, version;
     std::filesystem::path root;
@@ -42,9 +45,13 @@ struct PackageGraph {
     std::vector<ResolvedPackage> packages;
     std::vector<std::string> warnings, missingOutputs, members;
 };
+struct ManifestCompletion { Span replacement; std::string label, text, detail; bool value{}; };
 
 PackageGraph resolvePackages(const std::filesystem::path& directory, PackageOptions options = {});
 PackageGraph indexPackages(const std::filesystem::path& directory);
+std::vector<std::filesystem::path> indexLocalPackageRoots(const std::filesystem::path& directory);
+std::vector<ManifestCompletion> completeManifest(const Source& source, std::size_t offset);
+std::optional<Diagnostic> validateManifest(const Source& source);
 int packageCommand(const std::vector<std::string_view>& args);
 
 }
@@ -132,62 +139,249 @@ void validateHash(const string& hash) {
 }
 
 string render(const json::Value& value) { return llvm::formatv("{0:2}\n", value).str(); }
-string quote(const string& text) { return llvm::formatv("{0}", json::Value(text)).str(); }
 
-string manifestJson(string_view text, const string& where) {
-    string output;
-    output.reserve(text.size());
-    for (std::size_t pos = 0; pos < text.size();) {
-        char ch = text[pos++];
-        if (ch == '"' || ch == '\'') {
-            char delimiter = ch;
-            output.push_back('"');
-            bool closed = false;
-            while (pos < text.size()) {
-                ch = text[pos++];
-                if (ch == delimiter) { closed = true; break; }
-                if (ch == '\\' && pos < text.size()) {
-                    char escaped = text[pos++];
-                    if (escaped != '\'') output.push_back('\\');
-                    output.push_back(escaped);
-                } else {
-                    if (ch == '"') output.push_back('\\');
-                    output.push_back(ch);
-                }
-            }
-            if (!closed) invalid(where + "：字符串未闭合");
-            output.push_back('"');
-        } else if (ch == '/' && pos < text.size() && text[pos] == '/') {
-            pos = text.find_first_of("\r\n", pos + 1);
-            if (pos == string_view::npos) break;
-            output.push_back(' ');
-        } else if (ch == '/' && pos < text.size() && text[pos] == '*') {
-            auto end = text.find("*/", pos + 1);
-            if (end == string_view::npos) invalid(where + "：注释未闭合");
-            pos = end + 2;
-            output.push_back(' ');
-        } else if (letter(ch)) {
-            auto start = pos - 1;
-            while (pos < text.size() && word(text[pos])) ++pos;
-            auto next = text.find_first_not_of(" \t\r\n", pos);
-            string token(text.substr(start, pos - start));
-            output += (next != string_view::npos && text[next] == ':') ? quote(token) : token;
-        } else {
-            if (ch == '}' || ch == ']') {
-                auto prev = output.find_last_not_of(" \r\n\t");
-                if (prev != string::npos && output[prev] == ',') {
-                    auto before = output.find_last_not_of(" \r\n\t", prev - 1);
-                    if (before != string::npos && output[before] != '[' && output[before] != '{') output[prev] = ' ';
-                }
-            }
-            output.push_back(ch);
-        }
+enum class ManifestScope { Root, Workspace, Dependencies, Dependency, Scripts, Script, Macros, Inputs, Kind, Other };
+struct ManifestField { string_view name, detail, initial; ManifestScope scope = ManifestScope::Other; };
+constexpr std::array<string_view, 2> packageKinds{"app", "lib"};
+
+std::span<const ManifestField> manifestFields(ManifestScope scope) {
+    using enum ManifestScope;
+    static constexpr ManifestField root[] = {
+        {"name", "包名；可使用组织名/包名", "\"\""}, {"version", "SemVer 版本", "\"0.1.0\""},
+        {"kind", "app 可执行包（默认）；lib 库", "\"app\"", Kind}, {"dependencies", "按简称组织的依赖", "{}", Dependencies},
+        {"scripts", "显式运行的本地脚本和产物声明", "{}", Scripts}, {"macroInputs", "按宏名授权的包内只读输入", "{}", Macros},
+        {"workspace", "由多个本地包组成的工作区", "{ members: [] }", Workspace},
+    };
+    static constexpr ManifestField workspace[] = {{"members", "工作区内的包目录", "[]"}};
+    static constexpr ManifestField dependency[] = {
+        {"name", "依赖的包名", "\"\""}, {"version", "精确版本或 ^SemVer 范围", "\"^0.1.0\""},
+        {"path", "本地依赖目录；与 registry 二选一", "\"\""}, {"registry", "依赖的注册中心；与 path 二选一", "\"\""},
+    };
+    static constexpr ManifestField script[] = {{"command", "显式执行的本地命令", "\"\""}, {"outputs", "包内产物路径列表", "[]"}};
+    switch (scope) {
+        case Root: return root;
+        case Workspace: return workspace;
+        case Dependency: return dependency;
+        case Script: return script;
+        default: return {};
     }
-    return output;
 }
 
-json::Object objectFrom(string_view input, const string& where, bool manifest = false) {
-    auto parsed = json::parse(manifest ? manifestJson(input, where) : string(input));
+ManifestScope fieldScope(ManifestScope scope, string_view key) {
+    using enum ManifestScope;
+    if (scope == Dependencies) return Dependency;
+    if (scope == Scripts) return Script;
+    if (scope == Macros) return Inputs;
+    auto fields = manifestFields(scope);
+    auto field = std::ranges::find(fields, key, &ManifestField::name);
+    return field == fields.end() ? Other : field->scope;
+}
+
+using FieldPath = std::vector<string>;
+using ManifestSites = std::map<FieldPath, Span>;
+
+template<class Validate>
+decltype(auto) validateField(const ManifestSites* sites, std::initializer_list<string_view> path, Validate&& validate) {
+    try { return validate(); }
+    catch (PackageError& error) {
+        if (sites && !error.span) {
+            FieldPath keys(path.begin(), path.end());
+            if (auto site = sites->find(keys); site != sites->end()) error.span = site->second;
+            else while (!keys.empty()) {
+                keys.pop_back();
+                if (auto parent = sites->find(keys); parent != sites->end()) {
+                    error.span = Span{parent->second.begin, parent->second.begin + 1};
+                    break;
+                }
+            }
+        }
+        throw;
+    }
+}
+
+struct ManifestCursor { std::size_t offset; std::vector<ManifestCompletion> items{}; };
+struct ManifestCompleted {};
+
+class ManifestParser {
+public:
+    ManifestParser(string_view input, const string& where, ManifestSites* sites = nullptr, ManifestCursor* cursor = nullptr)
+        : input(input), where(where), sites(sites), cursor(cursor), token(next()) {}
+
+    json::Object parse() {
+        FieldPath path;
+        if (token.kind != '{') failAt(token.span, "应为对象");
+        auto parsed = value(ManifestScope::Root, path, 0);
+        if (token.kind) failAt(token.span, "清单末尾有多余内容");
+        return std::move(*parsed.getAsObject());
+    }
+
+private:
+    struct Token { char kind; Span span; bool closed = true; };
+    string_view input;
+    const string& where;
+    ManifestSites* sites;
+    ManifestCursor* cursor;
+    std::size_t position{}, previous{};
+    Token token;
+
+    [[noreturn]] void failAt(Span span, string message) const {
+        throw PackageError{"LYK0001", where + "：" + std::move(message), span};
+    }
+
+    Token next() {
+        constexpr string_view spaces = " \t\r\n", symbols = "{}[],:";
+        for (;;) {
+            position = input.find_first_not_of(spaces, position);
+            if (position == input.npos) { position = input.size(); return {0, {position, position}}; }
+            auto start = position;
+            if (input.substr(start).starts_with("//")) {
+                auto end = input.find_first_of("\r\n", start + 2);
+                position = end == input.npos ? input.size() : end;
+                if (cursor && start <= cursor->offset && cursor->offset <= position) throw ManifestCompleted{};
+            } else if (input.substr(start).starts_with("/*")) {
+                auto end = input.find("*/", start + 2);
+                if (cursor && start <= cursor->offset && (end == input.npos || cursor->offset < end + 2)) throw ManifestCompleted{};
+                if (end == input.npos) failAt({start, input.size()}, "注释未闭合");
+                position = end + 2;
+            } else break;
+        }
+        auto start = position;
+        auto first = input[position++];
+        if (symbols.contains(first)) return {first, {start, position}};
+        if (first == '"' || first == '\'') {
+            while (position < input.size()) {
+                auto next = input[position++];
+                if (next == first) return {'s', {start, position}};
+                if (next == '\\' && position < input.size()) ++position;
+                else if (next == '\r' || next == '\n') { --position; break; }
+            }
+            return {'s', {start, position}, false};
+        }
+        if (letter(first)) {
+            while (position < input.size() && word(input[position])) ++position;
+            return {'w', {start, position}};
+        }
+        while (position < input.size() && !spaces.contains(input[position]) && !symbols.contains(input[position]) &&
+            !string_view("\"'/").contains(input[position])) ++position;
+        return {'v', {start, position}};
+    }
+
+    Token take() { auto result = token; previous = token.span.end; token = next(); return result; }
+    void require(char kind, string message) { if (token.kind != kind) failAt(token.span, std::move(message)); take(); }
+    string_view text(Token item) const { return input.substr(item.span.begin, item.span.end - item.span.begin); }
+
+    json::Value scalar(Token item) const {
+        auto raw = text(item);
+        string normalized;
+        if (item.kind == 's') {
+            if (!item.closed) failAt(item.span, "字符串未闭合");
+            normalized.push_back('"');
+            for (std::size_t index = 1; index + 1 < raw.size(); ++index) {
+                auto letter = raw[index];
+                if (letter == '\\') {
+                    auto escaped = raw[++index];
+                    if (escaped != '\'') normalized.push_back('\\');
+                    normalized.push_back(escaped);
+                } else {
+                    if (letter == '"') normalized.push_back('\\');
+                    normalized.push_back(letter);
+                }
+            }
+            normalized.push_back('"');
+            raw = normalized;
+        }
+        auto parsed = json::parse(raw);
+        if (!parsed) failAt(item.span, "无效的 JSON5 值：" + llvm::toString(parsed.takeError()));
+        return std::move(*parsed);
+    }
+
+    bool atCursor() const {
+        if (!cursor || cursor->offset < previous) return false;
+        if (cursor->offset <= token.span.begin) return true;
+        return (token.kind == 's' || token.kind == 'w') && cursor->offset <= token.span.end;
+    }
+
+    void complete(ManifestScope scope, const json::Object* object = nullptr) {
+        if (!atCursor()) return;
+        auto offset = cursor->offset;
+        auto replace = Span{offset, offset};
+        string_view prefix;
+        char delimiter = '\0';
+        bool colon = token.kind == ':';
+        if (token.span.begin <= offset && (token.kind == 's' || token.kind == 'w')) {
+            replace = token.span;
+            auto raw = text(token);
+            prefix = raw.substr(0, offset - replace.begin);
+            if (token.kind == 's') {
+                delimiter = raw.front();
+                if (!prefix.empty()) prefix.remove_prefix(1);
+                if (token.closed && offset == replace.end && !prefix.empty()) prefix.remove_suffix(1);
+            }
+            colon = next().kind == ':';
+        }
+        auto offer = [&](string_view label, string_view detail, string_view initial, bool value) {
+            if (!label.starts_with(prefix) || (object && object->get(label))) return;
+            string insertion(label);
+            if (delimiter || value) {
+                auto quote = delimiter ? delimiter : '"';
+                insertion = quote + insertion + quote;
+            }
+            if (!value && !colon) insertion += ": " + string(initial);
+            cursor->items.push_back({replace, string(label), std::move(insertion), string(detail), value});
+        };
+        if (scope == ManifestScope::Kind) for (auto kind : packageKinds)
+            offer(kind, kind == "app" ? "可执行包（默认）" : "库", {}, true);
+        else for (const auto& field : manifestFields(scope)) offer(field.name, field.detail, field.initial, false);
+        throw ManifestCompleted{};
+    }
+
+    json::Value value(ManifestScope scope, FieldPath& path, unsigned depth) {
+        if (depth >= 128) failAt(token.span, "清单嵌套过深");
+        if (scope == ManifestScope::Kind) complete(scope);
+        auto begin = token.span.begin;
+        auto result = [&]() -> json::Value {
+            if (token.kind == '{') {
+                take();
+                json::Object object;
+                complete(scope, &object);
+                while (token.kind != '}') {
+                    if (token.kind != 'w' && token.kind != 's') failAt(token.span, "需要清单字段名");
+                    auto item = take();
+                    auto key = item.kind == 's' ? scalar(item).getAsString()->str() : string(text(item));
+                    require(':', "字段名后需要 :");
+                    path.push_back(key);
+                    object[key] = value(fieldScope(scope, key), path, depth + 1);
+                    path.pop_back();
+                    if (token.kind != ',') break;
+                    take();
+                    complete(scope, &object);
+                }
+                require('}', "对象字段之间需要逗号或 }");
+                return object;
+            }
+            if (token.kind == '[') {
+                take();
+                json::Array array;
+                while (token.kind != ']') {
+                    path.push_back(std::to_string(array.size()));
+                    array.push_back(value(ManifestScope::Other, path, depth + 1));
+                    path.pop_back();
+                    if (token.kind != ',') break;
+                    take();
+                }
+                require(']', "数组元素之间需要逗号或 ]");
+                return array;
+            }
+            if (token.kind != 's' && token.kind != 'v' && token.kind != 'w') failAt(token.span, "需要 JSON5 值");
+            return scalar(take());
+        }();
+        if (sites) sites->insert_or_assign(path, Span{begin, previous});
+        return result;
+    }
+};
+
+json::Object objectFrom(string_view input, const string& where) {
+    auto parsed = json::parse(input);
     if (!parsed) invalid(where + "：" + llvm::toString(parsed.takeError()));
     if (!parsed->getAsObject()) invalid(where + "：应为对象");
     return std::move(*parsed->getAsObject());
@@ -282,55 +476,78 @@ struct Manifest {
     std::map<string, std::map<string, fs::path>> macroInputs{};
 };
 
-Manifest manifestFrom(string_view bytes, const string& where) {
-    auto obj = objectFrom(bytes, where, true);
-    Manifest manifest{required(obj, "name", where), required(obj, "version", where), {}, {}};
-    packageName(manifest.name); versionOf(manifest.version);
-    if (obj.get("kind")) {
+Manifest manifestFromObject(const json::Object& obj, const string& where, const ManifestSites* sites = nullptr) {
+    auto name = validateField(sites, {"name"}, [&] { auto value = required(obj, "name", where); packageName(value); return value; });
+    auto version = validateField(sites, {"version"}, [&] { auto value = required(obj, "version", where); versionOf(value); return value; });
+    Manifest manifest{std::move(name), std::move(version), {}, {}};
+    if (obj.get("kind")) validateField(sites, {"kind"}, [&] {
         auto kind = required(obj, "kind", where);
-        if (kind != "app" && kind != "lib") invalid(where + "：kind 只能是 app 或 lib");
+        if (std::ranges::find(packageKinds, kind) == packageKinds.end()) invalid(where + "：kind 只能是 app 或 lib");
         manifest.library = kind == "lib";
-    }
+    });
     if (auto value = obj.get("dependencies")) {
-        for (const auto& [key, item] : asObject(*value, where + ": dependencies")) {
+        auto& dependencies = validateField(sites, {"dependencies"}, [&]() -> const json::Object& { return asObject(*value, where + ": dependencies"); });
+        for (const auto& [key, item] : dependencies) {
             auto alias = key.str(); auto location = where + ": dependencies." + alias;
-            if (!simpleName(alias)) invalid(location + "：依赖简称须是标识符");
-            const auto& dep = asObject(item, location);
-            Dependency dependency{required(dep, "name", location), required(dep, "version", location), {}, {}};
-            packageName(dependency.name); rangeOf(dependency.range);
-            if (dep.get("path")) {
-                auto path = required(dep, "path", location);
-                if (path.empty() || path.find('\0') != string::npos) invalid(location + "：无效本地路径");
-                dependency.path = fromUtf8(path);
-            }
-            if (dep.get("registry")) {
-                dependency.registry = required(dep, "registry", location);
-                if (dependency.registry.empty()) invalid(location + "：注册中心为空");
-            }
-            if (dependency.path.empty() == dependency.registry.empty()) invalid(location + "：必须指定 path 或 registry 其中一个");
-            manifest.dependencies.emplace(alias, std::move(dependency));
+            auto field = [&](string_view name, auto validate) { return validateField(sites, {"dependencies", alias, name}, validate); };
+            validateField(sites, {"dependencies", alias}, [&] {
+                if (!simpleName(alias)) invalid(location + "：依赖简称须是标识符");
+                const auto& dep = asObject(item, location);
+                auto name = field("name", [&] { auto value = required(dep, "name", location); packageName(value); return value; });
+                auto range = field("version", [&] { auto value = required(dep, "version", location); rangeOf(value); return value; });
+                Dependency dependency{std::move(name), std::move(range), {}, {}};
+                if (dep.get("path")) field("path", [&] {
+                    auto path = required(dep, "path", location);
+                    if (path.empty() || path.find('\0') != string::npos) invalid(location + "：无效本地路径");
+                    dependency.path = fromUtf8(path);
+                });
+                if (dep.get("registry")) field("registry", [&] {
+                    dependency.registry = required(dep, "registry", location);
+                    if (dependency.registry.empty()) invalid(location + "：注册中心为空");
+                });
+                if (dependency.path.empty() == dependency.registry.empty()) invalid(location + "：必须指定 path 或 registry 其中一个");
+                manifest.dependencies.emplace(alias, std::move(dependency));
+            });
         }
     }
     if (auto value = obj.get("scripts")) {
-        for (const auto& [key, item] : asObject(*value, where + ": scripts")) {
-            const auto& desc = asObject(item, where + ": scripts." + key.str());
-            Script script{key.str(), required(desc, "command", where), {}};
-            if (desc.get("outputs")) script.outputs = stringList(desc, "outputs", where);
-            for (const auto& path : script.outputs) if (!safeRelative(path)) invalid(where + "：脚本产物必须是包内相对路径");
-            manifest.scripts.push_back(std::move(script));
+        auto& scripts = validateField(sites, {"scripts"}, [&]() -> const json::Object& { return asObject(*value, where + ": scripts"); });
+        for (const auto& [key, item] : scripts) {
+            auto name = key.str();
+            validateField(sites, {"scripts", name}, [&] {
+                const auto& desc = asObject(item, where + ": scripts." + name);
+                auto command = validateField(sites, {"scripts", name, "command"}, [&] { return required(desc, "command", where); });
+                Script script{name, std::move(command), {}};
+                if (desc.get("outputs")) validateField(sites, {"scripts", name, "outputs"}, [&] {
+                    script.outputs = stringList(desc, "outputs", where);
+                    for (std::size_t index = 0; index < script.outputs.size(); ++index) if (!safeRelative(script.outputs[index]))
+                        validateField(sites, {"scripts", name, "outputs", std::to_string(index)}, [&] { invalid(where + "：脚本产物必须是包内相对路径"); });
+                });
+                manifest.scripts.push_back(std::move(script));
+            });
         }
     }
     if (auto macros = obj.get("macroInputs")) {
-        for (const auto& [name, inputs] : asObject(*macros, where + ": macroInputs")) {
-            auto& granted = manifest.macroInputs[name.str()];
-            for (const auto& [key, file] : asObject(inputs, where + ": macroInputs." + name.str())) {
-                auto path = file.getAsString();
-                if (!path || !safeRelative(path->str())) invalid(where + "：宏输入必须是包内相对文件路径");
-                granted.emplace(key.str(), fromUtf8(path->str()));
+        auto& entries = validateField(sites, {"macroInputs"}, [&]() -> const json::Object& { return asObject(*macros, where + ": macroInputs"); });
+        for (const auto& [nameKey, inputs] : entries) {
+            auto name = nameKey.str();
+            auto& granted = manifest.macroInputs[name];
+            auto& inputFields = validateField(sites, {"macroInputs", name}, [&]() -> const json::Object& { return asObject(inputs, where + ": macroInputs." + name); });
+            for (const auto& [key, file] : inputFields) {
+                auto alias = key.str();
+                validateField(sites, {"macroInputs", name, alias}, [&] {
+                    auto path = file.getAsString();
+                    if (!path || !safeRelative(path->str())) invalid(where + "：宏输入必须是包内相对文件路径");
+                    granted.emplace(alias, fromUtf8(path->str()));
+                });
             }
         }
     }
     return manifest;
+}
+
+Manifest manifestFrom(string_view bytes, const string& where) {
+    return manifestFromObject(ManifestParser(bytes, where).parse(), where);
 }
 
 Files collect(const fs::path& root) {
@@ -615,23 +832,30 @@ LockedNodes readLock(const json::Object& obj, const string& where) {
 }
 
 struct Layout { fs::path root, entry; std::vector<fs::path> members; };
-std::optional<std::vector<fs::path>> membersOf(const fs::path& root) {
-    auto obj = objectFrom(readFile(root / manifestFile), pathText(root / manifestFile), true);
+std::optional<std::vector<fs::path>> membersOfObject(const json::Object& obj, const fs::path& root, const ManifestSites* sites = nullptr) {
     auto field = obj.get("workspace"); if (!field) return std::nullopt;
-    const auto& ws = asObject(*field, pathText(root));
+    auto where = pathText(root);
+    const auto& ws = validateField(sites, {"workspace"}, [&]() -> const json::Object& { return asObject(*field, where); });
+    auto declared = validateField(sites, {"workspace", "members"}, [&] { return stringList(ws, "members", where); });
     std::vector<fs::path> members;
     if (obj.get("name")) members.push_back(root);
-    for (const auto& member : stringList(ws, "members", pathText(root))) {
+    for (std::size_t index = 0; index < declared.size(); ++index) validateField(sites, {"workspace", "members", std::to_string(index)}, [&] {
+        const auto& member = declared[index];
         if (!safeRelative(member)) invalid("workspace 成员须为内部目录：" + member);
         auto resolved = fs::weakly_canonical(root / fromUtf8(member));
         if (!safeRelative(pathText(resolved.lexically_relative(root)))) invalid("workspace 成员指向外部目录：" + member);
         if (std::find(members.begin(), members.end(), resolved) != members.end()) invalid("重复 workspace 成员：" + member);
         if (!fs::is_regular_file(resolved / manifestFile)) invalid("workspace 成员缺少清单：" + member);
         members.push_back(std::move(resolved));
-    }
-    if (members.empty()) invalid("workspace 至少需要一个包");
+    });
+    if (members.empty()) validateField(sites, {"workspace", "members"}, [&] { invalid("workspace 至少需要一个包"); });
     std::sort(members.begin(), members.end());
     return members;
+}
+
+std::optional<std::vector<fs::path>> membersOf(const fs::path& root) {
+    auto file = root / manifestFile;
+    return membersOfObject(ManifestParser(readFile(file), pathText(file)).parse(), root);
 }
 Layout layout(const fs::path& directory) {
     auto dir = fs::canonical(directory);
@@ -772,6 +996,49 @@ PackageGraph indexPackages(const fs::path& directory) {
         for (auto& [id, package] : packages) graph.packages.push_back(std::move(package));
     } catch (const PackageError&) {}
     return graph;
+}
+
+std::vector<fs::path> indexLocalPackageRoots(const fs::path& directory) {
+    std::set<fs::path> seen;
+    auto visit = [&](auto&& walk, const fs::path& root) -> void {
+        if (!seen.insert(root).second || !fs::is_regular_file(root / manifestFile)) return;
+        try {
+            auto manifest = manifestFrom(readFile(root / manifestFile), pathText(root / manifestFile));
+            for (const auto& [alias, dependency] : manifest.dependencies) if (!dependency.path.empty())
+                walk(walk, fs::weakly_canonical(root / dependency.path));
+        } catch (const PackageError&) {}
+        catch (const fs::filesystem_error&) {}
+    };
+    try {
+        for (const auto& member : layout(directory).members) visit(visit, member);
+    } catch (const PackageError&) {}
+    catch (const fs::filesystem_error&) {}
+    visit(visit, directory);
+    return {seen.begin(), seen.end()};
+}
+
+std::vector<ManifestCompletion> completeManifest(const Source& source, std::size_t offset) {
+    ManifestCursor cursor{offset};
+    auto where = pathText(source.path);
+    try { ManifestParser(source.text, where, nullptr, &cursor).parse(); }
+    catch (const ManifestCompleted&) {}
+    catch (const PackageError&) {}
+    return std::move(cursor.items);
+}
+
+std::optional<Diagnostic> validateManifest(const Source& source) {
+    auto where = pathText(source.path);
+    ManifestSites sites;
+    try {
+        auto object = ManifestParser(source.text, where, &sites).parse();
+        if (object.get("name") || !object.get("workspace")) manifestFromObject(object, where, &sites);
+        if (object.get("workspace")) membersOfObject(object, fs::weakly_canonical(source.path.parent_path()), &sites);
+    } catch (const PackageError& error) {
+        return at(source, error.span.value_or(Span{0, 0}), error.code, error.message);
+    } catch (const fs::filesystem_error& error) {
+        return at(source, {0, 0}, "LYK0006", error.what());
+    }
+    return {};
 }
 
 namespace {

@@ -3,6 +3,8 @@ module;
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <span>
+#include <tuple>
 #include <llvm/Support/FormatVariadic.h>
 #include <llvm/Support/JSON.h>
 #include <llvm/Support/Unicode.h>
@@ -55,6 +57,14 @@ Site Source::userSite(Span span) const {
     return origin && !previous ? *origin : site(span);
 }
 
+std::optional<Span> Source::authoredSpan(Span span) const {
+    if (span.begin >= span.end || span.end > text.size()) return {};
+    if (!previous) return origin ? std::nullopt : std::optional(span);
+    const auto& piece = pieceAt(*this, span.begin);
+    if (!piece.copied || span.end > piece.output.end) return {};
+    return previous->authoredSpan(beforeExpansion(*this, span));
+}
+
 Position Source::position(std::size_t offset) const {
     return previous ? site({offset, offset}).start : rawPosition(*this, offset);
 }
@@ -72,10 +82,18 @@ std::optional<Site> Source::generatedSite(Span span) const {
     return piece.hygiene ? std::optional(rawSite(*this, span)) : std::nullopt;
 }
 
+const Site* Source::macroSite(Span span) const {
+    if (!previous) return macroDefinition.get();
+    const auto& piece = pieceAt(*this, span.begin);
+    if (piece.copied) return previous->macroSite(beforeExpansion(*this, span));
+    return piece.macroDefinition ? piece.macroDefinition.get() : macroDefinition.get();
+}
+
 Diagnostic at(const Source& source, Span span, std::string code, std::string message) {
     Diagnostic error{std::move(code), std::move(message), source.userSite(span)};
     if (source.origin && !source.previous) error.generated = source.site(span);
     else error.generated = source.generatedSite(span);
+    if (const auto* definition = source.macroSite(span)) error.notes.push_back({*definition, "宏定义在这里"});
     return error;
 }
 
@@ -89,6 +107,25 @@ static llvm::json::Object jsonPosition(Position position) {
     return llvm::json::Object{{"offset", position.offset}, {"line", position.line}, {"column", position.column}};
 }
 
+static auto diagnosticKey(const Diagnostic& diagnostic) {
+    return std::tuple(diagnostic.site ? std::string_view(diagnostic.site->file) : std::string_view{},
+        diagnostic.site ? diagnostic.site->start.offset : 0, diagnostic.site ? diagnostic.site->end.offset : 0,
+        std::string_view(diagnostic.code), std::string_view(diagnostic.message));
+}
+
+void AnalysisDiagnostics::add(Diagnostic error) {
+    if (!full() && std::ranges::find(errors, diagnosticKey(error), diagnosticKey) == errors.end())
+        errors.push_back(std::move(error));
+}
+
+void AnalysisDiagnostics::sort() {
+    for (auto* diagnostics : {&errors, &warnings}) {
+        std::ranges::stable_sort(*diagnostics, {}, diagnosticKey);
+        auto duplicates = std::ranges::unique(*diagnostics, {}, diagnosticKey);
+        diagnostics->erase(duplicates.begin(), duplicates.end());
+    }
+}
+
 static llvm::json::Object jsonDiagnostic(const Diagnostic& error) {
     llvm::json::Object item{{"code", error.code}, {"message", llvm::json::fixUTF8(error.message)}};
     if (error.site) {
@@ -99,6 +136,12 @@ static llvm::json::Object jsonDiagnostic(const Diagnostic& error) {
     if (!error.actual.empty()) item["actual"] = error.actual;
     if (!error.hint.empty()) item["hint"] = error.hint;
     if (error.generated) item["generated"] = llvm::json::Object{{"file", error.generated->file}, {"start", jsonPosition(error.generated->start)}, {"end", jsonPosition(error.generated->end)}, {"source", error.generated->lineText}};
+    if (!error.notes.empty()) {
+        llvm::json::Array notes;
+        for (const auto& note : error.notes) notes.push_back(llvm::json::Object{{"file", note.site.file}, {"message", note.message},
+            {"range", llvm::json::Object{{"start", jsonPosition(note.site.start)}, {"end", jsonPosition(note.site.end)}}}});
+        item["notes"] = std::move(notes);
+    }
     return item;
 }
 
@@ -120,20 +163,22 @@ static void reportText(const Diagnostic& error, bool warning) {
     }
     if (!error.hint.empty()) stream << "提示：" << error.hint << '\n';
     if (error.generated) stream << "展开代码 " << error.generated->file << ':' << error.generated->start.line << ": " << error.generated->lineText << '\n';
+    for (const auto& note : error.notes)
+        stream << note.site.file << ':' << note.site.start.line << ':' << note.site.start.column << ": " << note.message << '\n';
 }
 
 void report(const Diagnostic& error, bool json) {
-    reportDiagnostics({}, &error, json);
+    reportDiagnostics({}, {&error, 1}, json);
 }
 
 void reportWarnings(const std::vector<Diagnostic>& warnings, bool json) {
-    reportDiagnostics(warnings, nullptr, json);
+    reportDiagnostics(warnings, {}, json);
 }
 
-void reportDiagnostics(const std::vector<Diagnostic>& warnings, const Diagnostic* error, bool json) {
+void reportDiagnostics(std::span<const Diagnostic> warnings, std::span<const Diagnostic> errors, bool json) {
     if (!json) {
         for (const auto& warning : warnings) reportText(warning, true);
-        if (error) reportText(*error, false);
+        for (const auto& error : errors) reportText(error, false);
         return;
     }
     llvm::json::Array diagnostics;
@@ -142,7 +187,7 @@ void reportDiagnostics(const std::vector<Diagnostic>& warnings, const Diagnostic
         item["severity"] = "warning";
         diagnostics.push_back(std::move(item));
     }
-    if (error) diagnostics.push_back(jsonDiagnostic(*error));
+    for (const auto& error : errors) diagnostics.push_back(jsonDiagnostic(error));
     llvm::errs() << llvm::formatv("{0}\n", llvm::json::Value(std::move(diagnostics)));
 }
 

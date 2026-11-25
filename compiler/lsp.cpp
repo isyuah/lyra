@@ -1,5 +1,6 @@
 module;
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cctype>
 #include <chrono>
@@ -17,6 +18,7 @@ module;
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <ranges>
 #include <set>
 #include <span>
 #include <string>
@@ -52,8 +54,7 @@ using Documents = std::map<std::string, Document>;
 struct Workspace {
     std::vector<Source> sources;
     EditorIndex editor;
-    std::vector<Diagnostic> warnings;
-    std::optional<Diagnostic> error;
+    AnalysisDiagnostics diagnostics;
     std::vector<EditorDeclaration> generated;
 };
 
@@ -188,27 +189,29 @@ Workspace loadWorkspace(const fs::path& root, const SourceOverlay& overlays, con
     Workspace workspace;
     workspace.editor.probe = probe;
     try {
-        Module syntax;
+        Compilation program;
         if (graph) {
-            auto program = loadProgram(*graph, graph->entry, {}, &overlays, &parseCache, probe != nullptr);
-            syntax = std::move(program.syntax);
-            workspace.sources = std::move(program.sources);
-            workspace.editor.references = std::move(program.references);
+            program = loadProgram(*graph, graph->entry, {}, &overlays, &parseCache, probe != nullptr, probe ? nullptr : &workspace.diagnostics);
         } else {
-            workspace.sources = loadSources(root);
-            for (auto& source : workspace.sources) if (auto found = overlays.find(source.path); found != overlays.end()) source = sourceText(source.path, found->second, {});
+            auto sources = loadSources(root);
+            for (auto& source : sources) if (auto found = overlays.find(source.path); found != overlays.end()) source = sourceText(source.path, found->second, {});
             if (probe) {
-                auto found = std::ranges::find(workspace.sources, probe->path, &Source::path);
-                if (found == workspace.sources.end()) return workspace;
-                workspace.sources = {std::move(*found)};
-                syntax = indexFileSyntax(workspace.sources.front());
-            } else syntax = parse(workspace.sources);
+                auto found = std::ranges::find(sources, probe->path, &Source::path);
+                if (found == sources.end()) return workspace;
+                program.sources = {std::move(*found)};
+                program.syntax = indexFileSyntax(program.sources.front());
+            } else program = loadLooseProgram(std::move(sources), workspace.diagnostics, &parseCache);
         }
-        if (!probe) workspace.generated = editorDeclarations(syntax, workspace.sources, true);
-        auto checked = check(std::move(syntax), workspace.sources, false, nullptr, &workspace.editor);
-        workspace.warnings = std::move(checked.warnings);
-    } catch (const Diagnostic& error) { workspace.error = error; }
+        workspace.sources = std::move(program.sources);
+        workspace.editor.references = std::move(program.references);
+        if (probe) check(std::move(program.syntax), workspace.sources, false, nullptr, &workspace.editor);
+        else if (!program.incompleteDeclaration) {
+            workspace.generated = editorDeclarations(program.syntax, workspace.sources, true);
+            checkForDiagnostics(std::move(program.syntax), workspace.sources, false, workspace.diagnostics, &workspace.editor);
+        }
+    } catch (const Diagnostic& error) { workspace.diagnostics.add(error); }
     catch (const EditorProbeFinished&) {}
+    workspace.diagnostics.sort();
     return workspace;
 }
 
@@ -343,7 +346,7 @@ struct WorkspaceInputs {
 
 std::optional<std::vector<std::pair<std::size_t, Source>>> triviaOnlyUpdates(
     const Snapshot& previous, const AnalysisInputs& inputs, const SourceOverlay& overlays) {
-    if (previous.inputs != inputs || previous.overlays == overlays || previous.workspace.error)
+    if (previous.inputs != inputs || previous.overlays == overlays || !previous.workspace.diagnostics.errors.empty())
         return {};
     for (const auto& source : previous.workspace.sources)
         if (source.text.find_first_of("#@") != std::string::npos) return {};
@@ -399,12 +402,23 @@ const Source* sourceFor(const Workspace& workspace, const fs::path& path) {
     return original;
 }
 
-const NameReference* referenceAt(const Workspace& workspace, const fs::path& path, std::size_t offset) {
+std::optional<std::size_t> originalFile(const Workspace& workspace, const Source& source) {
+    for (std::size_t file = 0; file < workspace.sources.size(); ++file) {
+        auto original = &workspace.sources[file];
+        while (original->previous) original = original->previous.get();
+        if (original == &source) return file;
+    }
+    return {};
+}
+
+const NameReference* referenceAt(const Workspace& workspace, const Source& source, std::size_t offset) {
+    auto file = originalFile(workspace, source);
+    if (!file) return nullptr;
+    const auto& current = workspace.sources[*file];
     auto matches = [&](SourceAnchor anchor) {
-        if (anchor.file >= workspace.sources.size()) return false;
-        const auto& source = workspace.sources[anchor.file];
-        auto site = source.userSite(anchor.span);
-        return pathKey(fromUtf8(site.file)) == pathKey(path) && site.start.offset <= offset && (offset < site.end.offset || site.start.offset == site.end.offset);
+        if (anchor.file != *file) return false;
+        auto span = current.authoredSpan(anchor.span);
+        return span && span->begin <= offset && offset < span->end;
     };
     for (const auto& reference : workspace.editor.references) if (matches(reference.use)) return &reference;
     for (const auto& reference : workspace.editor.references) if (matches(reference.declaration)) return &reference;
@@ -412,6 +426,30 @@ const NameReference* referenceAt(const Workspace& workspace, const fs::path& pat
 }
 
 SourceAnchor renameAnchor(const NameReference& reference) { return reference.renameTarget.value_or(reference.declaration); }
+
+std::optional<SourceAnchor> bindingAt(const Workspace& workspace, const Source& source, std::size_t offset) {
+    auto file = originalFile(workspace, source);
+    if (!file) return {};
+    const auto& current = workspace.sources[*file];
+    const auto& bindings = workspace.editor.bindings;
+    for (auto item = bindings.lower_bound({*file, {0, 0}}); item != bindings.end() && item->first.file == *file; ++item)
+        if (auto span = current.authoredSpan(item->first.span); span && span->begin <= offset && offset < span->end) return item->first;
+    return {};
+}
+
+json::Array highlights(const Workspace& workspace, const Source& source, SourceAnchor target) {
+    auto file = originalFile(workspace, source);
+    if (!file) return {};
+    std::set<Span> spans;
+    auto append = [&](SourceAnchor anchor) {
+        if (anchor.file == *file) if (auto span = workspace.sources[*file].authoredSpan(anchor.span)) spans.insert(*span);
+    };
+    append(target);
+    for (const auto& reference : workspace.editor.references) if (renameAnchor(reference) == target) append(reference.use);
+    json::Array result;
+    for (auto span : spans) result.push_back(json::Object{{"range", jsonRange(source, span)}, {"kind", 1}});
+    return result;
+}
 
 json::Array locationsFor(const Workspace& workspace, SourceAnchor target, bool includeDeclaration) {
     std::set<std::tuple<std::string, std::size_t, std::size_t>> seen;
@@ -458,6 +496,190 @@ int completionKind(EditorKind kind) {
         case TypeParameter: return 25;
     }
     std::abort();
+}
+
+int symbolKind(EditorKind kind) {
+    using enum EditorKind;
+    switch (kind) {
+        case Module: case Extension: return 2;
+        case Class: case TypeAlias: return 5;
+        case Method: return 6;
+        case Property: return 7;
+        case Field: return 8;
+        case Constructor: return 9;
+        case Enum: return 10;
+        case Trait: return 11;
+        case Function: case Macro: case Decorator: return 12;
+        case Variable: case Parameter: return 13;
+        case Constant: return 14;
+        case EnumCase: return 22;
+        case Struct: return 23;
+        case TypeParameter: return 26;
+        case Keyword: std::abort();
+    }
+    std::abort();
+}
+
+constexpr std::array<std::string_view, 15> semanticTypes{"namespace", "type", "class", "enum", "interface", "struct",
+    "typeParameter", "parameter", "variable", "property", "enumMember", "function", "method", "macro", "decorator"};
+
+int semanticType(EditorKind kind) {
+    using enum EditorKind;
+    switch (kind) {
+        case Module: case Extension: return 0;
+        case TypeAlias: return 1;
+        case Class: return 2;
+        case Enum: return 3;
+        case Trait: return 4;
+        case Struct: return 5;
+        case TypeParameter: return 6;
+        case Parameter: return 7;
+        case Variable: case Constant: return 8;
+        case Field: case Property: return 9;
+        case EnumCase: return 10;
+        case Function: return 11;
+        case Method: case Constructor: return 12;
+        case Macro: return 13;
+        case Decorator: return 14;
+        case Keyword: std::abort();
+    }
+    std::abort();
+}
+
+json::Object semanticLegend() {
+    json::Array types;
+    for (auto name : semanticTypes) types.emplace_back(name);
+    return json::Object{{"tokenTypes", std::move(types)}, {"tokenModifiers", json::Array{"declaration", "readonly", "static", "async"}}};
+}
+
+json::Object semanticTokens(const Workspace& workspace, const Source& source, std::span<const EditorDefinition> macros) {
+    struct Coloring { EditorKind kind; unsigned modifiers; };
+    std::map<Span, Coloring> colors;
+    if (auto file = originalFile(workspace, source)) {
+        const auto& current = workspace.sources[*file];
+        const auto& bindings = workspace.editor.bindings;
+        for (const auto& reference : workspace.editor.references) {
+            if (reference.use.file != *file) continue;
+            auto span = current.authoredSpan(reference.use.span);
+            if (!span) continue;
+            auto binding = bindings.find(reference.declaration);
+            if (!reference.kind && binding == bindings.end()) continue;
+            auto kind = reference.kind ? *reference.kind : binding->second.kind;
+            auto modifiers = binding == bindings.end() ? 0u : binding->second.modifiers;
+            if (reference.use == renameAnchor(reference)) modifiers |= Declaration;
+            colors.try_emplace(*span, Coloring{kind, modifiers});
+        }
+        for (auto item = bindings.lower_bound({*file, {0, 0}}); item != bindings.end() && item->first.file == *file; ++item)
+            if (auto span = current.authoredSpan(item->first.span))
+                colors.insert_or_assign(*span, Coloring{item->second.kind, item->second.modifiers | Declaration});
+    }
+    for (const auto& macro : macros) colors.insert_or_assign(macro.use, Coloring{macro.symbol.kind, 0});
+    json::Array data;
+    std::size_t line = 0, character = 0;
+    for (const auto& token : syntaxTokens(source, false, true)) {
+        auto found = colors.find(token.span);
+        if (found == colors.end()) continue;
+        if (token.kind != "name" && !(token.kind == "keyword" && found->second.kind == EditorKind::Constructor)) continue;
+        auto start = lspPosition(source, token.span.begin), end = lspPosition(source, token.span.end);
+        if (start.line != end.line) continue;
+        data.emplace_back(start.line - line);
+        data.emplace_back(start.column - (start.line == line ? character : 0));
+        data.emplace_back(end.column - start.column);
+        data.emplace_back(semanticType(found->second.kind));
+        data.emplace_back(found->second.modifiers);
+        line = start.line;
+        character = start.column;
+    }
+    return json::Object{{"data", std::move(data)}};
+}
+
+json::Array documentSymbols(const Source& source, const std::vector<OutlineSymbol>& outline) {
+    json::Array result;
+    for (const auto& item : outline) {
+        json::Object symbol{{"name", item.name}, {"kind", symbolKind(item.kind)},
+            {"range", jsonRange(source, item.extent)}, {"selectionRange", jsonRange(source, item.selection)}};
+        if (!item.children.empty()) symbol["children"] = documentSymbols(source, item.children);
+        result.push_back(std::move(symbol));
+    }
+    return result;
+}
+
+bool macroKind(EditorKind kind) { return kind == EditorKind::Macro || kind == EditorKind::Decorator; }
+
+json::Array workspaceSymbols(std::string query, const std::set<fs::path>& folders, const Documents& documents, EditorParseCache& cache) {
+    auto standard = fromUtf8(pathKey(sdkRoot() / "share" / "lyra" / "std"));
+    fs::path localCache;
+    if (auto path = cacheOverride(); !path.empty()) localCache = fromUtf8(pathKey(path));
+    auto excluded = [&](const fs::path& path) {
+        return path == standard || inside(standard, path) || (!localCache.empty() && (path == localCache || inside(localCache, path)));
+    };
+    auto ignoredDirectory = [](const fs::path& path) {
+        auto name = pathText(path.filename());
+        return name.starts_with('.') || name == "build" || name == "dist" || name == "node_modules";
+    };
+    std::set<fs::path> searched, roots, files;
+    auto addPackage = [&](const fs::path& path) {
+        if (!searched.insert(path).second) return;
+        for (const auto& root : indexLocalPackageRoots(path)) if (!excluded(root)) roots.insert(root);
+    };
+    for (const auto& folder : folders) {
+        if (excluded(folder)) continue;
+        if (fs::is_regular_file(folder / "lyra.json5")) { addPackage(folder); continue; }
+        auto options = fs::directory_options::skip_permission_denied;
+        if (fs::is_directory(folder / "src")) roots.insert(folder);
+        if (!fs::is_directory(folder)) continue;
+        for (auto entry = fs::recursive_directory_iterator(folder, options); entry != fs::recursive_directory_iterator{}; ++entry) {
+            if (!entry->is_directory()) continue;
+            const auto& path = entry->path();
+            if (entry->is_symlink() || ignoredDirectory(path) || excluded(path)) { entry.disable_recursion_pending(); continue; }
+            if (fs::is_regular_file(path / "lyra.json5")) { addPackage(path); entry.disable_recursion_pending(); }
+        }
+    }
+    for (const auto& [key, document] : documents) {
+        auto path = fromUtf8(key);
+        if (excluded(path)) continue;
+        if (path.extension() == ".ly") { files.insert(path); addPackage(packageRoot(path)); }
+        else if (path.filename() == "lyra.json5") addPackage(path.parent_path());
+    }
+    for (const auto& root : roots) {
+        auto src = root / "src";
+        if (!fs::is_directory(src) || fs::is_symlink(src)) continue;
+        auto options = fs::directory_options::skip_permission_denied;
+        for (auto entry = fs::recursive_directory_iterator(src, options); entry != fs::recursive_directory_iterator{}; ++entry) {
+            const auto& path = entry->path();
+            if (entry->is_directory()) {
+                auto name = path.filename();
+                bool macros = name == ".macros" || name == ".expressions" || name == ".decorators";
+                if (entry->is_symlink() || (ignoredDirectory(path) && !macros) || excluded(path)) entry.disable_recursion_pending();
+            } else if (path.extension() == ".ly" && !entry->is_symlink() && entry->is_regular_file()) files.insert(path);
+        }
+    }
+    auto lower = [](std::string text) {
+        std::ranges::transform(text, text.begin(), [](unsigned char letter) { return static_cast<char>(std::tolower(letter)); });
+        return text;
+    };
+    query = lower(std::move(query));
+    json::Array result;
+    for (const auto& path : files) {
+        try {
+            auto opened = documents.find(pathKey(path));
+            auto source = opened != documents.end() ? sourceText(path, opened->second.text, {}) : loadSource(path, {});
+            auto append = [&](const OutlineSymbol& symbol, const std::string& parent) {
+                auto name = parent.empty() ? symbol.name : parent + '.' + symbol.name;
+                if (result.size() >= 200 || (!lower(symbol.name).contains(query) && !lower(std::move(name)).contains(query))) return;
+                json::Object item{{"name", symbol.name}, {"kind", symbolKind(symbol.kind)}, {"location", jsonLocation(source, symbol.selection)}};
+                if (!parent.empty()) item["containerName"] = parent;
+                result.push_back(std::move(item));
+            };
+            for (const auto& symbol : editorOutline(source, editorFileSyntax(source, cache))) {
+                append(symbol, {});
+                for (const auto& member : symbol.children) append(member, symbol.name);
+            }
+            if (result.size() >= 200) break;
+        } catch (const Diagnostic&) {}
+        catch (const fs::filesystem_error&) {}
+    }
+    return result;
 }
 
 json::Object markdown(std::string text) { return json::Object{{"kind", "markdown"}, {"value", std::move(text)}}; }
@@ -588,17 +810,14 @@ json::Value completionItems(const Source& source, std::size_t offset, const Synt
     return json::Object{{"isIncomplete", syntax.incomplete}, {"items", std::move(items)}};
 }
 
-json::Array importActions(const Source& source, const Document& document, const Diagnostic& error, const EditorModuleIndex& catalog,
-    const json::Object& params) {
-    if (!error.missingName || !error.site || pathKey(fromUtf8(error.site->file)) != pathKey(source.path)) return {};
-    if (const auto* context = params.getObject("context")) if (const auto* only = context->getArray("only"))
-        if (std::ranges::none_of(*only, [](const auto& kind) { auto value = kind.getAsString(); return value && (value->empty() || *value == "quickfix"); })) return {};
-    const auto* range = params.getObject("range");
-    if (!range) return {};
-    const Span diagnostic{error.site->start.offset, error.site->end.offset};
-    const Span requested{requestOffset(source, range->getObject("start")), requestOffset(source, range->getObject("end"))};
-    if (requested.end < diagnostic.begin || requested.begin > diagnostic.end) return {};
-    const auto& missing = *error.missingName;
+json::Object codeAction(const Document& document, std::string title, std::string kind, json::Array edits) {
+    return json::Object{{"title", std::move(title)}, {"kind", std::move(kind)}, {"edit", json::Object{
+        {"documentChanges", json::Array{json::Object{{"textDocument", json::Object{{"uri", document.uri}, {"version", document.version}}}, {"edits", std::move(edits)}}}}
+    }}};
+}
+
+json::Array importActions(const Source& source, const Document& document, const MissingName& missing, const EditorModuleIndex& catalog,
+    Span diagnostic, Span requested) {
     const auto tokens = syntaxTokens(source, false, true);
     const auto text = std::string_view(source.text);
     std::optional<Span> site;
@@ -652,12 +871,53 @@ json::Array importActions(const Source& source, const Document& document, const 
         if (existing == catalog.namespaces.end()) edits.push_back(importEdit(source, importAnchor(source), directive));
         auto title = existing == catalog.namespaces.end() ? "添加导入：" + directive + " → " + name : "使用已导入的 " + name;
         auto& actions = existing == catalog.namespaces.end() ? added : reused;
-        actions.push_back(json::Object{{"title", std::move(title)}, {"kind", "quickfix"}, {"edit", json::Object{
-            {"documentChanges", json::Array{json::Object{{"textDocument", json::Object{{"uri", document.uri}, {"version", document.version}}}, {"edits", std::move(edits)}}}}
-        }}});
+        actions.push_back(codeAction(document, std::move(title), "quickfix", std::move(edits)));
     }
     for (auto& action : added) reused.push_back(std::move(action));
     return reused;
+}
+
+json::Array diagnosticActions(const Source& source, const Document& document, const std::vector<Diagnostic>& errors,
+    const EditorModuleIndex* catalog, const json::Object& params) {
+    const auto* context = params.getObject("context");
+    const auto* only = context ? context->getArray("only") : nullptr;
+    auto allows = [&](std::string_view kind) {
+        return std::ranges::any_of(*only, [&](const auto& item) {
+            auto requested = item.getAsString();
+            return requested && (requested->empty() || std::string_view(*requested) == kind ||
+                (kind.starts_with(*requested) && kind[requested->size()] == '.'));
+        });
+    };
+    bool quick = !only || allows("quickfix"), fixAll = only && allows("source.fixAll.lyra");
+    const auto* range = params.getObject("range");
+    if (!range || (!quick && !fixAll)) return {};
+    const Span requested{requestOffset(source, range->getObject("start")), requestOffset(source, range->getObject("end"))};
+    const auto* selected = context ? context->getArray("diagnostics") : nullptr;
+    auto key = pathKey(source.path);
+    json::Array result;
+    std::set<std::size_t> semicolons;
+    for (const auto& error : errors) {
+        if (!error.site || pathKey(fromUtf8(error.site->file)) != key) continue;
+        const Span span{error.site->start.offset, error.site->end.offset};
+        bool semicolon = error.removeTailSemicolon && span.begin < source.text.size() && span.end == span.begin + 1 && source.text[span.begin] == ';';
+        if (fixAll && semicolon) semicolons.insert(span.begin);
+        if (!quick || requested.end < span.begin || requested.begin > span.end) continue;
+        if (selected && !selected->empty() && std::ranges::none_of(*selected, [&](const auto& item) {
+            const auto* diag = item.getAsObject();
+            const auto* selectedRange = diag ? diag->getObject("range") : nullptr;
+            return selectedRange && diag->getString("code") == error.code && *selectedRange == jsonRange(source, span);
+        })) continue;
+        if (semicolon) result.push_back(codeAction(document, "删除末尾分号", "quickfix", json::Array{
+            json::Object{{"range", jsonRange(source, span)}, {"newText", ""}}}));
+        if (error.missingName && catalog)
+            for (auto& action : importActions(source, document, *error.missingName, *catalog, span, requested)) result.push_back(std::move(action));
+    }
+    if (!semicolons.empty()) {
+        json::Array edits;
+        for (auto offset : semicolons) edits.push_back(json::Object{{"range", jsonRange(source, {offset, offset + 1})}, {"newText", ""}});
+        result.push_back(codeAction(document, "删除错误的块尾分号", "source.fixAll.lyra", std::move(edits)));
+    }
+    return result;
 }
 
 std::string_view tokenText(const Source& source, const SyntaxToken& token) {
@@ -669,6 +929,64 @@ char closingDelimiter(std::string_view token) {
     if (token == "[") return ']';
     if (token == "{") return '}';
     return '\0';
+}
+
+json::Array foldingRanges(const Source& source, const Module& syntax) {
+    std::set<std::tuple<std::size_t, std::size_t, std::string_view>> ranges;
+    auto lineAt = [&](std::size_t offset) { return static_cast<std::size_t>(std::ranges::upper_bound(source.lineStarts, offset) - source.lineStarts.begin() - 1); };
+    auto fold = [&](std::size_t start, std::size_t end, std::string_view kind = {}) {
+        if (start < end) ranges.emplace(start, end, kind);
+    };
+    std::vector<std::pair<char, std::size_t>> blocks;
+    std::optional<std::pair<std::size_t, std::size_t>> lineComments;
+    auto flushComments = [&] {
+        if (lineComments) fold(lineComments->first, lineComments->second, "comment");
+        lineComments.reset();
+    };
+    for (const auto& token : syntaxTokens(source, true, true)) {
+        auto word = tokenText(source, token);
+        auto line = lineAt(token.span.begin);
+        if (token.kind == "comment") {
+            auto prefix = std::string_view(source.text).substr(source.lineStarts[line], token.span.begin - source.lineStarts[line]);
+            if (word.starts_with("//") && prefix.find_first_not_of(" \t") == prefix.npos) {
+                if (lineComments && lineComments->second + 1 == line) lineComments->second = line;
+                else { flushComments(); lineComments = {line, line}; }
+                continue;
+            }
+            flushComments();
+            fold(line, lineAt(token.span.end - 1), "comment");
+            continue;
+        }
+        flushComments();
+        if (token.kind != "token" || word.size() != 1) continue;
+        if (auto close = closingDelimiter(word)) blocks.emplace_back(close, line);
+        else if (word == "}" || word == ")" || word == "]") {
+            auto open = std::ranges::find(blocks | std::views::reverse, word.front(), &std::pair<char, std::size_t>::first);
+            if (open == blocks.rend()) continue;
+            fold(open->second, line);
+            blocks.erase(std::prev(open.base()), blocks.end());
+        }
+    }
+    flushComments();
+    std::map<std::size_t, std::size_t> imports;
+    for (const auto& use : syntax.imports) {
+        auto first = lineAt(use.path.front().span.begin);
+        auto last = lineAt(std::max(use.alias.span.end, use.member ? use.member->span.end : 0));
+        imports[first] = std::max(imports[first], last);
+    }
+    for (auto item = imports.begin(); item != imports.end();) {
+        const auto first = item->first;
+        auto last = item++->second;
+        while (item != imports.end() && item->first <= last + 1) last = std::max(last, item++->second);
+        fold(first, last, "imports");
+    }
+    json::Array result;
+    for (const auto& [start, end, kind] : ranges) {
+        json::Object range{{"startLine", start}, {"endLine", end}};
+        if (!kind.empty()) range["kind"] = std::string(kind);
+        result.push_back(std::move(range));
+    }
+    return result;
 }
 
 std::optional<Span> signatureOpening(const Source& source, const std::vector<SyntaxToken>& tokens, std::size_t offset) {
@@ -839,12 +1157,15 @@ public:
 
 private:
     Documents documents;
+    std::set<fs::path> workspaceFolders;
     std::map<fs::path, Snapshot> snapshots;
     ParseCache parseCache;
     EditorParseCache editorParseCache;
+    EditorParseCache workspaceSymbolCache;
     std::map<fs::path, PackageGraph> catalogPackages;
     std::map<fs::path, EditorModuleIndex> catalogs;
     std::map<std::string, std::vector<EditorSymbol>> generated;
+    std::set<std::string> publishedClosed;
     std::map<WatchPattern, std::string> activeWatchers;
     std::size_t nextWatcher{};
     std::size_t nextRequest{};
@@ -1074,12 +1395,18 @@ private:
             auto workspace = capabilities ? capabilities->getObject("workspace") : nullptr;
             auto watch = workspace ? workspace->getObject("didChangeWatchedFiles") : nullptr;
             relativeWatchers = watch && watch->getBoolean("dynamicRegistration").value_or(false) && watch->getBoolean("relativePatternSupport").value_or(false);
+            if (const auto* folders = params.getArray("workspaceFolders")) updateWorkspaceFolders(*folders, true);
+            else if (auto root = params.getString("rootUri"); root && root->starts_with("file://")) workspaceFolders.insert(fromUtf8(pathKey(decodeUri(*root))));
             return json::Object{{"capabilities", json::Object{
             {"positionEncoding", "utf-16"}, {"textDocumentSync", json::Object{{"openClose", true}, {"change", 2}}},
-            {"completionProvider", json::Object{{"triggerCharacters", json::Array{".", "@", "#", "{"}}}},
-            {"codeActionProvider", json::Object{{"codeActionKinds", json::Array{"quickfix"}}}},
+            {"completionProvider", json::Object{{"triggerCharacters", json::Array{".", "@", "#", "{", ":", "'", "\""}}}},
+            {"codeActionProvider", json::Object{{"codeActionKinds", json::Array{"quickfix", "source.fixAll.lyra"}}}},
             {"signatureHelpProvider", json::Object{{"triggerCharacters", json::Array{"(", ",", ":"}}, {"retriggerCharacters", json::Array{")"}}}},
             {"hoverProvider", true}, {"definitionProvider", true}, {"referencesProvider", true},
+            {"typeDefinitionProvider", true}, {"documentHighlightProvider", true}, {"documentSymbolProvider", true},
+            {"foldingRangeProvider", true}, {"workspaceSymbolProvider", true},
+            {"workspace", json::Object{{"workspaceFolders", json::Object{{"supported", true}, {"changeNotifications", true}}}}},
+            {"semanticTokensProvider", json::Object{{"legend", semanticLegend()}, {"full", true}}},
             {"renameProvider", true}, {"documentFormattingProvider", true}, {"inlayHintProvider", true}}}};
         }
         if (method == "initialized" || method == "$/cancelRequest") return {};
@@ -1090,6 +1417,20 @@ private:
         }
         if (method == "shutdown") { finishWorker(); shutdown = true; return json::Value(nullptr); }
         if (method == "exit") { exited = true; return {}; }
+        if (method == "workspace/didChangeWorkspaceFolders") {
+            if (const auto* event = params.getObject("event")) {
+                if (const auto* removed = event->getArray("removed")) updateWorkspaceFolders(*removed, false);
+                if (const auto* added = event->getArray("added")) updateWorkspaceFolders(*added, true);
+            }
+            return {};
+        }
+        if (id && method == "workspace/symbol") {
+            auto query = params.getString("query").value_or("").str();
+            enqueue(*id, json::Array{}, [this, query = std::move(query), folders = workspaceFolders, documents = documents] {
+                return workspaceSymbols(query, folders, documents, workspaceSymbolCache);
+            });
+            return {};
+        }
         if (method == "workspace/didChangeWatchedFiles") {
             auto changes = params.getArray("changes");
             if (!changes) return {};
@@ -1167,6 +1508,16 @@ private:
         return {};
     }
 
+    void updateWorkspaceFolders(const json::Array& folders, bool added) {
+        for (const auto& item : folders) if (const auto* folder = item.getAsObject()) {
+            auto uri = folder->getString("uri");
+            if (!uri || !uri->starts_with("file://")) continue;
+            auto path = fromUtf8(pathKey(decodeUri(*uri)));
+            if (added) workspaceFolders.insert(std::move(path));
+            else workspaceFolders.erase(path);
+        }
+    }
+
     fs::path requestPath(const json::Object& params) const {
         auto document = params.getObject("textDocument");
         auto uri = document ? document->getString("uri") : std::nullopt;
@@ -1176,7 +1527,9 @@ private:
 
     static json::Value unavailable(std::string_view method) {
         if (method == "textDocument/completion") return json::Object{{"isIncomplete", false}, {"items", json::Array{}}};
-        if (method == "textDocument/references" || method == "textDocument/inlayHint" || method == "textDocument/formatting" || method == "textDocument/codeAction") return json::Array{};
+        if (method == "textDocument/semanticTokens/full") return json::Object{{"data", json::Array{}}};
+        if (method == "textDocument/references" || method == "textDocument/inlayHint" || method == "textDocument/formatting" || method == "textDocument/codeAction" ||
+            method == "textDocument/documentSymbol" || method == "textDocument/foldingRange" || method == "textDocument/documentHighlight") return json::Array{};
         return nullptr;
     }
 
@@ -1201,6 +1554,22 @@ private:
         auto opened = documents.find(key);
         if (opened == documents.end()) return unavailable(method);
         const auto& document = opened->second;
+        if (path.filename() == "lyra.json5") {
+            if (method != "textDocument/completion") return unavailable(method);
+            auto source = sourceText(document.path, document.text, {});
+            auto offset = requestOffset(source, params.getObject("position"));
+            json::Array items;
+            for (auto& entry : completeManifest(source, offset)) items.push_back(json::Object{
+                {"label", std::move(entry.label)}, {"kind", entry.value ? 20 : 10}, {"detail", std::move(entry.detail)},
+                {"textEdit", json::Object{{"range", jsonRange(source, entry.replacement)}, {"newText", std::move(entry.text)}}}});
+            return json::Object{{"isIncomplete", false}, {"items", std::move(items)}};
+        }
+        if (method == "textDocument/documentSymbol" || method == "textDocument/foldingRange") {
+            auto source = sourceText(document.path, document.text, {});
+            const auto& syntax = editorFileSyntax(source, editorParseCache);
+            if (method == "textDocument/documentSymbol") return documentSymbols(source, editorOutline(source, syntax));
+            return foldingRanges(source, syntax);
+        }
         if (method == "textDocument/completion" || method == "textDocument/signatureHelp") {
             auto source = sourceText(fromUtf8(key), document.text, {});
             auto offset = requestOffset(source, params.getObject("position"));
@@ -1239,18 +1608,18 @@ private:
             return completionItems(source, offset, syntax, index, nullptr, expanded);
         }
         if (method == "textDocument/codeAction") {
-            try {
-                auto index = catalog(document.path);
-                enqueue(id, unavailable(method), [this, params, key, index = std::move(index), documents = documents] {
-                    const auto& document = documents.at(key);
-                    const auto& workspace = analyze(packageRoot(fromUtf8(key)), documents);
-                    auto source = sourceFor(workspace, document.path);
-                    if (!workspace.error || !source || source->text != document.text) return json::Array{};
-                    return importActions(*source, document, *workspace.error, index, params);
-                });
-                return {};
-            } catch (const PackageError&) { return unavailable(method); }
-            catch (const fs::filesystem_error&) { return unavailable(method); }
+            std::optional<EditorModuleIndex> index;
+            try { index = catalog(document.path); }
+            catch (const PackageError&) {}
+            catch (const fs::filesystem_error&) {}
+            enqueue(id, unavailable(method), [this, params, key, index = std::move(index), documents = documents] {
+                const auto& document = documents.at(key);
+                const auto& workspace = analyze(packageRoot(fromUtf8(key)), documents);
+                auto source = sourceFor(workspace, document.path);
+                if (!source || source->text != document.text) return json::Array{};
+                return diagnosticActions(*source, document, workspace.diagnostics.errors, index ? &*index : nullptr, params);
+            });
+            return {};
         }
         if (method == "textDocument/formatting") {
             FormatOptions options;
@@ -1281,26 +1650,60 @@ private:
             catch (const PackageError&) {}
             catch (const fs::filesystem_error&) {}
         }
+        if (method == "textDocument/semanticTokens/full" || method == "textDocument/documentHighlight") {
+            std::vector<EditorDefinition> macros;
+            if (document.text.find_first_of("#@") != std::string::npos || document.text.contains("import macro") || document.text.contains("import decorator")) {
+                try { for (const auto& item : catalog(path).definitions) if (macroKind(item.symbol.kind)) macros.push_back(item); }
+                catch (const Diagnostic&) {}
+                catch (const PackageError&) {}
+                catch (const fs::filesystem_error&) {}
+            }
+            enqueue(id, unavailable(method), [this, method = std::string(method), params, key, macros = std::move(macros), documents = documents] {
+                return checkedRequest(method, params, documents.at(key), documents, macros);
+            });
+            return {};
+        }
         if (method != "textDocument/inlayHint" && method != "textDocument/definition" && method != "textDocument/references" &&
-            method != "textDocument/rename" && method != "textDocument/hover") return unavailable(method);
+            method != "textDocument/rename" && method != "textDocument/hover" && method != "textDocument/typeDefinition") return unavailable(method);
         enqueue(id, unavailable(method), [this, method = std::string(method), params, key, documents = documents] {
             return checkedRequest(method, params, documents.at(key), documents);
         });
         return {};
     }
 
-    json::Value checkedRequest(std::string_view method, const json::Object& params, const Document& document, const Documents& documents) {
+    json::Value checkedRequest(std::string_view method, const json::Object& params, const Document& document, const Documents& documents,
+        std::span<const EditorDefinition> macros = {}) {
         const auto& path = document.path;
         const auto& workspace = analyze(packageRoot(fromUtf8(pathKey(path))), documents);
         auto source = sourceFor(workspace, path);
         if (!source || source->text != document.text) return unavailable(method);
+        if (method == "textDocument/semanticTokens/full") return semanticTokens(workspace, *source, macros);
         if (method == "textDocument/inlayHint") {
             auto range = params.getObject("range");
             if (!range) throw Diagnostic{"LYLSP0001", "缺少 range"};
             return inlayHints(workspace, *source, {requestOffset(*source, range->getObject("start")), requestOffset(*source, range->getObject("end"))});
         }
         auto offset = requestOffset(*source, params.getObject("position"));
-        auto reference = referenceAt(workspace, path, offset);
+        auto reference = referenceAt(workspace, *source, offset);
+        if (method == "textDocument/documentHighlight") {
+            auto target = std::ranges::find_if(macros, [&](const EditorDefinition& item) { return item.use.begin <= offset && offset < item.use.end; });
+            if (target != macros.end()) {
+                json::Array matches;
+                for (const auto& item : macros) if (item.path == target->path && item.target == target->target)
+                    matches.push_back(json::Object{{"range", jsonRange(*source, item.use)}, {"kind", 1}});
+                return matches;
+            }
+            auto symbol = reference ? std::optional(renameAnchor(*reference)) : bindingAt(workspace, *source, offset);
+            return symbol ? highlights(workspace, *source, *symbol) : json::Array{};
+        }
+        if (method == "textDocument/typeDefinition") {
+            auto symbol = reference ? std::optional(reference->declaration) : bindingAt(workspace, *source, offset);
+            if (symbol) if (auto binding = workspace.editor.bindings.find(*symbol); binding != workspace.editor.bindings.end() && binding->second.typeDefinition) {
+                auto location = jsonLocation(workspace, *binding->second.typeDefinition);
+                if (!location.empty()) return json::Array{std::move(location)};
+            }
+            return json::Value(nullptr);
+        }
         if (method == "textDocument/definition") {
             if (!reference || reference->declaration.file >= workspace.sources.size()) return json::Value(nullptr);
             return json::Array{jsonLocation(workspace, reference->declaration)};
@@ -1312,7 +1715,7 @@ private:
             return locationsFor(workspace, renameAnchor(*reference), include);
         }
         if (method == "textDocument/rename") {
-            if (workspace.error || !reference) return unavailable(method);
+            if (!workspace.diagnostics.errors.empty() || !reference) return unavailable(method);
             auto newName = params.getString("newName");
             if (!newName || newName->empty() || (!std::isalpha(static_cast<unsigned char>((*newName)[0])) && (*newName)[0] != '_')) throw Diagnostic{"LYLSP0001", "新名称必须是有效 Lyra 标识符"};
             if (!std::all_of(newName->begin() + 1, newName->end(), [](unsigned char ch) { return std::isalnum(ch) || ch == '_'; })) throw Diagnostic{"LYLSP0001", "新名称必须是有效 Lyra 标识符"};
@@ -1394,26 +1797,57 @@ private:
             else roots.try_emplace(std::move(root), &document);
         }
         std::erase_if(snapshots, [&](const auto& entry) { return !roots.contains(entry.first); });
+        std::map<std::string, std::optional<Source>> reportSources;
+        auto sourceAt = [&](const std::string& file) -> const Source* {
+            auto path = fromUtf8(file);
+            if (!path.is_absolute()) return nullptr;
+            auto key = pathKey(path);
+            auto [entry, inserted] = reportSources.try_emplace(key);
+            if (inserted) {
+                auto open = documents.find(key);
+                try {
+                    if (open != documents.end()) entry->second = sourceText(path, open->second.text, {});
+                    else if (path.extension() == ".ly" && fs::is_regular_file(path)) entry->second = loadSource(path, {});
+                } catch (const Diagnostic&) {}
+                catch (const fs::filesystem_error&) {}
+            }
+            return entry->second ? &*entry->second : nullptr;
+        };
         auto append = [&](const Diagnostic& error, const Document& owner, int severity = 1) {
-            const Document* target = &owner;
+            auto uri = owner.uri;
+            const Source* source = sourceAt(pathText(owner.path));
             Span span{0, 0};
             if (error.site) {
                 auto document = documents.find(pathKey(fromUtf8(error.site->file)));
-                if (document == documents.end()) return;
-                target = &document->second;
-                span = {error.site->start.offset, error.site->end.offset};
+                if (auto located = sourceAt(error.site->file); located && error.site->end.offset <= located->text.size()) {
+                    source = located;
+                    uri = document != documents.end() ? document->second.uri : encodeUri(source->path);
+                    span = {error.site->start.offset, error.site->end.offset};
+                }
             }
-            auto source = sourceText(target->path, target->text, {});
-            json::Value item = json::Object{{"severity", severity}, {"code", error.code}, {"message", error.message}, {"range", jsonRange(source, span)}};
-            auto& diagnostics = byUri[target->uri];
+            auto message = error.message;
+            if (!error.hint.empty()) message += "\n" + error.hint;
+            json::Object serialized{{"severity", severity}, {"source", "lyra"}, {"code", error.code}, {"message", std::move(message)}, {"range", jsonRange(*source, span)}};
+            json::Array related;
+            for (const auto& note : error.notes) if (auto target = sourceAt(note.site.file)) {
+                if (note.site.end.offset <= target->text.size()) related.push_back(json::Object{
+                    {"location", jsonLocation(*target, {note.site.start.offset, note.site.end.offset})}, {"message", note.message}});
+            }
+            if (!related.empty()) serialized["relatedInformation"] = std::move(related);
+            json::Value item(std::move(serialized));
+            auto& diagnostics = byUri[uri];
             if (std::ranges::find(diagnostics, item) == diagnostics.end()) diagnostics.push_back(std::move(item));
         };
         std::map<std::string, std::vector<EditorSymbol>> expanded;
+        for (const auto& [key, document] : documents) if (document.path.filename() == "lyra.json5") {
+            auto source = sourceText(document.path, document.text, {});
+            if (auto error = validateManifest(source)) append(*error, document);
+        }
         for (const auto& [root, owner] : roots) {
             try {
                 const auto& workspace = analyze(root, documents);
-                for (const auto& warning : workspace.warnings) append(warning, *owner, 2);
-                if (workspace.error) append(*workspace.error, *owner);
+                for (const auto& warning : workspace.diagnostics.warnings) append(warning, *owner, 2);
+                for (const auto& error : workspace.diagnostics.errors) append(error, *owner);
                 for (const auto& [key, document] : documents) if (auto source = sourceFor(workspace, document.path))
                     for (const auto& declaration : workspace.generated) if (workspace.sources[declaration.file].moduleId == source->moduleId)
                         expanded[key].push_back(declaration.symbol);
@@ -1430,7 +1864,16 @@ private:
         for (const auto& [key, document] : documents) {
             auto found = byUri.find(document.uri);
             auto diagnostics = found == byUri.end() ? json::Array{} : std::move(found->second);
+            if (found != byUri.end()) byUri.erase(found);
+            publishedClosed.erase(document.uri);
             send(json::Object{{"jsonrpc", "2.0"}, {"method", "textDocument/publishDiagnostics"}, {"params", json::Object{{"uri", document.uri}, {"version", document.version}, {"diagnostics", std::move(diagnostics)}}}});
+        }
+        for (const auto& uri : publishedClosed) if (!byUri.contains(uri))
+            send(json::Object{{"jsonrpc", "2.0"}, {"method", "textDocument/publishDiagnostics"}, {"params", json::Object{{"uri", uri}, {"diagnostics", json::Array{}}}}});
+        publishedClosed.clear();
+        for (auto& [uri, diagnostics] : byUri) {
+            publishedClosed.insert(uri);
+            send(json::Object{{"jsonrpc", "2.0"}, {"method", "textDocument/publishDiagnostics"}, {"params", json::Object{{"uri", uri}, {"diagnostics", std::move(diagnostics)}}}});
         }
     }
 };

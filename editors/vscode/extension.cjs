@@ -10,7 +10,7 @@ async function activate() {
         args: ['lsp', '--stdio'],
         options: { cwd: __dirname, shell: false, windowsHide: true },
     }, {
-        documentSelector: [{ scheme: 'file', language: 'lyra' }],
+        documentSelector: [{ scheme: 'file', language: 'lyra' }, { scheme: 'file', pattern: '**/lyra.json5' }],
     });
     await client.start();
 }

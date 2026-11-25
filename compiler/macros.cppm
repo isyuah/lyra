@@ -40,7 +40,7 @@ using MacroTypeResolver = std::function<MacroType(std::size_t, const Identifier&
 void expandMacros(Module& syntax, std::vector<Source>& sources, const std::map<std::string, MacroPackage>& packages,
     std::vector<std::filesystem::path>& inputs, const MacroTypeResolver& resolveType, std::string_view typeEnvironment, const MacroEnvironment& environment);
 void expandExpressions(Source& source, std::size_t file, const MacroPackage& package, std::vector<std::filesystem::path>& inputs,
-    const MacroEnvironment& environment);
+    const MacroEnvironment& environment, bool recovering = false);
 std::string_view macroDirectory(MacroKind kind);
 }
 
@@ -119,6 +119,7 @@ struct ExpandedMacro {
     std::set<std::size_t> defaultFields;
     std::vector<std::string> inputKeys;
     fs::path pendingCache{};
+    std::shared_ptr<const Site> definition{};
 };
 
 struct MacroInput { fs::path path; std::string text; };
@@ -553,6 +554,7 @@ ExpandedMacro expand(const Source& source, const Expansion& prefix, const MacroP
     if (!entry) throw at(source, prefix.name.span, "LYM0002", "宏实现缺少入口 fn " + origin.name + "(target: String, argument: String): Syntax");
     if (origin.imported && !parsed.functions[*entry].isPublic)
         throw at(source, prefix.name.span, "LYM0001", "导入的宏或装饰器入口必须是 pub fn：" + origin.name);
+    auto definition = std::make_shared<const Site>(code[1].site(parsed.functions[*entry].name.span));
     auto dependencies = environment.link(origin, parsed, code);
     std::optional<InputSnapshot> prepared;
     fs::path cache;
@@ -561,6 +563,7 @@ ExpandedMacro expand(const Source& source, const Expansion& prefix, const MacroP
         cache = package.cache / fromUtf8(cacheKey(source, prefix, code[1], target, kind, *prepared, declaration.typeEnvironment, dependencies) + ".expansion");
         if (auto hit = loadExpansion(cache, source, fields, *prepared)) {
             for (const auto& key : hit->inputKeys) files.push_back(prepared->at(key).path);
+            hit->definition = definition;
             return std::move(*hit);
         }
     }
@@ -581,10 +584,13 @@ ExpandedMacro expand(const Source& source, const Expansion& prefix, const MacroP
         auto diagnostic = at(source, prefix.name.span, phase ? "LYM0004" : "LYM0002",
             (phase ? "宏的编译期依赖必须是手写且已可用的声明：" : "宏求值失败：") + failure.message);
         if (failure.site) diagnostic.generated = failure.site;
+        diagnostic.notes.push_back({*definition, "宏定义在这里"});
+        if (failure.site && failure.site->file != definition->file) diagnostic.notes.push_back({*failure.site, "宏的编译期依赖在这里失败"});
+        diagnostic.notes.insert(diagnostic.notes.end(), failure.notes.begin(), failure.notes.end());
         throw diagnostic;
     }
     auto output = execution.output;
-    ExpandedMacro result{{}, std::move(machine.defaultFields), {}, std::move(cache)};
+    ExpandedMacro result{{}, std::move(machine.defaultFields), {}, std::move(cache), std::move(definition)};
     for (const auto& [key, text] : machine.inputs) result.inputKeys.push_back(key);
     if (machine.arena.get(output).form != SyntaxForm::Around) result.output.code = machine.arena.render(output);
     else {
@@ -595,7 +601,7 @@ ExpandedMacro expand(const Source& source, const Expansion& prefix, const MacroP
     return result;
 }
 
-Source generatedSource(const Source& source, const Expansion& prefix, const std::vector<SyntaxPiece>& code) {
+Source generatedSource(const Source& source, const Expansion& prefix, const std::vector<SyntaxPiece>& code, std::shared_ptr<const Site> definition) {
     std::string text;
     std::vector<SourcePiece> pieces;
     auto site = prefix.name.span;
@@ -612,17 +618,19 @@ Source generatedSource(const Source& source, const Expansion& prefix, const std:
     result.previous = std::make_shared<Source>(source);
     result.pieces = std::move(pieces);
     result.importParent = prefix.file;
+    result.macroDefinition = std::move(definition);
     return result;
 }
 }
 
 void expandExpressions(Source& source, std::size_t file, const MacroPackage& package, std::vector<fs::path>& inputs,
-    const MacroEnvironment& environment) {
+    const MacroEnvironment& environment, bool recovering) {
     const auto limit = source.text.size() + 4 * byteLimit;
     for (unsigned depth = 0; source.text.find('#') != std::string::npos; ++depth) {
         Module scratch;
         std::vector<ExpressionExpansion> calls;
-        parseFile(scratch, source, file, &calls);
+        if (recovering) recoverFileSyntax(source, &calls);
+        else parseFile(scratch, source, file, &calls);
         if (calls.empty()) break;
         if (depth == 32) throw at(source, calls.front().name.span, "LYM0002", "表达式宏嵌套超过 32 层");
         std::string text;
@@ -631,10 +639,10 @@ void expandExpressions(Source& source, std::size_t file, const MacroPackage& pac
         const auto original = std::string_view(source.text);
         for (const auto& call : calls) {
             auto site = call.name.span;
-            auto append = [&](std::string_view bytes, Span input, bool copied, std::size_t hygiene) {
+            auto append = [&](std::string_view bytes, Span input, bool copied, std::size_t hygiene, std::shared_ptr<const Site> definition = {}) {
                 if (bytes.empty()) return;
                 if (bytes.size() > limit - text.size()) throw at(source, site, "LYM0002", "展开后源码超过字节预算");
-                pieces.push_back({{text.size(), text.size() + bytes.size()}, input, copied, hygiene});
+                pieces.push_back({{text.size(), text.size() + bytes.size()}, input, copied, hygiene, std::move(definition)});
                 text += bytes;
             };
             auto copy = [&](Span span) { append(original.substr(span.begin, span.end - span.begin), span, true, 0); };
@@ -647,11 +655,12 @@ void expandExpressions(Source& source, std::size_t file, const MacroPackage& pac
             for (const auto& piece : generated.output.code) skeleton += piece.copied && piece.text.contains('#') ? "0" : piece.text;
             auto output = sourceText(fromUtf8(pathText(source.path) + "(#" + call.name.text + ")"), std::move(skeleton), source.moduleId);
             output.origin = source.site(site);
+            output.macroDefinition = generated.definition;
             validateMacroExpression(output);
             auto mark = output.origin->start.offset + 1;
-            append("(", wrapper, false, mark);
-            for (const auto& piece : generated.output.code) append(piece.text, piece.span.value_or(site), piece.copied, mark);
-            append("\n)", wrapper, false, mark);
+            append("(", wrapper, false, mark, generated.definition);
+            for (const auto& piece : generated.output.code) append(piece.text, piece.span.value_or(site), piece.copied, mark, generated.definition);
+            append("\n)", wrapper, false, mark, generated.definition);
             read = call.span.end;
             storeExpansion(generated);
         }
@@ -703,7 +712,7 @@ void expandMacros(Module& syntax, std::vector<Source>& sources, const std::map<s
                 continue;
             }
         }
-        auto output = generatedSource(source, prefix, generated.output.code);
+        auto output = generatedSource(source, prefix, generated.output.code, generated.definition);
         sources.push_back(std::move(output));
         auto start = syntax.functions.size(), records = syntax.aggregates.size(), imports = syntax.imports.size(), traits = syntax.traits.size(), enums = syntax.enums.size(), extensions = syntax.extensions.size(), exceptions = syntax.exceptions.size(), aliases = syntax.aliases.size();
         parseFile(syntax, sources.back(), sources.size() - 1);
@@ -762,7 +771,7 @@ void expandMacros(Module& syntax, std::vector<Source>& sources, const std::map<s
             auto body = pieces;
             body.insert(body.begin(), {"fn hook(" + parameters[slot] + "): Unit {\n"});
             body.push_back({"\n{}\n}"});
-            auto source = generatedSource(sources[prefix.file], prefix, body);
+            auto source = generatedSource(sources[prefix.file], prefix, body, generated.definition);
             Module parsed;
             parseFile(parsed, source, sources.size());
             if (parsed.functions.size() != 1 || !parsed.aggregates.empty() || !parsed.imports.empty() || !parsed.expansions.empty() ||

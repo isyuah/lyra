@@ -179,10 +179,11 @@ public:
         return {kind, {start, offset}, newline};
     }
 
-    Token editorNext() {
+    Token editorNext(std::vector<Diagnostic>* errors = nullptr) {
         auto before = offset;
         try { return next(); }
         catch (const Diagnostic& error) {
+            if (errors) errors->push_back(error);
             auto start = error.site->start.offset;
             auto from = text.substr(start);
             bool toEnd = from.starts_with("/*") || (error.code == "LYL0003" && (from.starts_with('r') || from.starts_with("br")));
@@ -306,21 +307,28 @@ struct CompletionReached {};
 class Parser {
 public:
     Parser(const Source& source, std::size_t file, std::vector<ExpressionExpansion>* expressions = nullptr, bool macroImplementation = false,
-        const std::vector<Token>* editorTokens = nullptr, CompletionScope* completion = nullptr)
+        const std::vector<Token>* editorTokens = nullptr, CompletionScope* completion = nullptr, RecoveredSyntax* recovery = nullptr)
         : source(source), file(file), lexer(source), editorTokens(editorTokens), token(readToken()), next(readToken()),
-          macros(expressions), macroImplementation(macroImplementation), completion(completion) {}
+          macros(expressions), macroImplementation(macroImplementation), completion(completion), recovery(recovery) {}
 
     void appendTo(Module& module) {
         while (token.kind != Kind::End) {
             if (completion) completion->names.clear();
             auto start = token.span.begin;
             auto functions = module.functions.size(), expansions = module.expansions.size();
+            auto exceptions = module.exceptions.size(), calls = macros ? macros->size() : 0;
             try { appendDeclaration(module); }
-            catch (const Diagnostic&) {
+            catch (const Diagnostic& error) {
                 if (!editorTokens) throw;
                 if (completion) completion->result.incomplete = true;
+                if (recovery) {
+                    recovery->errors.push_back(error);
+                    recovery->incompleteDeclaration = true;
+                }
                 module.functions.resize(functions);
                 module.expansions.resize(expansions);
+                module.exceptions.resize(exceptions);
+                if (macros) macros->resize(calls);
                 selfType.clear();
                 nodes.clear();
                 pendingExpansion.reset();
@@ -349,6 +357,7 @@ private:
                     if (fn.name.text == "main" || fn.result.text.empty() || std::ranges::any_of(fn.parameters, [](const auto& param) { return param.variadic; }))
                         throw at(source, prefix, "LYCT0001", "const fn 需要显式返回类型，且不能是入口函数或变长函数");
                     fn.constant = ConstKind::Function;
+                    fn.header.begin = prefix.begin;
                     module.functions.push_back(std::move(fn));
                 } else {
                     auto name = identifier();
@@ -356,12 +365,15 @@ private:
                     require(":");
                     auto annotation = type();
                     require("=");
+                    auto failures = bodyFailures;
                     auto initializer = expression();
                     if (is(";")) consume();
                     else if (token.kind != Kind::End && !token.newlineBefore) throw at(source, token.span, "LYP0001", "常量声明后需要换行或分号");
                     Function constant{file, std::move(name), {}, std::move(annotation), std::exchange(nodes, {}), initializer, {}, pub};
                     constant.constant = ConstKind::Value;
+                    constant.header = {prefix.begin, constant.expressions[initializer].span.begin};
                     constant.pendingExpansion = std::exchange(pendingExpansion, {});
+                    constant.incompleteBody = bodyFailures != failures;
                     module.functions.push_back(std::move(constant));
                 }
                 return;
@@ -373,13 +385,14 @@ private:
             }
             if (is("type")) {
                 if (firstPrefix != module.expansions.size()) throw at(source, module.expansions[firstPrefix].name.span, "LYM0001", "不能修饰类型别名");
-                consume();
+                auto start = consume().span.begin;
                 TypeAlias alias{file, identifier(), {}, pub};
                 std::vector<Bound> bounds;
                 typeParameters(alias.typeParameters, bounds);
                 if (!bounds.empty()) throw at(source, bounds.front().trait.span, "LYG0001", "透明类型别名自身不声明约束");
                 require("=");
                 alias.target = type();
+                alias.span = {start, alias.target.span.end};
                 if (is(";")) consume();
                 else if (token.kind != Kind::End && !token.newlineBefore) throw at(source, token.span, "LYP0001", "类型别名后需要换行或分号");
                 module.aliases.push_back(std::move(alias));
@@ -402,8 +415,10 @@ private:
             }
             if (is("exception")) {
                 if (firstPrefix != module.expansions.size()) throw at(source, module.expansions[firstPrefix].name.span, "LYM0001", "此版本不能修饰异常声明");
-                consume();
-                module.exceptions.push_back({file, identifier(), pub});
+                auto start = consume().span.begin;
+                auto name = identifier();
+                auto end = name.span.end;
+                module.exceptions.push_back({file, std::move(name), pub, {start, end}});
                 if (is(";")) consume();
                 else if (token.kind != Kind::End && !token.newlineBefore) throw at(source, token.span, "LYP0001", "异常声明后需要换行或分号");
                 return;
@@ -428,6 +443,8 @@ private:
     std::vector<ExpressionExpansion>* macros;
     bool macroImplementation;
     CompletionScope* completion{};
+    RecoveredSyntax* recovery{};
+    std::size_t bodyFailures{};
     std::vector<Expr> nodes;
     std::optional<Span> pendingExpansion;
     std::string selfType;
@@ -513,11 +530,27 @@ private:
         completeAt(place);
     }
 
+    bool startsDeclaration() const {
+        bool declarationName = !next.newlineBefore && (next.kind == Kind::Name || next.kind == Kind::Escaped);
+        return is("pub") || is("fn") || is("extern") || is("implicit") || is("static") ||
+            is("import") || is("struct") || is("class") || is("enum") || is("trait") ||
+            (declarationName && (is("extension") || is("type") || is("exception"))) ||
+            (!next.newlineBefore && (is("async") || is("const")) && text(next) == "fn");
+    }
+
     void recover(std::size_t start, bool topLevel) {
         unsigned braces = 0;
+        auto first = std::ranges::lower_bound(*editorTokens, start, {}, [](const Token& item) { return item.span.begin; });
+        for (; first != editorTokens->end() && first->span.begin < token.span.begin; ++first) {
+            if (first->kind != Kind::Symbol) continue;
+            auto spelling = text(*first);
+            if (spelling == "{") ++braces;
+            else if (spelling == "}" && braces) --braces;
+        }
         while (token.kind != Kind::End) {
             completeAt(topLevel ? CompletionPlace::TopLevel : CompletionPlace::Statement);
-            if (!braces && ((!topLevel && is("}")) || (token.span.begin > start && token.newlineBefore))) return;
+            bool nextLine = token.span.begin > start && token.newlineBefore;
+            if ((!braces && ((!topLevel && is("}")) || nextLine)) || (nextLine && startsDeclaration())) return;
             if (is("{")) ++braces;
             else if (is("}") && braces) --braces;
             else if (!braces && is(";")) { consume(); return; }
@@ -745,7 +778,7 @@ private:
     }
 
     Trait trait(bool pub) {
-        require("trait");
+        auto start = require("trait").span.begin;
         Trait declaration{file, identifier(), {}, pub};
         require("{");
         while (!is("}")) {
@@ -754,6 +787,7 @@ private:
                 consume();
                 declaration.associated.push_back(identifier());
             } else {
+                auto begin = token.span.begin;
                 bool asynchronous = is("async");
                 if (asynchronous) consume();
                 require("fn");
@@ -767,12 +801,14 @@ private:
                     consume();
                 }
                 require(")"); require(":");
-                declaration.methods.push_back({std::move(name), std::move(parameters), type(), asynchronous});
+                auto result = type();
+                auto end = result.span.end;
+                declaration.methods.push_back({std::move(name), std::move(parameters), std::move(result), asynchronous, {begin, end}});
             }
             if (is(";")) consume();
             else if (!is("}") && !token.newlineBefore) throw at(source, token.span, "LYP0001", "结构约束成员之间需要换行或分号");
         }
-        consume();
+        declaration.span = {start, consume().span.end};
         return declaration;
     }
 
@@ -827,6 +863,7 @@ private:
         if (is("}") || is(";")) throw at(source, token.span, "LYP0001", "enum 至少声明一个分支");
         while (!is("}") && !is(";")) {
             EnumCase entry{identifier(), {}};
+            entry.span = entry.name.span;
             if (is("(")) {
                 consume();
                 while (!is(")")) {
@@ -836,7 +873,7 @@ private:
                     if (!is(",")) break;
                     consume();
                 }
-                require(")");
+                entry.span.end = require(")").span.end;
             }
             result.cases.push_back(std::move(entry));
             if (is(",")) consume();
@@ -861,23 +898,29 @@ private:
 
     void field(Module& module, Aggregate& record, bool pub, std::vector<Attribute> marks, bool inParens) {
         if (!is("var") && !is("val")) throw at(source, token.span, "LYP0001", "字段声明需要 val 或 var");
+        auto start = token.span.begin;
         bool writable = text(consume()) == "var";
         auto name = identifier();
         require(":");
         Field member{std::move(name), type(), writable, pub, std::move(marks)};
+        member.span = {start, member.type.span.end};
         if (!inParens && is("get")) {
             if (writable || !member.attributes.empty()) throw at(source, member.name.span, "LYP0001", "计算属性只能使用没有标记的 val");
             module.functions.push_back(propertyGetter(std::move(member.name), std::move(member.type), nominalAnnotation(record), pub,
                 record.typeParameters, record.bounds, record.name));
+            module.functions.back().header.begin = start;
             return;
         }
         if (is("=")) {
             consume();
+            auto failures = bodyFailures;
             auto body = expression(inParens);
+            member.span.end = nodes[body].span.end;
             member.defaultValue = FieldDefault{module.functions.size(), std::holds_alternative<EmptyOption>(nodes[body].node)};
             Identifier helper{fieldDefaultName(record.name.text, member.name.text), member.name.span};
             module.functions.push_back({file, std::move(helper), {}, member.type, std::exchange(nodes, {}), body, {}, false, record.typeParameters, false, {}, false, record.bounds});
             module.functions.back().pendingExpansion = std::exchange(pendingExpansion, {});
+            module.functions.back().incompleteBody = bodyFailures != failures;
         }
         record.fields.push_back(std::move(member));
     }
@@ -915,6 +958,7 @@ private:
         typeParameters(decl.typeParameters, decl.bounds);
         selfType = nominalAnnotation(decl).text;
         bool primary = is("(");
+        auto end = decl.name.span.end;
         std::optional<std::size_t> initializer;
         if (primary) {
             consume();
@@ -927,7 +971,7 @@ private:
                 if (!is(",")) break;
                 consume();
             }
-            require(")");
+            end = require(")").span.end;
         }
         if (!primary || is("{")) {
             require("{");
@@ -960,10 +1004,10 @@ private:
                 if (is(";")) consume();
                 else if (!is("}") && !token.newlineBefore) throw at(source, token.span, "LYP0001", "成员之间需要换行或分号");
             }
-            consume();
+            end = consume().span.end;
         }
         bindFieldDefaults(module, decl, initializer ? &module.functions[*initializer] : nullptr);
-        decl.span = {start.span.begin, token.span.begin};
+        decl.span = {start.span.begin, end};
         selfType.clear();
         module.aggregates.push_back(std::move(decl));
     }
@@ -973,6 +1017,8 @@ private:
         require("get");
         require("(");
         require(")");
+        auto failures = bodyFailures;
+        auto header = Span{name.span.begin, token.span.begin};
         auto body = block();
         std::vector<Parameter> parameters{{{"$this", name.span}, std::move(receiver)}};
         Function function{file, std::move(name), std::move(parameters), std::move(result), std::exchange(nodes, {}), body, std::move(owner), pub,
@@ -980,11 +1026,13 @@ private:
         function.hasReceiver = true;
         function.property = true;
         function.pendingExpansion = std::exchange(pendingExpansion, {});
+        function.incompleteBody = bodyFailures != failures;
+        function.header = header;
         return function;
     }
 
     void extension(Module& module, bool pub) {
-        require("extension");
+        auto start = require("extension").span.begin;
         Extension decl{file, identifier(), {}, pub};
         typeParameters(decl.typeParameters, decl.bounds);
         require("for");
@@ -994,7 +1042,7 @@ private:
         while (!is("}")) {
             completeAt(CompletionPlace::ExtensionDeclaration);
             if (is("val")) {
-                consume();
+                auto begin = consume().span.begin;
                 auto name = identifier();
                 if (std::ranges::any_of(decl.properties, [&](const auto& property) { return property.name.text == name.text; }))
                     throw at(source, name.span, "LYN0002", "扩展属性重复：" + name.text);
@@ -1002,6 +1050,7 @@ private:
                 auto result = type();
                 auto getter = module.functions.size();
                 auto function = propertyGetter(name, std::move(result), decl.receiver, pub, decl.typeParameters, decl.bounds);
+                function.header.begin = begin;
                 function.extensionGroup = decl.name;
                 module.functions.push_back(std::move(function));
                 decl.properties.push_back({std::move(name), module.functions.back().result, getter});
@@ -1012,12 +1061,13 @@ private:
             if (is(";")) consume();
             else if (!is("}") && !token.newlineBefore) throw at(source, token.span, "LYP0001", "成员之间需要换行或分号");
         }
-        consume();
+        decl.span = {start, consume().span.end};
         module.extensions.push_back(std::move(decl));
     }
 
     Function function(std::optional<Identifier> owner, bool pub, const std::vector<Identifier>& enclosing = {}, bool initializer = false, bool staticMember = false, const std::vector<Bound>& enclosingBounds = {}, const Extension* extension = nullptr) {
         auto start = token.span.begin;
+        auto failures = bodyFailures;
         auto previousNames = completion ? std::optional(completion->names) : std::nullopt;
         completeAt(CompletionPlace::FunctionModifier);
         bool isAsync = false, foreign = false;
@@ -1105,6 +1155,7 @@ private:
         decl.header = {start, end};
         decl.throwsTypes = std::move(throwsTypes);
         decl.pendingExpansion = std::exchange(pendingExpansion, {});
+        decl.incompleteBody = bodyFailures != failures;
         if (completion) completion->names = std::move(*previousNames);
         return decl;
     }
@@ -1116,11 +1167,18 @@ private:
     ExprId blockContents(std::size_t start) {
         Block body;
         while (!is("}")) {
-            if (token.kind == Kind::End) {
-                if (!editorTokens) throw at(source, token.span, "LYP0001", "块缺少 }");
-                break;
+            if (token.kind == Kind::End || (editorTokens && token.newlineBefore && startsDeclaration())) {
+                auto end = Span{token.span.begin, token.span.begin};
+                if (!editorTokens) throw at(source, end, "LYP0001", "块缺少 }");
+                if (recovery) {
+                    recovery->errors.push_back(at(source, end, "LYP0001", "块缺少 }"));
+                    ++bodyFailures;
+                }
+                body.end = end;
+                return add({start, end.end}, std::move(body));
             }
             auto statementStart = token.span.begin, saved = nodes.size();
+            auto calls = macros ? macros->size() : 0;
             try {
                 auto value = statement();
                 std::optional<Span> semi;
@@ -1132,10 +1190,15 @@ private:
                     if (const auto* binding = std::get_if<PatternBinding>(&nodes[value].node)) completion->add(binding->pattern);
                 }
                 body.statements.push_back({value, semi});
-            } catch (const Diagnostic&) {
+            } catch (const Diagnostic& error) {
                 if (!editorTokens) throw;
                 if (completion) completion->result.incomplete = true;
+                if (recovery) {
+                    recovery->errors.push_back(error);
+                    ++bodyFailures;
+                }
                 nodes.resize(saved);
+                if (macros) macros->resize(calls);
                 recover(statementStart, false);
             }
         }
@@ -1855,14 +1918,14 @@ void validateMacroExpression(const Source& generated) {
 std::vector<SyntaxToken> syntaxTokens(const Source& source, bool comments, bool partial) {
     std::vector<SyntaxToken> tokens;
     Lexer lexer(source, comments ? &tokens : nullptr);
-    try {
-        for (auto token = lexer.next(); token.kind != Kind::End; token = lexer.next()) {
-            auto kind = token.kind == Kind::Name || token.kind == Kind::Escaped ? "name" : token.kind == Kind::Keyword ? "keyword" :
-                token.kind == Kind::String || token.kind == Kind::Bytes || token.kind == Kind::Char || token.kind == Kind::TextHead ||
-                    token.kind == Kind::TextMiddle || token.kind == Kind::TextTail ? "string" : token.kind == Kind::Number ? "number" : "token";
-            tokens.push_back({token.span, kind});
-        }
-    } catch (const Diagnostic&) { if (!partial) throw; }
+    auto next = [&] { return partial ? lexer.editorNext() : lexer.next(); };
+    for (auto token = next(); token.kind != Kind::End; token = next()) {
+        if (token.kind == Kind::Bad) continue;
+        auto kind = token.kind == Kind::Name || token.kind == Kind::Escaped ? "name" : token.kind == Kind::Keyword ? "keyword" :
+            token.kind == Kind::String || token.kind == Kind::Bytes || token.kind == Kind::Char || token.kind == Kind::TextHead ||
+                token.kind == Kind::TextMiddle || token.kind == Kind::TextTail ? "string" : token.kind == Kind::Number ? "number" : "token";
+        tokens.push_back({token.span, kind});
+    }
     return tokens;
 }
 
@@ -1965,6 +2028,106 @@ Module indexFileSyntax(const Source& source, std::vector<ExpressionExpansion>* e
         directory == "macros" || directory == "expressions" || directory == "decorators";
     Parser(source, 0, expressions ? expressions : &expansions, macro, &tokens).appendTo(module);
     return module;
+}
+
+std::vector<OutlineSymbol> editorOutline(const Source& source, const Module& syntax) {
+    std::vector<OutlineSymbol> result;
+    std::map<std::string, std::size_t> owners;
+    auto symbol = [&](const Identifier& name, EditorKind kind, Span extent) -> OutlineSymbol {
+        return {editorSpelling(source, name), kind, name.span,
+            {std::min(extent.begin, name.span.begin), std::max(extent.end, name.span.end)}};
+    };
+    auto container = [&](const auto& declaration, EditorKind kind) -> OutlineSymbol& {
+        owners.try_emplace(declaration.name.text, result.size());
+        return result.emplace_back(symbol(declaration.name, kind, declaration.span));
+    };
+    for (const auto& record : syntax.aggregates) {
+        auto& children = container(record, record.reference ? EditorKind::Class : EditorKind::Struct).children;
+        for (const auto& field : record.fields) children.push_back(symbol(field.name, EditorKind::Field, field.span));
+        for (const auto& member : record.associated) children.push_back(symbol(member.name, EditorKind::TypeAlias, {member.name.span.begin, member.type.span.end}));
+    }
+    for (const auto& item : syntax.enums) {
+        auto& children = container(item, EditorKind::Enum).children;
+        for (const auto& entry : item.cases) children.push_back(symbol(entry.name, EditorKind::EnumCase, entry.span));
+    }
+    for (const auto& trait : syntax.traits) {
+        auto& children = container(trait, EditorKind::Trait).children;
+        for (const auto& method : trait.methods) children.push_back(symbol(method.name, EditorKind::Method, method.span));
+        for (const auto& member : trait.associated) children.push_back(symbol(member, EditorKind::TypeAlias, member.span));
+    }
+    for (const auto& group : syntax.extensions) container(group, EditorKind::Extension);
+    for (const auto& alias : syntax.aliases) result.push_back(symbol(alias.name, EditorKind::TypeAlias, alias.span));
+    for (const auto& exception : syntax.exceptions) result.push_back(symbol(exception.name, EditorKind::Class, exception.span));
+    auto directory = source.path.parent_path().filename();
+    auto topFunction = directory == ".decorators" ? EditorKind::Decorator :
+        directory == ".macros" || directory == ".expressions" ? EditorKind::Macro : EditorKind::Function;
+    for (const auto& fn : syntax.functions) {
+        if ((!fn.initializer && !fn.conversion && fn.name.text.contains('$')) || fn.name.text == "_") continue;
+        auto where = fn.header;
+        if (!fn.expressions.empty()) where.end = fn.expressions[fn.body].span.end;
+        else if (where.end < source.text.size() && source.text[where.end] == ';') ++where.end;
+        const auto& owner = fn.owner ? fn.owner : fn.extensionGroup;
+        auto kind = fn.constant == ConstKind::Value ? EditorKind::Constant : fn.initializer ? EditorKind::Constructor :
+            fn.property ? EditorKind::Property : owner ? EditorKind::Method : topFunction;
+        if (!owner) result.push_back(symbol(fn.name, kind, where));
+        else if (auto found = owners.find(owner->text); found != owners.end())
+            result[found->second].children.push_back(symbol(fn.name, kind, where));
+    }
+    for (auto& item : result) std::ranges::stable_sort(item.children, {}, &OutlineSymbol::selection);
+    std::ranges::stable_sort(result, {}, &OutlineSymbol::selection);
+    return result;
+}
+
+RecoveredSyntax recoverFileSyntax(const Source& source, std::vector<ExpressionExpansion>* expressions) {
+    RecoveredSyntax result;
+    std::vector<ExpressionExpansion> calls;
+    auto* parsedCalls = expressions ? &calls : nullptr;
+    std::optional<Diagnostic> firstError;
+    try { parseFile(result.syntax, source, 0, parsedCalls); }
+    catch (const Diagnostic& error) { firstError = error; }
+    if (firstError) {
+        result.syntax = {};
+        calls.clear();
+        auto unmapped = source.previous || source.origin ? std::optional(sourceText(source.path, source.text, source.moduleId)) : std::nullopt;
+        const auto& input = unmapped ? *unmapped : source;
+        Lexer lexer(input);
+        std::vector<Diagnostic> lexical;
+        std::vector<Token> tokens;
+        do { tokens.push_back(lexer.editorNext(&lexical)); } while (tokens.back().kind != Kind::End);
+        Parser(input, 0, parsedCalls, false, &tokens, nullptr, &result).appendTo(result.syntax);
+        std::set<std::size_t> lexicalStarts;
+        for (const auto& error : lexical) lexicalStarts.insert(error.site->start.offset);
+        std::erase_if(result.errors, [&](const Diagnostic& error) { return lexicalStarts.contains(error.site->start.offset); });
+        for (auto& error : lexical) result.errors.push_back(std::move(error));
+        std::ranges::stable_sort(result.errors, {}, [](const Diagnostic& error) { return error.site->start.offset; });
+        std::set<ExprId> reportedBodies;
+        std::erase_if(result.errors, [&](const Diagnostic& error) {
+            for (std::size_t index = 0; index < result.syntax.functions.size(); ++index) {
+                auto& fn = result.syntax.functions[index];
+                if (fn.expressions.empty()) continue;
+                auto body = fn.expressions[fn.body].span;
+                auto offset = error.site->start.offset;
+                if ((body.begin <= offset && offset < body.end) || (offset == body.end && error.site->end.offset == offset && fn.incompleteBody)) {
+                    fn.incompleteBody = true;
+                    return !reportedBodies.insert(index).second;
+                }
+            }
+            return false;
+        });
+        if (unmapped) for (auto& error : result.errors)
+            error = at(source, {error.site->start.offset, error.site->end.offset}, std::move(error.code), std::move(error.message));
+        if (result.errors.empty()) {
+            result.errors.push_back(std::move(*firstError));
+            result.incompleteDeclaration = true;
+        }
+        std::erase_if(calls, [&](const ExpressionExpansion& call) {
+            return std::ranges::any_of(result.syntax.functions, [&](const Function& fn) {
+                return fn.incompleteBody && fn.name.span.begin <= call.span.begin && call.span.end <= fn.expressions[fn.body].span.end;
+            });
+        });
+    }
+    if (expressions) for (auto& call : calls) expressions->push_back(std::move(call));
+    return result;
 }
 
 namespace {

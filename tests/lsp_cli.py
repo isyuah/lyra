@@ -36,14 +36,16 @@ def message(value):
     return b'Content-Length: ' + str(len(body)).encode() + b'\r\n\r\n' + body
 
 
-def run_server(documents, messages):
+def run_server(documents, messages, folders=()):
     output = []
     transcript = [
-        {'jsonrpc': '2.0', 'id': 1, 'method': 'initialize', 'params': {'capabilities': {'general': {'positionEncodings': ['utf-16']}}}},
+        {'jsonrpc': '2.0', 'id': 1, 'method': 'initialize', 'params': {'capabilities': {'general': {'positionEncodings': ['utf-16']}},
+                                                               'workspaceFolders': [{'uri': uri(folder), 'name': folder.name} for folder in folders]}},
         {'jsonrpc': '2.0', 'method': 'initialized', 'params': {}},
     ]
     for path, text in documents:
-        transcript.append({'jsonrpc': '2.0', 'method': 'textDocument/didOpen', 'params': {'textDocument': {'uri': uri(path), 'languageId': 'lyra', 'version': 1, 'text': text}}})
+        language = 'lyra-manifest' if path.name == 'lyra.json5' else 'lyra'
+        transcript.append({'jsonrpc': '2.0', 'method': 'textDocument/didOpen', 'params': {'textDocument': {'uri': uri(path), 'languageId': language, 'version': 1, 'text': text}}})
     transcript.extend(messages)
     open_versions = {}
     with interactive_server(documents[0][0].parents[1]) as (send, receive):
@@ -121,6 +123,185 @@ def interactive_server(root):
 
 
 class LanguageServer(unittest.TestCase):
+    def test_navigation_and_semantics_use_current_symbol_identity(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / 'app/src/main.ly'
+            library = root / 'model/src/api.ly'
+            unopened = root / 'tools/src/tools.ly'
+            model = ('pub class User(pub val id: Int) {\n'
+                     '    pub fn getId(): Int { id }\n'
+                     '}\npub type UserView = User\n')
+            text = ('import model as records\nimport model.{UserView as Profile}\n'
+                    '/// Displays the user.\n/// This is folded as a group.\n'
+                    'fn getUser(value: Profile): Profile { value }\n'
+                    'fn main(): Unit {\n'
+                    '    val result = records.User(7)\n'
+                    '    /* 中文🙂 */ val view: Profile = getUser(result)\n'
+                    '    if true { val result = "inner"; print(result) }\n'
+                    '    print(view.getId())\n'
+                    '    print(result.id)\n}\n')
+            for path, content in [
+                (root / 'lyra.json5', "{workspace:{members:['app','model','tools']}}"),
+                (root / 'app/lyra.json5', "{name:'app',version:'0.1.0',dependencies:{model:{name:'model',version:'0.1.0',path:'../model'}}}"),
+                (root / 'model/lyra.json5', "{name:'model',version:'0.1.0',kind:'lib'}"),
+                (root / 'tools/lyra.json5', "{name:'tools',version:'0.1.0',kind:'lib'}"),
+                (root / 'cache/hidden/lyra.json5', "{name:'cached',version:'0.1.0',kind:'lib'}"),
+                (root / 'cache/hidden/src/hidden.ly', 'pub fn findWidget(): Unit {}'),
+                (unopened, 'pub fn findWidget(): Unit {}'),
+                (library, model), (source, text),
+            ]:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(content, encoding='utf-8')
+            target = position_at(text, text.index('Profile =') + 2)
+            break_edit = text.replace('print(result.id)', 'val writing = ;')
+            output = run_server([(source, text)], [
+                document_request(2, source, 'semanticTokens/full'),
+                document_request(3, source, 'documentHighlight', position=position_at(text, text.index('result.id') + 1)),
+                document_request(4, source, 'typeDefinition', position=position_at(text, text.index('view.getId') + 1)),
+                document_request(5, source, 'typeDefinition', position=target),
+                document_request(6, source, 'definition', position=target),
+                {'id': 7, 'method': 'workspace/symbol', 'params': {'query': 'findwidget'}},
+                {'id': 8, 'method': 'workspace/symbol', 'params': {'query': 'User.getId'}},
+                {'method': 'textDocument/didChange', 'params': {'textDocument': {'uri': uri(source), 'version': 2}, 'contentChanges': [{'text': break_edit}]}},
+                document_request(9, source, 'documentSymbol'),
+                document_request(10, source, 'foldingRange'),
+                document_request(11, source, 'semanticTokens/full'),
+            ], folders=(root,))
+            replies = {item['id']: item['result'] for item in output if 'id' in item}
+            legend = replies[1]['capabilities']['semanticTokensProvider']['legend']['tokenTypes']
+
+            def tokens(number):
+                result = {}
+                line = column = 0
+                data = iter(replies[number]['data'])
+                for row, col, length, kind, modifiers in zip(data, data, data, data, data, strict=True):
+                    line += row
+                    column = col if row else column + col
+                    result[line, column] = (legend[kind], length, modifiers)
+                return result
+
+            resolved = tokens(2)
+            for marker, name, kind, declaration in [
+                ('value: Profile', 'value', 'parameter', True), ('value }', 'value', 'parameter', False),
+                ('records.User', 'records', 'namespace', False), ('User(7)', 'User', 'class', False),
+                ('view: Profile', 'view', 'variable', True), ('Profile =', 'Profile', 'type', False),
+                ('getUser(result)', 'getUser', 'function', False), ('getId()', 'getId', 'method', False),
+                ('id)', 'id', 'property', False),
+            ]:
+                where = position_at(text, text.index(marker))
+                actual, length, modifiers = resolved[where['line'], where['character']]
+                self.assertEqual((actual, length, modifiers & 1), (kind, len(name), declaration))
+            self.assertEqual([item['range']['start'] for item in replies[3]],
+                             [position_at(text, text.index(marker)) for marker in ('result = records', 'result)\n    if', 'result.id')])
+            for number, name in ((4, 'User'), (5, 'User'), (6, 'UserView')):
+                location, = replies[number]
+                start = model.index(name)
+                self.assertEqual(location, {'uri': uri(library), 'range': {'start': position_at(model, start), 'end': position_at(model, start + len(name))}})
+            self.assertEqual([item['location']['uri'] for item in replies[7]], [uri(unopened)])
+            member, = replies[8]
+            self.assertEqual((member['name'], member['containerName'], member['location']['uri']), ('getId', 'User', uri(library)))
+            self.assertEqual([item['name'] for item in replies[9]], ['getUser', 'main'])
+            self.assertEqual(replies[9][1]['selectionRange']['start'], position_at(break_edit, break_edit.index('main')))
+            self.assertIn({'startLine': 2, 'endLine': 3, 'kind': 'comment'}, replies[10])
+            self.assertIn({'startLine': 0, 'endLine': 1, 'kind': 'imports'}, replies[10])
+            self.assertIn({'startLine': 5, 'endLine': 11}, replies[10])
+            partial = tokens(11)
+            where = position_at(text, text.index('value: Profile'))
+            self.assertIn((where['line'], where['character']), partial)
+            where = position_at(text, text.index('view.getId'))
+            self.assertNotIn((where['line'], where['character']), partial)
+
+    def test_unsaved_manifest_completion_and_diagnostics_leave_disk_resolution_unchanged(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            manifest = root / 'app/lyra.json5'
+            workspace = root / 'lyra.json5'
+            source = manifest.parent / 'src/main.ly'
+            library = root / 'model/src/api.ly'
+            text = 'import model.{available}\nfn main(): Unit { available() }\n'
+            saved = "{name:'app',version:'0.1.0',dependencies:{model:{name:'model',version:'0.1.0',path:'../model'}}}"
+            packages = "{workspace:{members:['app','model']}}"
+            for path, content in [(manifest, saved), (workspace, packages), (source, text), (library, 'pub fn available(): Unit {}'),
+                                  (root / 'model/lyra.json5', "{name:'model',version:'0.1.0',kind:'lib'}")]:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(content, encoding='utf-8')
+            edited = "{name:'app', version:'0.1.0', /* 中文🙂 */ kind: 'l', }"
+            nested = "{name:'app', version:'0.1.0', dependencies:{model:{name:'model', version:'^0.1.0', pat}}}"
+            editing_workspace = "{workspace:{ mem: ['app'] }}"
+            missing_member = "{workspace:{members:['app','absent']}}"
+
+            def change(path, version, content):
+                return {'method': 'textDocument/didChange', 'params': {'textDocument': {'uri': uri(path), 'version': version},
+                                                                      'contentChanges': [{'text': content}]}}
+
+            output = run_server([(source, text), (manifest, edited), (workspace, editing_workspace)], [
+                document_request(2, manifest, 'completion', position=position_at(edited, edited.index("'l'") + 2)),
+                document_request(3, workspace, 'completion', position=position_at(editing_workspace, editing_workspace.index('mem') + 3)),
+                change(manifest, 2, nested),
+                document_request(4, manifest, 'completion', position=position_at(nested, nested.index('pat') + 3)),
+                change(workspace, 2, missing_member),
+                change(manifest, 3, saved),
+            ])
+            replies = {item['id']: item['result'] for item in output if 'id' in item}
+            lib, = replies[2]['items']
+            value = edited.index("'l'")
+            value_range = {'start': position_at(edited, value), 'end': position_at(edited, value + 3)}
+            self.assertEqual(lib['textEdit'], {'range': value_range, 'newText': "'lib'"})
+            self.assertEqual([(item['label'], item['textEdit']['newText']) for item in replies[3]['items']], [('members', 'members')])
+            self.assertEqual([(item['label'], item['kind']) for item in replies[4]['items']], [('path', 10)])
+            diagnostics = {(item['params']['uri'], item['params'].get('version')): item['params']['diagnostics'] for item in output
+                           if item.get('method') == 'textDocument/publishDiagnostics'}
+            self.assertEqual(diagnostics[uri(source), 1], [])
+            self.assertEqual(diagnostics[uri(manifest), 1][0]['range'], value_range)
+            self.assertEqual(diagnostics[uri(manifest), 1][0]['code'], 'LYK0001')
+            self.assertEqual(diagnostics[uri(manifest), 3], [])
+            self.assertEqual(diagnostics[uri(workspace), 2][0]['range']['start'], position_at(missing_member, missing_member.index("'absent'")))
+            self.assertEqual(manifest.read_text(encoding='utf-8'), saved)
+            self.assertEqual(workspace.read_text(encoding='utf-8'), packages)
+
+    def test_recovery_keeps_other_functions_checking_and_versions_precise_fixes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / 'src/main.ly'
+            source.parent.mkdir()
+            other = source.with_name('other.ly')
+            definitions = ('fn brokenSyntax(): Int { val value = ; 0 }\n'
+                           'fn choose(value: Int8): Int { 1 }\n'
+                           'fn choose(value: UInt8): Int { 2 }\n')
+            other.write_text(definitions, encoding='utf-8')
+            text = ('fn first(): Int { /* 中文🙂 */ 1; }\r\n'
+                    'fn second(): Int { 2; }\r\n'
+                    'fn ambiguous(): Int { choose(1) }\r\n'
+                    'fn main(): Unit { val stable = 7; print(stable) }\r\n')
+            source.write_bytes(text.encode())
+
+            def selected(first, last):
+                return {'start': position_at(text, first), 'end': position_at(text, last)}
+
+            range_first = selected(text.index(';'), text.index(';') + 1)
+            whole = selected(0, len(text))
+            output = run_server([(source, text)], [
+                document_request(2, source, 'codeAction', range=range_first, context={'diagnostics': [], 'only': ['quickfix']}),
+                document_request(3, source, 'codeAction', range=whole, context={'diagnostics': [], 'only': ['source.fixAll.lyra']}),
+                document_request(4, source, 'inlayHint', range=whole),
+            ])
+            diagnostics = [item['params'] for item in output if item.get('method') == 'textDocument/publishDiagnostics']
+            current = next(item['diagnostics'] for item in diagnostics if item['uri'] == uri(source))
+            self.assertEqual([item['code'] for item in current], ['LYT0001', 'LYT0001', 'LYT0019'])
+            self.assertEqual(current[0]['range'], range_first)
+            self.assertEqual({(note['location']['uri'], note['location']['range']['start']['line']) for note in current[2]['relatedInformation']},
+                             {(uri(other), 1), (uri(other), 2)})
+            closed = next(item['diagnostics'] for item in diagnostics if item['uri'] == uri(other))
+            self.assertEqual([item['code'] for item in closed], ['LYP0001'])
+            results = {item['id']: item['result'] for item in output if 'id' in item}
+            quick, = results[2]
+            edit, = quick['edit']['documentChanges']
+            self.assertEqual(edit, {'textDocument': {'uri': uri(source), 'version': 1}, 'edits': [{'range': range_first, 'newText': ''}]})
+            fix_all, = results[3]
+            self.assertEqual([change['range']['start']['line'] for change in fix_all['edit']['documentChanges'][0]['edits']], [0, 1])
+            self.assertEqual([item['label'] for item in results[4]], [': Int'])
+
     def test_context_completion_distinguishes_declarations_values_types_and_macro_families(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -726,6 +907,25 @@ class LanguageServer(unittest.TestCase):
             output = run_server([(source, text)], [change])
             diagnostics = [item for item in output if item.get('method') == 'textDocument/publishDiagnostics']
             self.assertEqual(diagnostics[-1]['params']['diagnostics'], [])
+
+            macro_text = 'fn fail(target: String, raw: String): Syntax { syntaxCode("1 + false") }'
+            macro.write_text(macro_text, encoding='utf-8')
+            generated = run_server([(source, text)], [document_request(2, source, 'semanticTokens/full')])
+            details = next(item['params']['diagnostics'][0] for item in generated if item.get('method') == 'textDocument/publishDiagnostics')
+            self.assertEqual(details['range']['start'], position_at(text, text.index('fail')))
+            note, = details['relatedInformation']
+            self.assertEqual(note['location'], {'uri': uri(macro), 'range': {
+                'start': position_at(macro_text, macro_text.index('fail')), 'end': position_at(macro_text, macro_text.index('fail') + 4)}})
+            replies = {item['id']: item['result'] for item in generated if 'id' in item}
+            legend = replies[1]['capabilities']['semanticTokensProvider']['legend']['tokenTypes']
+            data = iter(replies[2]['data'])
+            column = 0
+            tokens = {}
+            for row, distance, length, kind, _ in zip(data, data, data, data, data, strict=True):
+                self.assertEqual(row, 0)
+                column += distance
+                tokens[column] = (legend[kind], length)
+            self.assertEqual(tokens[text.index('fail')], ('macro', len('fail')))
 
     def test_watched_disk_edits_refresh_closed_dependency_and_macro_input(self):
         with tempfile.TemporaryDirectory() as temporary:

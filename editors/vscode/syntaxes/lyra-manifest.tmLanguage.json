@@ -1,0 +1,16 @@
+{
+  "name": "Lyra Manifest",
+  "scopeName": "source.lyra-manifest",
+  "patterns": [
+    { "name": "comment.line.double-slash.lyra-manifest", "match": "//.*$" },
+    { "name": "comment.block.lyra-manifest", "begin": "/\\*", "end": "\\*/" },
+    { "name": "string.quoted.double.lyra-manifest", "begin": "\"", "end": "\"|$", "patterns": [{ "include": "#escape" }] },
+    { "name": "string.quoted.single.lyra-manifest", "begin": "'", "end": "'|$", "patterns": [{ "include": "#escape" }] },
+    { "name": "support.type.property-name.lyra-manifest", "match": "\\b[A-Za-z_][A-Za-z0-9_]*(?=\\s*:)" },
+    { "name": "constant.language.lyra-manifest", "match": "\\b(?:true|false|null)\\b" },
+    { "name": "constant.numeric.lyra-manifest", "match": "-?(?:0|[1-9][0-9]*)(?:\\.[0-9]+)?(?:[eE][+-]?[0-9]+)?" }
+  ],
+  "repository": {
+    "escape": { "name": "constant.character.escape.lyra-manifest", "match": "\\\\." }
+  }
+}

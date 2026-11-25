@@ -46,6 +46,12 @@
           ".ly"
         ],
         "configuration": "./language-configuration.json"
+      },
+      {
+        "id": "lyra-manifest",
+        "aliases": ["Lyra Manifest"],
+        "filenames": ["lyra.json5"],
+        "configuration": "./manifest-configuration.json"
       }
     ],
     "grammars": [
@@ -56,6 +62,11 @@
         "embeddedLanguages": {
           "meta.embedded.expression.lyra": "lyra"
         }
+      },
+      {
+        "language": "lyra-manifest",
+        "scopeName": "source.lyra-manifest",
+        "path": "./syntaxes/lyra-manifest.tmLanguage.json"
       }
     ]
   },
