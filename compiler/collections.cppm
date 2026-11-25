@@ -129,9 +129,20 @@ struct NativeLists {
         return builder.CreateCall(access, {list, index, builder.CreateGlobalStringPtr(pathText(source.path)), builder.getInt64(position.line), builder.getInt64(position.column)});
     }
 
-    void set(llvm::Value* list, llvm::Value* index, llvm::Value* value) const {
+    void set(llvm::Value* list, llvm::Value* index, llvm::Value* value, const Source& source, Span span) const {
         auto pointer = builder.getPtrTy();
-        builder.CreateCall(module().getOrInsertFunction("lyraListSet", builder.getVoidTy(), pointer, builder.getInt64Ty(), pointer), {list, index, box(value)});
+        auto integer = builder.getInt64Ty();
+        auto site = source.userSite(span);
+        builder.CreateCall(module().getOrInsertFunction("lyraListSet", builder.getVoidTy(), pointer, integer, pointer, pointer, integer, integer),
+            {list, index, box(value), builder.CreateGlobalStringPtr(site.file), builder.getInt64(site.start.line), builder.getInt64(site.start.column)});
+    }
+
+    llvm::Value* removeAt(llvm::Value* list, llvm::Value* index, const Source& source, Span span) const {
+        auto pointer = builder.getPtrTy();
+        auto integer = builder.getInt64Ty();
+        auto site = source.userSite(span);
+        return builder.CreateCall(module().getOrInsertFunction("lyraListRemoveAt", pointer, pointer, integer, pointer, integer, integer),
+            {list, index, builder.CreateGlobalStringPtr(site.file), builder.getInt64(site.start.line), builder.getInt64(site.start.column)});
     }
 };
 

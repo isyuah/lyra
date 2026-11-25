@@ -1,5 +1,7 @@
 #include "net.h"
+#include "tasks.h"
 
+#include <algorithm>
 #include <cerrno>
 
 #ifndef _WIN32
@@ -28,14 +30,14 @@ int error() {
 
 bool retry(int status) { return status == EINTR || status == EAGAIN || status == EWOULDBLOCK; }
 
-Socket open() {
+Socket open(int family) {
 #ifdef _WIN32
     static const auto startup = [] {
         WSADATA data;
         return WSAStartup(MAKEWORD(2, 2), &data);
     }();
     if (startup) { WSASetLastError(startup); return invalidSocket; }
-    auto socket = WSASocketW(AF_INET, SOCK_STREAM, IPPROTO_TCP, nullptr, 0, WSA_FLAG_OVERLAPPED | WSA_FLAG_NO_HANDLE_INHERIT);
+    auto socket = WSASocketW(family, SOCK_STREAM, IPPROTO_TCP, nullptr, 0, WSA_FLAG_OVERLAPPED | WSA_FLAG_NO_HANDLE_INHERIT);
     if (socket == invalidSocket) return socket;
     u_long nonblocking = 1;
     if (ioctlsocket(socket, FIONBIO, &nonblocking) == 0) return socket;
@@ -44,20 +46,26 @@ Socket open() {
     WSASetLastError(status);
     return invalidSocket;
 #else
-    return ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+    return ::socket(family, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
 #endif
 }
 
 Socket accept(Socket socket) {
 #ifdef _WIN32
     auto accepted = ::accept(socket, nullptr, nullptr);
-    if (accepted != invalidSocket && !SetHandleInformation(reinterpret_cast<HANDLE>(accepted), HANDLE_FLAG_INHERIT, 0)) {
+    if (accepted == invalidSocket) return accepted;
+    if (!SetHandleInformation(reinterpret_cast<HANDLE>(accepted), HANDLE_FLAG_INHERIT, 0)) {
         auto status = GetLastError();
         closesocket(accepted);
         WSASetLastError(static_cast<int>(status));
         return invalidSocket;
     }
-    return accepted;
+    u_long nonblocking = 1;
+    if (ioctlsocket(accepted, FIONBIO, &nonblocking) == 0) return accepted;
+    auto status = WSAGetLastError();
+    closesocket(accepted);
+    WSASetLastError(status);
+    return invalidSocket;
 #else
     return ::accept4(socket, nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
 #endif
@@ -68,6 +76,16 @@ void close(Socket socket) {
     closesocket(socket);
 #else
     ::close(socket);
+#endif
+}
+
+void shutdownConnection(Socket socket, uintptr_t monitor) {
+#ifdef _WIN32
+    ::shutdown(socket, SD_BOTH);
+    if (monitor) WSASetEvent(reinterpret_cast<WSAEVENT>(monitor));
+#else
+    (void)monitor;
+    ::shutdown(socket, SHUT_RDWR);
 #endif
 }
 
@@ -124,19 +142,26 @@ bool disconnected(Socket socket) {
 }
 
 bool waitDisconnect(uintptr_t monitor, int timeout) {
-#ifdef _WIN32
-    return WaitForSingleObject(reinterpret_cast<HANDLE>(monitor), timeout) == WAIT_OBJECT_0;
-#else
-    auto deadline = uv_hrtime() / 1000000 + static_cast<unsigned>(timeout);
+    auto now = [] { return static_cast<int64_t>(uv_hrtime() / UINT64_C(1000000)); };
+    auto deadline = now() + timeout;
+#ifndef _WIN32
     PollSlot slot{static_cast<Socket>(monitor - 1), POLLRDHUP, 0};
-    for (;;) {
-        auto now = uv_hrtime() / 1000000;
-        if (now > deadline) return false;
-        auto result = poll(slot, static_cast<int>(deadline - now));
-        if (result < 0 && error() == EINTR) continue;
-        return result > 0 && (slot.revents & (POLLRDHUP | POLLHUP | POLLERR | POLLNVAL));
-    }
 #endif
+    for (;;) {
+        if (lyraBlockingCancelled()) return false;
+        auto remaining = deadline - now();
+        if (remaining < 0) return false;
+        auto interval = static_cast<int>(std::min<int64_t>(remaining, 25));
+#ifdef _WIN32
+        auto result = WaitForSingleObject(reinterpret_cast<HANDLE>(monitor), interval);
+        if (result != WAIT_TIMEOUT) return result == WAIT_OBJECT_0;
+#else
+        auto result = poll(slot, interval);
+        if (result < 0 && error() == EINTR) continue;
+        if (result != 0) return result > 0 && (slot.revents & (POLLRDHUP | POLLHUP | POLLERR | POLLNVAL));
+#endif
+        if (remaining <= interval) return false;
+    }
 }
 
 }

@@ -84,18 +84,31 @@ export void asyncFailure(llvm::IRBuilder<>& builder, llvm::Value* error) {
     marker(builder, "lyra.fail", builder.getVoidTy(), {error});
 }
 
+export llvm::Value* nativeExitCode(llvm::IRBuilder<>& builder, llvm::Value* result) {
+    return builder.CreateCall(runtime(builder, "lyraExitCode", builder.getInt32Ty(), {builder.getInt64Ty()}), {result});
+}
+
 export llvm::Value* asyncEntry(llvm::IRBuilder<>& builder, llvm::Value* coldRoot, llvm::Type* resultType, bool commonError) {
     auto* status = builder.CreateCall(runtime(builder, "lyraTaskRunRoot", builder.getInt32Ty(), {builder.getPtrTy()}), {coldRoot});
     if (!resultType) return status;
     auto* start = builder.GetInsertBlock();
     auto* main = start->getParent();
     auto* check = llvm::BasicBlock::Create(builder.getContext(), "root.result", main);
-    auto* error = llvm::BasicBlock::Create(builder.getContext(), "root.error", main);
     auto* done = llvm::BasicBlock::Create(builder.getContext(), "root.done", main);
     builder.CreateCondBr(builder.CreateIsNull(status), check, done);
     builder.SetInsertPoint(check);
     auto* box = builder.CreateCall(runtime(builder, "lyraTaskOutcome", builder.getPtrTy(), {builder.getPtrTy()}), {coldRoot});
     auto* result = builder.CreateLoad(resultType, box);
+    if (resultType->isIntegerTy(64)) {
+        auto* code = nativeExitCode(builder, result);
+        builder.CreateBr(done);
+        builder.SetInsertPoint(done);
+        auto* exit = builder.CreatePHI(builder.getInt32Ty(), 2);
+        exit->addIncoming(status, start);
+        exit->addIncoming(code, check);
+        return exit;
+    }
+    auto* error = llvm::BasicBlock::Create(builder.getContext(), "root.error", main);
     builder.CreateCondBr(builder.CreateExtractValue(result, 0), done, error);
     builder.SetInsertPoint(error);
     auto* failed = builder.CreateCall(runtime(builder, commonError ? "lyraErrorReport" : "lyraReportStringError", builder.getInt32Ty(), {builder.getPtrTy()}), {builder.CreateExtractValue(result, 2)});

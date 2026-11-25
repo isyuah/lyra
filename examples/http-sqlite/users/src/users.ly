@@ -2,6 +2,7 @@ import std.json.JsonCodec
 import std.sqlite.Connection
 import std.sqlite.DbError
 import std.sqlite.Statement
+import std.sqlite.open
 import std.sqlite.openReadOnly
 
 #derive(Json)
@@ -34,5 +35,16 @@ pub fn findUser(path: String, id: Int): Result<User?, DbError> {
     match query.readText(0)? {
         Some(name) => Ok(Some(User(id, name))),
         None => Err(DbError.typeMismatch("readText", "users.name must not be NULL")),
+    }
+}
+
+pub fn insertUser(path: String, input: NewUser): Result<User, DbError> {
+    val db = open(path)?
+    defer db.close()
+    db.transaction<User>() { tx =>
+        val insert = tx.prepare("INSERT INTO users(name) VALUES(?1)")?
+        insert.bindText(1, input.name)?
+        insert.next()?;
+        Ok(User(tx.lastInsertRowid()?, input.name))
     }
 }

@@ -49,9 +49,11 @@ async fn main(): Unit {
 
     print(parallelism())
     while true {
-        val line = readLine()
-        if line.eof() { break }
-        if !line.ok() { throw Exception("cannot read benchmark command") }
+        match readLine() {
+            Ok(None) => break,
+            Ok(Some(_)) => {},
+            Err(error) => throw Exception(error.message()),
+        }
         val count = AtomicInt()
         val total = AtomicInt()
         val started = uv_hrtime()

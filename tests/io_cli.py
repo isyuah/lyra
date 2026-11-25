@@ -10,6 +10,20 @@ from platform_cli import assert_linkage, c_archive, executable
 
 COMPILER = Path(sys.argv.pop(1)).resolve()
 
+IO_HELPERS = '''
+import std.io.IoError
+import std.io.IoErrorKind
+import std.os.args
+
+fn require<T>(result: Result<T, IoError>): T {
+    match result { Ok(value) => value, Err(error) => throw Exception(error.message()) }
+}
+
+fn failed<T>(result: Result<T, IoError>, kind: IoErrorKind): Bool {
+    match result { Err(error) => error.kind == kind, _ => false }
+}
+'''
+
 
 class IO(unittest.TestCase):
     def setUp(self):
@@ -30,30 +44,23 @@ class IO(unittest.TestCase):
                 invoke(output)
 
     def test_utf8_args_file_stdin_and_stderr(self):
-        source = r'''
-import std.io.argCount
-import std.io.arg
+        source = IO_HELPERS + r'''
 import std.io.readFile
 import std.io.writeFile
 import std.io.readLine
 import std.io.writeError
-import std.io.assert
 fn main(): Unit {
-    assert(argCount() == 2, "argc")
-    assert(!arg(-1).ok() && !arg(2).ok(), "range")
-    val destination = arg(0).value
-    val word = arg(1).value
-    assert(writeFile(destination, word + "\0尾") == 0, "write")
-    val content = readFile(destination)
-    assert(content.ok(), "read")
-    print(content.value)
-    val empty = readLine()
-    assert(empty.ok() && empty.value == "", "empty line")
-    print(readLine().value)
-    val last = readLine()
-    assert(last.ok() && last.value == "last", "no final LF")
-    assert(readLine().eof(), "EOF")
-    assert(writeError("诊断\n") == 0, "stderr")
+    val arguments = require(args())
+    #assert(arguments.size == 2, "argc")
+    val destination = arguments[0]
+    val word = arguments[1]
+    require(writeFile(destination, word + "\0尾"))
+    print(require(readFile(destination)))
+    #assert(require(readLine()) == Some(""), "empty line")
+    print(require(readLine()) ?? "missing")
+    #assert(require(readLine()) == Some("last"), "no final LF")
+    #assert(require(readLine()) == None, "EOF")
+    require(writeError("诊断\n"))
 }
 '''
         def invoke(app):
@@ -72,28 +79,23 @@ fn main(): Unit {
             for raw in (b"\xc0\x80\n", b"\xf4\x90\x80\x80\n", b"\xe2\x82\n"):
                 result = subprocess.run([app, invalid, empty, missing], input=raw, capture_output=True, timeout=5)
                 self.assertEqual((result.returncode, result.stdout, result.stderr), (0, b"", b""))
-        self.example(r'''
-import std.io.arg
+        self.example(IO_HELPERS + r'''
 import std.io.readFile
 import std.io.readLine
 import std.io.writeFile
-import std.io.assert
 fn main(): Unit {
-    val bad = readFile(arg(0).value)
-    val empty = readFile(arg(1).value)
-    val missing = readFile(arg(2).value)
-    assert(bad.status > 0 && missing.status > 0 && bad.status != missing.status, "file error")
-    assert(empty.ok() && empty.value == "", "empty file")
-    assert(writeFile(arg(0).value + "\0ignored", "bad") > 0, "NUL path")
-    val invalid = readLine()
-    assert(invalid.status > 0 && !invalid.eof(), "invalid UTF-8")
-    assert(readLine().eof(), "next EOF")
+    val arguments = require(args())
+    #assert(failed(readFile(arguments[0]), IoErrorKind.InvalidUtf8), "invalid file")
+    #assert(require(readFile(arguments[1])) == "", "empty file")
+    #assert(match readFile(arguments[2]) { Err(error) => error.code() != None, _ => false }, "missing file")
+    #assert(failed(writeFile(arguments[0] + "\0ignored", "bad"), IoErrorKind.Invalid), "NUL path")
+    #assert(failed(readLine(), IoErrorKind.InvalidUtf8), "invalid UTF-8")
+    #assert(require(readLine()) == None, "next EOF")
 }
 ''', invoke)
 
     def test_run_preserves_forwarded_argument_boundaries(self):
-        self.source.write_text('import std.io.arg\nimport std.io.argCount\n'
-                               'fn main(): Unit { print(argCount()); print(arg(0).value); print(arg(1).value) }')
+        self.source.write_text(IO_HELPERS + 'fn main(): Unit { val values = require(args()); print(values.size); print(values[0]); print(values[1]) }')
         value = '中文 "quoted" \\'
         result = subprocess.run([COMPILER, 'run', self.package, '--', '', value], capture_output=True, timeout=30)
         self.assertEqual((result.returncode, result.stdout, result.stderr), (0, ('2\n\n' + value + '\n').encode(), b''))
@@ -102,8 +104,18 @@ fn main(): Unit {
         def invoke(app):
             result = subprocess.run([app], capture_output=True, timeout=5)
             self.assertNotEqual(result.returncode, 0)
-            self.assertEqual((result.stdout, result.stderr), (b"12\n", "assertion failed: 预期失败\n".encode()))
-        self.example('import std.io.assert\nextern fn llabs(number: Int): Int;\nfn main(): Unit { print(llabs(-12)); assert(false, "预期失败") }', invoke)
+            self.assertEqual(result.stdout, b"12\n2\n1\ncleanup\n")
+            self.assertIn('main.ly:7:', result.stderr.decode())
+            self.assertIn('assertion failed: 预期失败', result.stderr.decode())
+        self.example('''extern fn llabs(number: Int): Int;
+fn main(): Unit {
+    defer print("cleanup")
+    print(llabs(-12))
+    var calls = 0
+    #assert({ calls += 1; true }, { throw Exception("must not run") })
+    #assert({ calls += 1; print(calls); false }, { print(1); "预期失败" })
+}
+''', invoke)
 
     def test_no_native_layout_for_aggregate(self):
         self.source.write_text("class Box(val number: Int)\nextern fn bad(box: Box): Int;\nfn main(): Unit {}")

@@ -28,6 +28,26 @@ fn main(): Unit {
 - 非固定 schema 可 `import std.json.parseJson`：它返回 `Result<JsonValue,String>`。用 `isObject()`、`isArray()`、`size()`、`key(index)`、`field(name)`、`item(index)` 检查结构，用 `readString(path)`、`readChar(path)`、`readBool(path)` 或 `read` 加数值类型名（如 `readUInt16(path)`、`readFloat32(path)`）读取标量。`missing()` 和 `isNull()` 可分别检查缺键和显式空值。
 - 手写 `read类型名Json(value: JsonValue, path: String)` 时，可把 `value.field(name)`、`value.item(index)` 直接交给其他解码器，它们继承当前视图的策略。若手动遍历未知键，按 `value.rejectsUnknownFields` 决定是否报错。`value.ignoringUnknownFields()` 与原视图共用解析结果，不修改原视图。
 
+### 构造动态 JSON
+
+```lyra
+import std.json.jsonArray
+import std.json.jsonInt
+import std.json.jsonNull
+import std.json.jsonObject
+import std.json.jsonString
+
+fn main(): Unit {
+    val rows = jsonArray().add(jsonInt(7)).add(jsonNull()).build()
+    val report = jsonObject().put("title", jsonString("统计")).put("rows", rows).build()
+    print(report.encode(pretty: true))
+}
+```
+
+- `put(key, value)` 和 `add(value)` 修改构造器并返回自身；`build()` 返回独立的不可变 `JsonValue` 快照。后续修改同一个构造器时，已有快照保持原样。对象保持插入顺序，写入同一键时替换原位置的值。
+- `jsonString`、`jsonInt`、`jsonFloat`、`jsonBool`、`jsonNull` 创建标量，可与 `parseJson` 得到的节点混用。整数保留完整的有符号 64 位精度。空字符串可作键，NUL 只能出现在字符串值中。
+- `JsonValue.encode()` 默认紧凑输出，`pretty: true` 用两个空格缩进。读取缺失字段或越界数组项得到的是 Missing，不是 `jsonNull()`；把 Missing 插入容器或直接编码会抛出 `Exception`。`jsonFloat` 拒绝 NaN 和无穷；编码拒绝超过解析器的 128 层嵌套上限。
+
 ### 跨包复用编解码器
 
 库可以从公开函数返回 `JsonCodec<T>`。例如，`models` 包对外提供 `User` 的 JSON 格式，库作者选择公开名称 `userWire`。

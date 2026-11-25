@@ -28,7 +28,7 @@ int main() {
     auto* second = lyraListCreate();
     lyraListAdd(first, box(5));
     lyraListExtend(second, first);
-    lyraListSet(first, 0, box(9));
+    lyraListSet(first, 0, box(9), __FILE__, __LINE__, 1);
     check(load(second, 0) == 5, "spreading aliased a replaceable source slot");
     lyraListExtend(second, second);
     check(lyraListSize(second) == 2 && load(second, 1) == 5, "self append failed");

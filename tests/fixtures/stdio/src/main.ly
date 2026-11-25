@@ -1,15 +1,19 @@
-import std.io.arg
-import std.io.assert
+import std.os.args
+import std.io.IoError
 import std.io.readFile
 import std.io.readLine
 import std.io.writeFile
 
+fn copyLine(): Result<Unit, IoError> {
+    val arguments = args()?
+    val line = readLine()?
+    #assert(arguments.size == 1 && line != None, "expected a path and one line")
+    val path = arguments[0]
+    writeFile(path, line ?? "")?
+    print(readFile(path)?)
+    Ok({})
+}
+
 fn main(): Unit {
-    val path = arg(0)
-    val line = readLine()
-    assert(path.ok() && line.ok(), "expected a path and one line")
-    assert(writeFile(path.value, line.value) == 0, "write")
-    val file = readFile(path.value)
-    assert(file.ok(), "read")
-    print(file.value)
+    match copyLine() { Ok(_) => {}, Err(error) => throw Exception(error.message()) }
 }

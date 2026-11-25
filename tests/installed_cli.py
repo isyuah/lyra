@@ -16,6 +16,7 @@ import threading
 import unittest
 
 from platform_cli import LINKER, assert_linkage, c_archive, executable, isolated_environment, running
+from tls_fixture import OPENSSL, tls_fixture, trust_local
 
 
 EXAMPLES = Path(__file__).resolve().parents[1] / 'examples'
@@ -184,8 +185,7 @@ async fn main(): Unit { print(label()); print(await score()) }
             (app / 'tests/answer.ly').unlink()
             write(app / 'tests/contract.ly', '''import self.label
 import self.score
-import std.io.assert
-async fn main(): Unit { assert(label() == "relocated: 打包时的标题:v1", "wrong installed input"); assert(await score() == 42, "wrong C ABI result") }
+async fn main(): Unit { #assert(label() == "relocated: 打包时的标题:v1", "wrong installed input"); #assert(await score() == 42, "wrong C ABI result") }
 ''')
             environment['UV_THREADPOOL_SIZE'] = '2'
             run(compiler, 'fetch', app, *frozen_args)
@@ -231,6 +231,21 @@ async fn main(): Unit { assert(label() == "relocated: 打包时的标题:v1", "w
             database = root / '查询 数据库.db'
             with contextlib.closing(sqlite3.connect(database)) as connection, connection:
                 connection.executescript("CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT); INSERT INTO users VALUES(7,'Ada');")
+            ca, certificate, key = tls_fixture(root / '本地 CA') if OPENSSL else (None, None, None)
+            credentials = ('--cert', certificate, '--key', key) if certificate else ()
+            input_path = root / '输入 流.jsonl'
+            input_path.write_bytes(b'{"station":"west","delta":7}\ninvalid\n')
+            config_path = root / '程序 配置.toml'
+            config_path.write_text('input = ' + json.dumps(str(input_path), ensure_ascii=False) + '\n', encoding='utf-8')
+
+            def request(port, method, target, body=None):
+                protocol = http.client.HTTPSConnection if ca else http.client.HTTPConnection
+                options = {'context': trust_local(ca)} if ca else {}
+                with contextlib.closing(protocol('localhost', port, timeout=5, **options)) as connection:
+                    connection.request(method, target, body=body, headers={'Content-Type': 'application/json'} if body else {})
+                    response = connection.getresponse()
+                    return response.status, response.read()
+
             profiles = (('debug', ()), ('release', ('--release',)))
             verified = []
             for profile, flags in profiles:
@@ -239,25 +254,57 @@ async fn main(): Unit { assert(label() == "relocated: 打包时的标题:v1", "w
                     server = executable(root / 'deploy' / profile / 'users')
                     run('build', jsonlines / 'stats', *flags, '-o', cli)
                     run('build', service, *flags, '-o', server)
-                    result = subprocess.run([cli], input=b'{"station":"west","delta":7}\ninvalid\n',
-                                            cwd=root, env=isolated, capture_output=True, timeout=10)
+                    result = subprocess.run([cli, '--config', config_path], cwd=root, env=isolated, capture_output=True, timeout=10)
                     self.assertEqual(result.returncode, 0, result.stderr)
                     self.assertEqual(json.loads(result.stdout), {'rows': 1, 'total': 7, 'rejected': 1})
                     self.assertIn(b'line 2:', result.stderr)
-                    with running([server, database], cwd=root, env=isolated) as (process, output):
+                    profile_database = root / f'{profile} 数据库.db'
+                    shutil.copy2(database, profile_database)
+                    with contextlib.ExitStack() as stack:
+                        upstream_options = ()
+                        if ca:
+                            _, upstream = stack.enter_context(running([server, database, *credentials], cwd=root, env=isolated))
+                            upstream_options = ('--upstream', f'https://localhost:{int(upstream.line())}/users/7', '--ca', ca)
+                        process, output = stack.enter_context(running([server, profile_database, *credentials, *upstream_options], cwd=root, env=isolated))
                         port = int(output.line())
-                        for user, expected in ((7, 200), (8, 404)):
-                            with contextlib.closing(http.client.HTTPConnection('127.0.0.1', port, timeout=5)) as connection:
-                                connection.request('GET', f'/users/{user}')
-                                response = connection.getresponse()
-                                self.assertEqual(response.status, expected)
-                                body = response.read()
-                                if expected == 200:
-                                    self.assertEqual(json.loads(body), {'id': 7, 'name': 'Ada'})
+                        status, data = request(port, 'GET', '/users/7')
+                        self.assertEqual((status, json.loads(data)), (200, {'id': 7, 'name': 'Ada'}))
+                        self.assertEqual(request(port, 'GET', '/users/8')[0], 404)
+                        status, data = request(port, 'POST', '/users', b'{"name":"Grace"}')
+                        self.assertEqual((status, json.loads(data)), (201, {'id': 8, 'name': 'Grace'}))
+                        with contextlib.closing(sqlite3.connect(profile_database)) as connection:
+                            self.assertEqual(connection.execute('SELECT name FROM users WHERE id=8').fetchone(), ('Grace',))
+                        if ca:
+                            status, data = request(port, 'GET', '/upstream')
+                            self.assertEqual((status, json.loads(data)), (200, {'id': 7, 'name': 'Ada'}))
                         self.assertIsNone(process.poll())
                     assert_linkage(self, cli)
                     assert_linkage(self, server, 'libm.so.6')
                     verified.append(profile)
+            for name in ('liblyraHttpClient.a', 'liblyraHttpTls.a', 'libssl.a', 'libcrypto.a', 'libcurl.a', 'libcares.a'):
+                library = sdk / 'lib' / name
+                library.rename(library.with_suffix('.disabled'))
+            plain_http = root / 'plain-http/src/main.ly'
+            plain_http.parent.mkdir(parents=True)
+            (plain_http.parent.parent / 'lyra.json5').write_text('{name:"test/plain-http",version:"0.1.0"}', encoding='utf-8')
+            plain_http.write_text('''import std.http.listen
+import std.httpTls.listenTls
+
+fn main(): Unit {
+    match listen(0) {
+        Ok(listener) => { listener.close(); print("plain HTTP") },
+        Err(error) => throw Exception(error.message()),
+    }
+}
+''', encoding='utf-8')
+            plain = executable(root / 'plain')
+            locked = subprocess.run([compiler, 'lock', plain_http.parent.parent, '--offline'], cwd=root, env=isolated,
+                                    capture_output=True, text=True, timeout=20)
+            self.assertEqual(locked.returncode, 0, locked.stderr)
+            run('build', plain_http.parent.parent, '-o', plain)
+            result = subprocess.run([plain], cwd=root, env=isolated, capture_output=True, timeout=10)
+            self.assertEqual((result.returncode, result.stdout, result.stderr), (0, b'plain HTTP\n', b''))
+            run('build', jsonlines / 'stats', '-o', executable(root / 'plain-stats'))
             linker = sdk / 'libexec' / 'lyra' / LINKER
             linker.rename(linker.with_suffix('.disabled'))
             artifact = executable(root / 'deploy' / 'debug' / 'stats')
@@ -273,6 +320,8 @@ async fn main(): Unit { assert(label() == "relocated: 打包时的标题:v1", "w
                 bundle = OPTIONS.deployment_bundle
                 bundle.mkdir(parents=True)
                 shutil.copy2(database, bundle / 'users.db')
+                for path in (ca, certificate, key):
+                    shutil.copy2(path, bundle)
                 shutil.copy2(Path(__file__).with_name('windows-deploy-smoke.ps1'), bundle / 'verify.ps1')
                 for profile in verified:
                     destination = bundle / profile
@@ -294,8 +343,8 @@ if __name__ == '__main__':
         if not executable(OPTIONS.sdk / 'bin/lyra').is_file():
             parser.error('expected an SDK prefix containing bin/lyra')
     if OPTIONS.deployment_bundle is not None:
-        if os.name != 'nt' or OPTIONS.sdk is None:
-            parser.error('--deployment-bundle requires --sdk on Windows')
+        if os.name != 'nt' or OPTIONS.sdk is None or not OPENSSL:
+            parser.error('--deployment-bundle requires --sdk on Windows and the OpenSSL test command')
         OPTIONS.deployment_bundle = OPTIONS.deployment_bundle.resolve()
         if OPTIONS.deployment_bundle.exists():
             parser.error('--deployment-bundle must name a new directory')

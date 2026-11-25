@@ -15,8 +15,8 @@ endfunction()
 function(lyra_stage_linux_sdk)
     find_program(LYRA_LLD NAMES ld.lld-18 ld.lld HINTS "${LLVM_TOOLS_BINARY_DIR}" REQUIRED)
     lyra_stage_linker("${LYRA_LLD}" ld.lld)
-    foreach(input IN ITEMS Scrt1.o crti.o crtbeginS.o crtendS.o crtn.o libgcc.a libc.so.6 libc_nonshared.a libm.so.6)
-        execute_process(COMMAND "${CMAKE_C_COMPILER}" "--print-file-name=${input}"
+    foreach(input IN ITEMS Scrt1.o crti.o crtbeginS.o crtendS.o crtn.o libgcc.a libgcc_eh.a libstdc++.a libc.so.6 libc_nonshared.a libm.so.6)
+        execute_process(COMMAND "${CMAKE_CXX_COMPILER}" "--print-file-name=${input}"
             OUTPUT_VARIABLE source OUTPUT_STRIP_TRAILING_WHITESPACE COMMAND_ERROR_IS_FATAL ANY)
         lyra_stage_sdk_input("${source}" "lib/lyra/target/${input}")
     endforeach()

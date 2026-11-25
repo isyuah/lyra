@@ -1,6 +1,7 @@
 module;
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -52,7 +53,7 @@ std::string_view macroDirectory(MacroKind kind) {
         case MacroKind::Expression: return "expressions";
         case MacroKind::Decorator: return "decorators";
     }
-    std::unreachable();
+    std::abort();
 }
 
 namespace {

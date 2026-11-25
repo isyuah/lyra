@@ -26,7 +26,8 @@ function(lyra_stage_windows_sdk)
 
     set(syslib "${LYRA_WINDOWS_SYSROOT}/x86_64-w64-mingw32/lib")
     foreach(input IN ITEMS crt2u.o crtbegin.o crtend.o libc++.a libunwind.a libmingw32.a libmingwex.a libmoldname.a libmsvcrt.a
-            libws2_32.a libiphlpapi.a libuserenv.a libpsapi.a libadvapi32.a libuser32.a libdbghelp.a libole32.a libshell32.a libkernel32.a)
+            libws2_32.a libiphlpapi.a libuserenv.a libpsapi.a libadvapi32.a libuser32.a libdbghelp.a libole32.a libshell32.a libkernel32.a
+            libbcrypt.a libcrypt32.a libgdi32.a)
         lyra_stage_sdk_input("${syslib}/${input}" "lib/lyra/target/${input}")
     endforeach()
     execute_process(COMMAND "${cc}" --print-libgcc-file-name OUTPUT_VARIABLE builtins OUTPUT_STRIP_TRAILING_WHITESPACE COMMAND_ERROR_IS_FATAL ANY)
@@ -45,10 +46,11 @@ function(lyra_stage_windows_sdk)
             "-DLYRA_LLHTTP_OFFLINE=${LYRA_LLHTTP_OFFLINE}" "-DFETCHCONTENT_SOURCE_DIR_LYRA_TOMLC17=${FETCHCONTENT_SOURCE_DIR_LYRA_TOMLC17}"
             "-DFETCHCONTENT_FULLY_DISCONNECTED=${FETCHCONTENT_FULLY_DISCONNECTED}" "-DCMAKE_INSTALL_PREFIX=<INSTALL_DIR>"
         BUILD_ALWAYS TRUE)
-    foreach(archive IN ITEMS liblyraRuntime.a libllhttp.a libgc.a libuv.a libjansson.a libsqlite3.a)
+    foreach(archive IN ITEMS liblyraRuntime.a libllhttp.a libgc.a libuv.a libjansson.a libsqlite3.a
+            liblyraHttpClient.a liblyraHttpTls.a libcurl.a libcares.a libssl.a libcrypto.a libzs.a)
         install(FILES "${CMAKE_BINARY_DIR}/lib/${archive}" DESTINATION lib)
     endforeach()
-    foreach(port IN ITEMS bdwgc libuv jansson sqlite3 llhttp tomlc17)
+    foreach(port IN ITEMS bdwgc libuv jansson sqlite3 llhttp tomlc17 curl c-ares openssl zlib)
         install(DIRECTORY "${CMAKE_BINARY_DIR}/share/lyra/licenses/${port}" DESTINATION share/lyra/licenses)
     endforeach()
 endfunction()

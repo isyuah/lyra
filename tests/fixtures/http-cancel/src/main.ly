@@ -1,13 +1,23 @@
 import std.http.listen
+import std.http.HttpError
 import std.http.Request
-import std.io.arg
-import std.io.assert
+import std.http.Response
+import std.io.IoError
 import std.io.readLine
+import std.os.args
 import std.sqlite.DbError
 import std.sqlite.Statement
 import std.sqlite.openReadOnly
 
 fn require<T>(result: Result<T, DbError>): T {
+    match result { Ok(value) => value, Err(error) => throw Exception(error.message()) }
+}
+
+fn requireHttp<T>(result: Result<T, HttpError>): T {
+    match result { Ok(value) => value, Err(error) => throw Exception(error.message()) }
+}
+
+fn requireIo<T>(result: Result<T, IoError>): T {
     match result { Ok(value) => value, Err(error) => throw Exception(error.message()) }
 }
 
@@ -19,40 +29,40 @@ async fn observe(target: Task<Unit>): Unit { await target }
 async fn group(child: Task<Unit>): Unit { spawn child; }
 
 async fn handle(request: Request, work: Task<Unit>, probe: Task<Unit>): Unit {
-    defer { request.close(); print("request closed") }
-    assert(request.watchDisconnect(), "watch owner disconnect")
+    #assert(request.watchDisconnect(), "watch owner disconnect")
     spawn work;
     spawn probe;
     await work
     print("handler resumed")
-    request.respond(200, "text/plain", "done");
+    requireHttp(request.respond(Response.text(200, "done")))
 }
 
 async fn main(): Unit {
-    val server = listen(0)
-    assert(server.status() == 0, "listen")
+    val server = requireHttp(listen(0))
+    defer server.close()
     print(server.port())
-    val request = await blocking { server.accept(5000) }
-    assert(request.status() == 0, "accept")
-    val path = arg(0).value
+    val path = requireIo(args())[0]
     val work = blocking {
         val db = require(openReadOnly(path))
         defer { db.close(); print("database closed") }
         val query = require(db.prepare("SELECT id FROM rows ORDER BY id"))
         defer { query.close(); print("cursor closed") }
-        assert(require(query.next()) && currentId(query) == 7, "first row")
+        #assert(require(query.next()) && currentId(query) == 7, "first row")
         print("cursor open")
-        assert(readLine().value == "continue", "release worker")
-        assert(require(query.next()) && currentId(query) == 8 && !require(query.next()), "cursor still usable")
+        #assert(requireIo(readLine()) == Some("continue"), "release worker")
+        #assert(require(query.next()) && currentId(query) == 8 && !require(query.next()), "cursor still usable")
     }
     val probe = observe(work)
-    val serving = spawn group(handle(request, work, probe))
-    await group(observe(probe))
-    print("cancellation observed")
-    await serving
+    requireHttp(await server.withAccepted<Unit>(5000, async (request: Request) => {
+        val serving = spawn group(handle(request, work, probe))
+        await group(observe(probe))
+        print("cancellation observed")
+        await serving
+    }))
+    print("request closed")
     print("request group closed")
 
-    val next = await blocking { server.accept(5000) }
-    assert(next.status() == 0 && next.respond(200, "text/plain", "ready") == 0, "serve next request")
-    server.close()
+    requireHttp(await server.withAccepted<Unit>(5000, async (request: Request) => {
+        requireHttp(await blocking { request.respond(Response.text(200, "ready")) })
+    }))
 }

@@ -37,7 +37,7 @@ def assert_linkage(test, program, *linux_libraries):
         test.assertIn('Format: COFF-x86-64', output)
         libraries = {name.lower() for name in re.findall(r'^\s*Name:\s+(\S+\.dll)\s*$', output, re.I | re.M)}
         system_libraries = {
-            'advapi32.dll', 'bcrypt.dll', 'dbghelp.dll', 'iphlpapi.dll', 'kernel32.dll',
+            'advapi32.dll', 'bcrypt.dll', 'crypt32.dll', 'dbghelp.dll', 'gdi32.dll', 'iphlpapi.dll', 'kernel32.dll',
             'ntdll.dll', 'ole32.dll', 'psapi.dll', 'shell32.dll', 'user32.dll', 'userenv.dll', 'ws2_32.dll',
         }
         test.assertIn('kernel32.dll', libraries)

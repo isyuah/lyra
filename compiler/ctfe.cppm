@@ -186,7 +186,8 @@ struct Validator {
                 }
                 if (info.callee == Callee::ToString || info.callee == Callee::ToReal || info.callee == Callee::ToBytes ||
                     info.callee == Callee::ToIntegerChecked || info.callee == Callee::Sum || info.callee == Callee::Variant ||
-                    info.callee == Callee::ListAdd || info.callee == Callee::ListSlice || info.callee == Callee::Size || info.callee == Callee::FreezeList) return;
+                    info.callee == Callee::ListAdd || info.callee == Callee::ListSlice || info.callee == Callee::ListRemoveAt ||
+                    info.callee == Callee::Size || info.callee == Callee::FreezeList) return;
                 if (info.callee == Callee::ValueEqual || info.callee == Callee::ValueHash) {
                     auto operation = info.callee == Callee::ValueEqual ? ValueOperation::Equal : ValueOperation::Hash;
                     validateValueOperation(fn.expressions[*node.receiver].type, operation, node.name.span);
@@ -805,8 +806,11 @@ struct Evaluation {
         return place;
     }
 
-    EvalValue& cell(const Place& place) {
-        return place.owner ? composites[place.owner->index].fields[place.index] : *place.local;
+    EvalValue& cell(const Place& place, const CheckedFunction& fn, Span site) {
+        if (!place.owner) return *place.local;
+        auto& fields = composites[place.owner->index].fields;
+        if (place.index >= fields.size()) error(sources, fn, site, "LYCT0003", "编译期索引越界");
+        return fields[place.index];
     }
 
     EvalValue replace(const CheckedFunction& fn, Span site, const EvalValue& base,
@@ -986,8 +990,10 @@ struct Evaluation {
                     }
                 } else if (fn.expressions[item.input].type.kind == Type::List || fn.expressions[item.input].type.kind == Type::FrozenList) {
                     auto count = composite(input).fields.size();
-                    for (std::size_t index = 0; index < count; ++index)
-                        if (!iterate(composite(input).fields[index])) break;
+                    for (std::size_t index = 0; index < count; ++index) {
+                        auto current = listIndex(input, static_cast<std::uint64_t>(index), fn, site);
+                        if (!iterate(composite(input).fields[current])) break;
+                    }
                 } else {
                     const auto& text = std::get<std::string>(scalarValue(input, fn, site));
                     auto decode = fn.expressions[item.input].type == Type::String;
@@ -1016,7 +1022,7 @@ struct Evaluation {
                     auto place = address(fn, item.left, frame);
                     auto before = EvalValue{};
                     if (op != Op::Set) {
-                        auto* read = &cell(place);
+                        auto* read = &cell(place, fn, site);
                         for (auto slot : place.path) read = &composite(*read).fields[slot];
                         before = *read;
                     }
@@ -1026,7 +1032,7 @@ struct Evaluation {
                         if (const auto* scalar = std::get_if<ConstScalar>(&after))
                             if (const auto* text = std::get_if<std::string>(scalar)) chargeText(fn, site, text->size());
                     }
-                    auto& destination = cell(place);
+                    auto& destination = cell(place, fn, site);
                     destination = replace(fn, site, destination, place.path, 0, std::move(after));
                 } else {
                     auto left = sub(item.left);
@@ -1071,6 +1077,14 @@ struct Evaluation {
                         charge(fn, site, sizeof(EvalValue));
                         composite(receiver).fields.push_back(std::move(element));
                         return {};
+                    }
+                    if (info.callee == Callee::ListRemoveAt) {
+                        auto offset = sub(item.arguments.front().value);
+                        auto index = listIndex(receiver, offset, fn, item.name.span);
+                        auto& fields = composite(receiver).fields;
+                        auto removed = std::move(fields[index]);
+                        fields.erase(fields.begin() + index);
+                        return removed;
                     }
                     if (info.callee == Callee::ListSlice) {
                         auto [start, end, inclusive] = rangeParts(sub(item.arguments.front().value), fn, item.name.span);

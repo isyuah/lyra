@@ -97,23 +97,25 @@ pub class HashMap<Key,Value>(val keyHash: (Key) -> Int, val keysEqual: (Key, Key
         None
     }
 
-    pub fn entries(): List<MapEntry<Key,Value>> {
-        val snapshot: List<MapEntry<Key,Value>> = []
+    fn snapshot<Output>(project: (Key, Value) -> Output): List<Output> {
+        val output: List<Output> = []
         for head in buckets {
             var current = head
             while true {
                 match current {
                     None => { break },
                     Some(node) => {
-                        snapshot.add(MapEntry(node.key, node.value))
+                        output.add(project(node.key, node.value))
                         current = node.next
                     },
                 }
             }
         }
-        snapshot
+        output
     }
 
+    pub fn entries(): List<MapEntry<Key,Value>> { snapshot((key, value) => { MapEntry(key, value) }) }
+    pub fn keys(): List<Key> { snapshot((key, _) => { key }) }
     pub fn iterator(): SnapshotIterator<MapEntry<Key,Value>> { SnapshotIterator(entries()) }
 }
 
@@ -144,7 +146,7 @@ pub class HashSet<Item>(val items: HashMap<Item,Unit>) {
     pub fn contains(item: Item): Bool { items.contains(item) }
     pub fn add(item: Item): Bool { items.put(item, {}) == None }
     pub fn remove(item: Item): Bool { items.remove(item) != None }
-    pub fn values(): List<Item> { map(items.entries()) { it.key } }
+    pub fn values(): List<Item> { items.keys() }
     pub fn iterator(): SnapshotIterator<Item> { SnapshotIterator(values()) }
 }
 

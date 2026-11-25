@@ -119,7 +119,7 @@ class Frontend(PackageTest):
     def test_check_rejects_bad_programs(self):
         for source in ("fn main(): Unit { print(missing()) }", "fn main(): Unit { print() }",
                        "fn main(): Unit { print(1, 2) }", "fn main(): Unit { print(print(1)) }",
-                       "fn main(): Unit { print(9223372036854775808) }", "fn main(): Int { 1 }",
+                       "fn main(): Unit { print(9223372036854775808) }", "fn main(): Int32 { 1 }",
                        "fn f(): Int { 1 }", "fn main(): Unit {} fn main(): Unit {}",
                        "fn main(): Unit { print(1 }", "fn main(): Unit { 1\n+ 2; }"):
             with self.subTest(source=source):
@@ -130,6 +130,19 @@ class Frontend(PackageTest):
 
 
 class Native(PackageTest):
+    def test_main_int_returns_after_cleanup(self):
+        for prefix, body in (('', ''), ('async ', 'await sleepMs(0); ')):
+            for code in (0, 2, 255, -1, 256):
+                with self.subTest(prefix=prefix, code=code):
+                    self.main.write_text(f'{prefix}fn main(): Int {{ defer print("cleanup"); {body}{code} }}')
+                    result = self.cli('run')
+                    self.assertEqual(result.stdout, 'cleanup\n')
+                    if 0 <= code <= 255:
+                        self.assertEqual((result.returncode, result.stderr), (code, ''))
+                    else:
+                        self.assertEqual(result.returncode, 1)
+                        self.assertIn('expected an exit code in 0..255', result.stderr)
+
     def test_unavailable_or_corrupt_object_cache_does_not_break_build(self):
         self.fixture('pass')
         cache = self.package / '对象 cache'
@@ -356,7 +369,7 @@ fn main(): Unit {
     @unittest.skipUnless(WINDOWS, 'Windows keeps a loaded executable mapped')
     def test_failed_rebuild_preserves_the_running_executable(self):
         (self.package / 'lyra.json5').write_text('{name:"reload",version:"1.0.0"}')
-        self.main.write_text('import std.io.readLine\nfn main(): Unit { print(1); readLine(); print(2) }')
+        self.main.write_text('import std.io.readLine\nfn main(): Unit { print(1); val _ = readLine(); print(2) }')
         output = executable(self.package / 'running')
         built = self.cli('build', '-o', output)
         self.assertEqual(built.returncode, 0, built.stderr)

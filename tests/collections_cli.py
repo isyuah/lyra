@@ -346,6 +346,42 @@ fn main(): Unit {
 }
 ''', b"", b"main.ly:3:11: list slice 0..9223372036854775807 out of bounds (size 2)")
 
+    def test_remove_at_returns_element_and_mutates_aliases(self):
+        self.native('''
+const fn shift(): Int {
+    val input = [10, 20, 30]
+    input.removeAt(1) + input[1] + input.size
+}
+const folded: Int = shift()
+fn main(): Unit {
+    val input = ["first", "second", "third"]
+    val alias = input
+    print(alias.removeAt(index: 1))
+    gcCollect()
+    print(input.size); print(input[1]); print(folded)
+    input.add("last")
+    for value in input { print(value) }
+}
+''', b"second\n2\nthird\n52\nfirst\nthird\nlast\n")
+
+    def test_remove_at_preserves_iteration_length_and_rechecks_writes(self):
+        self.native('''fn main(): Unit {
+    val values = [1, 2]
+    for value in values { print(value); values.removeAt(1); }
+}
+''', b"1\n", b"list index 1 out of bounds (size 1)")
+        self.native('''fn main(): Unit {
+    val values = [1, 2]
+    values[1] = values.removeAt(0)
+}
+''', b"", b"list index 1 out of bounds (size 1)")
+        for body in ('values[1] = values.removeAt(0)', 'for item in values { values.removeAt(1); }'):
+            with self.subTest(body=body):
+                self.main.write_text(f'const fn bad(): Int {{ val values = [1, 2]; {body}; 0 }}\nconst value: Int = bad()\nfn main(): Unit {{}}', encoding='utf-8')
+                result = subprocess.run([COMPILER, 'check', self.package, '--diagnostics=json'], capture_output=True, timeout=10)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(json.loads(result.stderr)[0]['code'], 'LYCT0003')
+
     def test_bounds_error_is_located_before_rhs_runs(self):
         self.native('''fn update(): Int { print(9); 4 }
 fn main(): Unit {

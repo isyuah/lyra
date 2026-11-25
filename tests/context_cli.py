@@ -18,7 +18,6 @@ class TaskContext(unittest.TestCase):
             (root / 'src').mkdir()
             (root / 'lyra.json5').write_text("{name:'test/context',version:'1.0.0'}")
             (root / 'src/main.ly').write_text('''
-import std.io.assert
 import std.io.readLine
 import std.task.trace
 import std.task.remainingMs
@@ -28,7 +27,7 @@ import std.task.withTimeout
 async fn inspect(): String {
     val first = trace()
     val worker = await blocking { gcCollect(); trace() }
-    assert(trace() == first && worker == first, "worker or resumption lost trace")
+    #assert(trace() == first && worker == first, "worker or resumption lost trace")
     first
 }
 async fn shouldNotStart(): Unit { print("expired body ran") }
@@ -38,17 +37,17 @@ async fn deadlineGroup(live: Task<String>): Unit {
 }
 async fn main(): Unit {
     val cold = inspect()
-    assert(trace() == "" && remainingMs() == -1, "root context")
-    assert(await withTrace("B", cold) == "B", "context at activation")
-    assert(trace() == "" && await withTrace("C", cold) == "B", "waiter changed terminal result")
+    #assert(trace() == "" && remainingMs() == -1, "root context")
+    #assert(await withTrace("B", cold) == "B", "context at activation")
+    #assert(trace() == "" && await withTrace("C", cold) == "B", "waiter changed terminal result")
     val live = spawn withTrace("owner", blocking {
         val signal = readLine()
-        assert(signal.ok(), "read gate")
+        #assert(match signal { Ok(Some(_)) => true, _ => false }, "read gate")
         trace()
     })
     await deadlineGroup(live)
     print("deadline joined")
-    assert(await live == "owner", "waiter changed ownership")
+    #assert(await live == "owner", "waiter changed ownership")
     print("done")
 }
 ''')

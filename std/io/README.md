@@ -1,33 +1,22 @@
-# std.io：文本和文件
+# std.io：文本、字节和文件句柄
 
-`argCount()` 不含程序名，`arg(0)` 是第一个用户实参。`arg`、`readLine` 和 `readFile` 都返回 `TextRead`：`.ok()` 时 `.value` 为读到的文本，可能为空；`.eof()` 只表示标准输入已读完；其他失败的 `.status` 是本机 C Runtime 的正错误码。`.invalidUtf8()` 表示输入不能解码为 UTF-8；`readLine` 已消费该行，可以继续读下一行。逐行读取去掉 LF 或 CRLF，不去掉最后一个单独的 CR。Windows 的程序实参与文件路径走 UTF-16 系统接口，Lyra 中仍用 UTF-8。文件内容和重定向输出保留内嵌 NUL；路径拒绝 NUL。`writeFile` 以覆盖模式写入，`writeError` 原样写到标准错误，两者成功返回 `0`。
+- `readFile(path): Result<String, IoError>` 验证整文件为 UTF-8；`readBytes(path): Result<Bytes, IoError>` 原样读取。空文件成功返回空文本或空字节。
+- `writeFile(path, text)`、`writeBytes(path, bytes)` 创建或覆盖文件，返回 `Result<Unit, IoError>`；报错包含写入和关闭失败。`writeError(text)` 原样写入并刷新标准错误，也返回 `Result<Unit, IoError>`。
+- `IoError.kind` 区分 `System(code)`、`Closed`、`Busy`、`Invalid`、`InvalidUtf8` 和 `LineTooLong`；`operation` 说明失败的操作，`code()` 仅对 `System` 有值，不保证跨平台相同。调用方可读取 `message()`，或经 `?` 传播到共同 `Error`。
+- 文件正文与重定向输出保留内嵌 NUL；文件路径拒绝 NUL。Windows 使用 UTF-16 原生文件路径，Lyra API 仍用 UTF-8。目录、路径和临时文件见 [`std.fs`](../fs/README.md)，命令行参数见 `std.os.args()`。
 
-把下面的 `main.ly` 放在应用包的 `src/` 中，编译后执行 `./app note.txt`；输入一行中文并回车即可写入文件。
+## 有界读行
 
-```text
-import std.io.arg
-import std.io.assert
-import std.io.readLine
-import std.io.writeFile
+`readLine(maxBytes: Int = 1048576): Result<String?, IoError>` 读标准输入。`LineReader.stdin(maxBytes)` 和 `LineReader.fromFile(file, maxBytes)` 创建保存该限制的读取器，随后用 `reader.readLine()` 读取。读取器不接管或复制输入；多个读取器共享标准输入或原 `File` 的当前位置。保存的限制必须为正数。
 
-fn main(): Unit {
-    val path = arg(0)
-    assert(path.ok(), "请给一个输出文件名")
-    val line = readLine()
-    if line.eof() { return }
-    assert(line.ok(), "输入不是有效的 UTF-8 文本")
-    assert(writeFile(path.value, line.value + "\n") == 0, "写入失败")
-}
-```
+`Ok(Some(text))` 表示一行，包括空行；`Ok(None)` 表示 EOF。LF 与 CRLF 终止符不计入行长，其他 CR 保留。行长按 UTF-8 字节计；`InvalidUtf8` 和 `LineTooLong` 都会消费完整坏行，下一次读取从新行开始。最后一行可以没有换行。系统读取失败仍是 `Err(System(...))`。
 
-`assert` 在 Debug、Release 都生效：条件不成立时把消息写到标准错误并以非零状态退出。它适合测试和简单 CLI；服务程序可以检查状态并自行处理失败。
+## 句柄
 
-## 原始字节
-
-- `readBytes(path): Result<Bytes, IoError>` 读整个文件。空文件返回 `Ok(b"")`；失败返回 `Err`。`writeBytes(path, bytes): Result<Unit, IoError>` 创建或覆盖文件，返回前检查缓冲写入与关闭失败。
-- `File.openRead(path)` / `File.openWrite(path)` 返回 `Result<File, IoError>`。后者创建或覆盖。`file.read(maxBytes: Int = 65536)` 每次读取最多 `maxBytes` 字节（单次上限 64 KiB）：`Ok(Some(bytes))` 表示读到非空数据，`Ok(None)` 表示 EOF，`Err` 表示操作失败。长度必须为正。`file.write(bytes)` 可多次调用；`file.flush()` 提交缓冲写入，可检查操作失败。
-- 字节 API 保留原始文件内容，包括 NUL、CRLF 和无效 UTF-8。文件路径仍是 `String`。`IoError` 保留操作名、错误类别和可选的本机错误码；可用 `message()` 显示，或经 `?` 传播到共同 `Error`。
-- 所有操作是同步的。服务端用 `blocking` 隔离可能阻塞的文件操作。`close()` 是同步清理，可用 `defer file.close()`。别名共享关闭；闲置时重复关闭成功，关闭后读写返回 `Closed`，读写或关闭正使用句柄时抛 `std.io.Busy` 而不关闭。同一个文件对象上的并行读写返回 `IoErrorKind.Busy`，其他关闭错误抛 `std.io.CloseError`。
+- `File.openRead(path)`、`File.openWrite(path)`、`File.openAppend(path)` 都返回 `Result<File, IoError>`。写模式创建或截断；追加模式创建或保留，写入总是追加到末尾。
+- `file.read(maxBytes: Int = 65536)` 单次最多读 64 KiB；`Ok(Some(bytes))` 含非空片段，`Ok(None)` 为 EOF。`file.write(bytes)` 可多次调用；`file.flush()` 刷新缓冲，可处理失败。
+- `file.seek(offset: Int, origin: SeekOrigin = SeekOrigin.Start): Result<Int, IoError>` 用 64 位字节偏移定位并返回新位置。`Current` 和 `End` 分别从当前位置和末尾开始。追加模式即使定位，下一次写入也仍在末尾。
+- `file.close()` 是同步清理，可用 `defer file.close()`；别名共享关闭，闲置时重复关闭成功。并行操作占用同一文件时返回 `IoErrorKind.Busy`；此时 `close` 抛 `std.io.Busy` 而不关闭，其他关闭失败抛 `std.io.CloseError`。I/O 都是同步的，服务端可以通过 `blocking` 隔离等待。
 
 ```lyra
 import std.io.File

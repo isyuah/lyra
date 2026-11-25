@@ -205,15 +205,20 @@ void cancelDuringCall(LyraTask *self, void *storage) {
 struct DisconnectCase {
     lyraRuntime::net::Socket sockets[2];
     uintptr_t monitor{};
+    bool *locallyClosed{};
     NativeGate gate;
     LyraTask *handler{}, *blocked{};
     LyraCleanup *cleanups{};
     bool observed{}, closed{};
 };
 
+int disconnectSocketClosed(const void *target) {
+    return *static_cast<const bool *>(target);
+}
+
 void *queuedClosure(void *storage, const LyraException **) {
     auto *test = static_cast<DisconnectCase *>(storage);
-    check(!lyraTaskWatchDisconnect(test->monitor), "worker shared the caller's current task");
+    check(!lyraTaskWatchDisconnect(test->monitor, test->locallyClosed, disconnectSocketClosed), "worker shared the caller's current task");
     lyraRuntime::net::close(test->sockets[1]);
     nativeCall(&test->gate);
     lyraGcCollect();
@@ -244,12 +249,13 @@ void watchedHandler(LyraTask *self, void *storage) {
         lyraCleanupPush(&test->cleanups, [](void *environment) -> const LyraException * {
             auto *closing = static_cast<DisconnectCase *>(environment);
             check(closing->gate.returned && closing->observed && !closing->closed, "defer closed a resource before opaque native work ended");
+            *closing->locallyClosed = true;
             lyraRuntime::net::close(closing->sockets[0]);
             lyraRuntime::net::closeMonitor(closing->monitor);
             closing->closed = true;
             return nullptr;
         }, test);
-        check(lyraTaskWatchDisconnect(test->monitor), "owner could not watch a socket");
+        check(lyraTaskWatchDisconnect(test->monitor, test->locallyClosed, disconnectSocketClosed), "owner could not watch a socket");
         test->blocked = lyraTaskBlocking(queuedClosure, test);
         check(!lyraTaskAwait(self, test->blocked), "cold blocking closure was already done");
         return;
@@ -736,6 +742,8 @@ int main(int argc, char **argv) {
     lyraDomainRun(origin);
     check(gate.closed && lyraTaskState(call) == LYRA_TASK_CANCELLED, "native cleanup did not complete cancellation");
     DisconnectCase disconnected{};
+    disconnected.locallyClosed = static_cast<bool *>(lyraGcAlloc(sizeof(bool)));
+    *disconnected.locallyClosed = false;
     check(uv_socketpair(SOCK_STREAM, 0, disconnected.sockets, UV_NONBLOCK_PIPE, UV_NONBLOCK_PIPE) == 0, "cannot create test sockets");
     disconnected.monitor = lyraRuntime::net::disconnectMonitor(disconnected.sockets[0]);
     check(disconnected.monitor != 0, "cannot create disconnect monitor");

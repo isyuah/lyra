@@ -466,11 +466,11 @@ class LanguageServer(unittest.TestCase):
             source = package / 'src/main.ly'
             source.parent.mkdir(parents=True)
             (package / 'lyra.json5').write_text('{"name":"app","version":"0.1.0"}', encoding='utf-8')
-            text = 'import std.io.argCount\nfn main(): Unit { print(argCount()) }\n'
+            text = 'import std.io.readLine\nfn main(): Unit { val _ = readLine() }\n'
             source.write_text(text, encoding='utf-8')
             standard_source = COMPILER.parent.parent / 'share' / 'lyra' / 'std' / 'io' / 'src' / 'io.ly'
             standard_text = standard_source.read_text(encoding='utf-8')
-            replacement = standard_text.replace('pub fn argCount()', 'pub fn renamedArgCount()', 1)
+            replacement = standard_text.replace('pub fn readLine(', 'pub fn renamedReadLine(', 1)
             self.assertNotEqual(replacement, standard_text)
             update = {'jsonrpc': '2.0', 'method': 'textDocument/didChange', 'params': {
                 'textDocument': {'uri': uri(source), 'version': 2},

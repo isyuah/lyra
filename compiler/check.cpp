@@ -577,6 +577,7 @@ struct Symbols {
         auto noArgs = [](Callee callee, Type result) { return BuiltinMember{callee, {{}, {}, result, false}}; };
         if (name == "size" && (type.kind == Type::List || type.kind == Type::FrozenList || type == Type::String || type == Type::Bytes)) return noArgs(Callee::Size, Type::Int);
         if (name == "add" && type.kind == Type::List) return BuiltinMember{Callee::ListAdd, {{"value"}, {module.listElements[type.id]}, Type::Unit, false}};
+        if (name == "removeAt" && type.kind == Type::List) return BuiltinMember{Callee::ListRemoveAt, {{"index"}, {Type::Int}, module.listElements[type.id], false}};
         if (name == "slice" && type.kind == Type::List) return BuiltinMember{Callee::ListSlice, {{"range"}, {Type::IntRange}, type, false}};
         if (type.kind == Type::Channel) {
             auto element = module.channelElements[type.id];
@@ -945,7 +946,7 @@ struct Symbols {
     }
 
     std::optional<Type> resolveAlias(const TypeAlias& alias, std::span<const Type> arguments, const Source& source, Span span) {
-        if (std::ranges::contains(resolvingAliases, alias.name.text))
+        if (std::ranges::find(resolvingAliases, alias.name.text) != resolvingAliases.end())
             throw at(source, span, "LYT0003", "透明类型别名形成循环：" + alias.name.text);
         if (resolvingAliases.size() >= 128) throw at(source, span, "LYG0004", "类型别名展开过深：" + alias.name.text);
         resolvingAliases.push_back(alias.name.text);
@@ -1070,7 +1071,7 @@ struct Symbols {
             const auto& source = sources[function.syntax.file];
             auto type = resolve(function.syntax, annotation, arguments);
             if (type.kind != Type::Exception) throw at(source, annotation.span, "LYE0003", "throws 需要 Exception 或其具名子类型");
-            if (std::ranges::contains(function.throwsTypes, type)) throw at(source, annotation.span, "LYE0003", "throws 重复标注了同一个异常类型");
+            if (std::ranges::find(function.throwsTypes, type) != function.throwsTypes.end()) throw at(source, annotation.span, "LYE0003", "throws 重复标注了同一个异常类型");
             function.throwsTypes.push_back(type);
         }
         return function;
@@ -3587,7 +3588,12 @@ CheckedModule check(Module module, const std::vector<Source>& sources, bool requ
                 auto variable = variables[bound.parameter];
                 symbols.contracts.bind(variable, bound.trait, source);
                 for (const auto& binding : bound.bindings) {
-                    if (valueConstraint(bound.trait.text) || !std::ranges::contains(symbols.contracts.declaration(bound.trait.text).associated, binding.member.text, &Identifier::text))
+                    auto hasMember = [&] {
+                        if (valueConstraint(bound.trait.text)) return false;
+                        const auto& associated = symbols.contracts.declaration(bound.trait.text).associated;
+                        return std::ranges::find(associated, binding.member.text, &Identifier::text) != associated.end();
+                    };
+                    if (!hasMember())
                         throw at(source, binding.member.span, "LYG0007", "约束没有此关联类型：" + binding.member.text);
                     symbols.boundAssociations[{variable, binding.member.text}].push_back({syntax.file, binding.type, syntax.typeParameters, variables});
                 }
@@ -3752,11 +3758,12 @@ CheckedModule check(Module module, const std::vector<Source>& sources, bool requ
         const auto& syntax = concrete.syntax;
         if (!syntax.owner && !group && requireEntry && syntax.name.text == "main") {
             if (!syntax.parameters.empty()) throw at(source, syntax.name.span, "LYT0002", "main 不能接收形参");
-            if (syntax.isAsync && concrete.result != Type::Unit) {
-                auto expected = symbols.sum(Type::Result, Type::Unit, Type::String);
-                if (concrete.result != expected && concrete.result != symbols.sum(Type::Result, Type::Unit, Type::Error))
-                    throw at(source, syntax.result.span, "LYT0001", "async main 必须返回 Unit、Result<Unit,String> 或 Result<Unit,Error>");
-            } else if (concrete.result != Type::Unit) throw mismatch(checked, source, syntax.result.span, Type::Unit, concrete.result);
+            if (concrete.result != Type::Unit && concrete.result != Type::Int) {
+                if (!syntax.isAsync) throw at(source, syntax.result.span, "LYT0001", "main 必须返回 Unit 或 Int");
+                if (concrete.result != symbols.sum(Type::Result, Type::Unit, Type::String) &&
+                    concrete.result != symbols.sum(Type::Result, Type::Unit, Type::Error))
+                    throw at(source, syntax.result.span, "LYT0001", "async main 必须返回 Unit、Int、Result<Unit,String> 或 Result<Unit,Error>");
+            }
             checked.entry = checked.functions.size();
         }
         symbols.functionCallables[functionIndex] = symbols.callables.size();
@@ -3857,7 +3864,7 @@ CheckedModule check(Module module, const std::vector<Source>& sources, bool requ
     };
     for (std::size_t id = 0; id < checked.aggregates.size(); ++id) layout(layout, id);
     validateForeignDeclarations(checked, sources);
-    if (requireEntry && !checked.entry) throw Diagnostic{"LYN0001", "可执行包缺少入口 fn main(): Unit"};
+    if (requireEntry && !checked.entry) throw Diagnostic{"LYN0001", "可执行包缺少入口 fn main()"};
     if (!macro) evaluateConstants(checked, sources);
     for (const auto& deferred : checked.deferredPatternChecks) {
         std::vector<const CheckedPattern*> patterns;

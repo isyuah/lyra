@@ -11,9 +11,12 @@
 #include <limits>
 
 namespace {
+constexpr unsigned maxDepth = 128;
+constexpr char nestingError[] = "JSON nesting exceeds 128 levels";
+
 enum class Kind : std::int64_t { Missing, Null, Object, Array, Text, Integer, Boolean, Real, Invalid };
 struct Node;
-struct Entry { const void* key; Node* value; };
+struct Entry { const void* key; const Node* value; };
 struct Node {
     Kind kind;
     union { std::int64_t number; double real; };
@@ -30,16 +33,28 @@ Node* node(Kind kind) {
 
 const void* str(const char* value) { return lyraStringFromBytes(value, std::strlen(value)); }
 
-const void* scalarText(json_t* value, std::size_t flags = 0) {
+Node* textNode(Kind kind, const void* text) {
+    auto* value = node(kind);
+    value->text = text;
+    return value;
+}
+
+Node* integerNode(Kind kind, std::int64_t number) {
+    auto* value = node(kind);
+    value->number = number;
+    return value;
+}
+
+const void* dumpText(json_t* value, std::size_t flags) {
     if (!value) std::abort();
-    auto* bytes = json_dumps(value, JSON_ENCODE_ANY | JSON_COMPACT | flags);
+    auto* bytes = json_dumps(value, JSON_ENCODE_ANY | flags);
     json_decref(value);
     if (!bytes) std::abort();
     auto* result = str(bytes); std::free(bytes); return result;
 }
 
 Node* convert(json_t* json, unsigned depth) {
-    if (depth > 128) return nullptr;
+    if (depth > maxDepth) return nullptr;
     auto* value = node(Kind::Null);
     if (json_is_object(json) || json_is_array(json)) {
         bool object = json_is_object(json);
@@ -60,6 +75,47 @@ Node* convert(json_t* json, unsigned depth) {
     else if (json_is_real(json)) { value->kind = Kind::Real; value->real = json_real_value(json); }
     return value;
 }
+
+json_t* encodeTree(const Node* value, unsigned depth) {
+    if (depth > maxDepth) return nullptr;
+    json_t* json = nullptr;
+    switch (value->kind) {
+    case Kind::Null: json = json_null(); break;
+    case Kind::Text: json = json_stringn_nocheck(lyraStringBytes(value->text), lyraStringLength(value->text)); break;
+    case Kind::Integer: json = json_integer(value->number); break;
+    case Kind::Boolean: json = json_boolean(value->number); break;
+    case Kind::Real: json = json_real(value->real); break;
+    case Kind::Object:
+    case Kind::Array: {
+        const bool object = value->kind == Kind::Object;
+        json = object ? json_object() : json_array();
+        if (!json) std::abort();
+        for (std::size_t index = 0; index < value->size; ++index) {
+            const auto& entry = value->entries[index];
+            auto* child = encodeTree(entry.value, depth + 1);
+            if (!child) { json_decref(json); return nullptr; }
+            int status;
+            if (object) {
+                auto size = lyraStringLength(entry.key);
+                auto* key = static_cast<char*>(std::malloc(size + 1));
+                if (!key) std::abort();
+                std::memcpy(key, lyraStringBytes(entry.key), size);
+                key[size] = '\0';
+                status = json_object_set_new_nocheck(json, key, child);
+                std::free(key);
+            } else {
+                status = json_array_append_new(json, child);
+            }
+            if (status != 0) std::abort();
+        }
+        break;
+    }
+    case Kind::Missing:
+    case Kind::Invalid: std::abort();
+    }
+    if (!json) std::abort();
+    return json;
+}
 }
 
 extern "C" {
@@ -70,12 +126,39 @@ const Node* lyraJsonParse(const void* input) {
         auto* value = convert(json, 0);
         json_decref(json);
         if (value) return value;
+        return textNode(Kind::Invalid, str(nestingError));
     }
-    auto* invalid = node(Kind::Invalid);
     char message[320];
-    if (json) invalid->text = str("JSON nesting exceeds 128 levels");
-    else { std::snprintf(message, sizeof(message), "JSON %d:%d: %s", error.line, error.column, error.text); invalid->text = str(message); }
-    return invalid;
+    std::snprintf(message, sizeof(message), "JSON %d:%d: %s", error.line, error.column, error.text);
+    return textNode(Kind::Invalid, str(message));
+}
+
+const Node* lyraJsonNull() { return node(Kind::Null); }
+const Node* lyraJsonBool(std::uint8_t value) { return integerNode(Kind::Boolean, value); }
+const Node* lyraJsonInt(std::int64_t value) { return integerNode(Kind::Integer, value); }
+const Node* lyraJsonFloat(double real) {
+    auto* value = node(Kind::Real);
+    value->real = real;
+    return value;
+}
+const Node* lyraJsonString(const void* text) { return textNode(Kind::Text, text); }
+
+Node* lyraJsonContainer(std::int64_t size, std::uint8_t object) {
+    auto* value = node(object ? Kind::Object : Kind::Array);
+    value->size = static_cast<std::size_t>(size);
+    if (value->size) value->entries = static_cast<Entry*>(lyraGcAlloc(value->size * sizeof(Entry)));
+    return value;
+}
+
+void lyraJsonSetEntry(Node* container, std::int64_t index, const void* key, const Node* value) {
+    container->entries[index] = {key, value};
+}
+
+const Node* lyraJsonEncode(const Node* value, std::uint8_t pretty) {
+    auto* json = encodeTree(value, 0);
+    if (!json) return textNode(Kind::Invalid, str(nestingError));
+    auto flags = (pretty ? JSON_INDENT(2) : JSON_COMPACT) | JSON_REAL_PRECISION(std::numeric_limits<double>::max_digits10);
+    return textNode(Kind::Text, dumpText(json, flags));
 }
 
 std::int64_t lyraJsonKind(const Node* value) { return static_cast<std::int64_t>(value ? value->kind : Kind::Missing); }
@@ -83,8 +166,8 @@ std::int64_t lyraJsonSize(const Node* value) { return value ? static_cast<std::i
 std::int64_t lyraJsonNumber(const Node* value) { return value->number; }
 double lyraJsonReal(const Node* value) { return value->real; }
 std::uint8_t lyraJsonIsFinite(double value) { return std::isfinite(value); }
-const void* lyraJsonFloat32Text(float value) { return scalarText(json_real(value), JSON_REAL_PRECISION(std::numeric_limits<float>::max_digits10)); }
-const void* lyraJsonFloat64Text(double value) { return scalarText(json_real(value), JSON_REAL_PRECISION(std::numeric_limits<double>::max_digits10)); }
+const void* lyraJsonFloat32Text(float value) { return dumpText(json_real(value), JSON_COMPACT | JSON_REAL_PRECISION(std::numeric_limits<float>::max_digits10)); }
+const void* lyraJsonFloat64Text(double value) { return dumpText(json_real(value), JSON_COMPACT | JSON_REAL_PRECISION(std::numeric_limits<double>::max_digits10)); }
 const void* lyraJsonText(const Node* value) { return value->text; }
 const void* lyraJsonKey(const Node* value, std::int64_t index) {
     return value && value->kind == Kind::Object && index >= 0 && static_cast<std::size_t>(index) < value->size ? value->entries[index].key : str("");
@@ -113,7 +196,7 @@ std::uint8_t lyraJsonSimpleKey(const void* key) {
 }
 
 const void* lyraJsonQuote(const void* text) {
-    return scalarText(json_stringn_nocheck(lyraStringBytes(text), lyraStringLength(text)));
+    return dumpText(json_stringn_nocheck(lyraStringBytes(text), lyraStringLength(text)), JSON_COMPACT);
 }
 const void* lyraJsonIntText(std::int64_t value) {
     char buffer[32];

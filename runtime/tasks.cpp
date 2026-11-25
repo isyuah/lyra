@@ -66,6 +66,7 @@ struct ParallelPool { Executor *workers; size_t workerCount, next; };
 
 struct DisconnectWatch;
 struct DeadlineWatch;
+namespace { struct BlockingRequest; }
 struct WaitSet;
 struct Failure {
     size_t ordinal;
@@ -98,7 +99,7 @@ struct LyraTask {
     LyraTaskState state;
     LyraTaskState pendingState;
     bool cancelRequested;
-    bool blocking;
+    BlockingRequest *blocking;
     bool joining, resumeAfterChildren;
 };
 
@@ -112,6 +113,8 @@ struct DisconnectWatch {
 #endif
     LyraTask *task;
     LyraDomain *domain;
+    LyraGcRoot *target;
+    int (*locallyClosed)(const void *);
     DisconnectWatch *next;
 };
 
@@ -156,6 +159,7 @@ struct WaitSet {
 namespace {
 
 thread_local LyraTask *currentTask;
+thread_local LyraTask *blockingTask;
 thread_local const LyraContext *workerContext;
 thread_local Executor *currentExecutor;
 uv_mutex_t taskState;
@@ -605,21 +609,24 @@ void runBlocking(uv_work_t *work) {
     auto *request = static_cast<BlockingRequest *>(work->data);
     auto registration = lyraGcEnterWorker();
     auto *previous = workerContext;
+    auto *previousTask = blockingTask;
     workerContext = request->context;
+    blockingTask = request->task;
     request->work(request->nativeData);
+    blockingTask = previousTask;
     workerContext = previous;
     lyraGcLeaveWorker(registration);
 }
 
 void finishBlocking(uv_work_t *work, int status) {
-    require(status == 0, "native work did not finish");
+    require(status == 0 || status == UV_ECANCELED, "native work did not finish");
     auto *request = static_cast<BlockingRequest *>(work->data);
     auto *task = request->task;
+    TaskLock lock;
+    task->blocking = nullptr;
     lyraGcRootDrop(request->payloadRoot);
     free(request);
-    TaskLock lock;
     --task->domain->loopUsers;
-    task->blocking = false;
     enqueue(task);
 }
 
@@ -675,10 +682,20 @@ void closeWatch(DisconnectWatch *watch) {
 #ifndef _WIN32
         close(closing->fd);
 #endif
+        if (closing->target) lyraGcRootDrop(closing->target);
         auto *domain = closing->domain;
         free(closing);
         releaseWatchPin(*domain);
     });
+}
+
+void disconnectObserved(DisconnectWatch *watch) {
+    TaskLock lock;
+    auto **link = &watch->task->watches;
+    while (*link != watch) link = &(*link)->next;
+    *link = watch->next;
+    if (!watch->locallyClosed(lyraGcRootGet(watch->target))) requestCancel(watch->task);
+    closeWatch(watch);
 }
 
 void stopDeadline(LyraTask *task) {
@@ -791,6 +808,7 @@ void requestCancel(LyraTask *task) {
         if (!isTerminal(current) && !current->cancelRequested && !(current->wait && current->wait->winner)) {
             current->cancelRequested = true;
             if (current->joining && current->pendingState == LYRA_TASK_COMPLETED) current->pendingState = LYRA_TASK_CANCELLED;
+            if (current->blocking) uv_cancel(reinterpret_cast<uv_req_t *>(&current->blocking->request));
             if (current->state == LYRA_TASK_SUSPENDED && !current->joining && !current->blocking) {
                 if (current->waitingOn) detachWaiter(current);
                 if (current->wait) detachChoices(*current->wait);
@@ -1024,7 +1042,7 @@ void lyraTaskSharedCopy(void *destination, const void *source, size_t bytes) {
     memcpy(destination, source, bytes);
 }
 
-int lyraTaskWatchDisconnect(uintptr_t monitor) {
+int lyraTaskWatchDisconnect(uintptr_t monitor, void *target, int (*locallyClosed)(const void *)) {
     if (!currentTask || !monitor) return 0;
     TaskLock lock;
     auto *watch = static_cast<DisconnectWatch *>(calloc(1, sizeof(DisconnectWatch)));
@@ -1036,8 +1054,7 @@ int lyraTaskWatchDisconnect(uintptr_t monitor) {
     auto *process = GetCurrentProcess();
     if (!DuplicateHandle(process, reinterpret_cast<HANDLE>(monitor), process, &watch->event, 0, FALSE, DUPLICATE_SAME_ACCESS)) { free(watch); return 0; }
     if (uv_async_init(loop, &watch->ready, [](uv_async_t *handle) {
-        uv_unref(reinterpret_cast<uv_handle_t *>(handle));
-        lyraTaskRequestCancel(static_cast<DisconnectWatch *>(handle->data)->task);
+        disconnectObserved(static_cast<DisconnectWatch *>(handle->data));
     })) { CloseHandle(watch->event); free(watch); return 0; }
     watch->ready.data = watch;
     ++watch->domain->loopUsers;
@@ -1051,14 +1068,12 @@ int lyraTaskWatchDisconnect(uintptr_t monitor) {
     watch->poll.data = watch;
     ++watch->domain->loopUsers;
     int status = uv_poll_start(&watch->poll, UV_DISCONNECT, [](uv_poll_t *poll, int status, int events) {
-        auto *watch = static_cast<DisconnectWatch *>(poll->data);
-        if (status < 0 || (events & UV_DISCONNECT)) {
-            uv_poll_stop(poll);
-            lyraTaskRequestCancel(watch->task);
-        }
+        if (status < 0 || (events & UV_DISCONNECT)) disconnectObserved(static_cast<DisconnectWatch *>(poll->data));
     });
     if (status) { closeWatch(watch); return 0; }
 #endif
+    watch->target = lyraGcRootCreate(target);
+    watch->locallyClosed = locallyClosed;
     watch->next = currentTask->watches;
     currentTask->watches = watch;
     return 1;
@@ -1162,7 +1177,7 @@ void lyraTaskBlock(LyraTask *task, LyraNativeWork work, void *nativeData) {
     request->context = task->context;
     request->request.data = request;
     task->state = LYRA_TASK_SUSPENDED;
-    task->blocking = true;
+    task->blocking = request;
     ++task->domain->loopUsers;
     require(uv_queue_work(&task->domain->executor->loop, &request->request, runBlocking, finishBlocking) == 0, "cannot schedule native work");
 }
@@ -1188,6 +1203,8 @@ int lyraTaskCancelRequested(LyraTask *task) {
     TaskLock lock;
     return cancelled(task);
 }
+
+int lyraBlockingCancelled() { return blockingTask && lyraTaskCancelRequested(blockingTask); }
 
 void lyraTaskFinishCancelled(LyraTask *task) {
     TaskLock lock;

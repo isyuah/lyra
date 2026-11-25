@@ -416,7 +416,7 @@ struct DeclarationTypes {
                     Bindings mapped;
                     for (std::size_t slot = 0; slot < form.arguments.size(); ++slot)
                         mapped.emplace(target.typeParameters[slot].text, self(self, form.arguments[slot], from, span, generics, depth + 1));
-                    if (std::ranges::contains(active, symbol->name)) throw at(source, span, "LYT0003", "透明类型别名形成循环：" + lookup);
+                    if (std::ranges::find(active, symbol->name) != active.end()) throw at(source, span, "LYT0003", "透明类型别名形成循环：" + lookup);
                     active.push_back(symbol->name);
                     auto result = self(self, typeForm(target.target.text), target.file, target.target.span, mapped, depth + 1);
                     active.pop_back();

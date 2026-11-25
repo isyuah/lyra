@@ -1732,6 +1732,7 @@ struct Emitter {
                 return unit();
             case Callee::ListAdd: lists.add(args[0], args[1]); return unit();
             case Callee::ListSlice: return lists.sliceRange(receiver, args[1], source, call.name.span);
+            case Callee::ListRemoveAt: return builder.CreateLoad(layouts.native(builder, rawType(id)), lists.removeAt(receiver, args[1], source, call.name.span));
             case Callee::FreezeList: return lists.slice(args[0], builder.getInt64(0));
             case Callee::Size: return collectionSize(fn.expressions[*call.receiver].type, receiver);
             case Callee::ValueEqual: case Callee::ValueHash:
@@ -1924,7 +1925,7 @@ struct Emitter {
                     auto latest = lists.get(place.list, place.index, source, place.site);
                     right = builder.CreateInsertValue(builder.CreateLoad(layouts.native(builder, place.element), latest), right, place.path);
                 }
-                lists.set(place.list, place.index, right);
+                lists.set(place.list, place.index, right, source, place.site);
             } else if (shared) sharedWrite(builder, right, place.pointer);
             else builder.CreateStore(right, place.pointer);
             return unit();
@@ -2237,12 +2238,11 @@ std::unique_ptr<llvm::Module> lower(const CheckedModule& program, const std::vec
     if (commandLine) builder.CreateCall(module->getOrInsertFunction("lyraIoSetArgs", builder.getVoidTy(), builder.getInt32Ty(), builder.getPtrTy()), {main->getArg(0), main->getArg(1)});
     if (root.syntax.isAsync) {
         auto result = NativeExceptions{builder}.created(builder.CreateCall(functions[entry]), sources[root.syntax.file], root.syntax.name.span);
-        auto returnsResult = root.result.kind == Type::Result;
-        builder.CreateRet(asyncEntry(builder, result, returnsResult ? layouts.native(builder, root.result) : nullptr,
-            returnsResult && program.sumTypes[root.result.id].failure == Type::Error));
+        builder.CreateRet(asyncEntry(builder, result, root.result == Type::Unit ? nullptr : layouts.native(builder, root.result),
+            root.result.kind == Type::Result && program.sumTypes[root.result.id].failure == Type::Error));
     } else {
         auto slot = NativeExceptions{builder}.slot();
-        builder.CreateCall(functions[entry], {slot});
+        auto result = builder.CreateCall(functions[entry], {slot});
         auto error = builder.CreateLoad(builder.getPtrTy(), slot);
         auto failed = llvm::BasicBlock::Create(context, "failed", main), success = llvm::BasicBlock::Create(context, "success", main);
         builder.CreateCondBr(builder.CreateIsNotNull(error), failed, success);
@@ -2250,7 +2250,7 @@ std::unique_ptr<llvm::Module> lower(const CheckedModule& program, const std::vec
         NativeExceptions{builder}.report(error);
         builder.CreateRet(builder.getInt32(1));
         builder.SetInsertPoint(success);
-        builder.CreateRet(builder.getInt32(0));
+        builder.CreateRet(root.result == Type::Int ? nativeExitCode(builder, result) : builder.getInt32(0));
     }
     std::string reason;
     llvm::raw_string_ostream log(reason);

@@ -86,7 +86,7 @@ fn post(target: String, route: String): Syntax {
     val mountSeparator = if mountParameters == "" { "" } else { ", " + mountParameters }
     val callSeparator = if mountArguments == "" { "" } else { ", " + mountArguments }
     val handler = "__lyraPostHandler_" + target
-    val registration = "fn `" + target + "Route`(router: `Router`" + mountSeparator + "): Unit { router.post(" + macroQuote(route) + ", (request: `Request`) => { `" + handler + "`(request" + callSeparator + ") }) }\n"
+    val registration = "fn `" + target + "Route`(router: `Router`" + mountSeparator + "): Unit { router.route(\"POST\", " + macroQuote(route) + ", (request: `Request`) => { `" + handler + "`(request" + callSeparator + ") }) }\n"
     val adapter = "async fn `" + handler + "`(request: `Request`" + mountSeparator + "): `Response` {\n" + setup + "\n}\n"
     syntaxCode("import std.http.Router\nimport std.http.Request\nimport std.http.Response\n" + adapter + registration)
 }

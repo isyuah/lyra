@@ -1,4 +1,5 @@
 extern fn lyraJsonParse(text: String): CPtr;
+extern fn lyraJsonEncode(value: CPtr, pretty: Bool): CPtr;
 extern fn lyraJsonKind(value: CPtr): Int;
 extern fn lyraJsonSize(value: CPtr): Int;
 extern fn lyraJsonNumber(value: CPtr): Int;
@@ -26,6 +27,12 @@ pub struct JsonValue(val handle: CPtr, pub val rejectsUnknownFields: Bool) {
     pub fn item(index: Int): JsonValue { JsonValue(lyraJsonIndex(handle, index), rejectsUnknownFields) }
     pub fn field(name: String): JsonValue { JsonValue(lyraJsonField(handle, name), rejectsUnknownFields) }
     pub fn fieldAt(index: Int): JsonValue { JsonValue(lyraJsonFieldAt(handle, index), rejectsUnknownFields) }
+    pub fn encode(pretty: Bool = false): String {
+        requirePresent(this)
+        val encoded = lyraJsonEncode(handle, pretty)
+        if lyraJsonKind(encoded) == 8 { throw Exception(lyraJsonText(encoded)) }
+        lyraJsonText(encoded)
+    }
     pub fn readString(path: String): Result<String,String> {
         if lyraJsonKind(handle) == 4 { Ok(lyraJsonText(handle)) } else { Err(path + ": expected String") }
     }
@@ -82,6 +89,14 @@ pub fn parseJson(text: String): Result<JsonValue,String> {
     if lyraJsonKind(value) == 8 { Err(lyraJsonText(value)) } else { Ok(JsonValue(value, true)) }
 }
 pub fn quoteJson(text: String): String { lyraJsonQuote(text) }
+fn checkJsonKey(key: String): Unit {
+    for byte in key.toBytes() {
+        if byte == 0 { throw Exception("JSON object keys cannot contain NUL: " + quoteJson(key)) }
+    }
+}
+fn requirePresent(value: JsonValue): Unit {
+    if value.missing() { throw Exception("JSON cannot encode a missing value; use jsonNull() for null") }
+}
 pub fn keyPath(key: String): String { if lyraJsonSimpleKey(key) { "." + key } else { "[" + quoteJson(key) + "]" } }
 pub fn intText(value: Int): String { lyraJsonIntText(value) }
 pub fn float32Text(value: Float32): String {

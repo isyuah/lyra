@@ -35,6 +35,59 @@ pub fn find<T>(values: List<T>, predicate: (T) -> Bool): Option<T> {
     None
 }
 
+struct SortEntry<T>(val key: Int, val item: T)
+
+fn mergeLimit(start: Int, width: Int, count: Int): Int {
+    if width >= count - start { count } else { start + width }
+}
+
+pub fn sortedBy<T>(values: List<T>, key: (T) -> Int): List<T> {
+    var source: List<SortEntry<T>> = []
+    for item in values { source.add(SortEntry(key(item), item)) }
+    val count = source.size
+    var target = source.slice(0..<count)
+    var width = 1
+    while width < count {
+        var first = 0
+        while first < count {
+            val middle = mergeLimit(first, width, count)
+            val end = mergeLimit(middle, width, count)
+            var left = first
+            var right = middle
+            for index in first..<end {
+                if right == end || (left < middle && source[left].key <= source[right].key) {
+                    target[index] = source[left]
+                    left += 1
+                } else {
+                    target[index] = source[right]
+                    right += 1
+                }
+            }
+            first = end
+        }
+        val previous = source
+        source = target
+        target = previous
+        width = mergeLimit(width, width, count)
+    }
+    map(source) { it.item }
+}
+
+pub fn sum(values: List<Int>): Int {
+    var total = 0
+    for value in values { total += value }
+    total
+}
+
+pub fn distinct<T: Eq & Hash>(values: List<T>): List<T> {
+    val seen = hashSet<T>()
+    val output: List<T> = []
+    for value in values {
+        if seen.add(value) { output.add(value) }
+    }
+    output
+}
+
 async fn parallelForWorker<T>(values: List<T>, next: AtomicInt, action: (T) -> Task<Unit>): Unit {
     while true {
         val index = next.fetchAdd(1)
@@ -65,4 +118,5 @@ pub extension ListOps<T> for List<T> {
     fn fold<R>(initial: R, combine: (R, T) -> R): R { fold(this, initial, combine) }
     fn any(predicate: (T) -> Bool): Bool { any(this, predicate) }
     fn find(predicate: (T) -> Bool): Option<T> { find(this, predicate) }
+    fn sortedBy(key: (T) -> Int): List<T> { sortedBy(this, key) }
 }

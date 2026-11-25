@@ -1,6 +1,7 @@
 module;
 #include <filesystem>
 #include <initializer_list>
+#include <algorithm>
 #include <llvm/ADT/StringExtras.h>
 #include <llvm/Config/llvm-config.h>
 #include <llvm/IR/LegacyPassManager.h>
@@ -15,6 +16,7 @@ module;
 #include <llvm/Support/TargetSelect.h>
 #include <llvm/Support/raw_ostream.h>
 #include <llvm/Target/TargetMachine.h>
+#include <llvm/Transforms/IPO/GlobalDCE.h>
 #include <system_error>
 #include <vector>
 
@@ -66,7 +68,7 @@ std::string objectKey(const llvm::Module& module, bool release) {
     llvm::raw_string_ostream stream(ir);
     module.print(stream, nullptr);
     llvm::SHA256 digest;
-    digest.update("lyra-native-v1\n" LLVM_VERSION_STRING "\n");
+    digest.update("lyra-native-v2\n" LLVM_VERSION_STRING "\n");
     digest.update(nativeTriple);
     digest.update("\n");
     digest.update(targetCpu);
@@ -189,12 +191,27 @@ void emitExecutable(llvm::Module& module, llvm::TargetMachine& machine, const fs
     link.push_back(objectText);
     for (const auto& library : libraries) link.push_back(pathText(library));
     append(lib, {"liblyraRuntime.a", "libgc.a", "libuv.a", "libllhttp.a", "libjansson.a", "libsqlite3.a"});
+    auto uses = [&](llvm::StringRef prefix) {
+        return std::ranges::any_of(module, [&](const auto& fn) {
+            return fn.isDeclaration() && !fn.use_empty() && fn.getName().starts_with(prefix);
+        });
+    };
+    auto client = uses("lyraHttpClient");
+    auto serverTls = uses("lyraHttpTls");
+    auto tls = client || serverTls;
+    if (client) {
+        append(lib, {"liblyraHttpClient.a", "libcurl.a", "libcares.a"});
+        if constexpr (windows) append(lib, {"libzs.a"});
+    }
+    if (serverTls) append(lib, {"liblyraHttpTls.a"});
+    if (tls) append(lib, {"libssl.a", "libcrypto.a"});
     if constexpr (windows) {
+        if (tls) append(target, {"libbcrypt.a", "libcrypt32.a", "libgdi32.a"});
         append(target, {"libc++.a", "libunwind.a", "libmingw32.a", "libmingwex.a", "libmoldname.a", "libmsvcrt.a",
             "libclang_rt.builtins.a", "libws2_32.a", "libiphlpapi.a", "libuserenv.a", "libpsapi.a", "libadvapi32.a",
             "libuser32.a", "libdbghelp.a", "libole32.a", "libshell32.a", "libkernel32.a", "crtend.o"});
     } else {
-        append(target, {"libgcc.a", "libm.so.6", "libc.so.6", "libc_nonshared.a", "crtendS.o", "crtn.o"});
+        append(target, {"libstdc++.a", "libgcc.a", "libgcc_eh.a", "libm.so.6", "libc.so.6", "libc_nonshared.a", "crtendS.o", "crtn.o"});
     }
     linkNative(sdk, link, log);
     if (cacheMiss) storeObject(cacheObject, cacheKey, objectText);
@@ -223,6 +240,8 @@ void build(const CheckedModule& functions, const std::vector<Source>& sources, c
     const bool symbols = !options.release || options.debugInfo;
     auto machine = nativeMachine(options.release);
     auto module = lower(functions, sources, context, machine->createDataLayout(), options.release, symbols);
+    llvm::ModuleAnalysisManager analyses;
+    llvm::GlobalDCEPass{}.run(*module, analyses);
     emitExecutable(*module, *machine, fs::absolute(output), options.release, symbols, libraries);
 }
 

@@ -52,6 +52,13 @@ LyraList* copySlice(const LyraList* source, lyra::ListSliceBounds bounds) {
     return result;
 }
 
+void checkIndex(const LyraList* list, std::int64_t index, const char* file, std::uint64_t line, std::uint64_t column) {
+    if (index < 0 || static_cast<std::uint64_t>(index) >= list->count) {
+        std::fprintf(stderr, "%s:%" PRIu64 ":%" PRIu64 ": list index %" PRId64 " out of bounds (size %zu)\n", file, line, column, index, list->count);
+        std::exit(EXIT_FAILURE);
+    }
+}
+
 }
 
 LyraList* lyraListCreate() {
@@ -88,18 +95,27 @@ LyraList* lyraListSliceRange(const LyraList* source, std::int64_t start, std::in
 
 const void* lyraListGet(const LyraList* list, std::int64_t index, const char* file, std::uint64_t line, std::uint64_t column) {
     lyraRuntime::Lock guard(listLocks[stripe(list)]);
-    if (index < 0 || static_cast<std::uint64_t>(index) >= list->count) {
-        std::fprintf(stderr, "%s:%" PRIu64 ":%" PRIu64 ": list index %" PRId64 " out of bounds (size %zu)\n", file, line, column, index, list->count);
-        std::exit(EXIT_FAILURE);
-    }
+    checkIndex(list, index, file, line, column);
     return list->items[index];
 }
 
 const void* lyraFrozenListItem(const LyraList* list, std::uint64_t index) { return list->items[index]; }
 
-void lyraListSet(LyraList* list, std::int64_t index, const void* boxed) {
+void lyraListSet(LyraList* list, std::int64_t index, const void* boxed, const char* file, std::uint64_t line, std::uint64_t column) {
     lyraRuntime::Lock guard(listLocks[stripe(list)]);
+    checkIndex(list, index, file, line, column);
     list->items[index] = boxed;
+}
+
+const void* lyraListRemoveAt(LyraList* list, std::int64_t index, const char* file, std::uint64_t line, std::uint64_t column) {
+    lyraRuntime::Lock guard(listLocks[stripe(list)]);
+    checkIndex(list, index, file, line, column);
+    auto slot = list->items + index;
+    auto removed = *slot;
+    --list->count;
+    std::memmove(slot, slot + 1, (list->count - static_cast<std::size_t>(index)) * sizeof(*slot));
+    list->items[list->count] = nullptr;
+    return removed;
 }
 
 void lyraListAdd(LyraList* list, const void* boxed) {

@@ -92,9 +92,7 @@ pub fn jsonCodecStringMap<T>(element: JsonCodec<T>): JsonCodec<HashMap<String,T>
     jsonCodec<HashMap<String,T>>((map) => {
         var text = "{"
         for entry in map.entries() {
-            for byte in entry.key.toBytes() {
-                if byte == 0 { throw Exception("JSON object keys cannot contain NUL: " + quoteJson(entry.key)) }
-            }
+            checkJsonKey(entry.key)
             if text != "{" { text += "," }
             text += quoteJson(entry.key) + ":" + element.encode(entry.value)
         }

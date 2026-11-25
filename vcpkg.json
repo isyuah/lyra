@@ -2,5 +2,11 @@
   "name": "lyra",
   "version-string": "0.1.0-alpha.1",
   "builtin-baseline": "9eec002df1cd109f8f104cd966a763daf9751489",
-  "dependencies": ["bdwgc", "jansson", "libuv", "sqlite3"]
+  "dependencies": [
+    "bdwgc",
+    { "name": "curl", "default-features": false, "features": ["c-ares", "openssl"] },
+    "jansson",
+    "libuv",
+    "sqlite3"
+  ]
 }

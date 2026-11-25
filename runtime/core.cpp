@@ -28,6 +28,12 @@ extern "C" void lyraPrintFloat64(double value) {
     std::fflush(stdout);
 }
 
+extern "C" int lyraExitCode(std::int64_t result) {
+    if (result >= 0 && result <= 255) return static_cast<int>(result);
+    std::fprintf(stderr, "Lyra: main returned %" PRId64 "; expected an exit code in 0..255\n", result);
+    return EXIT_FAILURE;
+}
+
 extern "C" [[noreturn]] void lyraArithmeticError(const char* file, std::uint64_t line, std::uint64_t column, const char* reason) {
     std::fprintf(stderr, "%s:%" PRIu64 ":%" PRIu64 ": %s\n", file, line, column, reason);
     std::exit(EXIT_FAILURE);

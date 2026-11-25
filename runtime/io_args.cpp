@@ -1,8 +1,12 @@
 #include "text_io.h"
+#include "strings.h"
 
 #include <cerrno>
 #include <cstddef>
 #include <cstring>
+#include <string>
+#include <uv.h>
+#include <vector>
 
 #ifdef _WIN32
 #include <cstdio>
@@ -53,4 +57,20 @@ LyraIoText* lyraIoArgument(int64_t index) {
 #else
     return lyraIoDecode(value, std::strlen(value), 0);
 #endif
+}
+
+extern "C" LyraIoText* lyraOsEnv(const void* key) {
+    std::string name(lyraStringBytes(key), lyraStringLength(key));
+    if (name.empty() || name.find_first_of("=\0", 0, 2) != name.npos) return lyraIoDecode(nullptr, 0, -4);
+    char initial[256];
+    std::size_t size = sizeof(initial);
+    auto status = uv_os_getenv(name.c_str(), initial, &size);
+    if (!status) return lyraIoDecode(initial, size, 0);
+    std::vector<char> buffer;
+    while (status == UV_ENOBUFS) {
+        buffer.resize(size);
+        status = uv_os_getenv(name.c_str(), buffer.data(), &size);
+    }
+    if (!status) return lyraIoDecode(buffer.data(), size, 0);
+    return lyraIoDecode(nullptr, 0, status == UV_ENOENT ? -1 : status == UV_EINVAL ? -4 : -status);
 }

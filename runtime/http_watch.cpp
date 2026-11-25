@@ -2,8 +2,8 @@
 
 #include <cstdint>
 
-extern "C" uintptr_t lyraHttpDisconnectMonitor(const void* request);
+extern "C" uint8_t lyraHttpWatchMonitor(void* request, int (*watch)(uintptr_t, void*, int (*)(const void*)));
 
-extern "C" uint8_t lyraHttpWatchDisconnect(const void* request) {
-    return lyraTaskWatchDisconnect(lyraHttpDisconnectMonitor(request)) != 0;
+extern "C" uint8_t lyraHttpWatchDisconnect(void* request) {
+    return lyraHttpWatchMonitor(request, lyraTaskWatchDisconnect);
 }

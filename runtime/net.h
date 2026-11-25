@@ -25,9 +25,10 @@ inline constexpr auto invalidSocket = -1;
 
 int error();
 bool retry(int status);
-Socket open();
+Socket open(int family);
 Socket accept(Socket socket);
 void close(Socket socket);
+void shutdownConnection(Socket socket, uintptr_t monitor);
 int poll(PollSlot& slot, int timeout);
 int receive(Socket socket, char* data, int size, int flags = 0);
 int send(Socket socket, const char* data, int size);

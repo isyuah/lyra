@@ -9,7 +9,7 @@
 - 编译模型为 LLVM 后端的 AOT 原生编译。
 - 用户程序不得依赖 JVM、CLR 或 Lyra 托管虚拟机；程序可以携带语言 Runtime。应用与 Runtime 的代码被本机 linker 链接。
 - Windows 开发机可直接构建 Windows x64 程序。给 Linux 服务器构建时仍用 Linux 或 WSL；当前不做跨目标链接和 sysroot 管理。
-- Linux x86-64 以 Ubuntu 22.04/glibc 2.35 为发布基线。[部署验收](../tests/jammy-smoke.sh)检查 ELF 的动态依赖：整数、对象、标准 I/O 和 JSONL 样例只需系统 `libc.so.6`；SQLite 与 HTTP/SQLite 样例静态链接 SQLite，另用系统 `libm.so.6`。
+- Linux x86-64 以 Ubuntu 22.04/glibc 2.35 为发布基线。[部署验收](../tests/jammy-smoke.sh)检查 ELF 的动态依赖：整数、对象、标准 I/O 和 JSONL 样例只需系统 `libc.so.6`；SQLite 与 HTTP/SQLite 样例静态链接 SQLite，另用系统 `libm.so.6`。入站 HTTPS 只在使用 `std.httpTls` 时链接静态 OpenSSL，出站 HTTP(S) 额外链接静态 libcurl；部署不需要 TLS 动态库。
 - Windows 使用 x64 C ABI，通过 LLVM-MinGW 的开放启动代码和导入库链接系统 UCRT。GC、libuv、Jansson、llhttp、tomlc17 和 SQLite 静态链接进使用它们的应用。PE 默认只导入系统 DLL；通过外部导入库引入的 DLL 由应用另行部署。
 - 预编译 SDK 本身包含编译器、私有 LLD、链接库和标准库。`new`、`check`、`test`、`build` 和 `run` 不需要另外安装 Clang、LLVM、VS Build Tools、VC Redistributable 或 C 开发库，也不会在首次构建时联网安装工具。仅 `import-c` 显式加载 SDK 自带的 Clang 前端。未缓存的远程包另走现有注册中心下载流程；本地或冻结离线构建不用 `curl`。
 - 类 Go `scratch` 的零基础镜像/全静态交付是后续优化目标，不是首期门槛。不得以支持 scratch 为由让第一版构建链无法运行。
@@ -101,7 +101,7 @@ tar -czf "build/dist/$name.tar.gz" -C build/dist/staging "$name"
 
 解包后在对应平台从仓库根目录运行 `python tests/installed_cli.py --sdk <解包后的SDK目录>`。该验收用开发机预编译 C 适配器，然后清空 `PATH` 和 SDK/库搜索环境，从搬迁后的 SDK 构建、测试并运行依赖包与两个双包应用。Windows 的 Developer PowerShell 仅用于编译测试用的 C 适配器。Ubuntu 裸系统的构建和独立运行分别走[容器验收](../tests/jammy.Dockerfile)的两个阶段。VSIX 打包与联调见[扩展说明](../editors/vscode/README.md#真实编辑器验收)。
 
-Windows 的解包验收可加 `--deployment-bundle build/dist/windows-apps`，将两种构建的应用、测试数据库和验证脚本放进新目录。把该目录放到部署机，在目录里运行 `powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\verify.ps1`。脚本只用系统 PowerShell，检查 JSONL 正常行与坏行的结果，以及 SQLite 服务的 `200` 和 `404` 响应。
+Windows 的解包验收可加 `--deployment-bundle build/dist/windows-apps`，将两种构建的应用、测试数据库、本地 CA 和验证脚本放进新目录。生成包时需要 `openssl`，可通过 `LYRA_TEST_OPENSSL` 指定路径。把该目录放到部署机，在目录里运行 `powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\verify.ps1`。脚本只用系统 PowerShell，检查 JSONL 的 stdin、TOML 配置和 CLI 覆盖，以及 HTTPS 服务的 SQLite 写入、读回和出站 HTTPS。
 
 ### 开发机准备：WSL 2 + Ubuntu 24.04
 
@@ -112,7 +112,7 @@ Windows 的解包验收可加 `--deployment-bundle build/dist/windows-apps`，�
 
    ```sh
    sudo apt update
-   sudo apt install build-essential clang-18 clang-tools-18 llvm-18-dev libclang-18-dev lld-18 cmake ninja-build python3 libgc-dev libuv1-dev libsqlite3-dev libjansson-dev curl
+   sudo apt install build-essential clang-18 clang-tools-18 llvm-18-dev libclang-18-dev lld-18 cmake ninja-build python3 libgc-dev libuv1-dev libsqlite3-dev libjansson-dev libssl-dev openssl curl
    ```
 
 3. 在同一 Ubuntu 终端做一次冒烟检查。`LLVMConfig.cmake` 应可读；IR 编译链接出的程序应返回 `42`：

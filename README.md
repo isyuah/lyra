@@ -2,7 +2,7 @@
 
 Lyra 是一门使用 LLVM AOT 的编译型语言。编译器把通过静态检查的源码编译成 Windows x64 的 PE 或 Linux x86-64 的 ELF 可执行文件，部署应用不需要 Lyra 或 LLVM。语言设计和验收契约见 [RFC 索引](rfc/README.md)，当前可以运行的语法见下文。
 
-**0.1 Alpha 的使用范围：** Windows x64 和 Linux x86-64 上的单机 CLI、可发布的源码库，以及使用 SQLite 的小型 HTTP 服务。语言和包格式仍处于开发期。
+**0.1 Alpha 的使用范围：** Windows x64 和 Linux x86-64 上的单机 CLI、可发布的源码库，以及使用 SQLite 的小型 HTTP/HTTPS 服务。语言和包格式仍处于开发期。
 
 ## 用预编译 SDK 新建项目
 
@@ -28,7 +28,7 @@ lyra test hello --locked --offline
 lyra run hello --release --locked --offline
 ```
 
-测试运行项目自带的 `tests/answer.ly`，最后一条命令打印 `42`。搬迁时保留整个 SDK 目录；部署时只需分发 `hello/build/release/app.exe`（Windows）或 `hello/build/release/app`（Linux）。本地项目和已缓存的依赖可离线构建；仅在从 HTTP(S) 注册中心下载包时另需 `curl`。[原生工具链 RFC](rfc/native-toolchain.md#打包与复验-sdk)提供打包和验收命令。
+测试运行项目自带的 `tests/answer.ly`，最后一条命令打印 `42`。搬迁时保留整个 SDK 目录；部署时只需分发 `hello/build/release/app.exe`（Windows）或 `hello/build/release/app`（Linux）。本地项目和已缓存的依赖可离线构建；只有从 HTTP(S) 注册中心下载包时才需要外部 `curl` 命令。Lyra 应用使用 HTTPS 时走 SDK 的静态库，不运行 `curl` 或 `openssl` 命令；客户端默认使用系统信任根（Linux 通常由 `ca-certificates` 提供），也可以显式提供 PEM。[原生工具链 RFC](rfc/native-toolchain.md#打包与复验-sdk)提供打包和验收命令。
 
 ## 从源码构建
 
@@ -45,6 +45,8 @@ $lyra = Resolve-Path 'build/windows-release/bin/lyra.exe'
 
 最后一条命令输出 `42`。用 `cmake --install build/windows-release --prefix build/sdk-windows` 生成可搬迁 SDK；用这个 SDK 编译 Lyra 项目不需要源码构建机的工具。
 
+完整 HTTPS 测试需要开发机上的 `openssl` 命令来生成临时证书。若该命令不在 `PATH`，在运行 `ctest --preset windows-dev` 或 `ctest --preset windows-release` 前，把 `LYRA_TEST_OPENSSL` 设为实际路径，例如 Git for Windows 安装目录下的 `usr/bin/openssl.exe`。不需要信任测试证书或修改系统证书库。
+
 **Linux x86-64：** 在 Linux 的仓库根目录执行；在 Windows 上给 Linux 服务器构建应用时使用 WSL 2。源码构建使用 C++23 命名模块，需要 Clang/LLVM 18.1、配套的 `clang-scan-deps-18`、`libclang-18-dev`、`lld-18`、CMake 3.28+、Ninja 1.11+ 和 Python 3（测试）。
 
 ```sh
@@ -56,7 +58,9 @@ build/dev/bin/lyra build examples/compiler-smoke/pass --release
 examples/compiler-smoke/pass/build/release/app
 ```
 
-`check .../fail` 预期非零退出，在 `;` 处报告 `LYT0001`；最后一条命令应打印 `3` 并正常退出。要构建优化版编译器，把三个 preset 命令中的 `dev` 换成 `release`。用 `cmake --install build/dev --prefix <目录>` 安装工具链，搬迁时整体复制前缀，包含 `bin/`、`lib/`、`libexec/`、`share/` 和给 C 适配器使用的 `include/`。首次构建需要构建机上的 GC、libuv、SQLite、Jansson 开发包；CMake 下载并校验固定版本的 llhttp 与 tomlc17。离线配置可分别传 `-DLYRA_LLHTTP_SOURCE_DIR=...` 和 `-DFETCHCONTENT_SOURCE_DIR_LYRA_TOMLC17=...` 指定已准备的源码。部署**编译好的应用**只需复制产物到约定的 Linux 环境，不用带工具链。
+`check .../fail` 预期非零退出，在 `;` 处报告 `LYT0001`；最后一条命令应打印 `3` 并正常退出。要构建优化版编译器，把三个 preset 命令中的 `dev` 换成 `release`。用 `cmake --install build/dev --prefix <目录>` 安装工具链，搬迁时整体复制前缀，包含 `bin/`、`lib/`、`libexec/`、`share/` 和给 C 适配器使用的 `include/`。
+
+源码构建需要 `libgc-dev`、`libuv1-dev`、`libsqlite3-dev`、`libjansson-dev` 和 `libssl-dev`（OpenSSL 3），完整 HTTPS 测试另用 `openssl` 命令。CMake 下载并校验固定版本的 llhttp、tomlc17、curl 与 c-ares。离线配置可分别传 `-DLYRA_LLHTTP_SOURCE_DIR=...`、`-DFETCHCONTENT_SOURCE_DIR_LYRA_TOMLC17=...`、`-DFETCHCONTENT_SOURCE_DIR_LYRA_CURL=...` 和 `-DFETCHCONTENT_SOURCE_DIR_LYRA_CARES=...`，指向已准备的源码。部署**编译好的应用**不用带工具链或这些开发库。
 
 ### 试跑一个完整项目
 
@@ -68,7 +72,7 @@ printf '%s\n' '{"station":"东区","delta":7}' '{"station":"西区","delta":-2}'
   build/dev/bin/lyra run examples/jsonlines/stats --release --locked --offline
 ```
 
-输出是 `{"rows":2,"total":5,"rejected":0}`。想做服务，可按 [HTTP/SQLite 示例](examples/http-sqlite/README.md)建库，发送一次真实的 `GET /users/7`。
+输出是 `{"rows":2,"total":5,"rejected":0}`。CLI 还支持文件输入、TOML 默认值和命令行覆盖。想做服务，可按 [HTTP/SQLite 示例](examples/http-sqlite/README.md)建库，通过 HTTP 或 HTTPS 新增并查询用户。常用模块和各自的 API 示例见[标准库索引](std/README.md)。
 
 ## 命令与语言子集
 
@@ -98,7 +102,7 @@ lyra fmt [--check] <文件.ly>...
 - [列表和变长参数](compiler/collections.md)支持 `[1, 2]`、按下标读写、`.size`、`.add(value)`、参数默认值、`fn sum(values: Int...)`。`sum(...ids)` 展开元素；函数收到本次调用自己的列表，更改槽位不影响调用方。如果元素是对象引用，引用的仍是同一个对象。
 - `Option<T>`（简写 `T?`）和 `Result<T,E>` 支持嵌套和 `?` 提前返回。可用 [`enum`](rfc/language-core.md#封闭枚举与匹配) 定义带位置或命名载荷的分支。`match` 要求穷尽，支持嵌套解构、`A(x) | B(x)`、整数范围和 `Some(x) if x > 0 => x` 形式的守卫。
 - `for value in values` 遍历列表，或通过可见的同步 `iterator()`、`next(): Option<T>` 遍历自定义集合。整数循环可写 `for i in 0..<count`（不包含 `count`）或 `for i in 1..count`（包含 `count`）。`user?.name ?? "unknown"` 只在接收者有值时访问成员，只在结果为空时计算兜底表达式。
-- [std.collections](std/collections/README.md) 提供 `map`、`filter`、`fold`、`any` 和 `find`；导入扩展组 `ListOps` 后可链式调用。`HashMap` 和 `HashSet` 可直接用 `for` 遍历进入循环时的快照。
+- [std.collections](std/collections/README.md) 提供 `map`、`filter`、`fold`、`any`、`find`、稳定 `sortedBy`、`sum` 和 `distinct`；导入扩展组 `ListOps` 后可链式调用。`HashMap` 和 `HashSet` 可直接用 `for` 遍历进入循环时的快照。
 - 在源或目标类型的定义模块写 `implicit (user: User): Response { ... }`，即可在需要 `Response` 时直接传入或返回 `User`。不同具体错误之间的 `?` 也用同一种直接转换；不额外声明 trait、不串接转换，两端各有一条可见转换时在使用处报歧义。
 - `async fn` 调用返回冷 `Task<T>`；`await` 在需要时启动，重复等待复用结果，`spawn` 在同一串行域调度。`await blocking { ... }` 把同步工作交给有界线程池，不占住当前域；跨挂起点存活的局部值由 GC 扫描。`async fn main(): Result<Unit,String>` 的 `Err` 打印到 stderr 并以非零状态退出。见[异步实现说明](runtime/managed-tasks.md)。
 - `taskGroup` 等待孩子收尾；`parallel` 和 [`parallelFor`](std/collections/README.md#有界并行遍历) 可在多个 OS 线程上同时执行。用 `LYRA_PARALLEL_WORKERS` 调整 CPU Worker 数，复合共享更新可用 [std.sync](std/sync/README.md) 的锁和原子操作。
@@ -118,4 +122,4 @@ lyra fmt [--check] <文件.ly>...
 
 ## 验证 Ubuntu 22.04 部署
 
-在仓库根目录运行 `docker build --platform linux/amd64 -f tests/jammy.Dockerfile --target verify .`。构建阶段在 Ubuntu 22.04 上编译工具链并运行 CTest；一个裸镜像用搬迁后的 SDK 编译和运行应用，另一个裸镜像只运行独立产物。整数、对象、标准 I/O 和 JSONL 只动态依赖 `libc.so.6`；SQLite 样例另用系统 `libm.so.6`，无需安装 SQLite。用 `readelf -dW` 核对每个应用的依赖。
+在仓库根目录运行 `docker build --platform linux/amd64 -f tests/jammy.Dockerfile --target verify .`。构建阶段在 Ubuntu 22.04 上编译 Debug、Release 并运行 CTest；一个精简镜像用搬迁后的 SDK 编译和运行应用，另一个只运行独立产物，两者的 `openssl` 命令仅作为测试探针。应用验收覆盖 JSONL 标准输入和文件、TOML 配置和 CLI 覆盖、HTTPS 写入 SQLite 后读回，以及校验证书的出站 HTTPS。`readelf -dW` 检查整数、对象、标准 I/O 和 JSONL 只动态依赖 `libc.so.6`，SQLite 与 HTTPS/SQLite 服务另用系统 `libm.so.6`；SQLite 和 TLS 库不以动态依赖交付。

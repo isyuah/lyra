@@ -1,4 +1,3 @@
-import std.io.assert
 import std.sqlite.DbError
 import std.sqlite.open
 
@@ -8,7 +7,7 @@ fn read(): Result<String?, DbError> {
     val query = db.prepare("SELECT ?1")?
     defer query.close()
     query.bindText(1, "SQLite: 文本")?
-    assert(query.next()?, "query")
+    #assert(query.next()?, "query")
     query.readText(0)
 }
 

@@ -11,4 +11,5 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN _WIN32_WINNT=0x0A00)
 
 include(../cmake/LyraRuntime.cmake)
+include(../cmake/LyraSdk.cmake)
 lyra_add_runtime()

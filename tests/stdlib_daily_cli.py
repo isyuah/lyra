@@ -35,21 +35,20 @@ class DailyStdlib(unittest.TestCase):
 import std.collections.ListOps
 import std.collections.any as anyValue
 import std.collections.find as findValue
-import std.io.assert
 
 fn main(): Unit {
     var visits = 0
     val matched = [1, 2, 3, 4].filter { it >= 2 }.map { it * 2 }.find { visits += 1; it == 6 }
-    assert(visits == 2 && (matched ?? 0) == 6, "find stops immediately")
+    #assert(visits == 2 && (matched ?? 0) == 6, "find stops immediately")
     val found = anyValue([1, 2, 3]) { visits += 1; it > 1 }
-    assert(found && visits == 4, "any stops immediately")
+    #assert(found && visits == 4, "any stops immediately")
     val optional: List<Int?> = [None, Some(1)]
     val presentNull = findValue(optional) { it == None }
-    assert(match presentNull { Some(None) => true, _ => false }, "found null")
+    #assert(match presentNull { Some(None) => true, _ => false }, "found null")
     val empty: List<Int> = []
-    assert(!empty.any { visits += 1; true } && visits == 4, "empty any")
-    assert((empty.find { visits += 1; true }) == None && visits == 4, "empty find")
-    assert([2, 3].map { it * 2 }.fold(1, (sum, value) => { sum + value }) == 11, "chained fold")
+    #assert(!empty.any { visits += 1; true } && visits == 4, "empty any")
+    #assert((empty.find { visits += 1; true }) == None && visits == 4, "empty find")
+    #assert([2, 3].map { it * 2 }.fold(1, (sum, value) => { sum + value }) == 11, "chained fold")
 }
 '''
         for flags in ((), ('--release',)):
@@ -61,25 +60,24 @@ fn main(): Unit {
 import std.io.File
 import std.io.IoError
 import std.io.IoErrorKind
-import std.io.arg
-import std.io.assert
 import std.io.readBytes
 import std.io.readFile
 import std.io.writeBytes
+import std.os.args
 
 fn copyFile(source: String, destination: String): Result<Int, IoError> {
     val input = File.openRead(source)?
     defer input.close()
     val output = File.openWrite(destination)?
     defer output.close()
-    assert(match input.read(0) { Err(error) => match error.kind { Invalid => true, _ => false }, _ => false }, "non-positive size is an error")
-    assert(match output.read(1) { Err(error) => match error.kind { Invalid => true, _ => false }, _ => false }, "write-only handle is not EOF")
+    #assert(match input.read(0) { Err(error) => match error.kind { Invalid => true, _ => false }, _ => false }, "non-positive size is an error")
+    #assert(match output.read(1) { Err(error) => match error.kind { Invalid => true, _ => false }, _ => false }, "write-only handle is not EOF")
     var copied = 0
     while true {
         match input.read(70001)? {
             None => break,
             Some(chunk) => {
-                assert(chunk.size > 0 && chunk.size <= 65536, "bounded non-empty chunks")
+                #assert(chunk.size > 0 && chunk.size <= 65536, "bounded non-empty chunks")
                 copied += chunk.size
                 output.write(chunk)?;
             },
@@ -88,27 +86,28 @@ fn copyFile(source: String, destination: String): Result<Int, IoError> {
     output.flush()?
     val alias = input
     input.close()
-    assert(match alias.read() { Err(error) => match error.kind { Closed => true, _ => false }, _ => false }, "closed handle is not EOF")
+    #assert(match alias.read() { Err(error) => match error.kind { Closed => true, _ => false }, _ => false }, "closed handle is not EOF")
     alias.close()
     Ok(copied)
 }
 
 fn main(): Unit {
-    val source = arg(0).value
-    val destination = arg(1).value
-    val empty = arg(2).value
+    val arguments = match args() { Ok(value) => value, Err(error) => throw Exception(error.message()) }
+    val source = arguments[0]
+    val destination = arguments[1]
+    val empty = arguments[2]
     val invalidText = readFile(source)
-    assert(!invalidText.ok() && invalidText.invalidUtf8(), "text path still checks UTF-8")
+    #assert(match invalidText { Err(error) => error.kind == IoErrorKind.InvalidUtf8, _ => false }, "text path still checks UTF-8")
     val saved = match readBytes(source) { Ok(data) => data, Err(error) => throw Exception(error.message()) }
-    assert(saved.size > 65536 && saved[0] == 0 && saved[255] == 255, "reads arbitrary bytes")
-    assert(match writeBytes(empty, b"") { Ok(_) => true, Err(_) => false }, "creates empty file")
-    assert(match readBytes(empty) { Ok(data) => data == b"", _ => false }, "empty read succeeds")
-    assert(match readBytes(empty + ".missing") { Err(error) => (error.code() ?? 0) > 0, _ => false }, "missing input is a system error")
-    assert(match writeBytes(empty + "\0extra", b"!") { Err(error) => error.operation == "writeBytes", _ => false }, "NUL in a path is rejected")
+    #assert(saved.size > 65536 && saved[0] == 0 && saved[255] == 255, "reads arbitrary bytes")
+    #assert(match writeBytes(empty, b"") { Ok(_) => true, Err(_) => false }, "creates empty file")
+    #assert(match readBytes(empty) { Ok(data) => data == b"", _ => false }, "empty read succeeds")
+    #assert(match readBytes(empty + ".missing") { Err(error) => (error.code() ?? 0) > 0, _ => false }, "missing input is a system error")
+    #assert(match writeBytes(empty + "\0extra", b"!") { Err(error) => error.operation == "writeBytes", _ => false }, "NUL in a path is rejected")
     val size = match copyFile(source, destination) { Ok(length) => length, Err(error) => throw Exception(error.message()) }
-    assert(size == saved.size, "copy bytes")
+    #assert(size == saved.size, "copy bytes")
     gcCollect()
-    assert(match readBytes(destination) { Ok(data) => data == saved, _ => false }, "data survives close and GC")
+    #assert(match readBytes(destination) { Ok(data) => data == saved, _ => false }, "data survives close and GC")
 }
 '''
         original = self.package / '二进制 源'
@@ -130,13 +129,13 @@ fn main(): Unit {
 import std.io.Busy
 import std.io.File
 import std.io.IoErrorKind
-import std.io.arg
-import std.io.assert
+import std.os.args
 
 async fn checkpoint(): Unit {}
 
 async fn main(): Unit {
-    val file = match File.openRead(arg(0).value) { Ok(handle) => handle, Err(error) => throw Exception(error.message()) }
+    val arguments = match args() { Ok(value) => value, Err(error) => throw Exception(error.message()) }
+    val file = match File.openRead(arguments[0]) { Ok(handle) => handle, Err(error) => throw Exception(error.message()) }
     val alias = file
     val operation = spawn blocking { file.read(1) }
     var busy = false
@@ -146,9 +145,9 @@ async fn main(): Unit {
     }
     var refused = false
     try { alias.close() } catch error: Busy { refused = true }
-    assert(refused, "close must let the live read finish")
+    #assert(refused, "close must let the live read finish")
     print("leased")
-    assert(match await operation { Ok(Some(data)) => data == b"!", _ => false }, "lease survives Busy close")
+    #assert(match await operation { Ok(Some(data)) => data == b"!", _ => false }, "lease survives Busy close")
     file.close()
     alias.close()
     print("closed")
@@ -170,13 +169,13 @@ async fn main(): Unit {
     def test_write_bytes_reports_buffered_write_failure_and_preserves_error(self):
         app = self.build('''
 import std.io.IoError
-import std.io.arg
-import std.io.assert
 import std.io.writeBytes
+import std.os.args
 
 fn write(path: String): Result<Unit, Error> { writeBytes(path, b"data")?; Ok({}) }
 fn main(): Unit {
-    assert(match write(arg(0).value) {
+    val arguments = match args() { Ok(value) => value, Err(error) => throw Exception(error.message()) }
+    #assert(match write(arguments[0]) {
         Err(error) => error.original is IoError && error.message != "",
         _ => false,
     }, "flush failure must propagate")
@@ -197,12 +196,11 @@ const LyraBytes *echoBytes(const LyraBytes *value) { return value; }
         include = Path(__file__).resolve().parent.parent / 'include'
         archive = c_archive(native, self.package / 'view', '-I', include)
         app = self.build(r'''
-import std.io.assert
 extern fn inspectBytes(value: Bytes): Bool;
 extern fn echoBytes(value: Bytes): Bytes;
 fn main(): Unit {
     val expected = b"\0\xff\r"
-    assert(inspectBytes(expected) && echoBytes(expected) == expected, "C Bytes view")
+    #assert(inspectBytes(expected) && echoBytes(expected) == expected, "C Bytes view")
 }
 ''', '--release', '--link', archive)
         self.run_native(app)

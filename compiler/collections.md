@@ -7,7 +7,7 @@ val numbers = take(1, ...ids)       // List<Int>，有两个元素
 val lists = take(ids, ids)          // List<List<Int>>，有一个元素
 ```
 
-`List<T>` 是可变引用。`items.size` 读取个数，`items.add(value)` 在末尾追加，`items[index]` 读取或写入元素。空字面量需要元素类型，例如 `val ids: List<Int> = []`。下标从零开始；本阶段越界会定位到 `[` 并非零退出。
+`List<T>` 是可变引用。`items.size` 读取个数，`items.add(value)` 在末尾追加，`items[index]` 读取或写入元素，`items.removeAt(index)` 原地删除并返回元素，后续元素前移。空字面量需要元素类型，例如 `val ids: List<Int> = []`。下标从零开始；越界定位到索引或调用处并非零退出。`for` 在进入时记录长度；删除元素后若遍历到已不存在的索引，仍报告越界。
 
 变长形参只能在最后。绑定器先区分固定槽、单个变长元素和 `...` 展开；显式表达式按源码顺序各求值一次，展开在该位置取得列表元素的快照。每次调用都有自己的变长列表。元素本身仍遵循原有语义：改 `values[0]` 不会改调用方槽位，但改它指向的 Class 则双方可见。直接传给固定的 `List<T>` 形参时始终共享列表。
 

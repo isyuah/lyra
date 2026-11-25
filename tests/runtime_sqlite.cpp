@@ -49,10 +49,8 @@ void closeConnection(LyraSqliteConnection *connection) {
 }
 
 void execute(LyraSqliteConnection *connection, const char *sql) {
-    auto *statement = prepare(connection, sql);
     LyraSqliteError error;
-    check(lyraSqliteNext(statement, &error) == LYRA_SQLITE_DONE, "command failed");
-    closeStatement(statement);
+    check(lyraSqliteExec(connection, text(sql), &error) == LYRA_SQLITE_OK, "command failed");
 }
 
 void queryAndCleanup() {
@@ -93,13 +91,15 @@ void queryAndCleanup() {
     const auto prepareError = error;
     auto *badInsert = prepare(connection, "INSERT INTO users VALUES(7,'duplicate')");
     check(lyraSqliteNext(badInsert, &error) == LYRA_SQLITE_DB_ERROR, "step error became DONE");
-    check(lyraSqliteFinalize(badInsert, &error) == LYRA_SQLITE_DB_ERROR, "finalize lost prior SQLite step error");
+    auto stepError = error;
+    closeStatement(badInsert);
     closeStatement(badInsert);
     closeConnection(connection);
     closeConnection(alias);
     check(lyraSqlitePrepare(alias, text("SELECT 1"), &missing, &error) == LYRA_SQLITE_CLOSED, "connection alias used stale handle");
     lyraGcCollect();
     check(prepareError.code != 0 && strcmp(prepareError.operation, "prepare") == 0 && lyraStringLength(prepareError.message) > 0, "lost copied SQLite cause after close");
+    check(stepError.code != 0 && strcmp(stepError.operation, "next") == 0 && lyraStringLength(stepError.message) > 0, "lost step failure after cleanup");
     matches(name, "Ada", 3);
     matches(other, data, sizeof(data));
     matches(empty, "", 0);
@@ -115,6 +115,7 @@ struct Gate {
 struct Job {
     Gate *gate;
     LyraSqliteConnection *connection;
+    LyraSqliteTransaction *transaction;
     LyraSqliteStatement *statement;
     const void *name;
     bool closed;
@@ -124,7 +125,9 @@ struct Job {
 void nativeQuery(void *storage) {
     auto *job = static_cast<Job *>(storage);
     job->connection = openMemory();
-    job->statement = prepare(job->connection, "SELECT 'Ada'");
+    LyraSqliteError error;
+    check(lyraSqliteBegin(job->connection, &job->transaction, &error) == LYRA_SQLITE_OK, "begin failed");
+    check(lyraSqliteTransactionPrepare(job->transaction, text("SELECT 'Ada'"), &job->statement, &error) == LYRA_SQLITE_OK, "transaction prepare failed");
     auto *gate = job->gate;
     {
         std::unique_lock lock(gate->mutex);
@@ -133,10 +136,11 @@ void nativeQuery(void *storage) {
         gate->changed.wait(lock, [&] { return gate->released; });
     }
 
-    LyraSqliteError error;
     check(lyraSqliteNext(job->statement, &error) == LYRA_SQLITE_ROW, "cancel closed statement before native step");
     check(lyraSqliteReadText(job->statement, 0, &job->name, &error) == LYRA_SQLITE_OK, "worker failed to copy text");
-    closeStatement(job->statement);
+    LyraSqliteIssue cleanup;
+    check(lyraSqliteFinish(job->transaction, 1, &error, &cleanup) == LYRA_SQLITE_OK, "commit failed");
+    check(lyraSqliteNext(job->statement, &error) == LYRA_SQLITE_CLOSED, "transaction did not finalize statement");
     closeConnection(job->connection);
     job->closed = true;
 }
@@ -163,7 +167,11 @@ void disconnectTask(LyraTask *task, void *storage) {
         lyraTaskRequestCancel(event->query);
         check(lyraTaskState(event->query) == LYRA_TASK_SUSPENDED && !event->job->closed, "cancellation released active native resources");
         LyraSqliteError error;
-        check(lyraSqliteClose(event->job->connection, &error) == LYRA_SQLITE_BUSY, "close should report active statement");
+        check(lyraSqliteClose(event->job->connection, &error) == LYRA_SQLITE_BUSY, "close should report active transaction");
+        check(lyraSqliteNext(event->job->statement, &error) == LYRA_SQLITE_BUSY, "cross-thread transaction statement should be busy");
+        int64_t number;
+        check(lyraSqliteReadInt(event->job->statement, -1, &number, &error) == LYRA_SQLITE_BUSY, "cross-thread index validation must not preempt the transaction lease");
+        check(lyraSqliteTransactionExec(event->job->transaction, text("CREATE TABLE outside(x)"), &error) == LYRA_SQLITE_BUSY, "cross-thread transaction use succeeded");
         lyraGcCollect();
         gate->released = true;
         gate->changed.notify_one();
@@ -185,6 +193,8 @@ int main() {
     lyraTaskStart(domain, lyraTaskCreate(disconnectTask, &event));
     lyraDomainRun(domain);
     check(lyraTaskState(query) == LYRA_TASK_CANCELLED && job->closed, "cancelled task did not finish after safe close");
+    LyraSqliteError error;
+    check(lyraSqliteTransactionExec(job->transaction, text("CREATE TABLE after(x)"), &error) == LYRA_SQLITE_CLOSED, "transaction alias used stale scope");
     lyraGcCollect();
     matches(job->name, "Ada", 3);
     lyraDomainDestroy(domain);
