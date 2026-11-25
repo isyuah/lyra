@@ -119,6 +119,7 @@ std::string typeName(const CheckedModule& module, Type type, bool canonical = fa
         case Type::Task: return "Task<" + name(module.taskResults[type.id]) + ">";
         case Type::TaskLocal: return "TaskLocal<" + name(module.taskLocalValues[type.id]) + ">";
         case Type::List: return "List<" + name(module.listElements[type.id]) + ">";
+        case Type::IntRange: return "Range<Int>";
         case Type::Option: return "Option<" + name(module.sumTypes[type.id].success) + ">";
         case Type::Result: return "Result<" + name(module.sumTypes[type.id].success) + "," + name(module.sumTypes[type.id].failure) + ">";
         case Type::Closure: {
@@ -141,6 +142,10 @@ struct Callable {
     std::vector<Type> variables;
     mutable std::optional<Identifier> inferredResult{};
     mutable bool inferring{};
+};
+
+struct NoTypeLookup {
+    std::optional<Type> operator()(std::size_t) const { return {}; }
 };
 
 struct OverloadKey {
@@ -243,6 +248,7 @@ struct Symbols {
     std::vector<Overloads> methods;
     std::vector<Callable> callables;
     std::map<GenericInstanceKey, std::size_t> specializations;
+    std::map<std::pair<Type, std::string>, std::size_t> builtinImplementations{};
     std::vector<DirectConversion> conversions{};
     StructuralContracts contracts{};
     Names traitNames{};
@@ -261,18 +267,23 @@ struct Symbols {
     std::vector<std::vector<std::size_t>> visibleExtensions{};
     std::map<std::pair<std::size_t, std::vector<Type>>, Type> recordInstances{};
     std::map<std::pair<std::size_t, std::vector<Type>>, Type> enumInstances{};
+    std::vector<std::pair<bool, std::size_t>> activeNominals{};
     unsigned expandingNominal{};
     struct NominalCheck { Type type; const Source* source; Span site; };
     std::vector<NominalCheck> nominalChecks{};
     std::size_t nextNominalCheck{};
     bool boundsReady{};
     std::vector<std::pair<Type, std::string>> resolvingAssociated{};
+    Names aliases{};
+    std::vector<TypeAlias> aliasDeclarations{};
+    std::vector<std::string> resolvingAliases{};
 
     struct TypeTrial {
         Symbols& symbols;
         std::size_t aggregates = symbols.module.aggregates.size(), enums = symbols.module.enums.size(), tasks = symbols.module.taskResults.size(),
             sums = symbols.module.sumTypes.size(), lists = symbols.module.listElements.size(), signatures = symbols.module.signatures.size(),
-            taskLocals = symbols.module.taskLocalValues.size(), projections = symbols.module.projections.size();
+            taskLocals = symbols.module.taskLocalValues.size(), projections = symbols.module.projections.size(),
+            deferredPatterns = symbols.module.deferredPatternChecks.size();
         unsigned expanding = symbols.expandingNominal;
         std::size_t nominal = symbols.nominalChecks.size(), nextNominal = symbols.nextNominalCheck;
 
@@ -294,6 +305,7 @@ struct Symbols {
             symbols.module.listElements.resize(lists);
             symbols.module.signatures.resize(signatures);
             symbols.module.projections.resize(projections);
+            symbols.module.deferredPatternChecks.resize(deferredPatterns);
         }
     };
 
@@ -386,6 +398,174 @@ struct Symbols {
         return {};
     }
 
+    std::optional<std::size_t> valueOverride(Type type, ValueOperation operation) {
+        if (type.kind != Type::Record || module.aggregates[type.id].syntax.reference) return {};
+        const auto& record = module.aggregates[type.id];
+        auto name = operation == ValueOperation::Equal ? "equals" : "hashCode";
+        const auto& members = methods[record.declaration];
+        auto candidates = members.find(name);
+        if (candidates == members.end()) return {};
+        for (auto index : candidates->second) {
+            const auto& candidate = declaration(callables[index]);
+            if (candidate.result.text.empty() || candidate.isAsync || candidate.typeParameters.size() != record.arguments.size()) continue;
+            bool equality = operation == ValueOperation::Equal;
+            if (candidate.parameters.size() != (equality ? 2u : 1u)) continue;
+            if (equality && (candidate.parameters[1].variadic || resolve(candidate, candidate.parameters[1].type, record.arguments) != type)) continue;
+            if (resolve(candidate, candidate.result, record.arguments) == (equality ? Type::Bool : Type::Int)) return index;
+        }
+        return {};
+    }
+
+    struct ValueSupport {
+        std::optional<std::string> missing{};
+        std::vector<std::pair<Type, std::size_t>> overrides{};
+    };
+
+    ValueSupport valueSupport(Type root, ValueOperation operation) {
+        ValueSupport result;
+        std::set<Type> seen;
+        std::string path;
+        const auto equality = operation == ValueOperation::Equal;
+        auto check = [&](auto&& self, Type type) -> bool {
+            if (!seen.insert(type).second) return true;
+            auto reject = [&](std::string reason) {
+                result.missing = (path.empty() ? "" : path + "：") + std::move(reason);
+                return false;
+            };
+            auto child = [&](Type part, const std::string& name) {
+                auto length = path.size();
+                path += '.' + name;
+                bool supported = self(self, part);
+                path.resize(length);
+                return supported;
+            };
+            if (auto implementation = valueOverride(type, operation)) {
+                if (!equality && !valueOverride(type, ValueOperation::Equal))
+                    return reject(typeName(module, type) + " 手写了 hashCode，需要配套的 equals 才能满足 Hash");
+                result.overrides.emplace_back(type, *implementation);
+                return true;
+            }
+            switch (type.kind) {
+                case Type::Int: case Type::UInt: case Type::Real: case Type::Bool: case Type::Char:
+                case Type::String: case Type::Bytes: case Type::Unit: case Type::IntRange: return true;
+                case Type::Variable:
+                    if (std::ranges::find(contracts.constraints(type), equality ? "Eq" : "Hash") != contracts.constraints(type).end()) return true;
+                    break;
+                case Type::Record: {
+                    const auto& record = module.aggregates[type.id];
+                    if (record.syntax.reference) {
+                        return equality || reject(typeName(module, type) + " 按身份比较，但没有默认 Hash；请使用显式哈希回调");
+                    }
+                    if (!equality && valueOverride(type, ValueOperation::Equal))
+                        return reject(typeName(module, type) + " 手写了 equals，需要配套的 hashCode 才能满足 Hash");
+                    for (std::size_t slot = 0; slot < record.fields.size(); ++slot) {
+                        if (!child(record.fields[slot], record.syntax.fields[slot].name.text)) return false;
+                    }
+                    return true;
+                }
+                case Type::Enum: {
+                    const auto& item = module.enums[type.id];
+                    for (std::size_t variant = 0; variant < item.payloads.size(); ++variant) {
+                        const auto& entry = item.syntax.cases[variant];
+                        for (std::size_t slot = 0; slot < item.payloads[variant].size(); ++slot) {
+                            const auto& field = entry.fields[slot];
+                            auto name = field.name ? field.name->text : std::to_string(slot + 1);
+                            if (!child(item.payloads[variant][slot], entry.name.text + '.' + name)) return false;
+                        }
+                    }
+                    return true;
+                }
+                case Type::Option: return child(module.sumTypes[type.id].success, "Some");
+                case Type::Result:
+                    return child(module.sumTypes[type.id].success, "Ok") && child(module.sumTypes[type.id].failure, "Err");
+                case Type::Task: case Type::List: case Type::CPtr:
+                case Type::TaskLocal: case Type::Exception:
+                    if (equality) return true;
+                    break;
+                default: break;
+            }
+            return reject(typeName(module, type) + (equality ? " 未提供 Eq" : " 未提供 Hash"));
+        };
+        check(check, root);
+        return result;
+    }
+
+    std::optional<std::string> valuePairMismatch(Type root) {
+        std::vector<Type> pending{root};
+        std::set<Type> seen;
+        while (!pending.empty()) {
+            auto type = pending.back();
+            pending.pop_back();
+            if (!seen.insert(type).second) continue;
+            if (type.kind == Type::Record) {
+                const auto& record = module.aggregates[type.id];
+                auto equality = valueOverride(type, ValueOperation::Equal).has_value();
+                auto hashing = valueOverride(type, ValueOperation::Hash).has_value();
+                if (equality != hashing) return typeName(module, type) + " 的 equals 与 hashCode 必须同时提供，才能用于要求 Eq + Hash 的键";
+                if (!equality) pending.insert(pending.end(), record.fields.begin(), record.fields.end());
+            } else if (type.kind == Type::Enum) {
+                for (const auto& fields : module.enums[type.id].payloads) pending.insert(pending.end(), fields.begin(), fields.end());
+            } else if (type.kind == Type::Option || type.kind == Type::Result) {
+                const auto& shape = module.sumTypes[type.id];
+                pending.push_back(shape.success);
+                if (type.kind == Type::Result) pending.push_back(shape.failure);
+            }
+        }
+        return {};
+    }
+
+    void bindValueOperations(ValueOperation operation, const ValueSupport& support, const Source& use, Span site) {
+        for (auto [type, index] : support.overrides) {
+            auto key = std::pair{type, operation};
+            if (module.valueOverrides.contains(key)) continue;
+            const auto& target = callables[index];
+            auto function = target.generic ? instantiate(index, module.aggregates[type.id].arguments, use, site) : target.target;
+            module.valueOverrides.emplace(key, function);
+        }
+    }
+
+    struct BuiltinMember { Callee callee; RequiredMethod shape; };
+
+    std::optional<BuiltinMember> builtinMember(Type type, std::string_view name) {
+        auto noArgs = [](Callee callee, Type result) { return BuiltinMember{callee, {{}, {}, result, false}}; };
+        if (name == "size" && (type.kind == Type::List || type == Type::String || type == Type::Bytes)) return noArgs(Callee::Size, Type::Int);
+        if (name == "add" && type.kind == Type::List) return BuiltinMember{Callee::ListAdd, {{"value"}, {module.listElements[type.id]}, Type::Unit, false}};
+        if (name == "slice" && type.kind == Type::List) return BuiltinMember{Callee::ListSlice, {{"range"}, {Type::IntRange}, type, false}};
+        if (name == "toBytes" && type == Type::String) return noArgs(Callee::ToBytes, Type::Bytes);
+        if (name == "toString") {
+            if (builtInDisplay(type)) return noArgs(Callee::ToString, Type::String);
+            if (type == Type::Bytes) return noArgs(Callee::DecodeUtf8, sum(Type::Option, Type::String));
+        }
+        if (numericType(type) && name.starts_with("to")) {
+            name.remove_prefix(2);
+            bool checked = name.ends_with("Checked");
+            if (checked) name.remove_suffix(7);
+            if (auto target = numberType(name); target && (checked ? integerType(*target) : target->kind == Type::Real))
+                return checked ? noArgs(Callee::ToIntegerChecked, sum(Type::Option, *target)) : noArgs(Callee::ToReal, *target);
+        }
+        return {};
+    }
+
+    std::size_t builtinImplementation(Type owner, const std::string& name, const BuiltinMember& builtin, std::size_t file, Span site) {
+        auto [entry, inserted] = builtinImplementations.try_emplace({owner, name}, module.functions.size());
+        if (!inserted) return entry->second;
+        auto annotation = [&](Type type) { return Identifier{typeName(module, type, true), site}; };
+        Identifier receiver{"$receiver", site};
+        std::vector<Parameter> parameters{{receiver, annotation(owner)}};
+        std::vector<Expr> body{{site, receiver}};
+        Call call{{name, site}, {}, 0};
+        for (auto type : builtin.shape.parameters) {
+            Identifier parameter{"$arg" + std::to_string(parameters.size()), site};
+            parameters.push_back({parameter, annotation(type)});
+            call.arguments.push_back({{}, body.size()});
+            body.push_back({site, std::move(parameter)});
+        }
+        auto tail = body.size();
+        body.push_back({site, std::move(call)});
+        addConcrete(prepare({file, {"$builtin$" + name, site}, std::move(parameters), annotation(builtin.shape.result), std::move(body), tail}));
+        return entry->second;
+    }
+
     RequiredMethod requiredShape(Type owner, const Trait& trait, const TraitMethod& method, const Source& use, Span site) {
         auto resolve = [&](const Identifier& annotation) {
             return resolveWith(typeForm(annotation.text), sources[trait.file], annotation.span, trait.associated, [&](std::size_t slot) {
@@ -405,6 +585,7 @@ struct Symbols {
     std::optional<BoundMethod> boundMember(Type owner, const std::string& name, const Source& use, Span site) {
         std::optional<BoundMethod> result;
         for (const auto& bound : contracts.constraints(owner)) {
+            if (valueConstraint(bound)) continue;
             const auto& trait = contracts.declaration(bound);
             auto method = std::ranges::find(trait.methods, name, [](const auto& entry) { return entry.name.text; });
             if (method == trait.methods.end()) continue;
@@ -420,7 +601,18 @@ struct Symbols {
         const auto& definition = sources[file];
         auto nameOf = [&](Type type) { return typeName(module, type); };
         for (const auto& bound : bounds) {
+            if (bound.trait.text != "Eq" || types[bound.parameter].kind != Type::Record) continue;
+            if (!std::ranges::any_of(bounds, [&](const Bound& other) { return other.parameter == bound.parameter && other.trait.text == "Hash"; })) continue;
+            if (auto mismatch = valuePairMismatch(types[bound.parameter]))
+                throw at(use, site, "LYG0005", nameOf(types[bound.parameter]) + " 不满足 Eq + Hash：" + *mismatch);
+        }
+        for (const auto& bound : bounds) {
             auto actual = types[bound.parameter];
+            if (auto operation = valueConstraint(bound.trait.text)) {
+                if (auto support = valueSupport(actual, *operation); support.missing)
+                    throw at(use, site, "LYG0005", nameOf(actual) + " 不满足 " + bound.trait.text + "：" + *support.missing);
+                continue;
+            }
             const auto& trait = contracts.declaration(bound.trait.text);
             auto fail = [&](const std::string& reason) { return at(use, site, "LYG0005", nameOf(actual) + " 不满足 " + trait.name.text + "：" + reason); };
             for (const auto& member : trait.associated)
@@ -438,10 +630,14 @@ struct Symbols {
                     return false;
                 };
                 if (actual.kind == Type::Variable) {
-                    if (std::ranges::any_of(contracts.constraints(actual), [&](const auto& available) { return candidate(contracts.declaration(available)); })) continue;
+                    if (std::ranges::any_of(contracts.constraints(actual), [&](const auto& available) { return !valueConstraint(available) && candidate(contracts.declaration(available)); })) continue;
                 } else if (actual.kind == Type::Dyn) {
                     if (candidate(module.traits[actual.id])) continue;
                 } else {
+                    if (auto builtin = builtinMember(actual, name)) {
+                        if (builtin->shape == expected) continue;
+                        found = std::move(builtin->shape);
+                    }
                     if (shapedMethod(actual, name, definition, [&](const auto& shape) { return shape == expected; })) continue;
                     if (auto available = shapedMethod(actual, name, definition, [](const auto&) { return true; })) found = std::move(available->second);
                 }
@@ -511,6 +707,7 @@ struct Symbols {
         if (name == "Task" && value.kind == Type::Task && slot == 0) return module.taskResults[value.id];
         if (name == "TaskLocal" && value.kind == Type::TaskLocal && slot == 0) return module.taskLocalValues[value.id];
         if (name == "List" && value.kind == Type::List && slot == 0) return module.listElements[value.id];
+        if (name == "Range" && value == Type::IntRange && slot == 0) return Type::Int;
         if (name == "Option" && value.kind == Type::Option && slot == 0) return module.sumTypes[value.id].success;
         if (name == "Result" && value.kind == Type::Result && slot < 2) return slot ? module.sumTypes[value.id].failure : module.sumTypes[value.id].success;
         return std::nullopt;
@@ -561,6 +758,7 @@ struct Symbols {
     std::optional<Type> associatedType(Type owner, const std::string& member, const Source& source, Span site) {
         if (owner.kind == Type::Variable) {
             for (const auto& bound : contracts.constraints(owner)) {
+                if (valueConstraint(bound)) continue;
                 const auto& members = contracts.declaration(bound).associated;
                 if (std::ranges::find(members, member, &Identifier::text) == members.end()) continue;
                 TypeProjection projection{owner, member};
@@ -596,12 +794,16 @@ struct Symbols {
         if (arguments.size() != syntax.typeParameters.size())
             throw at(source, span, "LYG0001", syntax.name.text + " 需要 " + std::to_string(syntax.typeParameters.size()) + " 个类型实参");
         if (auto found = recordInstances.find({declaration, arguments}); found != recordInstances.end()) return found->second;
+        if (std::ranges::find(activeNominals, std::pair{false, declaration}) != activeNominals.end())
+            throw at(source, span, "LYG0004", "递归类型在展开时改变了类型实参：" + syntax.name.text);
         if (expandingNominal >= 128 || recordInstances.size() >= 4096)
             throw at(source, span, "LYG0004", "记录类型实例展开过深或超出编译单元实例预算：" + syntax.name.text);
         Type type{Type::Record, module.aggregates.size()};
         bool symbolic = std::ranges::any_of(arguments, [&](Type argument) { return abstract(argument); });
         recordInstances.emplace(std::pair{declaration, arguments}, type);
         auto& record = module.aggregates.emplace_back(syntax, std::vector<Type>{}, declaration, std::move(arguments), symbolic);
+        activeNominals.emplace_back(false, declaration);
+        struct Pop { std::vector<std::pair<bool, std::size_t>>& stack; ~Pop() { stack.pop_back(); } } restore{activeNominals};
         ++expandingNominal;
         for (const auto& field : syntax.fields) {
             auto resolved = resolveWith(typeForm(field.type.text), sources[syntax.file], field.type.span, syntax.typeParameters,
@@ -619,12 +821,16 @@ struct Symbols {
         if (arguments.size() != syntax.typeParameters.size())
             throw at(source, span, "LYG0001", syntax.name.text + " 需要 " + std::to_string(syntax.typeParameters.size()) + " 个类型实参");
         if (auto found = enumInstances.find({declaration, arguments}); found != enumInstances.end()) return found->second;
+        if (std::ranges::find(activeNominals, std::pair{true, declaration}) != activeNominals.end())
+            throw at(source, span, "LYG0004", "递归枚举在展开时改变了类型实参：" + syntax.name.text);
         if (expandingNominal >= 128 || enumInstances.size() >= 4096)
             throw at(source, span, "LYG0004", "枚举类型实例展开过深或超出编译单元实例预算：" + syntax.name.text);
         Type type{Type::Enum, module.enums.size()};
         bool symbolic = std::ranges::any_of(arguments, [&](Type argument) { return abstract(argument); });
         enumInstances.emplace(std::pair{declaration, arguments}, type);
         auto& instance = module.enums.emplace_back(syntax, std::vector<std::vector<Type>>{}, declaration, std::move(arguments), symbolic);
+        activeNominals.emplace_back(true, declaration);
+        struct Pop { std::vector<std::pair<bool, std::size_t>>& stack; ~Pop() { stack.pop_back(); } } restore{activeNominals};
         ++expandingNominal;
         for (const auto& entry : syntax.cases) {
             auto& payload = instance.payloads.emplace_back();
@@ -656,6 +862,14 @@ struct Symbols {
             }
             for (Type type : scalarTypes) if (form.name == typeName(module, type)) return type;
             if (auto exception = exceptionTypes.find(form.name); exception != exceptionTypes.end()) return Type{Type::Exception, exception->second + 1};
+            if (auto alias = aliases.find(form.name); alias != aliases.end()) {
+                if (std::ranges::find(resolvingAliases, form.name) != resolvingAliases.end())
+                    throw at(source, span, "LYT0003", "透明类型别名形成循环：" + form.name);
+                const auto& declaration = aliasDeclarations[alias->second];
+                resolvingAliases.push_back(form.name);
+                struct Pop { std::vector<std::string>& stack; ~Pop() { stack.pop_back(); } } restore{resolvingAliases};
+                return resolveWith(typeForm(declaration.target.text), sources[declaration.file], declaration.target.span, {}, NoTypeLookup{});
+            }
         }
         std::vector<Type> arguments;
         for (const auto& part : form.arguments) {
@@ -672,6 +886,10 @@ struct Symbols {
         if (arguments.size() == 1 && form.name == "Task") return task(arguments[0]);
         if (arguments.size() == 1 && form.name == "TaskLocal") return taskLocal(arguments[0]);
         if (arguments.size() == 1 && form.name == "List") return list(arguments[0]);
+        if (form.name == "Range") {
+            if (arguments.size() == 1 && arguments.front() == Type::Int) return Type::IntRange;
+            throw at(source, span, "LYT0003", "区间类型目前只支持 Range<Int>");
+        }
         if (arguments.size() == 1 && form.name == "Option") return sum(Type::Option, arguments[0]);
         if (arguments.size() == 2 && form.name == "Result") return sum(Type::Result, arguments[0], arguments[1]);
         if (auto record = records.find(form.name); record != records.end()) return recordType(record->second, std::move(arguments), source, span);
@@ -743,10 +961,14 @@ Diagnostic mismatch(const CheckedModule& module, const Source& source, Span span
     return error;
 }
 
+Diagnostic uncoveredPattern(const Source& source, Span site, PatternUse use, const std::string& missing) {
+    return at(source, site, "LYT0012", (use == PatternUse::Binding ? "val 解构必须匹配所有可能的值；例如不匹配 " : "match 未穷尽，缺少分支：") + missing);
+}
+
 struct Checker {
     CheckedFunction& fn;
     const Source& source;
-    const CheckedModule& module;
+    CheckedModule& module;
     Symbols& symbols;
     std::vector<Names> scopes;
     std::span<const Type> variables{};
@@ -763,6 +985,18 @@ struct Checker {
     Present present{};
 
     bool materializing() const { return variables.empty() && !probing && !inferredReturn; }
+
+    void requireValueOperation(Type type, ValueOperation operation, Span site) {
+        auto support = symbols.valueSupport(type, operation);
+        if (support.missing) throw at(source, site, "LYT0006", typeName(module, type) + "：" + *support.missing);
+        if (materializing()) {
+            symbols.bindValueOperations(operation, support, source, site);
+            for (auto [owner, candidate] : support.overrides) {
+                const auto& method = symbols.declaration(symbols.callables[candidate]);
+                fn.calls.push_back({method.file, method.name.span});
+            }
+        }
+    }
 
     std::optional<ExprId> currentWorker() const { return workers.empty() ? std::nullopt : std::optional(workers.back().id); }
     bool inAsync() const { return workers.empty() ? fn.syntax.isAsync : std::holds_alternative<AsyncBlock>(fn.syntax.expressions[workers.back().id].node); }
@@ -789,7 +1023,7 @@ struct Checker {
     }
 
     void referLocal(const Identifier& name, std::size_t slot) {
-        if (auto declaration = fn.locals[slot].declaration) refer(name, fn.syntax.file, *declaration);
+        if (auto declaration = fn.locals[slot].declaration) fn.references.push_back({{fn.syntax.file, name.span}, {fn.syntax.file, *declaration}, {}});
     }
 
     Type readLocal(ExprId id, const Identifier& name, std::size_t slot) {
@@ -995,6 +1229,12 @@ struct Checker {
                     implementations.push_back(found - available.begin());
                 } else {
                     auto expected = symbols.requiredShape(actual, trait, method, source, operation.site);
+                    if (auto builtin = symbols.builtinMember(actual, method.name.text)) {
+                        if (builtin->shape != expected)
+                            throw at(source, operation.site, "LYT0021", "内置成员签名与动态接口要求不匹配：" + method.name.text);
+                        implementations.push_back(symbols.builtinImplementation(actual, method.name.text, *builtin, fn.syntax.file, operation.site));
+                        continue;
+                    }
                     auto selected = symbols.shapedMethod(actual, method.name.text, source, [&](const auto& shape) { return shape == expected; }).value().first;
                     const auto& entry = symbols.callables[selected];
                     auto function = entry.generic ? symbols.instantiate(selected, module.aggregates[actual.id].arguments, source, operation.site) : entry.target;
@@ -1266,13 +1506,14 @@ struct Checker {
         }
         if (named.labels) {
             auto found = symbols.records.find(linkedName(name));
-            if (found == symbols.records.end() || symbols.recordDeclarations[found->second].reference)
-                throw at(source, name.span, "LYT0011", "此模式需要可见的 struct 或匹配类型的枚举分支：" + name.text);
+            if (found == symbols.records.end())
+                throw at(source, name.span, "LYT0011", "此模式需要可见的 struct、class 或匹配类型的枚举分支：" + name.text);
             if (subject.kind != Type::Record || module.aggregates[subject.id].declaration != found->second)
                 throw at(source, name.span, "LYT0011", name.text + " 不能匹配 " + typeName(module, subject));
             const auto& owner = module.aggregates[subject.id];
             refer(name, owner.syntax.file, owner.syntax.name.span);
-            CheckedPattern result{PatternConstructor(PatternProduct{}), std::vector<CheckedPattern>(owner.fields.size())};
+            auto constructor = owner.syntax.reference ? PatternConstructor(PatternClass{subject.id}) : PatternConstructor(PatternProduct{});
+            CheckedPattern result{std::move(constructor), std::vector<CheckedPattern>(owner.fields.size())};
             std::vector<bool> used(owner.fields.size());
             for (std::size_t index = 0; index < named.labels->size(); ++index) {
                 const auto& field = (*named.labels)[index];
@@ -1286,6 +1527,19 @@ struct Checker {
             }
             return result;
         }
+        if (!named.escaped) {
+            auto candidates = symbols.visibleFunctions(source, name);
+            for (auto candidate : candidates) {
+                const auto& declaration = symbols.declaration(symbols.callables[candidate]);
+                if (declaration.constant != ConstKind::Value) continue;
+                auto target = symbols.callables[candidate].target;
+                auto type = module.functions[target].result;
+                if (subject != type) throw mismatch(module, source, pattern.span, subject, type);
+                requireValueOperation(type, ValueOperation::Equal, pattern.span);
+                refer(name, declaration.file, declaration.name.span);
+                return {PatternConstant{target, type}};
+            }
+        }
         auto slot = fn.locals.size();
         fn.locals.push_back({subject, false, currentWorker()});
         declare(name, slot);
@@ -1294,6 +1548,7 @@ struct Checker {
 
     void remapPatternSlots(CheckedPattern& pattern, const std::unordered_map<std::size_t, std::size_t>& slots) {
         if (auto* slot = std::get_if<PatternSlot>(&pattern.node)) slot->local = slots.at(slot->local);
+        if (auto* rest = std::get_if<PatternListRest>(&pattern.node)) rest->local = slots.at(rest->local);
         for (auto& part : pattern.parts) remapPatternSlots(part, slots);
     }
 
@@ -1342,6 +1597,22 @@ struct Checker {
     CheckedPattern checkPattern(const Pattern& pattern, Type subject) {
         const auto& node = pattern.node;
         if (std::holds_alternative<PatternAlternatives>(node)) return alternativesPattern(pattern, subject);
+        if (const auto* list = std::get_if<PatternList>(&node)) {
+            if (subject.kind != Type::List) throw at(source, pattern.span, "LYT0011", "列表模式不能匹配 " + typeName(module, subject));
+            auto element = module.listElements[subject.id];
+            CheckedPattern tail;
+            if (list->rest) {
+                auto slot = fn.locals.size();
+                fn.locals.push_back({subject, false, currentWorker()});
+                declare(*list->rest, slot);
+                tail.node = PatternListRest{slot};
+            } else if (!list->openEnd) tail.node = PatternConstructor(ListTag{false, element, subject});
+            for (std::size_t index = pattern.parts.size(); index-- > 0;) {
+                auto head = checkPattern(pattern.parts[index], element);
+                tail = {PatternConstructor(ListTag{true, element, subject}), {std::move(head), std::move(tail)}};
+            }
+            return tail;
+        }
         if (auto* named = std::get_if<PatternName>(&node)) return namedPattern(pattern, subject, *named);
         if (auto* tag = std::get_if<SumTag>(&node)) return sumPattern(pattern, subject, *tag);
         if (std::holds_alternative<std::monostate>(node)) return {};
@@ -1365,6 +1636,18 @@ struct Checker {
             throw at(source, pattern.span, "LYT0011", typeName(module, literal) + " 字面量不能匹配 " + typeName(module, subject));
         if (auto* flag = std::get_if<bool>(&node)) return {PatternConstructor(*flag)};
         return {std::get<StringLiteral>(node)};
+    }
+
+    void checkExhaustiveness(Type subject, Span site, std::span<const CheckedPattern* const> patterns, PatternUse use) {
+        auto hasConstant = [&](auto&& self, const CheckedPattern& pattern) -> bool {
+            return std::holds_alternative<PatternConstant>(pattern.node) ||
+                std::ranges::any_of(pattern.parts, [&](const auto& part) { return self(self, part); });
+        };
+        if (std::ranges::any_of(patterns, [&](const auto* pattern) { return hasConstant(hasConstant, *pattern); })) {
+            std::vector<CheckedPattern> deferred;
+            for (const auto* pattern : patterns) deferred.push_back(*pattern);
+            module.deferredPatternChecks.push_back({fn.syntax.file, site, subject, std::move(deferred), use});
+        } else if (auto missing = missingPattern(module, subject, patterns, use)) throw uncoveredPattern(source, site, use, *missing);
     }
 
     Type infer(ExprId id, const Match& match, std::optional<Type> expected, bool discard) {
@@ -1411,7 +1694,7 @@ struct Checker {
             scopes.pop_back();
         }
         present = std::move(entry);
-        if (auto missing = missingPattern(module, subject, patterns)) throw at(source, fn.syntax.expressions[id].span, "LYT0012", "match 未穷尽，缺少分支：" + *missing);
+        checkExhaustiveness(subject, fn.syntax.expressions[id].span, patterns, PatternUse::Match);
         return discard && match.optional != OptionalForm::None ? Type{Type::Unit} : result.value_or(Type::Never);
     }
 
@@ -1562,6 +1845,17 @@ struct Checker {
         return value == Type::Never ? Type::Never : Type::Unit;
     }
 
+    Type infer(ExprId id, const PatternBinding& binding, auto, bool) {
+        auto annotation = binding.annotation ? std::optional(symbols.resolve(fn.syntax, *binding.annotation, variables)) : std::nullopt;
+        auto value = visit(binding.value, annotation);
+        if (value == Type::Never) return value;
+        auto& checked = fn.expressions[id].patterns;
+        checked.push_back(checkPattern(binding.pattern, value));
+        const CheckedPattern* pattern = &checked.front();
+        checkExhaustiveness(value, binding.pattern.span, {&pattern, 1}, PatternUse::Binding);
+        return Type::Unit;
+    }
+
     std::vector<ArgumentShape> argumentShapes(const Call& call, bool acceptsTail) const {
         std::vector<ArgumentShape> shapes;
         for (const auto& arg : call.arguments) {
@@ -1691,6 +1985,12 @@ struct Checker {
         auto owner = visit(member.receiver);
         if (owner == Type::Never) return owner;
         if (owner.kind == Type::List && member.name.text == "size") return Type::Int;
+        if (owner == Type::IntRange) {
+            for (std::size_t slot = 0; slot < std::size(rangeFields); ++slot) if (member.name.text == rangeFieldNames[slot]) {
+                fn.expressions[id].target = slot;
+                return rangeFields[slot];
+            }
+        }
         if (owner == Type::String && (member.name.text == "size" || member.name.text == "byteSize")) return Type::Int;
         if (owner == Type::Bytes && member.name.text == "size") return Type::Int;
         if (owner == Type::Char && member.name.text == "codePoint") return number(Type::UInt, 32);
@@ -1999,26 +2299,26 @@ struct Checker {
                 info.callee = Callee::ErrorSuppress;
                 return arguments(id, call, 1, [](auto) { return "error"; }, [](auto) { return Type{Type::Error}; }) ? Type::Never : Type::Error;
             }
-            if ((call.name.text == "toString" && (builtInDisplay(owner) || owner == Type::Bytes)) || (call.name.text == "toBytes" && owner == Type::String)) {
+            if (auto builtin = symbols.builtinMember(owner, call.name.text)) {
                 noTypeArgs();
-                if (!call.arguments.empty()) throw at(source, call.name.span, "LYT0002", call.name.text + " 不接收实参");
-                if (call.name.text == "toBytes") { info.callee = Callee::ToBytes; return Type::Bytes; }
-                if (owner == Type::Bytes) { info.callee = Callee::DecodeUtf8; return symbols.sum(Type::Option, Type::String); }
-                info.callee = Callee::ToString;
-                return Type::String;
+                info.callee = builtin->callee;
+                const auto& shape = builtin->shape;
+                return arguments(id, call, shape.parameters.size(), [&](auto slot) -> std::string_view { return shape.labels[slot]; },
+                    [&](auto slot) { return shape.parameters[slot]; }) ? Type{Type::Never} : shape.result;
             }
-            if (numericType(owner) && call.name.text.starts_with("to")) {
-                auto name = std::string_view(call.name.text).substr(2);
-                bool checked = name.ends_with("Checked");
-                if (checked) name.remove_suffix(7);
-                if (auto target = numberType(name); target && (checked ? integerType(*target) : target->kind == Type::Real)) {
-                    noTypeArgs();
-                    if (!call.arguments.empty()) throw at(source, call.name.span, "LYT0002", call.name.text + " 不接收实参");
-                    info.callee = checked ? Callee::ToIntegerChecked : Callee::ToReal;
-                    return checked ? symbols.sum(Type::Option, *target) : *target;
-                }
-            }
+            auto valueMember = [&](ValueOperation operation) {
+                bool equality = operation == ValueOperation::Equal;
+                noTypeArgs();
+                auto exits = arguments(id, call, equality ? 1u : 0u, [](auto) { return "other"; }, [&](auto) { return owner; });
+                requireValueOperation(owner, operation, call.name.span);
+                info.callee = equality ? Callee::ValueEqual : Callee::ValueHash;
+                if (owner.kind == Type::Variable) info.boundTrait = equality ? "Eq" : "Hash";
+                return exits ? Type{Type::Never} : equality ? Type::Bool : Type::Int;
+            };
             if (owner.kind == Type::Variable) {
+                auto capability = call.name.text == "equals" ? "Eq" : call.name.text == "hashCode" ? "Hash" : "";
+                auto constraints = symbols.contracts.constraints(owner);
+                if (std::ranges::find(constraints, capability) != constraints.end()) return valueMember(valueConstraint(capability).value());
                 if (auto method = symbols.boundMember(owner, call.name.text, source, call.name.span)) {
                     noTypeArgs();
                     info.boundTrait = method->trait->name.text;
@@ -2042,6 +2342,7 @@ struct Checker {
                     return exits ? Type{Type::Never} : method.asynchronous ? symbols.task(method.result) : method.result;
                 }
             }
+            if (call.boundTrait) if (auto operation = valueConstraint(*call.boundTrait)) return valueMember(*operation);
             if (owner.kind == Type::Record) {
                 const auto& decl = module.aggregates[owner.id];
                 ownerTypes = decl.arguments;
@@ -2067,6 +2368,9 @@ struct Checker {
                 }
                 staticMember = symbols.staticMethods[decl.declaration].contains(call.name.text);
             }
+            if (call.name.text == "equals" || call.name.text == "hashCode") {
+                if (!privateMember && !staticMember) return valueMember(call.name.text == "equals" ? ValueOperation::Equal : ValueOperation::Hash);
+            }
             if (owner.kind == Type::Task && call.name.text == "cancel") {
                 if (!inAsync()) throw at(source, call.name.span, "LYT0008", "Task.cancel() 只能在异步执行体中调用，不能在同步 lambda、blocking 或 defer 中调用");
                 noTypeArgs();
@@ -2079,11 +2383,6 @@ struct Checker {
                 if (!call.arguments.empty()) throw at(source, call.name.span, "LYT0002", "TaskLocal.get 不接收实参");
                 info.callee = Callee::LocalGet;
                 return symbols.sum(Type::Option, module.taskLocalValues[owner.id]);
-            }
-            if (owner.kind == Type::List && call.name.text == "add") {
-                noTypeArgs();
-                info.callee = Callee::ListAdd;
-                return arguments(id, call, 1, [](auto) { return "value"; }, [&](auto) { return module.listElements[owner.id]; }) ? Type::Never : Type::Unit;
             }
             if (auto result = extensionCall(id, call, owner, expected)) return *result;
             if (privateMember) throw at(source, call.name.span, "LYN0003", "此成员是模块私有的：" + call.name.text);
@@ -2270,6 +2569,12 @@ struct Checker {
         return fit(unary.operand, type, hint && hint->kind != Type::UInt ? *hint : Type{Type::Int});
     }
 
+    Type infer(ExprId, const RangeValue& range, auto, bool) {
+        auto start = visit(range.start, Type::Int);
+        auto end = visit(range.end, Type::Int);
+        return start == Type::Never || end == Type::Never ? Type{Type::Never} : Type{Type::IntRange};
+    }
+
     Type infer(ExprId, const Binary& binary, std::optional<Type> expected, bool) {
         if (binary.op <= Op::RemSet) {
             const auto& place = fn.syntax.expressions[binary.left];
@@ -2333,7 +2638,7 @@ struct Checker {
             return Type::Bool;
         }
         right = fit(binary.right, right, left);
-        if (equality && (left.kind == Type::Option || left.kind == Type::Result || left.kind == Type::Enum || left.kind == Type::Closure || left.kind == Type::Any || left.kind == Type::Dyn || left.kind == Type::Error || left.kind == Type::Variable || left.kind == Type::Projection || (left.kind == Type::Record && !module.aggregates[left.id].syntax.reference))) throw at(source, binary.site, "LYT0006", typeName(module, left) + " 未提供 Eq，不能用 == 或 != 比较");
+        if (equality) requireValueOperation(left, ValueOperation::Equal, binary.site);
         if (binary.op == Op::Add && left == Type::String) return Type::String;
         if (!equality) throw mismatch(module, source, binary.site, Type::Int, left);
         return Type::Bool;
@@ -2429,11 +2734,10 @@ struct Checker {
     }
 
     Type infer(ExprId id, const For& loop, auto, bool) {
-        auto input = visit(loop.input, loop.range ? std::optional(Type{Type::Int}) : std::nullopt);
+        auto input = visit(loop.input);
         auto element = input;
         bool exits = input == Type::Never;
-        if (loop.range) {
-            exits |= visit(loop.range->end, Type::Int) == Type::Never;
+        if (input == Type::IntRange) {
             element = Type::Int;
         } else if (input.kind == Type::List) {
             element = module.listElements[input.id];
@@ -2502,6 +2806,7 @@ CheckedModule check(Module module, const std::vector<Source>& sources, bool requ
     };
     auto exposeBounds = [&](const auto& syntax) {
         for (const auto& bound : syntax.bounds) {
+            if (valueConstraint(bound.trait.text)) continue;
             const auto& trait = *std::ranges::find(module.traits, bound.trait.text, [](const Trait& item) { return item.name.text; });
             if (!trait.isPublic) throw at(sources[syntax.file], bound.trait.span, "LYN0003", "公开签名不能暴露模块私有约束：" + bound.trait.text);
         }
@@ -2514,7 +2819,7 @@ CheckedModule check(Module module, const std::vector<Source>& sources, bool requ
         for (Type builtin : scalarTypes) {
             if (name == typeName(checked, builtin)) throw at(sources[decl.file], decl.name.span, "LYN0002", "类型名与内置类型冲突：" + std::string(name));
         }
-        if (name == "Never" || name == "TaskLocal") throw at(sources[decl.file], decl.name.span, "LYN0002", "类型名与内置类型冲突：" + std::string(name));
+        if (name == "Never" || name == "TaskLocal" || name == "Range" || name == "Eq" || name == "Hash") throw at(sources[decl.file], decl.name.span, "LYN0002", "类型名与内置类型冲突：" + std::string(name));
         if (decl.name.text == "print" || decl.name.text == "gcCollect" || !names.emplace(declaration, index).second) throw at(sources[decl.file], decl.name.span, "LYN0002", "类型名称已声明：" + decl.name.text);
     };
     for (auto& decl : module.aggregates) {
@@ -2529,6 +2834,18 @@ CheckedModule check(Module module, const std::vector<Source>& sources, bool requ
     for (auto& decl : module.exceptions) {
         reserveType(decl, symbols.exceptionTypes, checked.exceptions.size());
         checked.exceptions.push_back(std::move(decl));
+    }
+    for (auto& decl : module.aliases) {
+        if (symbols.records.contains(decl.name.text) || symbols.enums.contains(decl.name.text) || symbols.exceptionTypes.contains(decl.name.text))
+            throw at(sources[decl.file], decl.name.span, "LYN0002", "类型名称已声明：" + decl.name.text);
+        reserveType(decl, symbols.aliases, symbols.aliasDeclarations.size());
+        symbols.aliasDeclarations.push_back(std::move(decl));
+    }
+    for (std::size_t index = 0; index < symbols.aliasDeclarations.size(); ++index) {
+        const auto& alias = symbols.aliasDeclarations[index];
+        const auto& source = sources[alias.file];
+        auto target = symbols.resolve(source, alias.target);
+        if (alias.isPublic) expose(target, source, alias.target.span);
     }
     symbols.fields.resize(symbols.recordDeclarations.size());
     symbols.methods.resize(symbols.recordDeclarations.size());
@@ -2558,7 +2875,7 @@ CheckedModule check(Module module, const std::vector<Source>& sources, bool requ
     }
     for (const auto& trait : module.traits) {
         const auto& source = sources[trait.file];
-        if (symbols.records.contains(trait.name.text) || symbols.enums.contains(trait.name.text)) throw at(source, trait.name.span, "LYN0002", "类型名称已声明：" + trait.name.text);
+        if (symbols.records.contains(trait.name.text) || symbols.enums.contains(trait.name.text) || symbols.aliases.contains(trait.name.text) || symbols.exceptionTypes.contains(trait.name.text)) throw at(source, trait.name.span, "LYN0002", "类型名称已声明：" + trait.name.text);
         symbols.contracts.declare(trait, source);
         symbols.traitNames.emplace(trait.name.text, checked.traits.size());
         checked.traits.push_back(trait);
@@ -2689,7 +3006,7 @@ CheckedModule check(Module module, const std::vector<Source>& sources, bool requ
             addOverload(names[function.name.text], function, source);
         } else {
             const auto& name = function.name.text;
-            if (symbols.records.contains(name) || symbols.enums.contains(name) || name == "print" || name == "gcCollect")
+            if (symbols.records.contains(name) || symbols.enums.contains(name) || symbols.aliases.contains(name) || symbols.exceptionTypes.contains(name) || name == "print" || name == "gcCollect")
                 throw at(source, function.name.span, "LYN0002", "函数名已声明：" + name);
             auto& candidates = symbols.functions[name];
             if (!candidates.empty() && (name == "main" || name.ends_with("::main"))) throw at(source, function.name.span, "LYN0002", "main 不能重载");
@@ -2798,6 +3115,12 @@ CheckedModule check(Module module, const std::vector<Source>& sources, bool requ
     validateForeignDeclarations(checked, sources);
     if (requireEntry && !checked.entry) throw Diagnostic{"LYN0001", "可执行包缺少入口 fn main(): Unit"};
     evaluateConstants(checked, sources);
+    for (const auto& deferred : checked.deferredPatternChecks) {
+        std::vector<const CheckedPattern*> patterns;
+        for (const auto& pattern : deferred.patterns) patterns.push_back(&pattern);
+        if (auto missing = missingPattern(checked, deferred.subject, patterns, deferred.use))
+            throw uncoveredPattern(sources[deferred.file], deferred.site, deferred.use, *missing);
+    }
     return checked;
 }
 

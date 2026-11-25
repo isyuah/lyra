@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <lyra/list_slice.hpp>
 #include <new>
 
 struct LyraList { const void** items; std::size_t count, capacity; };
@@ -43,6 +44,14 @@ void lockedLists(LyraList* list, const LyraList* source, const auto& work) {
     else { lyraRuntime::Lock upper(listLocks[std::max(first, second)]); work(); }
 }
 
+LyraList* copySlice(const LyraList* source, lyra::ListSliceBounds bounds) {
+    auto* result = lyraListCreate();
+    reserve(result, bounds.count);
+    if (bounds.count) std::memcpy(result->items, source->items + bounds.start, bounds.count * sizeof(*result->items));
+    result->count = bounds.count;
+    return result;
+}
+
 }
 
 LyraList* lyraListCreate() {
@@ -53,6 +62,28 @@ LyraList* lyraListCreate() {
 std::int64_t lyraListSize(const LyraList* list) {
     lyraRuntime::Lock guard(listLocks[stripe(list)]);
     return static_cast<std::int64_t>(list->count);
+}
+
+LyraList* lyraListSlice(const LyraList* source, std::int64_t start) {
+    lyraRuntime::Lock guard(listLocks[stripe(source)]);
+    if (start < 0 || static_cast<std::uint64_t>(start) > source->count) {
+        std::fputs("Lyra runtime: invalid list slice start\n", stderr);
+        std::abort();
+    }
+    auto offset = static_cast<std::size_t>(start);
+    return copySlice(source, {offset, source->count - offset});
+}
+
+LyraList* lyraListSliceRange(const LyraList* source, std::int64_t start, std::int64_t end, std::uint8_t inclusive,
+                            const char* file, std::uint64_t line, std::uint64_t column) {
+    lyraRuntime::Lock guard(listLocks[stripe(source)]);
+    auto bounds = lyra::listSliceBounds(source->count, start, end, inclusive);
+    if (!bounds) {
+        std::fprintf(stderr, "%s:%" PRIu64 ":%" PRIu64 ": list slice %" PRId64 "%s%" PRId64 " out of bounds (size %zu)\n",
+                     file, line, column, start, inclusive ? ".." : "..<", end, source->count);
+        std::exit(EXIT_FAILURE);
+    }
+    return copySlice(source, *bounds);
 }
 
 const void* lyraListGet(const LyraList* list, std::int64_t index, const char* file, std::uint64_t line, std::uint64_t column) {

@@ -83,6 +83,27 @@ fn main(): Unit {
         self.write('app/src/main.ly', 'import cfg.internal.base\nfn main(): Unit {}\n')
         self.diagnose(self.app, 'LYN0003', 'base')
 
+    def test_constant_patterns_run_in_compile_time_functions(self):
+        self.write('app/src/main.ly', '''
+const Selected: Bool = true
+const fn choose(value: Bool): Int {
+    match value {
+        Selected => 1,
+        false => 0,
+    }
+}
+const answer: Int = choose(true)
+fn main(): Unit { print(answer) }
+''')
+        result = self.cli('run', self.app)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, '1\n')
+
+    def test_invalid_constant_slice_reports_bounds(self):
+        self.write('app/src/main.ly', 'const count: Int = [1, 2].slice(2..<1).size\nfn main(): Unit {}')
+        diagnostic = self.diagnose(self.app, 'LYCT0003', '列表切片越界')
+        self.assertEqual(diagnostic['range']['start']['column'], 27)
+
     def test_cross_module_cycle_reports_the_reference_that_closes_it(self):
         self.write('app/lyra.json5', '{name:"app",version:"0.1.0"}')
         (self.app / 'src/left').mkdir()

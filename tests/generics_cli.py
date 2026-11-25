@@ -59,6 +59,32 @@ class Generics(unittest.TestCase):
         ''')
         self.run_native('7\nAda\nyes\n')
 
+    def test_transparent_type_aliases_cross_module(self):
+        (self.package / 'lyra.json5').write_text('{name:"demo",version:"0.1.0"}')
+        module = self.package / 'src/types'
+        module.mkdir()
+        (module / 'ids.ly').write_text('pub type UserId = Int\npub type UserIds = List<UserId>\n')
+        self.program('''
+            import self.types.UserId
+            import self.types.UserIds
+            fn identity(id: UserId): UserId { id }
+            fn first(ids: UserIds): UserId { ids[0] }
+            fn main(): Unit {
+                val id: UserId = identity(7)
+                val ids: UserIds = [id]
+                print(first(ids))
+            }
+        ''')
+        self.run_native('7\n')
+
+    def test_type_alias_cycles_and_private_leaks_are_rejected(self):
+        self.program('type Left = Right\ntype Right = Left\nfn main(): Unit {}')
+        self.rejects('LYT0003', '循环')
+        self.program('struct Hidden(val value: Int)\npub type Public = Hidden\nfn main(): Unit {}')
+        self.rejects('LYN0003', '私有类型')
+        self.program('enum Loop<T> { Next(Loop<List<T>>) }\nfn main(): Unit {}')
+        self.rejects('LYG0004', '改变了类型实参')
+
     def test_two_parameters_named_arguments_and_nominal_aggregate(self):
         self.program('''
             struct Point(val x: Int)
@@ -69,6 +95,23 @@ class Generics(unittest.TestCase):
             }
         ''')
         self.run_native('4\n')
+
+    def test_structural_bound_can_use_builtin_collection_and_text_methods(self):
+        self.program('''
+            trait HasSize { fn size(): Int }
+            fn empty<T: HasSize>(value: T): Bool { value.size() == 0 }
+            fn count(value: dyn HasSize): Int { value.size() }
+            fn main(): Unit {
+                val values: List<Int> = []
+                print(empty(values))
+                print(empty([1, 2]))
+                print(empty(""))
+                print(empty("Lyra"))
+                print(count("Hi" as dyn HasSize))
+                print(count([1, 2, 3] as dyn HasSize))
+            }
+        ''')
+        self.run_native('true\nfalse\ntrue\nfalse\n2\n3\n')
 
     def test_structural_bound_specializes_without_an_implements_clause(self):
         (self.package / 'lyra.json5').write_text('{name:"demo",version:"0.1.0"}')

@@ -105,6 +105,75 @@ fn main(): Unit {
 }
 ''', b"20\nitem 12\nfalse\nitem 7\n19\nupdated\n19\npresent null\ntrue\ntrue\nfalse\ntrue\n0\n")
 
+    def test_structural_hash_keys_and_custom_equality(self):
+        (self.package / 'lyra.json5').write_text('{name:"test/hash-derived",version:"0.1.0"}')
+        self.native('''import std.collections.hashSet
+struct User(val id: Int, val name: String)
+struct UserKey(val id: Int, val name: String) {
+    fn equals(other: UserKey): Bool { id == other.id }
+    fn hashCode(): Int { id }
+}
+struct WrappedKey(val key: UserKey, val shard: Int)
+enum Tree { Empty, Node(Int, Tree) }
+fn equivalent<T: Eq>(left: T, right: T): Bool { left.equals(right) }
+fn hashValue<T: Hash>(value: T): Int { value.hashCode() }
+const knownEqual: Bool = equivalent(User(5, "Ada"), User(5, "Ada"))
+const knownHash: Int = hashValue(User(5, "Ada"))
+fn main(): Unit {
+    print(knownEqual)
+    print(knownHash == User(5, "Ada").hashCode())
+    val users = hashSet<User>()
+    print(users.add(User(1, "Ada")))
+    print(users.add(User(1, "Ada")))
+    print(users.contains(User(1, "Ada")))
+    print(User(1, "Ada").hashCode() == User(1, "Ada").hashCode())
+    val custom = hashSet<UserKey>()
+    print(custom.add(UserKey(3, "first")))
+    print(custom.add(UserKey(3, "second")))
+    print(custom.size())
+
+    val wrapped = hashSet<WrappedKey>()
+    print(wrapped.add(WrappedKey(UserKey(4, "first"), 1)))
+    print(wrapped.add(WrappedKey(UserKey(4, "second"), 1)))
+
+    val trees = hashSet<Tree>()
+    print(trees.add(Tree.Node(1, Tree.Node(2, Tree.Empty))))
+    print(trees.add(Tree.Node(1, Tree.Node(2, Tree.Empty))))
+}
+''', b'true\ntrue\ntrue\nfalse\ntrue\ntrue\ntrue\nfalse\n1\ntrue\nfalse\ntrue\nfalse\n')
+
+    def test_hash_capability_rejects_non_hashable_struct_fields(self):
+        cases = [
+            ('struct Key(val value: Any)\nfn main(): Unit { val items = hashSet<Key>() }', 'value'),
+            ('class Handle {}\nstruct Key(val value: Handle)\nfn main(): Unit { val items = hashSet<Key>() }', 'value'),
+            ('struct Key(val callback: () -> Int)\nfn main(): Unit { val items = hashSet<Key>() }', 'callback'),
+            ('trait Render { fn render(): String }\nstruct Key(val value: dyn Render)\nfn main(): Unit { val items = hashSet<Key>() }', 'value'),
+            ('class Handle {}\nfn main(): Unit { val items = hashSet<Handle>() }', 'Hash'),
+            ('struct Key(val id: Int) { fn equals(other: Key): Bool { id == other.id } }\nfn main(): Unit { val items = hashSet<Key>() }', 'hashCode'),
+            ('struct Key(val id: Int) { fn hashCode(): Int { id } }\nfn main(): Unit { val items = hashSet<Key>() }', 'equals'),
+        ]
+        (self.package / 'lyra.json5').write_text('{name:"test/hash-rejections",version:"0.1.0"}')
+        for body, fragment in cases:
+            with self.subTest(body=body):
+                self.main.write_text('import std.collections.hashSet\n' + body, encoding='utf-8')
+                check = subprocess.run([COMPILER, 'check', self.package, '--diagnostics=json'], capture_output=True, text=True, timeout=10)
+                self.assertNotEqual(check.returncode, 0, check.stdout)
+                error, = json.loads(check.stderr)
+                self.assertEqual(error['code'], 'LYT0019', error)
+                self.assertIn(fragment, error['message'])
+
+    def test_class_equality_uses_identity(self):
+        self.native('''class Handle(val id: Int) {}
+fn main(): Unit {
+    val first = Handle(1)
+    val alias = first
+    val second = Handle(1)
+    print(first == alias)
+    print(first == second)
+    print(first != second)
+}
+''', b'true\nfalse\ntrue\n')
+
     def test_hash_collection_loops_traverse_shallow_snapshots(self):
         (self.package / 'lyra.json5').write_text('{name:"test/hash-iteration",version:"0.1.0"}')
         self.native('''
@@ -223,6 +292,44 @@ fn main(): Unit {
 }
 ''', b"1\nafter\n7\n33\n")
 
+    def test_range_values_and_list_slices(self):
+        self.native('''
+class Item(var value: Int)
+fn mark(value: Int): Int { print(value); value }
+fn take<T>(items: List<T>, portion: Range<Int>): List<T> { items.slice(portion) }
+fn total(portion: Range<Int>): Int {
+    var result = 0
+    for number in portion { result += number }
+    result
+}
+const saved: Range<Int> = 0 + 1..<2 * 2
+const first: Int = [8, 9, 10, 11].slice(saved)[0]
+const same: Bool = saved == (1..<4)
+fn main(): Unit {
+    val range = mark(1)..mark(2)
+    print(range.start); print(range.end); print(range.inclusive)
+    print(total(range)); print(total(saved)); print(total(3..1)); print(total(4..<4))
+    print(first); print(same)
+    val limit = 9223372036854775807
+    for number in limit..limit { print(number); continue }
+    val input = [Item(10), Item(20), Item(30)]
+    val copy = take(input, range)
+    copy[0].value = 21
+    copy[1] = Item(99)
+    input.add(Item(40))
+    gcCollect()
+    print(input[1].value); print(input[2].value); print(copy[1].value)
+    print(copy.size); print(input.slice(4..<4).size)
+}
+''', b"1\n2\n1\n2\ntrue\n3\n6\n0\n0\n9\ntrue\n9223372036854775807\n21\n30\n99\n2\n0\n")
+
+    def test_list_slice_checks_bounds_at_call_site(self):
+        self.native('''fn main(): Unit {
+    val items = [1, 2]
+    items.slice(0..9223372036854775807);
+}
+''', b"", b"main.ly:3:11: list slice 0..9223372036854775807 out of bounds (size 2)")
+
     def test_bounds_error_is_located_before_rhs_runs(self):
         self.native('''fn update(): Int { print(9); 4 }
 fn main(): Unit {
@@ -241,6 +348,10 @@ fn main(): Unit {
             ("fn only(items: List<Int>): Unit {}", "only(...[1])", "LYT0002", "变长"),
             ("fn only(text: List<String>): Unit {}", "val ints = [1]; only(ints)", "LYT0001", "List"),
             ("", "val items = []", "LYT0014", "List"),
+            ("", "val range: Range<String> = 0..1", "LYT0003", "Range<Int>"),
+            ("", "val range = 0..1..2", "LYP0001", "区间"),
+            ("", "val range = 0..<true", "LYT0001", "Int"),
+            ("", "[1].slice(0)", "LYT0001", "Range<Int>"),
         )
         for declaration, body, code, fragment in cases:
             with self.subTest(declaration=declaration, body=body):

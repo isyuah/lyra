@@ -85,6 +85,21 @@ struct NativeLists {
         return builder.CreateCall(module().getOrInsertFunction("lyraListSize", builder.getInt64Ty(), builder.getPtrTy()), {list});
     }
 
+    llvm::Value* slice(llvm::Value* list, llvm::Value* start) const {
+        return builder.CreateCall(module().getOrInsertFunction("lyraListSlice", builder.getPtrTy(), builder.getPtrTy(), builder.getInt64Ty()), {list, start});
+    }
+
+    llvm::Value* sliceRange(llvm::Value* list, llvm::Value* range, const Source& source, Span span) const {
+        auto pointer = builder.getPtrTy();
+        auto integer = builder.getInt64Ty();
+        auto flag = builder.getInt8Ty();
+        auto site = source.userSite(span);
+        auto slice = module().getOrInsertFunction("lyraListSliceRange", pointer, pointer, integer, integer, flag, pointer, integer, integer);
+        return builder.CreateCall(slice, {list, builder.CreateExtractValue(range, 0), builder.CreateExtractValue(range, 1),
+            builder.CreateZExt(builder.CreateExtractValue(range, 2), flag), builder.CreateGlobalStringPtr(site.file),
+            builder.getInt64(site.start.line), builder.getInt64(site.start.column)});
+    }
+
     llvm::Value* box(llvm::Value* value) const {
         auto allocate = module().getOrInsertFunction("lyraGcAlloc", builder.getPtrTy(), builder.getInt64Ty());
         auto snapshot = builder.CreateCall(allocate, {llvm::ConstantExpr::getSizeOf(value->getType())});

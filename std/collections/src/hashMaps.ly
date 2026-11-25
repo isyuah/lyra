@@ -121,6 +121,10 @@ pub fn hashMap<Key,Value>(hash: (Key) -> Int, equal: (Key, Key) -> Bool): HashMa
     HashMap(hash, equal, emptyBuckets<Key,Value>(8), 0)
 }
 
+pub fn hashMap<Key: Eq & Hash,Value>(): HashMap<Key,Value> {
+    hashMap<Key,Value>((key) => { key.hashCode() }, (left, right) => { left == right })
+}
+
 fn hashString(key: String): Int {
     var result = 0
     for byte in key.toBytes() { result = (result * 131 + byte) % 2147483647 }
@@ -145,5 +149,6 @@ pub class HashSet<Item>(val items: HashMap<Item,Unit>) {
 }
 
 pub fn hashSet<Item>(hash: (Item) -> Int, equal: (Item, Item) -> Bool): HashSet<Item> { HashSet(hashMap<Item,Unit>(hash, equal)) }
+pub fn hashSet<Item: Eq & Hash>(): HashSet<Item> { HashSet(hashMap<Item,Unit>()) }
 pub fn stringSet(): HashSet<String> { HashSet(stringMap<Unit>()) }
 pub fn intSet(): HashSet<Int> { HashSet(intMap<Unit>()) }

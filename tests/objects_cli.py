@@ -244,8 +244,7 @@ fn main(): Unit {
                            ("val b = Box(Point(1), 2); b.point = Point(3)", "LYT0004"),
                            ("Point(x: true)", "LYT0001"),
                            ("Point(other: 1)", "LYT0002"),
-                           ("val p = Point(1); p.missing", "LYN0001"),
-                           ("val p = Point(1); val same = p == p", "LYT0006")):
+                           ("val p = Point(1); p.missing", "LYN0001")):
             with self.subTest(body=body):
                 self.main.write_text(types + "fn main(): Unit { " + body + "; }", encoding="utf-8")
                 result = subprocess.run([COMPILER, "check", self.package, "--diagnostics=json"],
@@ -254,6 +253,14 @@ fn main(): Unit {
                 diagnostic, = json.loads(result.stderr)
                 self.assertEqual(diagnostic["code"], code)
                 self.assertEqual(diagnostic["range"]["start"]["line"], 3)
+
+    def test_structural_equality_rejects_dynamic_fields(self):
+        self.main.write_text("struct Key(val value: Any)\nfn main(): Unit { val first = Key(1); val second = Key(1); print(first == second) }", encoding="utf-8")
+        result = subprocess.run([COMPILER, "check", self.package, "--diagnostics=json"], capture_output=True, timeout=10)
+        self.assertNotEqual(result.returncode, 0)
+        diagnostic, = json.loads(result.stderr)
+        self.assertEqual(diagnostic["code"], "LYT0006")
+        self.assertIn("value", diagnostic["message"])
 
     def test_inline_layout_cycle_rejected(self):
         self.main.write_text("struct Outer(val inner: Inner)\nstruct Inner(val outer: Outer)\nfn main(): Unit {}")

@@ -29,9 +29,11 @@ namespace fs = std::filesystem;
 namespace {
 
 struct LinkedDeclaration { SourceAnchor anchor; bool visible; };
+enum class SymbolKind { Type, Callable, Constant, Extension };
 struct Symbol {
     std::string name;
-    bool visible, callable, imported{}, extension{};
+    SymbolKind kind;
+    bool visible, imported{};
     std::vector<LinkedDeclaration> targets{};
     std::optional<SourceAnchor> renameTarget{};
 };
@@ -49,13 +51,14 @@ struct Linker {
     std::vector<NameReference>& references;
     bool indexing;
 
-    void declare(std::size_t file, Identifier& id, bool visible, bool callable, bool extension = false) {
+    void declare(std::size_t file, Identifier& id, bool visible, SymbolKind kind = SymbolKind::Type) {
         auto scope = sources[file].moduleId;
         auto& defs = spaces.at(scope).definitions;
+        bool callable = kind == SymbolKind::Callable;
         auto name = scope == entry && callable && id.text == "main" ? id.text : scope + "::" + id.text;
-        auto [symbol, inserted] = defs.try_emplace(id.text, Symbol{name, visible, callable, false, extension});
+        auto [symbol, inserted] = defs.try_emplace(id.text, Symbol{name, kind, visible});
         if (!inserted) {
-            if (!callable || !symbol->second.callable || name == "main") throw at(sources[file], id.span, "LYN0002", "名称已声明：" + id.text);
+            if (!callable || symbol->second.kind != SymbolKind::Callable || name == "main") throw at(sources[file], id.span, "LYN0002", "名称已声明：" + id.text);
             symbol->second.visible |= visible;
         }
         if (indexing) symbol->second.targets.push_back({{file, id.span}, visible});
@@ -117,12 +120,14 @@ struct Linker {
     }
 
     void rewrite(Module& syntax) {
-        for (auto& trait : syntax.traits) declare(trait.file, trait.name, trait.isPublic, false);
-        for (auto& record : syntax.aggregates) declare(record.file, record.name, record.isPublic, false);
-        for (auto& item : syntax.enums) declare(item.file, item.name, item.isPublic, false);
-        for (auto& item : syntax.exceptions) declare(item.file, item.name, item.isPublic, false);
-        for (auto& extension : syntax.extensions) declare(extension.file, extension.name, extension.isPublic, false, true);
-        for (auto& fn : syntax.functions) if (!fn.owner && !fn.extensionGroup) declare(fn.file, fn.name, fn.isPublic, fn.constant != ConstKind::Value);
+        for (auto& trait : syntax.traits) declare(trait.file, trait.name, trait.isPublic);
+        for (auto& record : syntax.aggregates) declare(record.file, record.name, record.isPublic);
+        for (auto& item : syntax.enums) declare(item.file, item.name, item.isPublic);
+        for (auto& item : syntax.exceptions) declare(item.file, item.name, item.isPublic);
+        for (auto& item : syntax.aliases) declare(item.file, item.name, item.isPublic);
+        for (auto& extension : syntax.extensions) declare(extension.file, extension.name, extension.isPublic, SymbolKind::Extension);
+        for (auto& fn : syntax.functions) if (!fn.owner && !fn.extensionGroup)
+            declare(fn.file, fn.name, fn.isPublic, fn.constant == ConstKind::Value ? SymbolKind::Constant : SymbolKind::Callable);
         std::map<std::size_t, std::map<std::string, const Import*>> generatedImports;
         for (const auto& use : syntax.imports) {
             const auto& source = sources[use.file];
@@ -162,7 +167,7 @@ struct Linker {
                     if (std::exchange(projection, false) || token.kind != "name") continue;
                     if (name.starts_with('`')) name = name.substr(1, name.size() - 2);
                     if (std::ranges::any_of(parameters, [&](const auto& parameter) { return parameter.text == name; })) continue;
-                    if (auto found = scope.find(std::string(name)); found != scope.end() && !found->second.callable && found->second.targets.size() == 1)
+                    if (auto found = scope.find(std::string(name)); found != scope.end() && found->second.kind == SymbolKind::Type && found->second.targets.size() == 1)
                         references.push_back({{file, {type.span.begin + token.span.begin, type.span.begin + token.span.end}}, found->second.targets.front().anchor, found->second.renameTarget});
                 }
             }
@@ -174,7 +179,7 @@ struct Linker {
         syntax.importedExtensions.resize(sources.size());
         if (!syntax.extensions.empty()) for (std::size_t file = 0; file < sources.size(); ++file) {
             std::set<std::string> groups;
-            for (const auto& [alias, symbol] : scopeOf(file)) if (symbol.imported && symbol.extension) groups.insert(symbol.name);
+            for (const auto& [alias, symbol] : scopeOf(file)) if (symbol.imported && symbol.kind == SymbolKind::Extension) groups.insert(symbol.name);
             syntax.importedExtensions[file].assign(groups.begin(), groups.end());
         }
         for (auto& extension : syntax.extensions) {
@@ -190,6 +195,7 @@ struct Linker {
             for (auto& bound : item.bounds) renameTypeIn(item.file, bound.trait);
             for (auto& entry : item.cases) for (auto& field : entry.fields) renameTypeIn(item.file, field.type, item.typeParameters);
         }
+        for (auto& alias : syntax.aliases) renameTypeIn(alias.file, alias.target);
         for (auto& trait : syntax.traits) for (auto& method : trait.methods) {
             renameTypeIn(trait.file, method.result, trait.associated);
             for (auto& parameter : method.parameters) renameTypeIn(trait.file, parameter.type, trait.associated);
@@ -207,18 +213,20 @@ struct Linker {
             for (auto& bound : fn.bounds) rename(bound.trait);
             if (!fn.result.text.empty()) renameType(fn.result);
             for (auto& param : fn.parameters) renameType(param.type);
-            auto reference = [&](Identifier& name) {
+            auto reference = [&](Identifier& name, std::optional<SymbolKind> kind = {}) {
                 if (auto found = scope.find(name.text); found != scope.end()) {
+                    if (kind && found->second.kind != *kind) return;
                     name.linked = found->second.name;
                     name.exportedOnly = found->second.imported;
                     name.renameTarget = found->second.renameTarget;
                 }
-                else if (name.text == "main") name.linked = sources[fn.file].moduleId + "::main";
+                else if (!kind && name.text == "main") name.linked = sources[fn.file].moduleId + "::main";
             };
             auto renamePattern = [&](auto&& self, Pattern& pattern) -> void {
                 if (auto* name = std::get_if<PatternName>(&pattern.node)) {
-                    if (name->owner) reference(*name->owner);
-                    else if (name->labels) reference(name->name);
+                    if (name->owner) reference(*name->owner, SymbolKind::Type);
+                    else if (name->labels) reference(name->name, SymbolKind::Type);
+                    else if (!name->escaped) reference(name->name, SymbolKind::Constant);
                 }
                 for (auto& part : pattern.parts) self(self, part);
             };
@@ -235,6 +243,10 @@ struct Linker {
                     for (auto& type : call->typeArguments) renameType(type);
                 }
                 if (auto* binding = std::get_if<Binding>(&expr.node); binding && binding->annotation) renameType(*binding->annotation);
+                if (auto* binding = std::get_if<PatternBinding>(&expr.node)) {
+                    if (binding->annotation) renameType(*binding->annotation);
+                    renamePattern(renamePattern, binding->pattern);
+                }
                 if (auto* operation = std::get_if<TypeOperation>(&expr.node)) renameType(operation->type);
                 if (auto* attempt = std::get_if<Attempt>(&expr.node)) for (auto& arm : attempt->arms) if (arm.binding) renameType(arm.binding->type);
                 if (auto* match = std::get_if<Match>(&expr.node)) for (auto& arm : match->arms) renamePattern(renamePattern, arm.pattern);
@@ -301,6 +313,10 @@ void appendCachedSyntax(Module& target, const Module& cached, std::size_t file) 
     for (auto exception : cached.exceptions) {
         exception.file = file;
         target.exceptions.push_back(std::move(exception));
+    }
+    for (auto alias : cached.aliases) {
+        alias.file = file;
+        target.aliases.push_back(std::move(alias));
     }
 }
 

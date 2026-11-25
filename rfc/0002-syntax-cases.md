@@ -89,6 +89,12 @@ fn lookup<Key, Value>(key: Key): Value? { null }
 | S2-039 | 对 `Int8` 匹配 `-128..-1` 和 `0..127`；另测 `-10..<0` 与 `0..2` | 首例穷尽整个 `Int8` 域；闭区间包含上界，`..<` 不包含上界。 |
 | S2-040 | `Left(item) | Right(item)`，其中载荷分别为 `Int` 和 `String`；另测 `Left(item) | Right(other)` | 两例都在 OR 模式处拒绝：备选必须绑定相同名称且类型一致。 |
 | S2-041 | `Int8` 只匹配 `-128..0` | 在 match 处报告缺失值 `1`；范围参与穷尽性分析，而不是退化成 `_`。 |
+| S2-042 | `Gate(open: false)`、`Gate(open: true)` 和 `_` 匹配 `class Gate(val open: Bool)`；另测只匹配 `Gate(open: true)` | Class 使用具名字段解构且按字段判断分支；Class 模式不参与穷尽推断，因此缺少 `_` 时报告不穷尽。 |
+| S2-043 | `if let Some(text) = value { text } else { "empty" }`，并分别传入 `Some("ready")` 与 `None` | 成功时绑定只在 then 分支可见；subject 仅求值一次，失败时进入 else。无 else 的 `if let` 在 `Unit` 语境下不执行失败分支。 |
+| S2-044 | `val Point(x: x) = point`；`val Some(x) = nullable` | 前者声明可供后续语句使用的 `x`；后者在模式处报 `LYT0012`，因为不能覆盖 `None`。 |
+| S2-045 | `val range: Range<Int> = 1 + 1..<2 * 3`；`items.slice(range)` | 构造从 `2` 到 `6` 的半开区间，支持直接传参和 `for`；切片复制下标 `2` 到 `5` 的元素。`0..1..2` 不可连写。 |
+| S2-044 | `match values { [] => ..., [first] => ..., [first, ..rest] => ... }` | 空、精确长度和末尾 rest 均按列表长度匹配；rest 是独立浅拷贝。`[]` 与 `[first, ..rest]` 穷尽任意 `List<T>`；只写 `[first]` 不穷尽。 |
+| S2-045 | `const Timeout: Int = 3`；分别匹配 `Timeout` 与 `` `Timeout` `` | 前者按常量值匹配；后者创建局部绑定，可在该分支中读取。 |
 
 **S2-025 · 提前返回只退出当前 lambda。** `readInt()` 总返回 `Err`，`note` 记录字符串。下面的 `probe()` 须返回 `9`，并依次记录 `second, first, after`。把 `Ok(readInt()?)` 换成 `return Ok(3)` 后，同样记录三项并返回 `3`。外层声明返回 `Int`，并不是 `?` 或 `return Ok(3)` 要匹配的返回类型。
 

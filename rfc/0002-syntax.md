@@ -73,7 +73,7 @@ val name: String? = absent()
 
 - **已定：** 在声明前缀位置，`[path]` 是标记，`@trace` 是函数装饰器，`#derive(Json)` 是声明宏调用；在表达式位置，`#query(...)` 是表达式宏调用，`items[index]` 仍是索引。宏种类必须与使用位置匹配。见[元编程与数据交换](metaprogramming-data.md#f1-macro-inputs)。
 - **已定：** 标识符区分大小写，首版为 ASCII 字母或 `_` 开头，后接 ASCII 字母、数字或 `_`，关键字作名字用反引号转义。Lyra 自有 API 和示例采用驼峰：函数、方法、参数、局部值、字段用 `lowerCamelCase`（`getUser`、`teamId`），类型、trait 和枚举分支用 `UpperCamelCase`（`Request`、`Some`）。这是命名风格，不是让词法器拒绝下划线；C ABI 原符号如 `sqlite3_open` 不改名，SQL 和 JSON 的外部键名也不受影响。
-- 当前保留词为 `fn val var const if else while for in return break continue true false struct class enum trait pub import as is async await spawn extern match null implicit defer throw try catch this static`。`init` 仅在对象声明体内引入构造器；`blocking`、`taskGroup` 和 `parallel` 仅在表达式中紧接同一行块时作为任务操作；`extension` 只在声明起始处引入扩展组；`it` 只在单参尾部 lambda 内自动绑定。裸表达式 `None` 表示空值，同名绑定可用反引号引用；在模式中按被匹配的类型解析，反引号可以强制把裸名称当绑定。
+- 当前保留词为 `fn val var const if else while for in return break continue true false struct class enum trait pub import as is async await spawn extern match null implicit defer throw try catch this static`。`type` 在顶层引入透明类型别名，在 trait 中引入关联类型；`init` 仅在对象声明体内引入构造器；`blocking`、`taskGroup` 和 `parallel` 仅在表达式中紧接同一行块时作为任务操作；`extension` 只在声明起始处引入扩展组；`it` 只在单参尾部 lambda 内自动绑定。裸表达式 `None` 表示空值，同名绑定可用反引号引用；在模式中按被匹配的类型解析，反引号可以强制把裸名称当绑定。
 - **已定：** `//` 行注释及 `/* ... */` 块注释。块注释不嵌套，遇到首个 `*/` 结束；到文件末尾未闭合，定位开头的 `/*`。注释不拼接两侧 token，内部的换行参与和普通空白相同的换行规则。
 - **已定：** `Int`/`UInt` 为 64 位；支持十进制、`0x`、`0b`、`0o` 和数字分隔符 `_`。无后缀浮点默认 `Float64`。双引号为字符串，单引号为单个 Unicode 标量。`${expr}` 在匹配的 `}` 结束；内部的字符串和花括号按表达式解析，而不是遇到第一个 `}` 就截断。插值按 `Display` 的 `toString` 检查，失败定位到插值内的表达式。
 - 字符和普通字符串支持 `\n`、`\r`、`\t`、`\0`、`\\`、转义引号和 `\u{1F642}`（1–6 个十六进制数字，必须是 Unicode 标量）；字符串中可写 `\${` 输出字面量 `${`。只有插值表达式和原始字面量可跨行。
@@ -104,10 +104,11 @@ val name: String? = absent()
 4. 前缀 `!`、`-`，从右向左。
 5. `*`、`/`、`%`。
 6. `+`、`-`。
-7. `<`、`<=`、`>`、`>=`、`==`、`!=`、`is T`、`as? T`、`as dyn Trait`；本层不连写，区间判断写 `low < value && value < high`。
-8. `&&`，再是 `||`（两级，各自左结合）。
-9. `??`，右结合。
-10. `=` 与复合赋值（如 `+=`）；不连写赋值，结果为 `Unit`。
+7. `..` 与 `..<`，构造 `Range<Int>`；不连写。
+8. `<`、`<=`、`>`、`>=`、`==`、`!=`、`is T`、`as? T`、`as dyn Trait`；本层不连写，区间判断写 `low < value && value < high`。
+9. `&&`，再是 `||`（两级，各自左结合）。
+10. `??`，右结合。
+11. `=` 与复合赋值（如 `+=`）；不连写赋值，结果为 `Unit`。
 
 `?.`、`??` 是完整记号，类型位置的 `T?` 是可空类型，都不是对表达式重复使用传播符。
 
@@ -121,10 +122,10 @@ val name: String? = absent()
 
 - 值位置的 `if` 必须有 `else`；各正常完成的分支须能得到目标类型。语句位置允许 `if id == null { return Response.status(400) }`。条件要求 `Bool`，不按数字或对象的“真假”转换。普通循环结果为 `Unit`；`while`、`for item in items` 支持不带值的 `break` / `continue`，只针对当前函数内最近的循环。
 - `for item in items` 只求值一次输入，每轮建立新的只读绑定。对 `List<T>` 记录开始时的长度；随后追加的元素不延长遍历，修改尚未遍历的下标会在读取时可见。
-- `for i in start..<end` 遍历半开区间，`for i in start..end` 包含终点。两个 `Int` 端点从左到右各求值一次，步长为 `1`；起点大于终点时遍历为空，闭区间到达 `Int` 最大值后直接结束。区间写法目前只在 `for` 的头部使用。
+- `start..<end` 和 `start..end` 是不可变的 `Range<Int>` 值，可以保存、传参、返回及参与编译期求值；两个端点从左到右各求值一次。区间公开只读的 `start`、`end` 和 `inclusive`，按这三个值比较、哈希。`for i in range` 按步长 `1` 迭代，闭区间包含终点；起点大于终点时不迭代，闭区间到达 `Int` 最大值后直接结束。
 - `for character in text` 遍历 `String` 的 Unicode 标量（`Char`）；`for byte in bytes` 遍历 `Bytes` 的 `UInt8`。其他类型通过可见的同步方法 `iterator(): I` 和 `I.next(): Option<T>` 参与遍历，两个方法除接收者外不接收参数，也不声明类型形参。进入循环时调用一次 `iterator()`，每轮调用一次 `next()`；只有最外层的 `None` 才结束，`Some(None)` 仍是一个元素。协议按静态类型检查；有状态的游标可以用 Class 保存可变位置。`...` 的展开仍只接受 `List<T>`。
 - 标准库的 [`HashMap` 和 `HashSet`](../std/collections/README.md#字典与集合) 通过这个协议遍历进入循环时的浅快照，分别产出键值项和集合元素，不承诺顺序。
-- `match` 必须穷尽。被匹配值只求一次，按源码顺序选第一个模式和守卫都通过的分支。内置和类型和[封闭枚举](language-core.md#封闭枚举与匹配)可嵌套匹配，也可以匹配 `Bool`、整数、`Char` 和 `String` 字面量；整数范围参与穷尽性分析。`_` 忽略该位置，普通标识符创建只读绑定。用 `=>` 隔开模式和值，分支之间用逗号，允许末尾逗号。
+- `match` 必须穷尽。被匹配值只求一次，按源码顺序选第一个模式和守卫都通过的分支。内置和类型和[封闭枚举](language-core.md#封闭枚举与匹配)可嵌套匹配，也可以匹配 `Bool`、整数、`Char` 和 `String` 字面量；整数范围参与穷尽性分析。未转义的顶层常量名按常量值匹配，反引号强制绑定。Struct/Class 使用具名字段模式；列表支持 `[]`、精确长度模式和末尾 `..rest`。`_` 忽略该位置，普通标识符创建只读绑定。用 `=>` 隔开模式和值，分支之间用逗号，允许末尾逗号。
 - 模式支持 `|` 表示 OR，例如 `Text(value) | Failure(value)`；可嵌套在载荷和 Struct 字段内。每个备选分支必须绑定完全相同名称且类型一致的只读值。整数模式支持整数字面量端点的 `lower..upper`（含上界）和 `lower..<upper`（不含上界）；倒序或空区间不匹配任何值。浮点范围不属于模式，需用守卫表达。
 - `match value { Point(x: 0, y: distance) => distance, _ => 0 }` 按字段名解构 Struct，不调用构造器；可以省去不关心的字段，显式解构的字段遵守访问权限。`Some(x) if x > 0 => x` 只在模式命中后求值 `Bool` 守卫，守卫为假就尝试下一分支；绑定仅在同一分支的守卫和结果中可见。有守卫的分支不计入穷尽检查。
 - **已定：** 后缀 `?` 由操作数静态类型区分 `Err` 与 `None`，要求最近的函数或 lambda 返回兼容类型；对 `async fn` 检查其声明的完成值。不会把 `None` 自动变成 `Err` 或 HTTP 状态。[同步 `defer`](errors-and-resources.md) 在离开登记的块时倒序执行一次，包括 `return`、`?`、异常与协作式取消；`defer` 自身不可 `await`。

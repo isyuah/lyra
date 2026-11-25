@@ -77,6 +77,23 @@ class Modules(unittest.TestCase):
         self.assertEqual(error['code'], 'LYN0003')
         self.assertIn('secret', error['message'])
 
+    def test_type_and_constant_aliases_through_reexports(self):
+        (self.lib / 'src/net/types.ly').write_text('pub type Identity = Int\npub const Limit: Identity = 42\n', encoding='utf-8')
+        (self.lib / 'src/lib.ly').write_text('pub import self.net.Identity as Owner\npub import self.net.Limit as Capacity\n', encoding='utf-8')
+        self.source.write_text('''import cfg.Owner as UserId
+import cfg.Capacity as Limit
+type LocalId = UserId
+fn classify(value: LocalId): String {
+    match value { Limit => "full", `Limit` => "free ${Limit}" }
+}
+fn main(): Unit {
+    val owner: UserId = 42
+    print(classify(owner))
+    print(classify(7))
+}
+''', encoding='utf-8')
+        self.assertEqual(self.command('run', self.app).stdout, 'full\nfree 7\n')
+
     def test_enum_variants_and_implicit_conversion_across_modules(self):
         (self.lib / 'src/net/status.ly').write_text('''
 enum Internal { Wait }

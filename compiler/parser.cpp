@@ -250,7 +250,7 @@ struct Infix { std::string_view text; int rank; Op op; };
 constexpr Infix infix[] = {
     {"=", 1, Op::Set}, {"+=", 1, Op::AddSet}, {"-=", 1, Op::SubSet}, {"*=", 1, Op::MulSet}, {"/=", 1, Op::DivSet}, {"%=", 1, Op::RemSet},
     {"||", 3, Op::Or}, {"&&", 4, Op::And}, {"==", 5, Op::Eq}, {"!=", 5, Op::Ne}, {"<", 5, Op::Lt}, {"<=", 5, Op::Le}, {">", 5, Op::Gt}, {">=", 5, Op::Ge},
-    {"+", 6, Op::Add}, {"-", 6, Op::Sub}, {"*", 7, Op::Mul}, {"/", 7, Op::Div}, {"%", 7, Op::Rem}
+    {"+", 7, Op::Add}, {"-", 7, Op::Sub}, {"*", 8, Op::Mul}, {"/", 8, Op::Div}, {"%", 8, Op::Rem}
 };
 
 class Parser {
@@ -307,6 +307,17 @@ public:
             if (is("trait")) {
                 if (firstPrefix != module.expansions.size()) throw at(source, module.expansions[firstPrefix].name.span, "LYM0001", "不能修饰 trait 约束声明");
                 module.traits.push_back(trait(pub));
+                continue;
+            }
+            if (is("type")) {
+                if (firstPrefix != module.expansions.size()) throw at(source, module.expansions[firstPrefix].name.span, "LYM0001", "不能修饰类型别名");
+                consume();
+                TypeAlias alias{file, identifier(), {}, pub};
+                require("=");
+                alias.target = type();
+                if (is(";")) consume();
+                else if (token.kind != Kind::End && !token.newlineBefore) throw at(source, token.span, "LYP0001", "类型别名后需要换行或分号");
+                module.aliases.push_back(std::move(alias));
                 continue;
             }
             if (is("enum")) {
@@ -805,12 +816,21 @@ private:
         }
         if (is("val") || is("var")) {
             bool writable = text(consume()) == "var";
-            auto name = identifier();
-            std::optional<Identifier> annotation;
-            if (is(":")) { consume(); annotation = type(); }
-            require("=");
-            auto value = expression();
-            return add({start, nodes[value].span.end}, Binding{std::move(name), writable, std::move(annotation), value});
+            auto initializer = [&] {
+                std::optional<Identifier> annotation;
+                if (is(":")) { consume(); annotation = type(); }
+                require("=");
+                return std::pair{std::move(annotation), expression()};
+            };
+            bool simpleName = (token.kind == Kind::Name || token.kind == Kind::Escaped) && !is("_") && (text(next) == ":" || text(next) == "=");
+            if (writable || simpleName) {
+                auto name = identifier();
+                auto [annotation, value] = initializer();
+                return add({start, nodes[value].span.end}, Binding{std::move(name), writable, std::move(annotation), value});
+            }
+            auto binding = pattern();
+            auto [annotation, value] = initializer();
+            return add({start, nodes[value].span.end}, PatternBinding{std::move(binding), std::move(annotation), value});
         }
         if (is("return")) {
             auto site = consume().span;
@@ -841,13 +861,8 @@ private:
         auto item = identifier();
         require("in");
         auto input = expression(false, 1, false);
-        std::optional<ForRange> range;
-        if (!token.newlineBefore && (is("..") || is("..<"))) {
-            bool inclusive = text(consume()) == "..";
-            range = ForRange{expression(false, 1, false), inclusive};
-        }
         auto body = block();
-        return add({site.begin, nodes[body].span.end}, For{std::move(item), input, body, range});
+        return add({site.begin, nodes[body].span.end}, For{std::move(item), input, body});
     }
 
     ExprId optional(ExprId subject, Identifier payload, ExprId present, ExprId absent, Span site, Span span, OptionalForm form) {
@@ -881,6 +896,15 @@ private:
                 auto target = type();
                 auto span = Span{nodes[left].span.begin, target.span.end};
                 left = add(span, TypeOperation{operation, left, std::move(target), site});
+                continue;
+            }
+            constexpr int rangeRank = 6;
+            if ((is("..") || is("..<")) && minRank <= rangeRank) {
+                if (previous == rangeRank) throw at(source, token.span, "LYP0001", "区间运算符不能连写");
+                previous = rangeRank;
+                bool inclusive = text(consume()) == "..";
+                auto right = expression(inParens, rangeRank + 1, trailingBlock);
+                left = add({nodes[left].span.begin, nodes[right].span.end}, RangeValue{left, right, inclusive});
                 continue;
             }
             auto op = std::ranges::find(infix, text(token), &Infix::text);
@@ -988,6 +1012,32 @@ private:
 
     Pattern patternAtom() {
         auto site = token.span;
+        if (is("[")) {
+            consume();
+            std::vector<Pattern> parts;
+            PatternList list{};
+            while (!is("]")) {
+                if (is("..")) {
+                    consume();
+                    list.openEnd = true;
+                    if (token.kind != Kind::Name && token.kind != Kind::Escaped)
+                        throw at(source, token.span, "LYP0001", "列表 rest 模式需要绑定名称");
+                    if (is("_")) consume();
+                    else list.rest = identifier();
+                    if (is(",")) {
+                        auto comma = consume().span;
+                        if (!is("]")) throw at(source, comma, "LYP0001", "列表 rest 模式必须位于末尾");
+                    }
+                    break;
+                }
+                parts.push_back(pattern());
+                if (!is(",")) break;
+                consume();
+                if (is("]")) break;
+            }
+            auto end = require("]").span.end;
+            return {{site.begin, end}, std::move(list), std::move(parts)};
+        }
         if (token.kind == Kind::Number || (is("-") && next.kind == Kind::Number)) {
             auto lower = patternInteger(site);
             if (is("..") || is("..<")) {
@@ -1213,6 +1263,26 @@ private:
         }
         if (is("if")) {
             consume();
+            if (is("let")) {
+                consume();
+                auto matched = pattern();
+                require("=");
+                auto subject = expression(false, 1, false);
+                auto yes = block();
+                std::optional<ExprId> no;
+                if (is("else")) { consume(); no = is("if") ? atom(false, trailingBlock) : block(); }
+                if (!no) {
+                    auto point = nodes[yes].span.end;
+                    no = add({point, point}, Block{{}, {point, point}});
+                }
+                auto end = nodes[*no].span.end;
+                auto point = nodes[yes].span.end;
+                Match match{subject, {
+                    {std::move(matched), yes},
+                    {Pattern{{point, point}, std::monostate{}}, *no},
+                }};
+                return add({start, end}, std::move(match));
+            }
             auto condition = expression(false, 1, false);
             auto yes = block();
             std::optional<ExprId> no;

@@ -43,6 +43,7 @@ struct RealLiteral { std::string digits; std::optional<unsigned> width; };
 enum class Op { Set, AddSet, SubSet, MulSet, DivSet, RemSet, Or, And, Eq, Ne, Lt, Le, Gt, Ge, Add, Sub, Mul, Div, Rem, Not };
 struct Unary { Op op; Span site; ExprId operand; };
 struct Binary { Op op; Span site; ExprId left, right; };
+struct RangeValue { ExprId start, end; bool inclusive; };
 enum class TypeOperator { Is, CheckedCast, InterfaceCast };
 struct TypeOperation { TypeOperator op; ExprId value; Identifier type; Span site; };
 struct Statement { ExprId expression; std::optional<Span> semicolon; };
@@ -50,8 +51,7 @@ struct Block { std::vector<Statement> statements; Span end; };
 struct Binding { Identifier name; bool writable; std::optional<Identifier> annotation; ExprId value; };
 struct Conditional { ExprId condition, yes; std::optional<ExprId> no; };
 struct While { ExprId condition, body; };
-struct ForRange { ExprId end; bool inclusive; };
-struct For { Identifier item; ExprId input, body; std::optional<ForRange> range; };
+struct For { Identifier item; ExprId input, body; };
 struct Return { std::optional<ExprId> value; };
 struct Raise { Span site; std::optional<ExprId> value; };
 struct CatchBinding { Identifier name, type; };
@@ -73,11 +73,13 @@ struct PatternName {
 };
 struct PatternIntegerRange { IntegerLiteral lower, upper; bool inclusive; };
 struct PatternAlternatives {};
+struct PatternList { bool openEnd; std::optional<Identifier> rest; };
 struct Pattern {
     Span span;
-    std::variant<std::monostate, PatternName, SumTag, IntegerLiteral, PatternIntegerRange, PatternAlternatives, bool, StringLiteral, CharLiteral> node;
+    std::variant<std::monostate, PatternName, SumTag, IntegerLiteral, PatternIntegerRange, PatternAlternatives, PatternList, bool, StringLiteral, CharLiteral> node;
     std::vector<Pattern> parts{};
 };
+struct PatternBinding { Pattern pattern; std::optional<Identifier> annotation; ExprId value; };
 struct MatchArm { Pattern pattern; ExprId value; std::optional<ExprId> guard{}; };
 enum class OptionalForm { None, Access, Default };
 struct Match { ExprId subject; std::vector<MatchArm> arms; OptionalForm optional{}; Span operation{}; };
@@ -85,7 +87,7 @@ enum class Jump { Break, Continue };
 
 struct Expr {
     Span span;
-    std::variant<IntegerLiteral, RealLiteral, bool, StringLiteral, BytesLiteral, CharLiteral, DisplayValue, TextTemplate, Identifier, This, Call, Member, QualifiedMember, Unary, Binary, TypeOperation, Block, Binding, Conditional, While, For, Return, Raise, Attempt, Jump, TaskOp, Blocking, AsyncBlock, Deferred, EmptyOption, Propagate, Match, ListLiteral, Index, Lambda> node;
+    std::variant<IntegerLiteral, RealLiteral, bool, StringLiteral, BytesLiteral, CharLiteral, DisplayValue, TextTemplate, Identifier, This, Call, Member, QualifiedMember, Unary, Binary, RangeValue, TypeOperation, Block, Binding, PatternBinding, Conditional, While, For, Return, Raise, Attempt, Jump, TaskOp, Blocking, AsyncBlock, Deferred, EmptyOption, Propagate, Match, ListLiteral, Index, Lambda> node;
 };
 
 struct Parameter { Identifier name, type; bool variadic{}; std::optional<ExprId> defaultValue{}; std::vector<Attribute> attributes{}; };
@@ -125,12 +127,13 @@ struct EnumField { std::optional<Identifier> name; Identifier type; };
 struct EnumCase { Identifier name; std::vector<EnumField> fields; };
 struct Enumeration { std::size_t file; Identifier name; std::vector<EnumCase> cases; bool isPublic; std::vector<Identifier> typeParameters{}; std::vector<Bound> bounds{}; };
 struct ExceptionType { std::size_t file; Identifier name; bool isPublic; };
+struct TypeAlias { std::size_t file; Identifier name, target; bool isPublic; };
 struct Import { std::size_t file; bool isPublic; std::vector<Identifier> path; Identifier alias; };
 struct Expansion { std::size_t file; Identifier name; std::optional<Identifier> argument; bool decorator; bool record; std::size_t target; std::vector<Identifier> exports{}; };
 struct MacroArgument { Span span; std::optional<std::string> literal; };
 struct ExpressionExpansion { Identifier name; Span span, argumentsSpan; std::vector<MacroArgument> arguments; };
 struct SyntaxToken { Span span; std::string kind; };
-struct Module { std::vector<Function> functions; std::vector<Aggregate> aggregates; std::vector<Import> imports; std::vector<Expansion> expansions; std::vector<Trait> traits{}; std::vector<Enumeration> enums{}; std::vector<Extension> extensions{}; std::vector<std::vector<std::string>> importedExtensions{}; std::vector<ExceptionType> exceptions{}; };
+struct Module { std::vector<Function> functions; std::vector<Aggregate> aggregates; std::vector<Import> imports; std::vector<Expansion> expansions; std::vector<Trait> traits{}; std::vector<Enumeration> enums{}; std::vector<Extension> extensions{}; std::vector<std::vector<std::string>> importedExtensions{}; std::vector<ExceptionType> exceptions{}; std::vector<TypeAlias> aliases{}; };
 Module parse(const std::vector<Source>& sources);
 void parseFile(Module& module, const Source& source, std::size_t file, std::vector<ExpressionExpansion>* expressions = nullptr);
 void validateMacroExpression(const Source& generated);

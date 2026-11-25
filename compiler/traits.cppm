@@ -2,9 +2,11 @@ module;
 #include <algorithm>
 #include <cstddef>
 #include <map>
+#include <optional>
 #include <set>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 export module lyra.traits;
@@ -19,6 +21,12 @@ struct RequiredMethod {
     bool asynchronous;
     bool operator==(const RequiredMethod&) const = default;
 };
+
+std::optional<ValueOperation> valueConstraint(std::string_view name) {
+    if (name == "Eq") return ValueOperation::Equal;
+    if (name == "Hash") return ValueOperation::Hash;
+    return {};
+}
 
 std::string describeRequirement(const std::string& name, const RequiredMethod& method, const auto& typeName) {
     std::string text = method.asynchronous ? "async fn " : "fn ";
@@ -36,6 +44,7 @@ class StructuralContracts {
 
 public:
     void declare(const Trait& trait, const Source& source) {
+        if (valueConstraint(trait.name.text)) throw at(source, trait.name.span, "LYN0002", "trait 名称是内置值能力：" + trait.name.text);
         if (!traits.emplace(trait.name.text, &trait).second) throw at(source, trait.name.span, "LYN0002", "结构约束重复：" + trait.name.text);
         std::set<std::string> associated, methods;
         for (const auto& type : trait.associated)
@@ -49,7 +58,7 @@ public:
     }
 
     void bind(Type variable, const Identifier& bound, const Source& source) {
-        if (!traits.contains(bound.text)) throw at(source, bound.span, "LYG0005", "找不到结构约束 trait：" + bound.text);
+        if (!valueConstraint(bound.text) && !traits.contains(bound.text)) throw at(source, bound.span, "LYG0005", "找不到结构约束 trait：" + bound.text);
         auto& constraints = variables[variable.id];
         if (std::ranges::find(constraints, bound.text) != constraints.end())
             throw at(source, bound.span, "LYN0002", "结构约束重复：" + bound.text);

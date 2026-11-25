@@ -15,6 +15,7 @@ uint8_t lyraUtf8Valid(const char* bytes, size_t length);
 const void* lyraStringConcat(const void* left, const void* right);
 const void* lyraStringJoin(size_t count, const void* const* parts);
 uint8_t lyraStringEqual(const void* left, const void* right);
+uint64_t lyraStringHash(const void* value);
 size_t lyraStringScalarCount(const void* text);
 uint8_t lyraBytesUtf8(const void* bytes);
 uint32_t lyraStringAtByte(const void* text, size_t offset);

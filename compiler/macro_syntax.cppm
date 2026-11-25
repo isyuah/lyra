@@ -58,18 +58,22 @@ struct SyntaxArena {
                 return "call";
             } else if constexpr (std::is_same_v<Node, Binary>) {
                 child(node.left); children.push_back(input("operator", node.site)); child(node.right); return "binary";
+            } else if constexpr (std::is_same_v<Node, RangeValue>) {
+                child(node.start); child(node.end); return node.inclusive ? "rangeInclusive" : "rangeExclusive";
             } else if constexpr (std::is_same_v<Node, Unary>) {
                 children.push_back(input("operator", node.site)); child(node.operand); return "unary";
             } else if constexpr (std::is_same_v<Node, Return> || std::is_same_v<Node, Raise>) {
                 optional(node.value); return std::is_same_v<Node, Return> ? "return" : "throw";
             } else if constexpr (std::is_same_v<Node, Binding>) {
                 named("name", node.name); if (node.annotation) named("type", *node.annotation); child(node.value); return node.writable ? "var" : "val";
+            } else if constexpr (std::is_same_v<Node, PatternBinding>) {
+                children.push_back(input("pattern", node.pattern.span)); if (node.annotation) named("type", *node.annotation); child(node.value); return "val";
             } else if constexpr (std::is_same_v<Node, Conditional>) {
                 child(node.condition); child(node.yes); optional(node.no); return "if";
             } else if constexpr (std::is_same_v<Node, While>) {
                 child(node.condition); child(node.body); return "while";
             } else if constexpr (std::is_same_v<Node, For>) {
-                named("name", node.item); child(node.input); if (node.range) child(node.range->end); child(node.body); return "for";
+                named("name", node.item); child(node.input); child(node.body); return "for";
             } else if constexpr (std::is_same_v<Node, Member>) {
                 child(node.receiver); named("name", node.name); return "member";
             } else if constexpr (std::is_same_v<Node, QualifiedMember>) {

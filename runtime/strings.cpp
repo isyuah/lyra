@@ -2,6 +2,7 @@
 #include "strings.h"
 #include <lyra/string.h>
 #include <lyra/utf8.hpp>
+#include <lyra/value_hash.hpp>
 
 #include <cinttypes>
 #include <cstddef>
@@ -92,6 +93,10 @@ const void* lyraStringJoin(std::size_t count, const void* const* parts) {
 std::uint8_t lyraStringEqual(const void* left, const void* right) {
     auto count = lyraStringLength(left);
     return count == lyraStringLength(right) && std::memcmp(lyraStringBytes(left), lyraStringBytes(right), count) == 0;
+}
+
+std::uint64_t lyraStringHash(const void* value) {
+    return lyra::hashValueBytes({lyraStringBytes(value), lyraStringLength(value)});
 }
 
 std::size_t lyraStringScalarCount(const void* text) {

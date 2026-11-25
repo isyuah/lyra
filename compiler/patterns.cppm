@@ -16,13 +16,13 @@ namespace {
 
 using PatternRow = std::vector<const CheckedPattern*>;
 using Witness = std::vector<std::string>;
-struct Constructor { PatternConstructor key; std::span<const Type> fields; };
+struct Constructor { PatternConstructor key; std::vector<Type> fields; };
 
 std::vector<Constructor> constructors(const CheckedModule& module, Type type) {
     switch (type.kind) {
         case Type::Bool: return {{true, {}}, {false, {}}};
-        case Type::Option: return {{SumTag::None, {}}, {SumTag::Some, {&module.sumTypes[type.id].success, 1}}};
-        case Type::Result: return {{SumTag::Ok, {&module.sumTypes[type.id].success, 1}}, {SumTag::Err, {&module.sumTypes[type.id].failure, 1}}};
+        case Type::Option: return {{SumTag::None, {}}, {SumTag::Some, {module.sumTypes[type.id].success}}};
+        case Type::Result: return {{SumTag::Ok, {module.sumTypes[type.id].success}}, {SumTag::Err, {module.sumTypes[type.id].failure}}};
         case Type::Enum: {
             std::vector<Constructor> result;
             const auto& payloads = module.enums[type.id].payloads;
@@ -32,13 +32,97 @@ std::vector<Constructor> constructors(const CheckedModule& module, Type type) {
         case Type::Record:
             if (!module.aggregates[type.id].syntax.reference) return {{PatternProduct{}, module.aggregates[type.id].fields}};
             break;
+        case Type::List: return {{ListTag{false, module.listElements[type.id], type}, {}}, {ListTag{true, module.listElements[type.id], type}, {module.listElements[type.id], type}}};
         default: break;
     }
     return {};
 }
 
 bool wildcard(const CheckedPattern* pattern) {
-    return !pattern || std::holds_alternative<std::monostate>(pattern->node) || std::holds_alternative<PatternSlot>(pattern->node);
+    return !pattern || std::holds_alternative<std::monostate>(pattern->node) || std::holds_alternative<PatternSlot>(pattern->node) ||
+        std::holds_alternative<PatternListRest>(pattern->node);
+}
+
+bool plainDestructure(const CheckedPattern& pattern) {
+    if (wildcard(&pattern)) return true;
+    auto* constructor = std::get_if<PatternConstructor>(&pattern.node);
+    return constructor && (std::holds_alternative<PatternProduct>(*constructor) || std::holds_alternative<PatternClass>(*constructor)) &&
+        std::ranges::all_of(pattern.parts, plainDestructure);
+}
+
+std::optional<CheckedPattern> constantPattern(const CheckedModule& module, const ConstValue& value, Type type) {
+    if (module.valueOverrides.contains({type, ValueOperation::Equal})) return {};
+    if (const auto* scalar = std::get_if<ConstScalar>(&value)) {
+        if (const auto* flag = std::get_if<bool>(scalar)) return CheckedPattern{PatternConstructor(*flag)};
+        if (const auto* integer = std::get_if<std::uint64_t>(scalar)) return CheckedPattern{*integer};
+        if (const auto* text = std::get_if<std::string>(scalar)) return CheckedPattern{StringLiteral{*text}};
+        return {};
+    }
+    const auto& composite = module.constantComposites[std::get<ConstRef>(value).index];
+    if (type.kind == Type::Record) {
+        if (module.aggregates[type.id].syntax.reference || !std::holds_alternative<std::monostate>(composite.tag)) return {};
+        CheckedPattern result{PatternConstructor(PatternProduct{}), {}};
+        const auto& fields = module.aggregates[type.id].fields;
+        for (std::size_t slot = 0; slot < fields.size(); ++slot) {
+            auto part = constantPattern(module, composite.fields[slot], fields[slot]);
+            if (!part) return {};
+            result.parts.push_back(std::move(*part));
+        }
+        return result;
+    }
+    if (type.kind == Type::Enum) {
+        const auto* tag = std::get_if<VariantTag>(&composite.tag);
+        if (!tag) return {};
+        CheckedPattern result{PatternConstructor(*tag), {}};
+        const auto& fields = module.enums[type.id].payloads[tag->index];
+        for (std::size_t slot = 0; slot < fields.size(); ++slot) {
+            auto part = constantPattern(module, composite.fields[slot], fields[slot]);
+            if (!part) return {};
+            result.parts.push_back(std::move(*part));
+        }
+        return result;
+    }
+    if (type.kind == Type::Option || type.kind == Type::Result) {
+        const auto* tag = std::get_if<SumTag>(&composite.tag);
+        if (!tag) return {};
+        CheckedPattern result{PatternConstructor(*tag), {}};
+        if (*tag != SumTag::None) {
+            const auto& shape = module.sumTypes[type.id];
+            auto field = successTag(*tag) ? shape.success : shape.failure;
+            auto part = constantPattern(module, composite.fields.front(), field);
+            if (!part) return {};
+            result.parts.push_back(std::move(*part));
+        }
+        return result;
+    }
+    return {};
+}
+
+CheckedPattern normalize(const CheckedModule& module, const CheckedPattern& pattern, Type type, PatternUse use) {
+    if (use == PatternUse::Binding && plainDestructure(pattern)) return {};
+    if (const auto* constant = std::get_if<PatternConstant>(&pattern.node))
+        if (module.constants[constant->target])
+            if (auto resolved = constantPattern(module, *module.constants[constant->target], constant->type)) return std::move(*resolved);
+    auto result = pattern;
+    if (std::holds_alternative<CheckedAlternatives>(pattern.node)) {
+        for (auto& part : result.parts) part = normalize(module, part, type, use);
+    } else if (const auto* constructor = std::get_if<PatternConstructor>(&pattern.node)) {
+        if (const auto* list = std::get_if<ListTag>(constructor); list && list->cons) {
+            result.parts[0] = normalize(module, result.parts[0], list->element, use);
+            result.parts[1] = normalize(module, result.parts[1], list->list, use);
+        } else if (const auto* variant = std::get_if<VariantTag>(constructor)) {
+            const auto& fields = module.enums[type.id].payloads[variant->index];
+            for (std::size_t slot = 0; slot < result.parts.size(); ++slot) result.parts[slot] = normalize(module, result.parts[slot], fields[slot], use);
+        } else if (const auto* tag = std::get_if<SumTag>(constructor); tag && *tag != SumTag::None) {
+            const auto& shape = module.sumTypes[type.id];
+            auto field = successTag(*tag) ? shape.success : shape.failure;
+            result.parts.front() = normalize(module, result.parts.front(), field, use);
+        } else if (std::holds_alternative<PatternProduct>(*constructor) || std::holds_alternative<PatternClass>(*constructor)) {
+            const auto& fields = module.aggregates[type.id].fields;
+            for (std::size_t slot = 0; slot < result.parts.size(); ++slot) result.parts[slot] = normalize(module, result.parts[slot], fields[slot], use);
+        }
+    }
+    return result;
 }
 
 struct IntegerInterval { std::uint64_t first, last; bool empty; };
@@ -84,6 +168,10 @@ std::string integerWitness(Type type, std::uint64_t ordered) {
 }
 
 std::string display(const CheckedModule& module, Type type, const Constructor& constructor, std::span<const std::string> fields) {
+    if (const auto* list = std::get_if<ListTag>(&constructor.key)) {
+        if (!list->cons) return "[]";
+        return "[" + fields[0] + ", .." + fields[1] + "]";
+    }
     if (const auto* tag = std::get_if<SumTag>(&constructor.key)) {
         std::string name(tagName(*tag));
         return fields.empty() ? name : name + "(" + fields.front() + ")";
@@ -211,9 +299,12 @@ std::optional<Witness> uncovered(const CheckedModule& module, std::span<const Ty
 
 }
 
-export std::optional<std::string> missingPattern(const CheckedModule& module, Type subject, std::span<const CheckedPattern* const> patterns) {
+export std::optional<std::string> missingPattern(const CheckedModule& module, Type subject, std::span<const CheckedPattern* const> patterns, PatternUse use) {
+    std::vector<CheckedPattern> normalized;
+    normalized.reserve(patterns.size());
+    for (const auto* pattern : patterns) normalized.push_back(normalize(module, *pattern, subject, use));
     std::vector<PatternRow> rows;
-    for (const auto* pattern : patterns) rows.push_back({pattern});
+    for (const auto& pattern : normalized) rows.push_back({&pattern});
     if (auto missing = uncovered(module, {&subject, 1}, rows)) return std::move(missing->front());
     return std::nullopt;
 }

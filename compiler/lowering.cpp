@@ -9,6 +9,7 @@ module;
 #include <llvm/IR/Module.h>
 #include <llvm/IR/Verifier.h>
 #include <llvm/Support/MathExtras.h>
+#include <lyra/value_hash.hpp>
 #include <map>
 #include <optional>
 #include <set>
@@ -42,6 +43,7 @@ struct Layouts {
     mutable std::map<Type, llvm::GlobalVariable*> typeTokens{};
     mutable std::set<Type> initializedTypeTokens{};
     mutable std::map<std::vector<std::size_t>, llvm::Constant*> interfaceTables{};
+    mutable std::map<std::pair<Type, ValueOperation>, llvm::Function*> valueHelpers{};
     bool workers{};
 
     Layouts(const CheckedModule& program, Builder& builder) : program(program) {
@@ -100,6 +102,7 @@ struct Layouts {
             case Type::Task: return "Task<" + nested(program.taskResults[type.id]) + ">";
             case Type::TaskLocal: return "TaskLocal<" + nested(program.taskLocalValues[type.id]) + ">";
             case Type::List: return "List<" + nested(program.listElements[type.id]) + ">";
+            case Type::IntRange: return "Range<Int>";
             case Type::Option: return "Option<" + nested(program.sumTypes[type.id].success) + ">";
             case Type::Result: return "Result<" + nested(program.sumTypes[type.id].success) + ", " + nested(program.sumTypes[type.id].failure) + ">";
             case Type::Dyn: return "dyn " + program.traits[type.id].name.text;
@@ -232,12 +235,134 @@ struct Layouts {
         case Type::String: case Type::Bytes: case Type::Task: case Type::CPtr: case Type::List: case Type::Exception: case Type::Closure: case Type::Error: case Type::TaskLocal: return builder.getPtrTy();
         case Type::Variable: case Type::Projection: llvm_unreachable("abstract type reached LLVM lowering");
         case Type::Any: case Type::Dyn: return llvm::StructType::get(builder.getContext(), {builder.getPtrTy(), builder.getPtrTy()});
+        case Type::IntRange: return llvm::StructType::get(builder.getContext(), {builder.getInt64Ty(), builder.getInt64Ty(), builder.getInt1Ty()});
         case Type::Record: return reference(type) ? static_cast<llvm::Type*>(builder.getPtrTy()) : objects[type.id];
         case Type::Enum: return llvm::StructType::get(builder.getContext(), {builder.getInt32Ty(), builder.getPtrTy()});
         case Type::Option: return llvm::StructType::get(builder.getContext(), {builder.getInt1Ty(), native(builder, program.sumTypes[type.id].success)});
         case Type::Result: return llvm::StructType::get(builder.getContext(), {builder.getInt1Ty(), native(builder, program.sumTypes[type.id].success), native(builder, program.sumTypes[type.id].failure), builder.getPtrTy()});
         }
         llvm_unreachable("invalid Lyra type");
+    }
+};
+
+struct NativeValues {
+    const Layouts& layouts;
+    const std::vector<llvm::Function*>& functions;
+
+    struct Result { Value value; bool mayThrow; };
+
+    static Value mix(Builder& builder, Value state, Value part) {
+        auto mixed = builder.CreateMul(builder.CreateXor(state, part), builder.getInt64(valueHashFactor));
+        return builder.CreateXor(mixed, builder.CreateLShr(mixed, 32));
+    }
+
+    Result emit(Builder& builder, Type type, ValueOperation operation, Value left, Value right, Value error) const {
+        bool equality = operation == ValueOperation::Equal;
+        std::vector<Value> args{left};
+        if (equality) args.push_back(right);
+        args.push_back(error);
+        auto& module = *builder.GetInsertBlock()->getModule();
+        if (auto found = layouts.program.valueOverrides.find({type, operation}); found != layouts.program.valueOverrides.end())
+            return {builder.CreateCall(functions[found->second], args), true};
+        if ((type.kind == Type::Record && !layouts.reference(type)) || type.kind == Type::Enum || type.kind == Type::Option || type.kind == Type::Result || type == Type::IntRange)
+            return {builder.CreateCall(helper(builder, module, type, operation), args), true};
+        auto pointer = builder.getPtrTy();
+        bool text = type == Type::String || type == Type::Bytes;
+        if (equality) {
+            if (type == Type::Unit) return {builder.getTrue(), false};
+            if (type.kind == Type::Real) return {builder.CreateFCmpOEQ(left, right), false};
+            if (type.kind == Type::Exception) return {NativeExceptions{builder}.same(left, right), false};
+            if (text) {
+                auto same = module.getOrInsertFunction("lyraStringEqual", builder.getInt8Ty(), pointer, pointer);
+                return {builder.CreateIsNotNull(builder.CreateCall(same, {left, right})), false};
+            }
+            return {builder.CreateICmpEQ(left, right), false};
+        }
+        if (text) return {builder.CreateCall(module.getOrInsertFunction("lyraStringHash", builder.getInt64Ty(), pointer), {left}), false};
+        Value bits;
+        if (type == Type::Unit) bits = builder.getInt64(0);
+        else if (type.kind == Type::Real) {
+            bits = numberWidth(type) == 32 ? builder.CreateZExt(builder.CreateBitCast(left, builder.getInt32Ty()), builder.getInt64Ty())
+                                           : builder.CreateBitCast(left, builder.getInt64Ty());
+            bits = builder.CreateSelect(builder.CreateFCmpOEQ(left, llvm::ConstantFP::get(left->getType(), 0.0)), builder.getInt64(0), bits);
+        } else bits = builder.CreateZExtOrTrunc(left, builder.getInt64Ty());
+        return {mix(builder, builder.getInt64(valueHashSeed), bits), false};
+    }
+
+    llvm::Function* helper(Builder& caller, llvm::Module& module, Type type, ValueOperation operation) const {
+        auto [entry, inserted] = layouts.valueHelpers.try_emplace({type, operation});
+        if (!inserted) return entry->second;
+        bool equality = operation == ValueOperation::Equal;
+        auto* native = layouts.native(caller, type);
+        std::vector<llvm::Type*> params{native};
+        if (equality) params.push_back(native);
+        params.push_back(caller.getPtrTy());
+        auto signature = llvm::FunctionType::get(equality ? caller.getInt1Ty() : caller.getInt64Ty(), params, false);
+        auto* function = entry->second = llvm::Function::Create(signature, llvm::Function::InternalLinkage,
+            equality ? "lyra.value.equal" : "lyra.value.hash", module);
+        auto label = [&](const char* name) { return llvm::BasicBlock::Create(module.getContext(), name, function); };
+        Builder builder(label("entry"));
+        auto failure = label("failed");
+        auto left = function->getArg(0);
+        auto right = equality ? function->getArg(1) : nullptr;
+        auto error = function->getArg(params.size() - 1);
+        auto parts = [&](std::span<const Type> fields, Value hash, const auto& access) {
+            for (unsigned slot = 0; slot < fields.size(); ++slot) {
+                auto first = access(left, slot);
+                auto second = equality ? access(right, slot) : nullptr;
+                auto result = emit(builder, fields[slot], operation, first, second, error);
+                if (result.mayThrow) {
+                    auto success = label("field.returned");
+                    builder.CreateCondBr(builder.CreateIsNull(builder.CreateLoad(builder.getPtrTy(), error)), success, failure);
+                    builder.SetInsertPoint(success);
+                }
+                if (equality) {
+                    auto next = label("field.equal");
+                    builder.CreateCondBr(result.value, next, failure);
+                    builder.SetInsertPoint(next);
+                } else hash = mix(builder, hash, result.value);
+            }
+            builder.CreateRet(equality ? static_cast<Value>(builder.getTrue()) : hash);
+        };
+        auto* seed = builder.getInt64(valueHashSeed);
+        if (type.kind == Type::Record || type == Type::IntRange) {
+            auto fields = type == Type::IntRange ? std::span<const Type>(rangeFields) : std::span<const Type>(layouts.program.aggregates[type.id].fields);
+            parts(fields, seed, [&](Value record, unsigned slot) {
+                return builder.CreateExtractValue(record, slot);
+            });
+        } else {
+            auto tag = builder.CreateExtractValue(left, 0);
+            if (equality) {
+                auto matched = label("tag.equal");
+                builder.CreateCondBr(builder.CreateICmpEQ(tag, builder.CreateExtractValue(right, 0)), matched, failure);
+                builder.SetInsertPoint(matched);
+            }
+            auto hash = equality ? nullptr : mix(builder, seed, builder.CreateZExt(tag, builder.getInt64Ty()));
+            auto invalid = label("invalid.tag");
+            auto count = type.kind == Type::Enum ? layouts.program.enums[type.id].payloads.size() : 2;
+            auto branch = builder.CreateSwitch(tag, invalid, static_cast<unsigned>(count));
+            for (unsigned index = 0; index < count; ++index) {
+                auto active = label("active.payload");
+                branch->addCase(llvm::ConstantInt::get(llvm::cast<llvm::IntegerType>(tag->getType()), index), active);
+                builder.SetInsertPoint(active);
+                if (type.kind == Type::Enum) {
+                    auto* storage = layouts.payloads[type.id][index];
+                    parts(layouts.program.enums[type.id].payloads[index], hash, [&](Value item, unsigned slot) {
+                        auto payload = builder.CreateExtractValue(item, 1);
+                        return builder.CreateLoad(storage->getElementType(slot), builder.CreateStructGEP(storage, payload, slot));
+                    });
+                } else {
+                    const auto& shape = layouts.program.sumTypes[type.id];
+                    auto fields = index ? std::span{&shape.success, 1} : type.kind == Type::Result ? std::span{&shape.failure, 1} : std::span<const Type>{};
+                    parts(fields, hash, [&](Value item, unsigned) { return builder.CreateExtractValue(item, index ? 1 : 2); });
+                }
+            }
+            builder.SetInsertPoint(invalid);
+            builder.CreateUnreachable();
+        }
+        builder.SetInsertPoint(failure);
+        builder.CreateRet(llvm::Constant::getNullValue(function->getReturnType()));
+        return function;
     }
 };
 
@@ -328,6 +453,16 @@ struct DebugInfo {
         return cached;
     }
 
+    llvm::DIType* range(Type value) {
+        auto* storage = llvm::cast<llvm::StructType>(layouts.native(ir, value));
+        auto* compound = product(layouts.typeName(value), unit->getFile(), 0, storage);
+        std::vector<llvm::Metadata*> members;
+        for (unsigned slot = 0; slot < std::size(rangeFields); ++slot)
+            members.push_back(member(compound, storage, slot, rangeFieldNames[slot], type(rangeFields[slot]), 0));
+        builder.replaceArrays(compound, builder.getOrCreateArray(members));
+        return compound;
+    }
+
     llvm::DIType* enumeration(Type value, llvm::DIType*& cached) {
         const auto& item = layouts.program.enums[value.id];
         const auto& source = sources[item.syntax.file];
@@ -379,6 +514,7 @@ struct DebugInfo {
             case Type::Record: return record(value, cached);
             case Type::Enum: return enumeration(value, cached);
             case Type::Option: case Type::Result: return sum(value, cached);
+            case Type::IntRange: return cached = range(value);
             default: break;
         }
         auto name = layouts.typeName(value);
@@ -507,6 +643,12 @@ struct Emitter {
         auto result = builder.CreateCall(functions[target], nativeArgs);
         guard(builder.CreateLoad(builder.getPtrTy(), errorSlot), handlers.size(), site, "call");
         return result;
+    }
+
+    Value valueOperation(Type type, ValueOperation operation, Value left, Value right, Span site) {
+        auto result = NativeValues{layouts, functions}.emit(builder, type, operation, left, right, errorSlot);
+        if (result.mayThrow) guard(builder.CreateLoad(builder.getPtrTy(), errorSlot), handlers.size(), site, "call");
+        return result.value;
     }
 
     Value cell(std::size_t slot) {
@@ -796,7 +938,7 @@ struct Emitter {
             result = makeVariant(type, variant->index, fields);
         } else {
             result = llvm::Constant::getNullValue(representation);
-            const auto& types = layouts.program.aggregates[type.id].fields;
+            auto types = type == Type::IntRange ? std::span<const Type>(rangeFields) : std::span<const Type>(layouts.program.aggregates[type.id].fields);
             for (unsigned slot = 0; slot < stored.fields.size(); ++slot)
                 result = builder.CreateInsertValue(result, emitConstant(stored.fields[slot], types[slot], emitted), slot);
         }
@@ -948,8 +1090,20 @@ struct Emitter {
         builder.SetInsertPoint(matched);
     }
 
-    void emitPattern(const CheckedPattern& pattern, Value subject, Label miss, std::vector<std::pair<std::size_t, Value>>& bindings) {
+    void emitPattern(const CheckedPattern& pattern, Value subject, Label miss, std::vector<std::pair<std::size_t, Value>>& bindings,
+                     Span site, Value listBase = nullptr, Value listOffset = nullptr) {
         if (auto* slot = std::get_if<PatternSlot>(&pattern.node)) bindings.emplace_back(slot->local, subject);
+        else if (auto* rest = std::get_if<PatternListRest>(&pattern.node)) {
+            auto lists = NativeLists{builder};
+            auto sourceList = listBase ? listBase : subject;
+            auto start = listOffset ? listOffset : builder.getInt64(0);
+            bindings.emplace_back(rest->local, lists.slice(sourceList, start));
+        }
+        else if (auto* constant = std::get_if<PatternConstant>(&pattern.node)) {
+            std::map<std::size_t, Value> emitted;
+            auto expected = emitConstant(*layouts.program.constants[constant->target], constant->type, emitted);
+            matchTest(valueOperation(constant->type, ValueOperation::Equal, subject, expected, site), miss);
+        }
         else if (auto* number = std::get_if<std::uint64_t>(&pattern.node))
             matchTest(builder.CreateICmpEQ(subject, llvm::ConstantInt::get(subject->getType(), *number)), miss);
         else if (auto* range = std::get_if<CheckedIntegerRange>(&pattern.node)) {
@@ -966,7 +1120,7 @@ struct Emitter {
             for (std::size_t index = 0; index < pattern.parts.size(); ++index) {
                 auto failed = index + 1 == pattern.parts.size() ? miss : label("match.pattern.next-alternative");
                 std::vector<std::pair<std::size_t, Value>> alternativeBindings;
-                emitPattern(pattern.parts[index], subject, failed, alternativeBindings);
+                emitPattern(pattern.parts[index], subject, failed, alternativeBindings, site, listBase, listOffset);
                 auto predecessor = builder.GetInsertBlock();
                 builder.CreateBr(matched);
                 incoming.emplace_back(predecessor, std::move(alternativeBindings));
@@ -990,7 +1144,7 @@ struct Emitter {
             if (auto* tag = std::get_if<SumTag>(constructor)) {
                 auto success = builder.CreateExtractValue(subject, 0);
                 matchTest(successTag(*tag) ? success : builder.CreateNot(success), miss);
-                if (*tag != SumTag::None) emitPattern(pattern.parts.front(), builder.CreateExtractValue(subject, payloadSlot(*tag)), miss, bindings);
+                if (*tag != SumTag::None) emitPattern(pattern.parts.front(), builder.CreateExtractValue(subject, payloadSlot(*tag)), miss, bindings, site);
             } else if (auto* variant = std::get_if<VariantTag>(constructor)) {
                 matchTest(builder.CreateICmpEQ(builder.CreateExtractValue(subject, 0), builder.getInt32(variant->index)), miss);
                 auto payload = builder.CreateExtractValue(subject, 1);
@@ -999,14 +1153,43 @@ struct Emitter {
                     const auto& part = pattern.parts[slot];
                     if (std::holds_alternative<std::monostate>(part.node)) continue;
                     auto value = builder.CreateLoad(storage->getElementType(slot), builder.CreateStructGEP(storage, payload, slot));
-                    emitPattern(part, value, miss, bindings);
+                    emitPattern(part, value, miss, bindings, site);
+                }
+            } else if (auto* record = std::get_if<PatternClass>(constructor)) {
+                const auto& aggregate = layouts.program.aggregates[record->owner];
+                for (unsigned slot = 0; slot < pattern.parts.size(); ++slot) {
+                    const auto& part = pattern.parts[slot];
+                    if (std::holds_alternative<std::monostate>(part.node)) continue;
+                    auto* fieldType = layouts.native(builder, aggregate.fields[slot]);
+                    auto* address = builder.CreateStructGEP(layouts.objects[record->owner], subject, slot);
+                    auto value = layouts.workers ? sharedRead(builder, fieldType, address) : builder.CreateLoad(fieldType, address);
+                    emitPattern(part, value, miss, bindings, site);
+                }
+            } else if (auto* list = std::get_if<ListTag>(constructor)) {
+                auto lists = NativeLists{builder};
+                auto snapshot = listBase ? listBase : lists.slice(subject, builder.getInt64(0));
+                auto offset = listOffset ? listOffset : builder.getInt64(0);
+                auto count = builder.CreateSub(lists.size(snapshot), offset);
+                if (!list->cons) matchTest(builder.CreateICmpEQ(count, builder.getInt64(0)), miss);
+                else {
+                    matchTest(builder.CreateICmpSGT(count, builder.getInt64(0)), miss);
+                    auto* elementType = layouts.native(builder, list->element);
+                    auto head = builder.CreateLoad(elementType, lists.get(snapshot, offset, source, site));
+                    emitPattern(pattern.parts[0], head, miss, bindings, site);
+                    emitPattern(pattern.parts[1], snapshot, miss, bindings, site, snapshot, builder.CreateAdd(offset, builder.getInt64(1)));
                 }
             } else if (auto* flag = std::get_if<bool>(constructor)) matchTest(*flag ? subject : builder.CreateNot(subject), miss);
             else for (unsigned slot = 0; slot < pattern.parts.size(); ++slot) {
                 const auto& part = pattern.parts[slot];
-                if (!std::holds_alternative<std::monostate>(part.node)) emitPattern(part, builder.CreateExtractValue(subject, slot), miss, bindings);
+                if (!std::holds_alternative<std::monostate>(part.node)) emitPattern(part, builder.CreateExtractValue(subject, slot), miss, bindings, site);
             }
         }
+    }
+
+    void emitBindings(const CheckedPattern& pattern, Value subject, Label miss, Span site) {
+        std::vector<std::pair<std::size_t, Value>> bindings;
+        emitPattern(pattern, subject, miss, bindings, site);
+        for (auto [slot, payload] : bindings) initialize(slot, payload);
     }
 
     Value emitNode(ExprId id, const Match& match) {
@@ -1017,9 +1200,7 @@ struct Emitter {
         for (std::size_t index = 0; index < match.arms.size(); ++index) {
             const auto& arm = match.arms[index];
             auto next = label("match.next");
-            std::vector<std::pair<std::size_t, Value>> bindings;
-            emitPattern(fn.expressions[id].patterns[index], subject, next, bindings);
-            for (auto [slot, payload] : bindings) initialize(slot, payload);
+            emitBindings(fn.expressions[id].patterns[index], subject, next, arm.pattern.span);
             if (arm.guard) {
                 auto condition = emit(*arm.guard);
                 if (live()) matchTest(condition, next);
@@ -1069,6 +1250,12 @@ struct Emitter {
 
     Value emitNode(ExprId id, const QualifiedMember&) { return makeVariant(id); }
 
+    Value collectionSize(Type owner, Value value, bool byteCount = false) {
+        if (owner.kind == Type::List) return NativeLists{builder}.size(value);
+        auto symbol = owner == Type::String && !byteCount ? "lyraStringScalarCount" : "lyraStringLength";
+        return builder.CreateCall(module.getOrInsertFunction(symbol, builder.getInt64Ty(), builder.getPtrTy()), {value});
+    }
+
     Value emitNode(ExprId id, const Member& member) {
         if (fn.expressions[id].callee == Callee::Variant) return makeVariant(id);
         auto object = emit(member.receiver);
@@ -1076,12 +1263,10 @@ struct Emitter {
         if (fn.expressions[id].callee == Callee::ExtensionProperty)
             return callFunction(fn.expressions[id].target, {object}, member.name.span);
         auto owner = fn.expressions[member.receiver].type;
-        if (owner.kind == Type::List) return NativeLists{builder}.size(object);
+        if (owner.kind == Type::List || owner == Type::String || owner == Type::Bytes)
+            return collectionSize(owner, object, member.name.text == "byteSize");
+        if (owner == Type::IntRange) return builder.CreateExtractValue(object, static_cast<unsigned>(fn.expressions[id].target));
         if (owner == Type::Char) return object;
-        if (owner == Type::String || owner == Type::Bytes) {
-            auto symbol = owner == Type::String && member.name.text == "size" ? "lyraStringScalarCount" : "lyraStringLength";
-            return builder.CreateCall(module.getOrInsertFunction(symbol, builder.getInt64Ty(), builder.getPtrTy()), {object});
-        }
         if (owner.kind == Type::Exception) return NativeExceptions{builder}.message(object);
         if (owner.kind == Type::Error) {
             switch (static_cast<ErrorMember>(fn.expressions[id].target)) {
@@ -1108,6 +1293,15 @@ struct Emitter {
     Value emitNode(ExprId id, const Binding& binding) {
         auto value = emit(binding.value);
         if (live()) initialize(fn.expressions[id].target, value);
+        return unit();
+    }
+
+    Value emitNode(ExprId id, const PatternBinding& binding) {
+        auto value = emit(binding.value);
+        if (!live()) return unit();
+        auto miss = label("binding.impossible");
+        Builder{miss}.CreateUnreachable();
+        emitBindings(fn.expressions[id].patterns.front(), value, miss, binding.pattern.span);
         return unit();
     }
 
@@ -1284,6 +1478,12 @@ struct Emitter {
                 builder.CreateCall(module.getOrInsertFunction("lyraTaskRequestCancel", builder.getVoidTy(), builder.getPtrTy()), args);
                 return unit();
             case Callee::ListAdd: lists.add(args[0], args[1]); return unit();
+            case Callee::ListSlice: return lists.sliceRange(receiver, args[1], source, call.name.span);
+            case Callee::Size: return collectionSize(fn.expressions[*call.receiver].type, receiver);
+            case Callee::ValueEqual: case Callee::ValueHash:
+                return valueOperation(fn.expressions[*call.receiver].type,
+                    info.callee == Callee::ValueEqual ? ValueOperation::Equal : ValueOperation::Hash,
+                    receiver, info.callee == Callee::ValueEqual ? args[1] : nullptr, call.name.span);
             case Callee::Sum: return makeSum(rawType(id), static_cast<SumTag>(info.target), args[0]);
             case Callee::Variant: return makeVariant(id, args);
             case Callee::ToReal: return castNumber(receiver, fn.expressions[*call.receiver].type, rawType(id));
@@ -1484,19 +1684,13 @@ struct Emitter {
         auto right = emit(binary.right);
         if (!live()) return unit();
         auto type = fn.expressions[binary.left].type;
-        if (type.kind == Type::Exception) {
-            auto same = NativeExceptions{builder}.same(left, right);
-            return op == Op::Eq ? same : builder.CreateNot(same);
-        }
-        if (type == Type::String || type == Type::Bytes) {
-            if (op == Op::Add) return concatenate(left, right);
-            auto equal = stringEqual(left, right);
+        if (op == Op::Eq || op == Op::Ne) {
+            auto equal = valueOperation(type, ValueOperation::Equal, left, right, binary.site);
             return op == Op::Eq ? equal : builder.CreateNot(equal);
         }
+        if (type == Type::String) return concatenate(left, right);
         if (type.kind == Type::Real) {
             switch (op) {
-                case Op::Eq: return builder.CreateFCmpOEQ(left, right);
-                case Op::Ne: return builder.CreateFCmpUNE(left, right);
                 case Op::Lt: return builder.CreateFCmpOLT(left, right);
                 case Op::Le: return builder.CreateFCmpOLE(left, right);
                 case Op::Gt: return builder.CreateFCmpOGT(left, right);
@@ -1506,8 +1700,6 @@ struct Emitter {
         }
         auto unsignedType = type.kind == Type::UInt;
         switch (op) {
-            case Op::Eq: return builder.CreateICmpEQ(left, right);
-            case Op::Ne: return builder.CreateICmpNE(left, right);
             case Op::Lt: return unsignedType ? builder.CreateICmpULT(left, right) : builder.CreateICmpSLT(left, right);
             case Op::Le: return unsignedType ? builder.CreateICmpULE(left, right) : builder.CreateICmpSLE(left, right);
             case Op::Gt: return unsignedType ? builder.CreateICmpUGT(left, right) : builder.CreateICmpSGT(left, right);
@@ -1565,15 +1757,27 @@ struct Emitter {
         return unit();
     }
 
+    Value emitNode(ExprId id, const RangeValue& range) {
+        auto start = emit(range.start);
+        if (!live()) return unit();
+        auto last = emit(range.end);
+        if (!live()) return unit();
+        auto result = llvm::PoisonValue::get(layouts.native(builder, rawType(id)));
+        auto endpoints = builder.CreateInsertValue(builder.CreateInsertValue(result, start, 0), last, 1);
+        return builder.CreateInsertValue(endpoints, builder.getInt1(range.inclusive), 2);
+    }
+
     template<class Element, class Advance>
-    Value countedLoop(const For& loop, std::size_t slot, Value first, Value last, bool inclusive, Element element, Advance advance) {
+    Value countedLoop(const For& loop, std::size_t slot, Value first, Value last, Value inclusive, Element element, Advance advance) {
         auto entry = builder.GetInsertBlock();
         auto test = label("for.test"), body = label("for.body"), step = label("for.step"), done = label("for.end");
         builder.CreateBr(test);
         builder.SetInsertPoint(test);
         auto index = builder.CreatePHI(builder.getInt64Ty(), 2, "for.index");
         index->addIncoming(first, entry);
-        builder.CreateCondBr(inclusive ? builder.CreateICmpSLE(index, last) : builder.CreateICmpSLT(index, last), body, done);
+        auto within = builder.CreateICmpSLT(index, last);
+        if (inclusive) within = builder.CreateOr(within, builder.CreateAnd(inclusive, builder.CreateICmpEQ(index, last)));
+        builder.CreateCondBr(within, body, done);
         builder.SetInsertPoint(body);
         auto current = element(index);
         initialize(slot, current);
@@ -1591,7 +1795,7 @@ struct Emitter {
     }
 
     template<class Element>
-    Value countedLoop(const For& loop, std::size_t slot, Value first, Value last, bool inclusive, Element element) {
+    Value countedLoop(const For& loop, std::size_t slot, Value first, Value last, Value inclusive, Element element) {
         return countedLoop(loop, slot, first, last, inclusive, element, [&](Value index, Value) { return builder.CreateAdd(index, builder.getInt64(1)); });
     }
 
@@ -1599,11 +1803,10 @@ struct Emitter {
         auto input = emit(loop.input);
         if (!live()) return unit();
         auto slot = fn.expressions[id].target;
-        if (loop.range) {
-            auto last = emit(loop.range->end);
-            if (!live()) return unit();
-            return countedLoop(loop, slot, input, last, loop.range->inclusive, [](Value index) { return index; });
-        }
+        auto owner = fn.expressions[loop.input].type;
+        if (owner == Type::IntRange)
+            return countedLoop(loop, slot, builder.CreateExtractValue(input, 0), builder.CreateExtractValue(input, 1),
+                builder.CreateExtractValue(input, 2), [](Value index) { return index; });
         auto site = fn.syntax.expressions[loop.input].span;
         if (const auto& plan = fn.expressions[id].iterator) {
             auto iterator = callFunction(plan->open, {input}, site);
@@ -1618,13 +1821,12 @@ struct Emitter {
             builder.SetInsertPoint(done);
             return unit();
         }
-        auto owner = fn.expressions[loop.input].type;
         if (owner == Type::String || owner == Type::Bytes) {
             auto pointer = builder.getPtrTy(); auto integer = builder.getInt64Ty();
             auto size = builder.CreateCall(module.getOrInsertFunction("lyraStringLength", integer, pointer), {input});
             auto element = layouts.native(builder, fn.locals[slot].type);
             auto get = module.getOrInsertFunction(owner == Type::String ? "lyraStringAtByte" : "lyraBytesAtByte", element, pointer, integer);
-            return countedLoop(loop, slot, builder.getInt64(0), size, false, [&](Value index) {
+            return countedLoop(loop, slot, builder.getInt64(0), size, nullptr, [&](Value index) {
                 return builder.CreateCall(get, {input, index});
             }, [&](Value index, Value value) {
                 if (owner == Type::Bytes) return builder.CreateAdd(index, builder.getInt64(1));
@@ -1634,7 +1836,7 @@ struct Emitter {
         }
         NativeLists lists{builder};
         auto type = layouts.native(builder, fn.locals[slot].type);
-        return countedLoop(loop, slot, builder.getInt64(0), lists.size(input), false, [&](Value index) {
+        return countedLoop(loop, slot, builder.getInt64(0), lists.size(input), nullptr, [&](Value index) {
             return builder.CreateLoad(type, lists.get(input, index, source, site));
         });
     }
