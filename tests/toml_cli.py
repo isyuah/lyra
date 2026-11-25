@@ -102,6 +102,49 @@ fn main(): Unit {
                 self.assertEqual(error['code'], 'LYM0002', error)
                 self.assertIn(message, error['message'])
 
+    def test_generic_and_enum_derives_share_defaults_paths_and_codecs(self):
+        source = r'''import std.toml.tomlCodecString
+import std.toml.tomlCodecOption
+import std.toml.tomlCodecInt
+import std.toml.parseToml
+type Counter = UInt16
+#derive(Json, Toml)
+enum Status<T> { Ready, Failed(T), Retry(T, Counter) }
+#derive(Toml)
+struct Config<T>(pub val status: Status<T>, pub val count: Counter = 3, pub val events: List<Status<T>> = [])
+
+fn read(text: String, loose: Bool): Result<String,String> {
+    val item = tomlCodecConfig(tomlCodecString())
+    val parsed = parseToml(text)?
+    val config = item.read(if loose { parsed.ignoringUnknownFields() } else { parsed }, "$")?
+    Ok(item.write(config, "$", false))
+}
+
+fn show(text: String, loose: Bool): String {
+    match read(text, loose) { Ok(value) => value, Err(error) => error }
+}
+
+fn main(): Unit {
+    val ready = Status<String>.Ready
+    print(encodeStatusToml(ready, tomlCodecString()))
+    print(show("status = { tag = 'Retry', value = ['network', 3] }\n", false))
+    print(show("status = { tag = 'Failed', value = true }\n", false))
+    print(show("status = { tag = 'Ready', extra = 1 }\n", false))
+    print(show("status = { tag = 'Ready', extra = 1 }\n", true))
+    val optional = tomlCodecOption(tomlCodecOption(tomlCodecInt()))
+    val value: Option<Int?> = Some(None)
+    val text = optional.write(value, "$", false)
+    print(match parseToml(text) { Ok(node) => optional.read(node, "$") == Ok(value), Err(_) => false })
+}'''
+        expected = ['tag = "Ready"', 'status = {tag = "Retry", value = ["network",3]}', 'count = 3', 'events = []',
+                    '$.status.value: expected String', '$.status.extra: unknown field',
+                    'status = {tag = "Ready"}', 'count = 3', 'events = []', 'true']
+        for flags in ([], ['--release']):
+            with self.subTest(flags=flags):
+                result = self.command(source, 'run', *flags)
+                self.assertEqual(result.returncode, 0, result.stderr.decode())
+                self.assertEqual(result.stdout.decode().splitlines(), expected)
+
 
 if __name__ == '__main__':
     unittest.main()

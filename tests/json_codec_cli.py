@@ -28,6 +28,9 @@ class JsonCodecs(unittest.TestCase):
 #derive(Json)
 pub struct User([jsonName("display-name")] pub val name: String = "guest", val secret: String = "private")
 pub fn wire(): JsonCodec<User> { jsonCodecUser() }
+#derive(Json)
+pub struct Page<T>(pub val items: List<T>, pub val total: Int = items.size)
+pub fn pageWire<T>(item: JsonCodec<T>): JsonCodec<Page<T>> { jsonCodecPage(item) }
 ''', encoding='utf-8')
 
     def command(self, action, *flags):
@@ -151,6 +154,53 @@ fn main(): Unit {
                 diagnostic, = json.loads(result.stderr)
                 self.assertEqual(diagnostic['code'], code, diagnostic)
                 self.assertIn(reason, diagnostic['message'])
+
+    def test_generic_records_and_enums_roundtrip_across_packages(self):
+        self.main.write_text(r'''import model.Page as RemotePage
+import model.User
+import model.pageWire as remoteWire
+import model.wire as userWire
+import std.collections.HashMap as Table
+import std.json.jsonCodecString
+import std.json.JsonCodec
+import std.json.jsonCodecInt
+type Count = Int
+type Owners = RemotePage<User>
+#derive(Json)
+enum State<T> { Active, Banned(T), Pair(id: Count, note: T), `else` }
+#derive(Json)
+struct Batch<T>([jsonCodec("ownersWire")] pub val owners: Owners,
+                pub val statuses: List<State<T>>, pub val outcomes: Table<String,Result<T,String?>>)
+fn ownersWire(): JsonCodec<Owners> { remoteWire(userWire()) }
+
+fn show(text: String, loose: Bool): String {
+    val codec = jsonCodecBatch(jsonCodecString())
+    val decoded = if loose { codec.decodeIgnoringUnknownFields(text) } else { codec.decode(text) }
+    match decoded { Ok(value) => codec.encode(value), Err(error) => error }
+}
+
+fn main(): Unit {
+    val states = jsonCodecState(jsonCodecInt())
+    print(states.encode(State<Int>.Active))
+    print(states.encode(State<Int>.Banned(7)))
+    print(states.encode(State<Int>.`else`))
+    print(show(r#"{"owners":{"items":[{}]},"statuses":[{"tag":"Pair","value":[3,"ok"]}],"outcomes":{"build":{"tag":"Err","value":{"tag":"None"}}}}"#, false))
+    print(show(r#"{"owners":{"items":[{"extra":1}]},"statuses":[],"outcomes":{}}"#, false))
+    print(show(r#"{"owners":{"items":[{"extra":1}]},"statuses":[],"outcomes":{}}"#, true))
+    print(show(r#"{"owners":{"items":[]},"statuses":[{"tag":"Pair","value":[3,true]}],"outcomes":{}}"#, false))
+    print(show(r#"{"owners":{"items":[]},"statuses":[{"tag":"Banned"}],"outcomes":{}}"#, false))
+    print(show(r#"{"owners":{"items":[]},"statuses":[{"tag":"unknown"}],"outcomes":{}}"#, false))
+}''', encoding='utf-8')
+        expected = ['{"tag":"Active"}', '{"tag":"Banned","value":7}', '{"tag":"else"}',
+                    '{"owners":{"items":[{"display-name":"guest"}],"total":1},"statuses":[{"tag":"Pair","value":[3,"ok"]}],"outcomes":{"build":{"tag":"Err","value":{"tag":"None"}}}}',
+                    '$.owners.items[0].extra: unknown field',
+                    '{"owners":{"items":[{"display-name":"guest"}],"total":1},"statuses":[],"outcomes":{}}',
+                    '$.statuses[0].value[1]: expected String', '$.statuses[0].value: missing field', '$.statuses[0].tag: unknown State tag "unknown"']
+        for flags in ([], ['--release', '--locked']):
+            with self.subTest(flags=flags):
+                run = self.command('run', *flags)
+                self.assertEqual(run.returncode, 0, run.stderr.decode())
+                self.assertEqual(run.stdout.decode().splitlines(), expected)
 
 
 if __name__ == '__main__':

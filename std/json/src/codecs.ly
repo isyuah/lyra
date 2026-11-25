@@ -18,11 +18,28 @@ pub fn jsonCodec<T>(encode: (T) -> String, read: (JsonValue, String) -> Result<T
 pub fn jsonCodecString(): JsonCodec<String> { jsonCodec<String>(quoteJson, (value, path) => { value.readString(path) }) }
 pub fn jsonCodecChar(): JsonCodec<Char> { jsonCodec<Char>((value) => { quoteJson(value.toString()) }, (value, path) => { value.readChar(path) }) }
 pub fn jsonCodecInt(): JsonCodec<Int> { jsonCodec<Int>(intText, (value, path) => { value.readInt(path) }) }
+pub fn jsonCodecInt64(): JsonCodec<Int64> { jsonCodec<Int64>(intText, (value, path) => { value.readInt64(path) }) }
+pub fn jsonCodecInt8(): JsonCodec<Int8> { jsonCodec<Int8>((value) => { intText(value) }, (node, path) => { node.readInt8(path) }) }
+pub fn jsonCodecInt16(): JsonCodec<Int16> { jsonCodec<Int16>((value) => { intText(value) }, (node, path) => { node.readInt16(path) }) }
+pub fn jsonCodecInt32(): JsonCodec<Int32> { jsonCodec<Int32>((value) => { intText(value) }, (node, path) => { node.readInt32(path) }) }
+pub fn jsonCodecUInt8(): JsonCodec<UInt8> { jsonCodec<UInt8>((value) => { intText(value) }, (node, path) => { node.readUInt8(path) }) }
+pub fn jsonCodecUInt16(): JsonCodec<UInt16> { jsonCodec<UInt16>((value) => { intText(value) }, (node, path) => { node.readUInt16(path) }) }
+pub fn jsonCodecUInt32(): JsonCodec<UInt32> { jsonCodec<UInt32>((value) => { intText(value) }, (node, path) => { node.readUInt32(path) }) }
 pub fn jsonCodecBool(): JsonCodec<Bool> { jsonCodec<Bool>(boolText, (value, path) => { value.readBool(path) }) }
 pub fn jsonCodecFloat32(): JsonCodec<Float32> { jsonCodec<Float32>(float32Text, (value, path) => { value.readFloat32(path) }) }
 pub fn jsonCodecFloat64(): JsonCodec<Float64> { jsonCodec<Float64>(float64Text, (value, path) => { value.readFloat64(path) }) }
 pub fn jsonCodecUnit(): JsonCodec<Unit> {
     jsonCodec<Unit>((_) => { "null" }, (value, path) => { if value.isNull() { Ok({}) } else { Err(path + ": expected null") } })
+}
+
+pub fn jsonCodecNullable<T>(element: JsonCodec<T>): JsonCodec<Option<T>> {
+    jsonCodec<Option<T>>((value) => { match value { None => "null", Some(item) => element.encode(item) } },
+                         (node, path) => { if node.isNull() { Ok(None) } else { Ok(Some(element.read(node, path)?)) } })
+}
+
+pub fn jsonCodecOptionalField<T>(element: JsonCodec<T>): JsonCodec<Option<T>> {
+    jsonCodec<Option<T>>((value) => { match value { None => "null", Some(item) => element.encode(item) } },
+                         (node, path) => { if node.missing() { Ok(None) } else { Ok(Some(element.read(node, path)?)) } })
 }
 
 pub fn jsonCodecList<T>(element: JsonCodec<T>): JsonCodec<List<T>> {

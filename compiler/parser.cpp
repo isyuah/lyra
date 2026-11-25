@@ -276,8 +276,8 @@ public:
                     }
                     require(")");
                 }
-                module.expansions.push_back({file, name, std::move(argument), decorator, false, 0, exports});
-                for (auto& item : extra) module.expansions.push_back({file, name, std::move(item), decorator, false, 0, exports});
+                module.expansions.push_back({file, name, std::move(argument), decorator, ExpansionTarget::Function, 0, exports});
+                for (auto& item : extra) module.expansions.push_back({file, name, std::move(item), decorator, ExpansionTarget::Function, 0, exports});
             }
             bool pub = visibility();
             if (is("const")) {
@@ -321,7 +321,12 @@ public:
                 continue;
             }
             if (is("enum")) {
-                if (firstPrefix != module.expansions.size()) throw at(source, module.expansions[firstPrefix].name.span, "LYM0001", "此版本不能修饰 enum 声明");
+                for (auto index = firstPrefix; index < module.expansions.size(); ++index) {
+                    auto& prefix = module.expansions[index];
+                    if (prefix.decorator) throw at(source, prefix.name.span, "LYM0001", "装饰器不适用于 enum 声明");
+                    prefix.kind = ExpansionTarget::Enumeration;
+                    prefix.target = module.enums.size();
+                }
                 module.enums.push_back(enumeration(pub));
                 continue;
             }
@@ -341,8 +346,8 @@ public:
             for (auto index = firstPrefix; index < module.expansions.size(); ++index) {
                 auto& prefix = module.expansions[index];
                 if (is("import")) throw at(source, prefix.name.span, "LYM0001", "不能修饰 import");
-                prefix.record = is("struct") || is("class");
-                prefix.target = prefix.record ? module.aggregates.size() : module.functions.size();
+                if (is("struct") || is("class")) prefix.kind = ExpansionTarget::Aggregate;
+                prefix.target = prefix.kind == ExpansionTarget::Aggregate ? module.aggregates.size() : module.functions.size();
             }
             if (is("import")) {
                 consume();
@@ -564,7 +569,7 @@ private:
     }
 
     Enumeration enumeration(bool pub) {
-        require("enum");
+        auto start = require("enum").span.begin;
         Enumeration result{file, identifier(), {}, pub};
         typeParameters(result.typeParameters, result.bounds);
         require("{");
@@ -586,7 +591,7 @@ private:
             if (is(",")) consume();
             else if (!token.newlineBefore) break;
         }
-        require("}");
+        result.span = {start, require("}").span.end};
         return result;
     }
 

@@ -1,6 +1,6 @@
 # `std.toml`
 
-`#derive(Toml)` 为当前模块中的非泛型 `struct` 生成配置文档的读写函数。`decodeConfigToml(text)` 返回 `Result<Config,String>`，`encodeConfigToml(config)` 返回可再次解析的 TOML 文本。
+`#derive(Toml)` 为当前模块中的 `struct` 和 `enum` 生成配置文档的读写函数。`decodeConfigToml(text)` 返回 `Result<Config,String>`，`encodeConfigToml(config)` 返回可再次解析的 TOML 文本。
 
 ```lyra
 #derive(Toml)
@@ -33,6 +33,10 @@ port = 443
 - 缺键采用构造默认值，按字段声明顺序求值，可以读取已确定的前置字段。只映射公开字段，私有字段通过声明处的显式默认值初始化。
 - 可空字段在无默认值或默认值直接写 `None` / `null` 时，以缺键表示 `None`。若有其他默认表达式，缺键用于触发该表达式，此时编码 `None` 会抛出带字段路径的 `Exception`。TOML 没有空值，`Option<Option<T>>` 和 `List<T?>` 需要自定义表示。
 - `parseToml(text)` 返回 `Result<TomlValue,String>`，可直接读取表、数组和标量。`field(key)` 选择字面键，`item(index)` 选择数组元素，`missing()` 检查缺失。日期和时间可以解析并通过 `isTemporal()` 识别，首版保留为时间节点，业务类型的时间映射留待日期标准库。
+
+`TomlCodec<T>` 可跨包复用：`read(node, path)` 继承已有解析节点的未知键策略，`write(value, path, inline)` 的 `inline` 为 `true` 时生成可嵌入文档的值。泛型派生工厂按声明顺序接收各类型实参的 codec，例如 `tomlCodecConfig(tomlCodecString())`。用 `[tomlCodec("wire")]` 指定字段最内层类型的手写或外部 codec 工厂。
+
+Enum 编码为包含 `tag` 的表；单位分支只写 `tag`，带一个载荷写 `value`，多个载荷依序写入 `value` 数组。`tomlCodecList`、`tomlCodecStringMap`、`tomlCodecResult` 和 `tomlCodecOption` 可以组合；显式 Option 使用 `None` / `Some` 标签，可保留嵌套空值状态。普通可空字段仍沿用缺键规则。
 
 ## 构建
 

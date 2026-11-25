@@ -24,7 +24,7 @@ fn main(): Unit {
 - 对每个 `struct`，解码器先读取公开字段，再按声明顺序求缺键字段的构造默认值。默认表达式可引用前面已确定的字段，各执行一次。显式 `null` 只由字段类型解释，例如必填 `Int` 收到 `null` 会报字段路径错误。
 - 若声明 `pub val name: String? = "guest"`，`{}` 解为 `"guest"`，`{"name":null}` 解为 `None`。编码这个 `None` 会写 `null`。单层可空字段没有默认值，或默认值直接写 `None` / `null` 时，编码 `None` 会省略键。其他默认表达式一律按可能产生非空值处理，编码不执行该表达式。
 - `Option<T?>` 在没有默认值或默认值直接写 `None` / `null` 时区分三种状态：缺键得到 `None`，显式 `null` 得到 `Some(None)`，非空值得到 `Some(Some(value))`。这种字段若使用其他默认表达式，或字段有第三层可空类型，须手写映射。
-- 私有字段必须有显式默认值。解码时由默认值初始化，编码时省略，类型可以没有 JSON 编解码实现。输入中的私有字段名按未知键处理。自动派生面向非泛型 `struct`，`class` 身份图需手写映射。
+- 私有字段必须有显式默认值。解码时由默认值初始化，编码时省略，类型可以没有 JSON 编解码实现。输入中的私有字段名按未知键处理。自动派生面向 `struct` 和 `enum`，`class` 身份图需手写映射。
 - 非固定 schema 可 `import std.json.parseJson`：它返回 `Result<JsonValue,String>`。用 `isObject()`、`isArray()`、`size()`、`key(index)`、`field(name)`、`item(index)` 检查结构，用 `readString(path)`、`readChar(path)`、`readBool(path)` 或 `read` 加数值类型名（如 `readUInt16(path)`、`readFloat32(path)`）读取标量。`missing()` 和 `isNull()` 可分别检查缺键和显式空值。
 - 手写 `read类型名Json(value: JsonValue, path: String)` 时，可把 `value.field(name)`、`value.item(index)` 直接交给其他解码器，它们继承当前视图的策略。若手动遍历未知键，按 `value.rejectsUnknownFields` 决定是否报错。`value.ignoringUnknownFields()` 与原视图共用解析结果，不修改原视图。
 
@@ -60,6 +60,8 @@ struct Article([jsonCodec("userFormat")] pub val authors: List<Author?>)
 直接组合现有 codec，不额外触发派生。例如 `jsonCodecList(userWire())` 处理 `List<User>`，`jsonCodecStringMap(userWire())` 处理 `HashMap<String,User>`。内置的 `jsonCodecString()`、`jsonCodecInt()` 等可充当叶子 codec。`jsonCodecResult(jsonCodecInt(), jsonCodecString())` 使用带 `tag` 和 `value` 的对象区分 `Ok` 与 `Err`。
 
 显式 `jsonCodecOption(element)` 使用 `{"tag":"None"}` 或 `{"tag":"Some","value":…}`。这样即使 `element` 自己可空，也能无损区分 `None` 和 `Some(None)`；它与 Struct 派生中省略字段／使用 `null` 的约定不同。列表路径使用 `[index]`，Map 路径使用键，标签载荷路径使用 `.value`。Map 不限制输入键集合，但会把严格/宽松策略传给每个值；编码含 NUL 的键会抛异常。
+
+派生泛型类型时，按声明顺序传入类型实参的 codec。比如 `struct Page<T>(pub val items: List<T>)` 派生后，可用 `jsonCodecPage(jsonCodecString())`，或通过公开函数返回 `JsonCodec<Page<T>>`。派生枚举 `enum Status { Active, Banned(String), Retry(Int, String) }` 分别编码为 `{"tag":"Active"}`、`{"tag":"Banned","value":"…"}` 或 `{"tag":"Retry","value":[3,"…"]}`。枚举载荷、`Result` 和字符串键 `HashMap` 可组合带标签的 Option codec。
 
 ### 数值怎样映射
 

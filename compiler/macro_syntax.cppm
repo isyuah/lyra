@@ -14,12 +14,14 @@ import lyra.syntax;
 export namespace lyra {
 
 struct SyntaxRef { std::size_t index; bool operator==(const SyntaxRef&) const = default; };
-enum class SyntaxForm { Code, Input, Argument, Join, Call, Member, Block, Around };
+enum class SyntaxForm { Code, Input, Argument, Join, Call, Member, Block, Around, Type };
 struct SyntaxNode {
     SyntaxForm form;
     std::string kind, text;
     std::vector<SyntaxRef> children{};
     std::optional<Span> span{};
+    std::string canonical{};
+    std::string module{};
 };
 struct SyntaxPiece { std::string text; std::optional<Span> span{}; bool copied{}; };
 struct SyntaxOutput { std::vector<SyntaxPiece> code; std::optional<std::vector<std::vector<SyntaxPiece>>> hooks{}; };
@@ -128,10 +130,14 @@ struct SyntaxArena {
         return input(kind, expr.span, std::move(children));
     }
 
-    SyntaxRef declaration(const Identifier& name, const std::vector<Field>& fields, const Function* fn, const Aggregate* aggregate, std::optional<SyntaxRef> body) {
+    SyntaxRef annotation(const Identifier& type) {
+        return add({SyntaxForm::Input, "type", {}, {}, type.span, type.text});
+    }
+
+    SyntaxRef declaration(const Identifier& name, const std::vector<Field>& fields, const Function* fn, const Aggregate* aggregate, const Enumeration* enumeration, std::optional<SyntaxRef> body) {
         std::vector<SyntaxRef> children{input("name", name.span)};
         for (const auto& field : fields) {
-            std::vector<SyntaxRef> signature{input("name", field.name.span), input("type", field.type.span)};
+            std::vector<SyntaxRef> signature{input("name", field.name.span), annotation(field.type)};
             for (const auto& mark : field.attributes) {
                 std::vector<SyntaxRef> items;
                 if (mark.argument) items.push_back(input("argument", mark.argument->span));
@@ -139,10 +145,23 @@ struct SyntaxArena {
             }
             children.push_back(input(aggregate ? "field" : "parameter", {field.name.span.begin, field.type.span.end}, std::move(signature)));
         }
-        if (fn && !fn->result.text.empty()) children.push_back(input("type", fn->result.span));
+        if (enumeration) for (const auto& entry : enumeration->cases) {
+            std::vector<SyntaxRef> parts{input("name", entry.name.span)};
+            auto span = entry.name.span;
+            for (const auto& field : entry.fields) {
+                std::vector<SyntaxRef> payload;
+                if (field.name) payload.push_back(input("name", field.name->span));
+                payload.push_back(annotation(field.type));
+                parts.push_back(input("payload", {field.name ? field.name->span.begin : field.type.span.begin, field.type.span.end}, std::move(payload)));
+                span.end = field.type.span.end;
+            }
+            children.push_back(input("case", span, std::move(parts)));
+        }
+        if (fn && !fn->result.text.empty()) children.push_back(annotation(fn->result));
         if (body) children.push_back(*body);
-        auto span = aggregate ? aggregate->span : Span{name.span.begin, body ? get(*body).span->end : fn->result.span.end};
-        return input(aggregate ? aggregate->reference ? "class" : "struct" : "fn", span, std::move(children));
+        auto span = enumeration ? enumeration->span : aggregate ? aggregate->span
+            : Span{name.span.begin, body ? get(*body).span->end : fn->result.span.end};
+        return input(enumeration ? "enum" : aggregate ? aggregate->reference ? "class" : "struct" : "fn", span, std::move(children));
     }
 
     void emit(SyntaxRef ref, std::vector<SyntaxPiece>& out, std::size_t& size, std::size_t& steps, unsigned depth = 0) const {
@@ -155,7 +174,7 @@ struct SyntaxArena {
         const auto& node = get(ref);
         auto child = [&](std::size_t index) { emit(node.children[index], out, size, steps, depth + 1); };
         switch (node.form) {
-            case SyntaxForm::Code: append(node.text); break;
+            case SyntaxForm::Code: append(node.text, node.span); break;
             case SyntaxForm::Input: append(text(*node.span), node.span, true); break;
             case SyntaxForm::Argument: append("(", node.span); append(text(*node.span), node.span, true); append("\n)", node.span); break;
             case SyntaxForm::Join: child(0); append(node.text); child(1); break;
@@ -163,6 +182,7 @@ struct SyntaxArena {
             case SyntaxForm::Member: child(0); append("." + node.text); break;
             case SyntaxForm::Block: append("{\n"); child(0); append("\n}"); break;
             case SyntaxForm::Around: throw at(source, site, "LYM0002", "syntaxAround 只能作为装饰器的整个输出");
+            case SyntaxForm::Type: throw at(source, site, "LYM0002", "已解析类型只能查询，不能当作源码输出");
         }
     }
 

@@ -3,11 +3,13 @@ module;
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <limits>
 #include <map>
 #include <memory>
 #include <optional>
 #include <set>
+#include <span>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -29,7 +31,10 @@ export namespace lyra {
 inline constexpr std::size_t macroInputByteLimit = 1024 * 1024;
 using MacroFiles = std::map<std::string, std::map<std::string, std::filesystem::path>>;
 struct MacroPackage { std::filesystem::path root; MacroFiles inputs; const SourceOverlay* overlays{}; std::filesystem::path cache{}; };
-void expandMacros(Module& syntax, std::vector<Source>& sources, const std::map<std::string, MacroPackage>& packages, std::vector<std::filesystem::path>& inputs);
+struct MacroType { std::string kind, name, module; std::vector<MacroType> arguments{}; };
+using MacroTypeResolver = std::function<MacroType(std::size_t, const Identifier&, std::span<const Identifier>)>;
+void expandMacros(Module& syntax, std::vector<Source>& sources, const std::map<std::string, MacroPackage>& packages,
+    std::vector<std::filesystem::path>& inputs, const MacroTypeResolver& resolveType, std::string_view typeEnvironment);
 void parsePackageFile(Module& syntax, Source& source, std::size_t file, const MacroPackage& package, std::vector<std::filesystem::path>& inputs);
 }
 
@@ -54,6 +59,10 @@ fn fieldAttributeValue(index: Int, name: String): String { "" }
 fn argumentCount(): Int { 0 }
 fn argumentString(index: Int): String { "" }
 fn targetKind(): String { "" }
+fn typeParameterCount(): Int { 0 }
+fn typeParameterName(index: Int): String { "" }
+fn typeParameterDeclarations(): String { "" }
+fn typeParameterArguments(): String { "" }
 fn syntaxTarget(): Syntax { Syntax(0) }
 fn syntaxBody(): Syntax { Syntax(0) }
 fn syntaxArgument(index: Int): Syntax { Syntax(index) }
@@ -61,11 +70,15 @@ fn syntaxChildCount(node: Syntax): Int { 0 }
 fn syntaxChild(node: Syntax, index: Int): Syntax { node }
 fn syntaxKind(node: Syntax): String { "" }
 fn syntaxText(node: Syntax): String { "" }
+fn syntaxIdentifier(node: Syntax): String { "" }
 fn syntaxStart(node: Syntax): Int { 0 }
 fn syntaxEnd(node: Syntax): Int { 0 }
 fn syntaxLine(node: Syntax): Int { 0 }
 fn syntaxColumn(node: Syntax): Int { 0 }
 fn syntaxCode(text: String): Syntax { Syntax(0) }
+fn syntaxCodeAt(node: Syntax, text: String): Syntax { node }
+fn syntaxResolvedType(node: Syntax): Syntax { node }
+fn syntaxTypeModule(node: Syntax): String { "" }
 fn syntaxString(text: String): Syntax { Syntax(0) }
 fn syntaxInt(number: Int): Syntax { Syntax(0) }
 fn syntaxName(text: String): Syntax { Syntax(0) }
@@ -149,7 +162,7 @@ const std::string& compilerFingerprint() {
 }
 
 std::string cacheKey(const Source& source, const Expansion& prefix, const Source& code, const Identifier* target,
-                     std::string_view kind, const InputSnapshot& inputs) {
+                     std::string_view kind, const InputSnapshot& inputs, std::string_view typeEnvironment) {
     llvm::SHA256 hash;
     auto text = [&](std::string_view value) {
         hash.update(std::to_string(value.size()));
@@ -158,12 +171,13 @@ std::string cacheKey(const Source& source, const Expansion& prefix, const Source
     };
     auto number = [&](std::size_t value) { text(std::to_string(value)); };
     auto span = [&](Span value) { number(value.begin); number(value.end); };
-    text("lyra-macro-cache-1");
+    text("lyra-macro-cache-2");
     text(nativeTriple);
     text(compilerFingerprint());
     text(pathText(code.path));
     text(code.text);
     text(kind);
+    text(typeEnvironment);
     text(prefix.name.text);
     span(prefix.name.span);
     number(prefix.decorator);
@@ -321,6 +335,9 @@ struct Machine {
     const ExpressionExpansion* expression;
     SyntaxArena arena;
     const InputSnapshot* prepared;
+    const MacroTypeResolver* resolveType{};
+    std::span<const Identifier> parameters{};
+    std::span<const Bound> bounds{};
     std::optional<SyntaxRef> target{}, body{};
     unsigned fuel = 50000, depth = 0;
     std::size_t bytes = 0;
@@ -344,6 +361,28 @@ struct Machine {
     Value host(const std::string& name, const std::vector<Value>& args) {
         if (name == "fieldCount") return static_cast<std::int64_t>(fields.size());
         if (name == "targetKind") return kind;
+        if (name == "typeParameterCount") return static_cast<std::int64_t>(parameters.size());
+        if (name == "typeParameterName") {
+            auto index = std::get<std::int64_t>(args.front());
+            if (index < 0 || static_cast<std::size_t>(index) >= parameters.size()) error("宏读取的类型形参下标越界");
+            return parameters[index].text;
+        }
+        if (name == "typeParameterDeclarations" || name == "typeParameterArguments") {
+            if (parameters.empty()) return std::string{};
+            std::string text = "<";
+            for (std::size_t index = 0; index < parameters.size(); ++index) {
+                if (index) text += ",";
+                text += arena.text(parameters[index].span);
+                if (name == "typeParameterDeclarations") {
+                    bool first = true;
+                    for (const auto& bound : bounds) if (bound.parameter == index) {
+                        text += std::exchange(first, false) ? ": " : " & ";
+                        text += arena.text(bound.trait.span);
+                    }
+                }
+            }
+            return text + '>';
+        }
         if (name == "syntaxTarget" || name == "syntaxBody") {
             auto ref = name == "syntaxTarget" ? target : body;
             if (!ref) error("此位置没有 " + name + " 所需的语法节点");
@@ -387,6 +426,7 @@ struct Machine {
                 return '`' + value + '`';
             };
             if (name == "syntaxCode") return arena.add({SyntaxForm::Code, "code", text(0)});
+            if (name == "syntaxCodeAt") return arena.add({SyntaxForm::Code, "code", text(1), {}, arena.get(syntax(0)).span});
             if (name == "syntaxString") return arena.add({SyntaxForm::Code, "string", quote(text(0))});
             if (name == "syntaxInt") return arena.add({SyntaxForm::Code, "number", std::to_string(std::get<std::int64_t>(args[0]))});
             if (name == "syntaxName") return arena.add({SyntaxForm::Code, "name", identifier(0)});
@@ -397,7 +437,26 @@ struct Machine {
             if (name == "syntaxAround") return arena.add({SyntaxForm::Around, "around", {}, {syntax(0), syntax(1), syntax(2)}});
             auto ref = syntax(0);
             auto& node = arena.get(ref);
+            if (name == "syntaxResolvedType") {
+                if (!resolveType || node.canonical.empty()) error("已解析类型查询只适用于目标声明的显式类型标注");
+                auto span = *node.span;
+                auto append = [&](auto&& self, const MacroType& type) -> SyntaxRef {
+                    std::vector<SyntaxRef> arguments;
+                    for (const auto& part : type.arguments) arguments.push_back(self(self, part));
+                    return arena.add({SyntaxForm::Type, type.kind, type.name, std::move(arguments), span, {}, type.module});
+                };
+                return append(append, (*resolveType)(expansion.file, Identifier{node.canonical, span}, parameters));
+            }
+            if (name == "syntaxTypeModule") {
+                if (node.form != SyntaxForm::Type) error("syntaxTypeModule 需要已解析类型节点");
+                return node.module;
+            }
             if (name == "syntaxKind") return node.kind;
+            if (name == "syntaxIdentifier") {
+                if (node.kind != "name" || node.form != SyntaxForm::Input) error("syntaxIdentifier 需要源码名称节点");
+                auto value = arena.text(*node.span);
+                return value.starts_with('`') ? value.substr(1, value.size() - 2) : value;
+            }
             if (name == "syntaxChildCount") return static_cast<std::int64_t>(node.children.size());
             if (name == "syntaxChild") {
                 auto index = std::get<std::int64_t>(args[1]);
@@ -405,6 +464,7 @@ struct Machine {
                 return node.children[index];
             }
             if (name == "syntaxText") {
+                if (node.form == SyntaxForm::Type) return node.text;
                 if (node.span) return arena.text(*node.span);
                 std::string generated;
                 for (auto& piece : arena.render(ref)) generated += piece.text;
@@ -540,7 +600,15 @@ struct Machine {
     }
 };
 
-ExpandedMacro expand(const Source& source, const Expansion& prefix, const MacroPackage& package, const Identifier* target, const std::vector<Field>& fields, const std::string& kind, std::vector<fs::path>& files, const ExpressionExpansion* expression = nullptr, const Function* function = nullptr, const Aggregate* aggregate = nullptr) {
+struct MacroDeclaration {
+    const Function* function{};
+    const Aggregate* aggregate{};
+    const Enumeration* enumeration{};
+    const MacroTypeResolver* resolveType{};
+    std::string_view typeEnvironment{};
+};
+
+ExpandedMacro expand(const Source& source, const Expansion& prefix, const MacroPackage& package, const Identifier* target, const std::vector<Field>& fields, const std::string& kind, std::vector<fs::path>& files, const ExpressionExpansion* expression = nullptr, MacroDeclaration declaration = {}) {
     auto directory = expression ? "expressions" : prefix.decorator ? "decorators" : "macros";
     auto file = prefix.name.text + ".ly";
     auto path = package.root / "src" / (std::string(".") + directory) / file;
@@ -549,7 +617,6 @@ ExpandedMacro expand(const Source& source, const Expansion& prefix, const MacroP
         auto relative = fs::weakly_canonical(path).lexically_relative(fs::canonical(package.root));
         if (relative.empty() || *relative.begin() == "..") throw at(source, prefix.name.span, "LYM0002", "宏实现必须位于声明包内");
     } else {
-        if (!expression && !prefix.decorator && prefix.name.text == "derive" && prefix.argument && prefix.argument->text == "Toml") file = "deriveToml.ly";
         path = sdkRoot() / "share/lyra/std/meta" / directory / file;
     }
     if (!overlaid && !fs::is_regular_file(path)) throw at(source, prefix.name.span, "LYM0001", "找不到" + std::string(expression ? "表达式宏 #" : prefix.decorator ? "装饰器 @" : "声明宏 #") + prefix.name.text);
@@ -560,7 +627,7 @@ ExpandedMacro expand(const Source& source, const Expansion& prefix, const MacroP
     fs::path cache;
     if (!package.cache.empty() && !compilerFingerprint().empty()) prepared = snapshotInputs(source, prefix, package);
     if (prepared) {
-        cache = package.cache / fromUtf8(cacheKey(source, prefix, implementation, target, kind, *prepared) + ".expansion");
+        cache = package.cache / fromUtf8(cacheKey(source, prefix, implementation, target, kind, *prepared, declaration.typeEnvironment) + ".expansion");
         if (auto hit = loadExpansion(cache, source, fields, *prepared)) {
             for (const auto& key : hit->inputKeys) files.push_back(prepared->at(key).path);
             return std::move(*hit);
@@ -585,9 +652,14 @@ ExpandedMacro expand(const Source& source, const Expansion& prefix, const MacroP
     if (it == checked.functions.end() || it->result != syntaxType || it->syntax.parameters.size() != 2 || it->locals[0].type != Type::String || it->locals[1].type != Type::String) {
         throw at(source, prefix.name.span, "LYM0002", "宏入口应为 fn " + prefix.name.text + "(target: String, argument: String): Syntax");
     }
-    Machine machine{checked, source, prefix, fields, kind, package, files, expression, {source, prefix.name.span}, prepared ? &*prepared : nullptr};
+    auto [function, aggregate, enumeration, resolveType, environment] = declaration;
+    Machine machine{checked, source, prefix, fields, kind, package, files, expression, {source, prefix.name.span}, prepared ? &*prepared : nullptr, resolveType};
+    auto generics = [&](const auto& item) { machine.parameters = item.typeParameters; machine.bounds = item.bounds; };
+    if (function) generics(*function);
+    if (aggregate) generics(*aggregate);
+    if (enumeration) generics(*enumeration);
     if (function && !function->foreignSymbol) machine.body = machine.arena.expression(*function, function->body);
-    if (target) machine.target = machine.arena.declaration(*target, fields, function, aggregate, machine.body);
+    if (target) machine.target = machine.arena.declaration(*target, fields, function, aggregate, enumeration, machine.body);
     auto output = std::get<SyntaxRef>(machine.invoke(*it, {target ? target->text : std::string{}, prefix.argument ? prefix.argument->text : std::string{}}));
     ExpandedMacro result{{}, std::move(machine.defaultFields), {}, std::move(cache)};
     for (const auto& [key, text] : machine.inputs) result.inputKeys.push_back(key);
@@ -644,7 +716,7 @@ void parsePackageFile(Module& syntax, Source& source, std::size_t file, const Ma
             copy({read, call.span.begin});
             auto argument = call.argumentsSpan;
             auto wrapper = call.arguments.empty() ? call.name.span : call.argumentsSpan;
-            Expansion prefix{file, call.name, Identifier{std::string(original.substr(argument.begin, argument.end - argument.begin)), argument}, false, false, 0};
+            Expansion prefix{file, call.name, Identifier{std::string(original.substr(argument.begin, argument.end - argument.begin)), argument}, false, ExpansionTarget::Function, 0};
             auto generated = expand(source, prefix, package, nullptr, {}, "expression", inputs, &call);
             std::string skeleton;
             for (const auto& piece : generated.output.code) skeleton += piece.copied && piece.text.contains('#') ? "0" : piece.text;
@@ -671,29 +743,30 @@ void parsePackageFile(Module& syntax, Source& source, std::size_t file, const Ma
     parseFile(syntax, source, file);
 }
 
-void expandMacros(Module& syntax, std::vector<Source>& sources, const std::map<std::string, MacroPackage>& packages, std::vector<fs::path>& inputs) {
+void expandMacros(Module& syntax, std::vector<Source>& sources, const std::map<std::string, MacroPackage>& packages,
+    std::vector<fs::path>& inputs, const MacroTypeResolver& resolveType, std::string_view typeEnvironment) {
     auto prefixes = std::exchange(syntax.expansions, {});
     std::vector<std::pair<Expansion, ExpandedMacro>> decorators;
     for (const auto& prefix : prefixes) {
         const auto& source = sources[prefix.file];
         if (prefix.decorator && prefix.name.text == "derive") throw at(source, prefix.name.span, "LYM0001", "derive 是声明宏；请写 #derive(Json)");
-        auto& name = prefix.record ? syntax.aggregates[prefix.target].name : syntax.functions[prefix.target].name;
         std::vector<Field> fields;
-        const Function* function = nullptr;
-        const Aggregate* aggregate = nullptr;
-        if (prefix.record) {
-            aggregate = &syntax.aggregates[prefix.target];
-            if (prefix.name.text == "derive" && !aggregate->typeParameters.empty()) throw at(source, prefix.name.span, "LYM0002", "派生暂不支持泛型 struct 或 class");
-            fields = aggregate->fields;
+        MacroDeclaration declaration{.resolveType = &resolveType, .typeEnvironment = typeEnvironment};
+        if (prefix.kind == ExpansionTarget::Aggregate) {
+            declaration.aggregate = &syntax.aggregates[prefix.target];
+            fields = declaration.aggregate->fields;
+        } else if (prefix.kind == ExpansionTarget::Enumeration) {
+            declaration.enumeration = &syntax.enums[prefix.target];
         } else {
-            function = &syntax.functions[prefix.target];
-            if (prefix.decorator && (function->foreignSymbol || function->conversion)) throw at(source, prefix.name.span, "LYM0002", "装饰器需要普通函数体");
-            for (const auto& param : function->parameters) fields.push_back({param.name, param.type, false, true, param.attributes});
+            declaration.function = &syntax.functions[prefix.target];
+            if (prefix.decorator && (declaration.function->foreignSymbol || declaration.function->conversion)) throw at(source, prefix.name.span, "LYM0002", "装饰器需要普通函数体");
+            for (const auto& param : declaration.function->parameters) fields.push_back({param.name, param.type, false, true, param.attributes});
         }
-        auto generated = expand(source, prefix, packages.at(source.moduleId), &name, fields,
-            aggregate ? aggregate->reference ? "class" : "struct" : "fn", inputs, nullptr, function, aggregate);
+        const auto& name = declaration.enumeration ? declaration.enumeration->name : declaration.aggregate ? declaration.aggregate->name : declaration.function->name;
+        auto kind = declaration.enumeration ? "enum" : declaration.aggregate ? declaration.aggregate->reference ? "class" : "struct" : "fn";
+        auto generated = expand(source, prefix, packages.at(source.moduleId), &name, fields, kind, inputs, nullptr, declaration);
         if (prefix.decorator) {
-            if (prefix.record) {
+            if (prefix.kind == ExpansionTarget::Aggregate) {
                 if (generated.output.hooks) throw at(source, prefix.name.span, "LYM0002", "类型装饰器应生成辅助声明，不能返回 syntaxAround");
             } else {
                 if (!prefix.exports.empty()) throw at(source, prefix.name.span, "LYM0002", "函数装饰器不能生成公开声明");
@@ -704,7 +777,7 @@ void expandMacros(Module& syntax, std::vector<Source>& sources, const std::map<s
         }
         auto output = generatedSource(source, prefix, generated.output.code);
         sources.push_back(std::move(output));
-        auto start = syntax.functions.size(), records = syntax.aggregates.size(), imports = syntax.imports.size(), traits = syntax.traits.size(), enums = syntax.enums.size(), extensions = syntax.extensions.size(), exceptions = syntax.exceptions.size();
+        auto start = syntax.functions.size(), records = syntax.aggregates.size(), imports = syntax.imports.size(), traits = syntax.traits.size(), enums = syntax.enums.size(), extensions = syntax.extensions.size(), exceptions = syntax.exceptions.size(), aliases = syntax.aliases.size();
         parseFile(syntax, sources.back(), sources.size() - 1);
         std::map<std::string, std::size_t> defaultReferences;
         for (auto field : generated.defaultFields) defaultReferences.emplace(fieldDefaultReference(field), fields[field].defaultValue->function);
@@ -735,7 +808,7 @@ void expandMacros(Module& syntax, std::vector<Source>& sources, const std::map<s
                 if (declarations[index].isPublic) publish(declarations[index].name.text, true);
         };
         publishAll(syntax.traits, traits); publishAll(syntax.aggregates, records); publishAll(syntax.enums, enums);
-        publishAll(syntax.extensions, extensions); publishAll(syntax.exceptions, exceptions);
+        publishAll(syntax.extensions, extensions); publishAll(syntax.exceptions, exceptions); publishAll(syntax.aliases, aliases);
         if (!syntax.expansions.empty() || std::any_of(syntax.imports.begin() + imports, syntax.imports.end(), [](const auto& use) { return use.isPublic; })) reject();
         for (const auto& request : prefix.exports) if (!allowed.at(request.text))
             throw at(original, request.span, "LYM0002", "宏没有生成所请求的公开声明：" + request.text);
@@ -758,7 +831,7 @@ void expandMacros(Module& syntax, std::vector<Source>& sources, const std::map<s
             Module parsed;
             parseFile(parsed, source, sources.size());
             if (parsed.functions.size() != 1 || !parsed.aggregates.empty() || !parsed.imports.empty() || !parsed.expansions.empty() ||
-                !parsed.traits.empty() || !parsed.enums.empty() || !parsed.extensions.empty() || !parsed.exceptions.empty())
+                !parsed.traits.empty() || !parsed.enums.empty() || !parsed.extensions.empty() || !parsed.exceptions.empty() || !parsed.aliases.empty())
                 throw at(sources[prefix.file], site, "LYM0002", "装饰器阶段只能生成块中的语句");
             auto& hook = parsed.functions.front();
             enabled[slot] = true;

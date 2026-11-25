@@ -268,8 +268,40 @@ fn main(): Unit {
         self.diagnostic('LYN0001', 'encodeItem')
         main.write_text('struct Item(pub val id: Int)\n#derive(Json)\nstruct Envelope(pub val item: Item)\nfn main(): Unit {}')
         error = self.diagnostic('LYN0001', 'encodeItem')
-        self.assertEqual(error['range']['start']['line'], 2)
+        self.assertEqual(error['range']['start']['line'], 3)
         self.assertIn('item', error['generated']['source'])
+
+    def test_resolved_declaration_types_follow_aliases_and_invalidate_cache(self):
+        (self.src / '.macros/inspect.ly').write_text('''fn inspect(target: String, argument: String): Syntax {
+    val first = syntaxResolvedType(syntaxChild(syntaxChild(syntaxTarget(), 1), 1))
+    val element = syntaxChild(first, 0)
+    val leaf = syntaxChild(element, 0)
+    val generic = syntaxResolvedType(syntaxChild(syntaxChild(syntaxTarget(), 2), 1))
+    val local = syntaxResolvedType(syntaxChild(syntaxChild(syntaxTarget(), 3), 1))
+    val text = syntaxText(first) + "/" + syntaxText(element) + "/" + syntaxText(leaf) + "/" + syntaxKind(generic) + ":" + syntaxText(generic) + "/" + syntaxTypeModule(local) + ":" + syntaxText(local)
+    syntaxCode("fn shape(): String { " + macroQuote(text) + " }")
+}''', encoding='utf-8')
+        model = self.src / 'model'
+        model.mkdir()
+        aliases = model / 'model.ly'
+        api = self.src / 'api'
+        api.mkdir()
+        (api / 'api.ly').write_text('pub import self.model.Payload as Wire\npub import self.model.Named', encoding='utf-8')
+        main = self.src / 'main.ly'
+        main.write_text('''import self.api.Wire as Alias
+import self.api.Named as PublicName
+#inspect
+struct Probe<T>(val items: Alias, val other: T, val record: PublicName)
+fn main(): Unit { print(shape()) }
+''', encoding='utf-8')
+        for kind in ('Int8', 'String'):
+            aliases.write_text('struct Private()\npub struct Named()\ntype Leaf = ' + kind + '\npub type Payload = List<Leaf?>', encoding='utf-8')
+            run = self.cli('run', self.pkg)
+            self.assertEqual(run.returncode, 0, run.stderr.decode())
+            text = run.stdout.decode().strip()
+            self.assertTrue(text.startswith(f'List/Option/{kind}/parameter:T/'), text)
+            self.assertTrue(text.endswith('.model:Named'), text)
+        self.assertEqual(len(list((self.root / 'cache/compiler/macros').glob('*.expansion'))), 2)
 
     def test_derive_fixed_width_integers_check_the_wire_value(self):
         types = ('Int8', 'Int16', 'Int32', 'Int64', 'UInt8', 'UInt16', 'UInt32')
