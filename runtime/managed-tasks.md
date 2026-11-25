@@ -16,7 +16,7 @@
 | 推进域 | `lyraDomainRun(domain)` 在该域的执行器上驱动 libuv，串行调用就绪的 `step(task, frame)`，返回本次执行的步数。没有就绪任务、活动 libuv 工作或来自 Worker 域的待交付结果时返回；手动门闩未放行的任务可以仍挂起。只在回调外泵循环，域中没有存活任务时再 `lyraDomainDestroy`。 |
 | 显式换域 | `lyraTaskParallel(parent, target)` 接收当前运行任务和一个冷 Task，在不同执行器上的新域登记并启动子任务；若目标已激活则只返回原句柄。`lyraTaskSpawn` 则仍把冷子任务放进父域。两者都从首次激活处继承 Context，子任务的收尾由登记它的父任务负责。 |
 | 局部上下文 | `lyraTaskWithLocal(key, boxed, body)` 创建冷包装任务，首次激活时在继承的 Context 中加入该键和值，再等待 `body`。冷 `body` 获得扩展后的 Context；已激活的 `body` 保留原 Context 和归属。键和值盒都由 GC 保活，包装任务转发结果、异常与取消。 |
-| 等待 | 正在运行的 `step` 调用 `lyraTaskAwait(self, target)`。冷目标在等待者域启动；活跃目标保持原域。返回 `0` 时保存过恢复点的回调须立即返回；返回 `1` 时按 `lyraTaskState(target)` 分支，成功只读 `lyraTaskOutcome`，失败读 `lyraTaskException`。等待者总是入**自身**域的队列。 |
+| 等待 | 正在运行的 `step` 调用 `lyraTaskAwaitValue(self, target, &error)`。冷目标在等待者域启动；活跃目标保持原域。返回 `LYRA_AWAIT_PENDING` 时保存过恢复点的回调须立即返回；`LYRA_AWAIT_VALUE` 才能读 `lyraTaskOutcome`，`LYRA_AWAIT_EXCEPTION` 从 `error` 取原因。等待者总是入**自身**域的队列。 |
 | 手动门闩 | 设置恢复点后调用 `lyraTaskSuspend(self)` 并返回；域线程可用 `lyraTaskWake(task)` 解除本次门闩。真实外部事件应在清理时撤销旧回调，不把上一轮的通知复用到下一次挂起。 |
 | 完成 | `lyraTaskComplete(self, value)`、`lyraTaskFail(self, error)` 等已登记子任务完成后，逆序执行剩余清理，再发布终态并唤醒等待者。`Unit` 可用空指针；其他载荷应存在可追踪的受管理存储中，不能传短命的栈地址。句柄存活时，多次等到同一终态；需要按值复制的结果由调用端读取。 |
 | 取消 | `lyraTaskRequestCancel(task)` 设置请求，唤醒可取消的挂起点。回调在恢复入口用 `lyraTaskCancelRequested` 检查；`lyraTaskFinishCancelled` 与其余退出路径共用任务清理。取消一个等待者会撤销它自己的订阅，不替它取消别人已启动的任务。 |
@@ -41,7 +41,7 @@ LLVM 后端给每个异步函数生成一个用于创建冷 Task 的普通函数
 
 生成的状态机使用 `lyraTaskAwaitValue`：挂起时返回调度循环，成功时读取结果盒，普通异常时从独立的错误槽进入当前 `catch`。被等待者取消时则直接收尾，不经过普通 `catch`。`lyraTaskFail` 接受 `LyraException`，原生错误需显式适配；不把 C 指针当异常，不让 C++ 异常或 `longjmp` 越过 Worker 回调。Worker 通过异常输出参数交回失败，`defer` 回调直接返回异常或空指针。
 
-`lyraTaskAwaitOutcome` 使用相同等待队列和归组规则；目标取消且已完成清理时返回 `LYRA_AWAIT_CANCELLED`，不取消等待者。等待者自身收到取消时仍从状态机取消入口收尾。
+`lyraTaskAwaitOutcome` 使用相同等待队列和归组规则；目标失败时读目标的终态异常，目标取消且已完成清理时返回 `LYRA_AWAIT_CANCELLED`，不取消等待者。`LYRA_AWAIT_CYCLE` 才写入 `error`，表示本次等待不能登记，与目标终态无关；普通等待直接从其错误槽传播 `TaskCycleError`。等待者自身收到取消时仍从状态机取消入口收尾。
 
 每次调用清理前先弹栈。正常退出时第一个清理失败成为主异常；已有异常或取消时保留原主因，后续清理仍运行，所有附加原因按实际执行顺序保留。任务缓存不可变的失败记录，附带抛出及创建位置；每个等待者只给自己的异常视图附加 `await` 位置。未处理的普通异常到达根时打印原因链并非零退出。[源码用例](../tests/exceptions_cli.py)覆盖跨挂起重抛、Worker、`?` 和取消收尾。
 

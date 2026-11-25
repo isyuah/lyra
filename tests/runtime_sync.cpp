@@ -122,7 +122,7 @@ int main() {
     auto *shared = ::new (lyraGcAlloc(sizeof(Shared))) Shared{lyraMutexCreate(), lyraAtomicIntCreate(0)};
     SyncCase test{shared, {{&test, 0}, {&test, 1}}};
     auto *root = lyraTaskCreate(runBoth, &test);
-    check(lyraTaskRunRoot(root) == 0 && lyraTaskState(root) == LYRA_TASK_COMPLETED, "parallel updates did not finish");
+    check(lyraTaskRunRoot(root, nullptr) == 0 && lyraTaskState(root) == LYRA_TASK_COMPLETED, "parallel updates did not finish");
     constexpr auto total = 2 * updates;
     check(shared->count == total, "mutex lost a protected update");
     check(lyraAtomicIntLoad(shared->atomic) == total && test.peers[0].sum + test.peers[1].sum == total * (total - 1) / 2,

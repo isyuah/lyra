@@ -60,7 +60,11 @@ void scoped(LyraTask *self, void *storage) {
         check(lyraContextDeadline(work->expected) == lyraContextDeadline(deadline), "inner extended deadline");
         check(lyraContextEnter(work->expected) && !lyraContextEnter(local), "failed to narrow deadline");
     }
-    if (lyraTaskAwait(self, work->cold)) lyraTaskComplete(self, nullptr);
+    const LyraException* error;
+    auto status = lyraTaskAwaitValue(self, work->cold, &error);
+    if (status == LYRA_AWAIT_PENDING) return;
+    check(status == LYRA_AWAIT_VALUE && !error, "cold context task failed");
+    lyraTaskComplete(self, nullptr);
 }
 
 void root(LyraTask *self, void *storage) {
@@ -139,13 +143,14 @@ void localRoot(LyraTask *self, void *storage) {
         test.failing = withLocal(test.identity, 99, failing);
         lyraGcCollect();
     }
-    if (lyraTaskAwaitValue(self, test.scope) == LYRA_AWAIT_PENDING) return;
+    const LyraException* error;
+    if (lyraTaskAwaitValue(self, test.scope, &error) == LYRA_AWAIT_PENDING) return;
     check(lyraTaskState(test.scope) == LYRA_TASK_COMPLETED && *static_cast<int *>(lyraTaskOutcome(test.scope)) == 73 && test.steps == 2,
           "scoped task did not forward its original outcome");
     localNumber(test.identity, 23);
-    auto failure = lyraTaskAwaitValue(self, test.failing);
+    auto failure = lyraTaskAwaitValue(self, test.failing, &error);
     if (failure == LYRA_AWAIT_PENDING) return;
-    check(failure == LYRA_AWAIT_EXCEPTION && lyraTaskException(test.failing) == test.failure, "scoped task changed the exception");
+    check(failure == LYRA_AWAIT_EXCEPTION && error == test.failure, "scoped task changed the exception");
     lyraTaskComplete(self, nullptr);
 }
 

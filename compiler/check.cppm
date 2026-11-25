@@ -28,7 +28,8 @@ inline constexpr const char* rangeFieldNames[] = {"start", "end", "inclusive"};
 inline constexpr Type channelClosed{Type::Exception, 1};
 inline constexpr Type boundsError{Type::Exception, 2};
 inline constexpr Type arithmeticError{Type::Exception, 3};
-inline constexpr std::string_view builtinExceptionNames[] = {"Exception", "ChannelClosed", "BoundsError", "ArithmeticError"};
+inline constexpr Type taskCycleError{Type::Exception, 4};
+inline constexpr std::string_view builtinExceptionNames[] = {"Exception", "ChannelClosed", "BoundsError", "ArithmeticError", "TaskCycleError"};
 inline constexpr std::size_t firstDeclaredException = sizeof(builtinExceptionNames) / sizeof(builtinExceptionNames[0]);
 inline std::optional<Type> builtinException(std::string_view name) {
     for (std::size_t index = 0; index < firstDeclaredException; ++index)

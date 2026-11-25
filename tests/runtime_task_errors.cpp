@@ -38,9 +38,11 @@ void sibling(LyraTask *self, void *storage) {
 void observe(LyraTask *self, void *storage) {
     auto *group = static_cast<Group *>(storage);
     auto await = group->outcome ? lyraTaskAwaitOutcome : lyraTaskAwaitValue;
-    if (await(self, group->target) == LYRA_AWAIT_PENDING) return;
-    check(await(self, group->target) == LYRA_AWAIT_EXCEPTION, "repeat await observed a successful completion");
-    check(lyraTaskException(group->target) == group->error, "await changed the task's terminal exception");
+    const LyraException *error;
+    if (await(self, group->target, &error) == LYRA_AWAIT_PENDING) return;
+    check(await(self, group->target, &error) == LYRA_AWAIT_EXCEPTION, "repeat await observed a successful completion");
+    check((group->outcome ? !error : error == group->error) && lyraTaskException(group->target) == group->error,
+          "await changed the task's terminal exception");
     group->caught = true;
     lyraTaskWake(group->sibling);
     lyraTaskComplete(self, nullptr);
@@ -92,7 +94,8 @@ void cancelledObservation(LyraDomain *origin, LyraDomain *other) {
     }, nullptr);
     auto *waiter = lyraTaskCreate([](LyraTask *self, void *storage) {
         if (lyraTaskCancelRequested(self)) { lyraTaskFinishCancelled(self); return; }
-        check(lyraTaskAwaitOutcome(self, static_cast<LyraTask *>(storage)) == LYRA_AWAIT_PENDING, "cancelled observer executed its continuation");
+        const LyraException *error;
+        check(lyraTaskAwaitOutcome(self, static_cast<LyraTask *>(storage), &error) == LYRA_AWAIT_PENDING, "cancelled observer executed its continuation");
     }, target);
     lyraTaskStart(origin, target);
     lyraTaskStart(other, waiter);
@@ -105,11 +108,12 @@ void cancelledObservation(LyraDomain *origin, LyraDomain *other) {
     lyraTaskRequestCancel(target);
     auto *observer = lyraTaskCreate([](LyraTask *self, void *storage) {
         auto *observed = static_cast<LyraTask *>(storage);
+        const LyraException *error;
         if (lyraTaskState(observed) != LYRA_TASK_CANCELLED) {
-            check(lyraTaskAwaitOutcome(self, observed) == LYRA_AWAIT_PENDING, "observed cancellation before cleanup completed");
+            check(lyraTaskAwaitOutcome(self, observed, &error) == LYRA_AWAIT_PENDING, "observed cancellation before cleanup completed");
             return;
         }
-        check(lyraTaskAwaitOutcome(self, observed) == LYRA_AWAIT_CANCELLED, "target cancellation propagated into observer");
+        check(lyraTaskAwaitOutcome(self, observed, &error) == LYRA_AWAIT_CANCELLED, "target cancellation propagated into observer");
         lyraTaskComplete(self, nullptr);
     }, target);
     lyraTaskStart(other, observer);
@@ -181,7 +185,8 @@ void failingPeer(LyraTask *self, void *storage) {
         lyraTaskKeepCleanups(peers->victim, &peers->stack);
         lyraTaskSpawn(self, lyraTaskCreate([](LyraTask *child, void *capture) { lyraTaskFail(child, static_cast<PeerFailure *>(capture)->failure); }, peers));
     }
-    check(lyraTaskAwaitValue(self, peers->victim) == LYRA_AWAIT_PENDING, "ordinary catch swallowed a sibling's cancellation");
+    const LyraException *error;
+    check(lyraTaskAwaitValue(self, peers->victim, &error) == LYRA_AWAIT_PENDING, "ordinary catch swallowed a sibling's cancellation");
 }
 
 }

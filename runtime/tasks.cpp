@@ -21,6 +21,7 @@ struct Executor;
 struct ReadyDomains;
 struct LyraDomain {
     Executor *executor;
+    const void *cycleErrorType;
     LyraTask *first, *last;
     ReadyDomains *queued;
     LyraDomain *previousReady, *nextReady;
@@ -89,6 +90,7 @@ struct LyraTask {
     LyraTask *firstWaiter;
     LyraTask *nextWaiter;
     LyraTask *waitingOn;
+    LyraTask *nextWaitSearch;
     WaitSet *wait;
     LyraTask *owner, *firstChild, *lastChild, *previousChild, *nextChild;
     size_t ordinal, nextOrdinal;
@@ -728,8 +730,47 @@ void armDeadline(LyraTask *task, int64_t remaining) {
     ++task->domain->loopUsers;
 }
 
+bool closesWaitCycle(LyraTask *waiter, LyraTask *target = nullptr) {
+    if (target == waiter) return true;
+    if (target && !target->waitingOn && !target->joining && !target->resumeAfterChildren) return false;
+    LyraTask *first = nullptr, *last = nullptr;
+    auto visit = [&](LyraTask *task) {
+        if (!task || task->nextWaitSearch) return;
+        if (last) last->nextWaitSearch = task;
+        else first = task;
+        last = task;
+        task->nextWaitSearch = task;
+    };
+    auto visitChildren = [&](LyraTask *task) {
+        for (auto *child = task->firstChild; child; child = child->nextChild) visit(child);
+    };
+    if (target) visit(target);
+    else visitChildren(waiter);
+    auto *current = first;
+    while (current && current != waiter) {
+        visit(current->waitingOn);
+        if (current->joining || current->resumeAfterChildren) visitChildren(current);
+        current = current == last ? nullptr : current->nextWaitSearch;
+    }
+    for (auto *task = first; task;) {
+        auto *next = task == last ? nullptr : task->nextWaitSearch;
+        task->nextWaitSearch = nullptr;
+        task = next;
+    }
+    return current == waiter;
+}
+
+const LyraException *cycleError(LyraTask *task, const char *message) {
+    return lyraExceptionCreateTyped(lyraStringFromBytes(message, strlen(message)), task->domain->cycleErrorType, "TaskCycleError");
+}
+
 void finish(TaskLock& lock, LyraTask *task, LyraTaskState state, void *outcome) {
     require(task->state == LYRA_TASK_RUNNING, "only a running task can finish");
+    if (state == LYRA_TASK_COMPLETED && task->firstChild && closesWaitCycle(task)) {
+        task->error = cycleError(task, "joining child tasks would create a task wait cycle");
+        state = LYRA_TASK_FAILED;
+        outcome = nullptr;
+    }
     task->pendingState = state;
     task->outcome = outcome;
     if (task->firstChild) {
@@ -823,10 +864,13 @@ void requestCancel(LyraTask *task) {
     }
 }
 
-int awaitTask(LyraTask *waiter, LyraTask *target) {
-    require(waiter->state == LYRA_TASK_RUNNING && waiter != target, "invalid task wait");
-    if (waiter->cancelRequested) { enqueue(waiter); return 0; }
-    if (isTerminal(target)) return 1;
+LyraAwaitStatus awaitTask(LyraTask *waiter, LyraTask *target) {
+    require(waiter->state == LYRA_TASK_RUNNING, "only a running task can await");
+    if (waiter->cancelRequested) { enqueue(waiter); return LYRA_AWAIT_PENDING; }
+    if (target->state == LYRA_TASK_COMPLETED) return LYRA_AWAIT_VALUE;
+    if (target->state == LYRA_TASK_FAILED) return LYRA_AWAIT_EXCEPTION;
+    if (target->state == LYRA_TASK_CANCELLED) return LYRA_AWAIT_CANCELLED;
+    if (closesWaitCycle(waiter, target)) return LYRA_AWAIT_CYCLE;
     startChild(waiter, target, false, waiter->domain);
     if (target->owner == waiter) target->reportToGroup = false;
     waiter->nextWaiter = target->firstWaiter;
@@ -834,7 +878,7 @@ int awaitTask(LyraTask *waiter, LyraTask *target) {
     waiter->waitingOn = target;
     waiter->state = LYRA_TASK_SUSPENDED;
     transferLease(waiter->domain, target->domain, true);
-    return 0;
+    return LYRA_AWAIT_PENDING;
 }
 
 struct BlockingClosure {
@@ -875,11 +919,12 @@ void localScopeStep(LyraTask *self, void *storage) {
         require(lyraContextEnter(lyraContextWithLocal(lyraContextCurrent(), scope->key, scope->boxed)), "cannot install task local scope");
         scope->installed = true;
     }
-    switch (lyraTaskAwaitValue(self, scope->body)) {
+    const LyraException *error;
+    switch (lyraTaskAwaitValue(self, scope->body, &error)) {
         case LYRA_AWAIT_PENDING: return;
         case LYRA_AWAIT_VALUE: lyraTaskComplete(self, lyraTaskOutcome(scope->body)); return;
-        case LYRA_AWAIT_EXCEPTION: lyraTaskFail(self, lyraTaskException(scope->body)); return;
-        case LYRA_AWAIT_CANCELLED: require(false, "ordinary await must propagate cancellation"); return;
+        case LYRA_AWAIT_EXCEPTION: lyraTaskFail(self, error); return;
+        case LYRA_AWAIT_CANCELLED: case LYRA_AWAIT_CYCLE: require(false, "unexpected ordinary await status"); return;
     }
 }
 
@@ -1102,13 +1147,15 @@ LyraTask *lyraTaskParallel(LyraTask *parent, LyraTask *target) {
     if (executor == &host && pool.workerCount > 1) executor = next();
     auto *domain = allocateRuntime<LyraDomain>("cannot allocate parallel execution domain");
     domain->executor = executor;
+    domain->cycleErrorType = parent->domain->cycleErrorType;
     domain->pooled = true;
     startChild(parent, target, true, domain);
     return target;
 }
 
-int lyraTaskRunRoot(LyraTask *task) {
+int lyraTaskRunRoot(LyraTask *task, const void *cycleErrorType) {
     auto *domain = lyraDomainCreate();
+    domain->cycleErrorType = cycleErrorType;
     lyraTaskStart(domain, task);
     lyraDomainRun(domain);
     require(domain->live == 0, "no runnable work can complete the root task group");
@@ -1119,16 +1166,16 @@ int lyraTaskRunRoot(LyraTask *task) {
     return status;
 }
 
-int lyraTaskAwait(LyraTask *waiter, LyraTask *target) {
+LyraAwaitStatus lyraTaskAwaitValue(LyraTask *waiter, LyraTask *target, const LyraException **error) {
     TaskLock lock;
-    return awaitTask(waiter, target);
-}
-
-LyraAwaitStatus lyraTaskAwaitValue(LyraTask *waiter, LyraTask *target) {
-    TaskLock lock;
-    if (!awaitTask(waiter, target)) return LYRA_AWAIT_PENDING;
-    if (target->state == LYRA_TASK_FAILED) return LYRA_AWAIT_EXCEPTION;
-    if (target->state == LYRA_TASK_CANCELLED) {
+    *error = nullptr;
+    auto status = awaitTask(waiter, target);
+    if (status == LYRA_AWAIT_CYCLE) {
+        *error = cycleError(waiter, "await would create a task wait cycle");
+        return LYRA_AWAIT_EXCEPTION;
+    }
+    if (status == LYRA_AWAIT_EXCEPTION) *error = target->error;
+    if (status == LYRA_AWAIT_CANCELLED) {
         if (waiter->failures && !waiter->cancelRequested) {
             finish(lock, waiter, LYRA_TASK_FAILED, nullptr);
             return LYRA_AWAIT_PENDING;
@@ -1138,15 +1185,15 @@ LyraAwaitStatus lyraTaskAwaitValue(LyraTask *waiter, LyraTask *target) {
         finish(lock, waiter, LYRA_TASK_CANCELLED, nullptr);
         return LYRA_AWAIT_PENDING;
     }
-    return LYRA_AWAIT_VALUE;
+    return status;
 }
 
-LyraAwaitStatus lyraTaskAwaitOutcome(LyraTask *waiter, LyraTask *target) {
+LyraAwaitStatus lyraTaskAwaitOutcome(LyraTask *waiter, LyraTask *target, const LyraException **error) {
     TaskLock lock;
     cancelled(waiter);
-    if (!awaitTask(waiter, target)) return LYRA_AWAIT_PENDING;
-    if (target->state == LYRA_TASK_FAILED) return LYRA_AWAIT_EXCEPTION;
-    return target->state == LYRA_TASK_CANCELLED ? LYRA_AWAIT_CANCELLED : LYRA_AWAIT_VALUE;
+    auto status = awaitTask(waiter, target);
+    *error = status == LYRA_AWAIT_CYCLE ? cycleError(waiter, "awaitOutcome would create a task wait cycle") : nullptr;
+    return status;
 }
 
 void lyraTaskSuspend(LyraTask *task) {

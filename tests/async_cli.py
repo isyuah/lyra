@@ -156,6 +156,101 @@ async fn main(): Unit {
     show(awaitOutcome(child))
 }''', '42\noriginal\noriginal\n2\nfirst cleanup\nsecond cleanup\n2\nfirst cleanup\nsecond cleanup\n')
 
+    def test_self_wait_is_an_exception_not_a_task_outcome(self):
+        self.run_source('''async fn main(): Unit {
+    var work = async {}
+    work = async {
+        defer print("cleanup")
+        try { await work } catch error: TaskCycleError { print(error.message) }
+        try { awaitOutcome(work); } catch error: TaskCycleError { print(error.message) }
+        print("still running")
+    }
+    await work
+    print("completed")
+}
+''', 'await would create a task wait cycle\nawaitOutcome would create a task wait cycle\nstill running\ncleanup\ncompleted\n')
+
+    def test_mutual_await_in_one_domain(self):
+        self.run_source('''async fn main(): Unit {
+    var first = async {}
+    var second = async {}
+    first = async {
+        defer print("first cleanup")
+        await second
+    }
+    second = async {
+        defer print("second cleanup")
+        try { await first } catch error: TaskCycleError { print(error.message) }
+    }
+    await first
+}
+''', 'await would create a task wait cycle\nsecond cleanup\nfirst cleanup\n')
+
+    def test_wait_cycle_across_parallel_domains(self):
+        self.run_source('''async fn main(): Unit {
+    var first = async {}
+    var second = async {}
+    val ready = Channel<Unit>(2)
+    val start = Channel<Unit>(2)
+    val caught = Channel<String>(2)
+    val marks = [0, 0]
+    first = parallel {
+        defer { marks[0] = 1 }
+        await ready.send({})
+        await start.receive()
+        try { await second } catch error: TaskCycleError { await caught.send(error.message) }
+    }
+    second = parallel {
+        defer { marks[1] = 1 }
+        await ready.send({})
+        await start.receive()
+        try { await first } catch error: TaskCycleError { await caught.send(error.message) }
+    }
+    await ready.receive()
+    await ready.receive()
+    await start.send({})
+    await start.send({})
+    await first
+    await second
+    caught.close()
+    print(match await caught.receive() { Some(message) => message, None => "missing cycle" })
+    print(await caught.receive() == None)
+    print(marks[0] + marks[1])
+}
+''', 'await would create a task wait cycle\ntrue\n2\n', env={**os.environ, "LYRA_PARALLEL_WORKERS": "2"})
+
+    def test_implicit_join_cycle_cancels_and_unwinds_children(self):
+        self.run_source('''async fn main(): Unit {
+    var owner = async {}
+    owner = async {
+        defer print("owner cleanup")
+        spawn async {
+            defer { print("child cleanup"); throw Exception("child close failed") }
+            await owner
+        };
+        await sleepMs(0)
+    }
+    try { await owner } catch error: TaskCycleError {
+        print(error.message)
+        print(error.cleanupFailures[0].message)
+    }
+}
+''', 'child cleanup\nowner cleanup\njoining child tasks would create a task wait cycle\nchild close failed\n')
+
+    def test_await_detects_existing_implicit_join_edge(self):
+        self.run_source('''async fn main(): Unit {
+    var owner = async {}
+    owner = async {
+        defer print("owner cleanup")
+        spawn async {
+            defer print("child cleanup")
+            try { await owner } catch error: TaskCycleError { print(error.message) }
+        };
+    }
+    await owner
+}
+''', 'await would create a task wait cycle\nchild cleanup\nowner cleanup\n')
+
     def test_async_iteration_and_outcome_require_an_async_context(self):
         for program, name in [
             ('fn main(): Unit { for await value in Channel<Int>(1) {} }', 'await'),

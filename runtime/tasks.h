@@ -23,7 +23,7 @@ typedef enum LyraTaskState {
     LYRA_TASK_COMPLETED, LYRA_TASK_FAILED, LYRA_TASK_CANCELLED
 } LyraTaskState;
 
-typedef enum LyraAwaitStatus { LYRA_AWAIT_PENDING, LYRA_AWAIT_VALUE, LYRA_AWAIT_EXCEPTION, LYRA_AWAIT_CANCELLED } LyraAwaitStatus;
+typedef enum LyraAwaitStatus { LYRA_AWAIT_PENDING, LYRA_AWAIT_VALUE, LYRA_AWAIT_EXCEPTION, LYRA_AWAIT_CANCELLED, LYRA_AWAIT_CYCLE } LyraAwaitStatus;
 
 LyraDomain *lyraDomainCreate(void);
 int64_t lyraTaskParallelism(void);
@@ -45,12 +45,11 @@ void lyraTaskSelectArm(LyraTask *select, size_t index, const LyraTask *operation
 void lyraTaskSharedCopy(void *destination, const void *source, size_t bytes);
 int lyraTaskWatchDisconnect(uintptr_t monitor, void *target, int (*locallyClosed)(const void *));
 void lyraTaskStart(LyraDomain *domain, LyraTask *task);
-int lyraTaskAwait(LyraTask *waiter, LyraTask *target);
-LyraAwaitStatus lyraTaskAwaitValue(LyraTask *waiter, LyraTask *target);
-LyraAwaitStatus lyraTaskAwaitOutcome(LyraTask *waiter, LyraTask *target);
+LyraAwaitStatus lyraTaskAwaitValue(LyraTask *waiter, LyraTask *target, const LyraException **error);
+LyraAwaitStatus lyraTaskAwaitOutcome(LyraTask *waiter, LyraTask *target, const LyraException **error);
 LyraTask *lyraTaskSpawn(LyraTask *parent, LyraTask *target);
 LyraTask *lyraTaskParallel(LyraTask *parent, LyraTask *target);
-int lyraTaskRunRoot(LyraTask *task);
+int lyraTaskRunRoot(LyraTask *task, const void *cycleErrorType);
 void lyraTaskSuspend(LyraTask *task);
 void lyraTaskWake(LyraTask *task);
 void lyraTaskBlock(LyraTask *task, LyraNativeWork work, void *nativeData);

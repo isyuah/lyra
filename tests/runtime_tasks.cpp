@@ -73,9 +73,11 @@ void observe(LyraTask *self, void *storage) {
         lyraTaskFinishCancelled(self);
         return;
     }
-    if (!lyraTaskAwait(self, frame->target)) return;
-    if (lyraTaskState(frame->target) == LYRA_TASK_FAILED) {
-        lyraTaskFail(self, lyraTaskException(frame->target));
+    const LyraException *error;
+    auto status = lyraTaskAwaitValue(self, frame->target, &error);
+    if (status == LYRA_AWAIT_PENDING) return;
+    if (status == LYRA_AWAIT_EXCEPTION) {
+        lyraTaskFail(self, error);
         return;
     }
     check(lyraTaskState(frame->target) == LYRA_TASK_COMPLETED, "unexpected observed outcome");
@@ -257,7 +259,8 @@ void watchedHandler(LyraTask *self, void *storage) {
         }, test);
         check(lyraTaskWatchDisconnect(test->monitor, test->locallyClosed, disconnectSocketClosed), "owner could not watch a socket");
         test->blocked = lyraTaskBlocking(queuedClosure, test);
-        check(!lyraTaskAwait(self, test->blocked), "cold blocking closure was already done");
+        const LyraException *error;
+        check(lyraTaskAwaitValue(self, test->blocked, &error) == LYRA_AWAIT_PENDING, "cold blocking closure was already done");
         return;
     }
     check(lyraTaskCancelRequested(self) && test->observed && test->gate.returned, "cleanup ran early or missed disconnect");
@@ -364,14 +367,16 @@ void parallelRendezvous(LyraTask *self, void *storage) {
         }
         check(!test.sameDomainSteps, "spawn ran during an unsuspended step in its own domain");
         collectUnderPressure();
-        check(lyraTaskAwaitValue(self, test.children[0]) == LYRA_AWAIT_PENDING, "cross-domain await did not park on a closed gate");
+        const LyraException *error;
+        check(lyraTaskAwaitValue(self, test.children[0], &error) == LYRA_AWAIT_PENDING, "cross-domain await did not park on a closed gate");
         return;
     }
     check(std::this_thread::get_id() == test.caller && test.sameDomainSteps == 1, "parallel completion resumed outside the waiter's domain");
     check(lyraContextLocal(lyraContextCurrent(), &test) == &test.laterLocal, "cross-domain resume changed the waiter's context");
     for (unsigned index = 0; index < 2; ++index) {
         auto *target = test.children[index];
-        if (lyraTaskAwaitValue(self, target) == LYRA_AWAIT_PENDING) return;
+        const LyraException *error;
+        if (lyraTaskAwaitValue(self, target, &error) == LYRA_AWAIT_PENDING) return;
         check(lyraTaskState(target) == LYRA_TASK_COMPLETED && static_cast<Counter *>(lyraTaskOutcome(target))->count == 90 + index,
               "parallel result was lost during collection or transfer");
     }
@@ -392,7 +397,8 @@ void nestedDomain(LyraTask *self, void *storage) {
             *child = {frame.depth - 1, nullptr};
             frame.child = lyraTaskParallel(self, lyraTaskCreate(nestedDomain, child));
         }
-        if (lyraTaskAwaitValue(self, frame.child) == LYRA_AWAIT_PENDING) return;
+        const LyraException *error;
+        if (lyraTaskAwaitValue(self, frame.child, &error) == LYRA_AWAIT_PENDING) return;
         check(lyraTaskState(frame.child) == LYRA_TASK_COMPLETED, "nested domain failed while sharing the worker pool");
     }
     lyraTaskComplete(self, nullptr);
@@ -651,7 +657,7 @@ void checkSingleWorker() {
         lyraTaskParallel(self, worker);
         lyraTaskComplete(self, nullptr);
     }, &caller);
-    check(lyraTaskRunRoot(root) == 0, "nested parallel work deadlocked with one Worker");
+    check(lyraTaskRunRoot(root, nullptr) == 0, "nested parallel work deadlocked with one Worker");
 }
 
 }

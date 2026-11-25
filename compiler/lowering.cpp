@@ -1094,12 +1094,13 @@ struct Emitter {
 
     Value awaitValue(llvm::Type* type, Value task, Span site) {
         auto result = asyncAwait(builder, type, task, errorSlot);
-        guard(builder.CreateLoad(builder.getPtrTy(), errorSlot), handlers.size(), site, "await");
+        guardSlot(site, "await");
         return result;
     }
 
-    Value awaitOutcome(ExprId id, Value task) {
-        auto status = asyncAwaitOutcome(builder, task);
+    Value awaitOutcome(ExprId id, Value task, Span site) {
+        auto status = asyncAwaitOutcome(builder, task, errorSlot);
+        guardSlot(site, "awaitOutcome");
         auto type = rawType(id);
         auto invalid = label("outcome.invalid"), merge = label("outcome.end");
         auto dispatch = builder.CreateSwitch(status, invalid, 3);
@@ -1588,7 +1589,7 @@ struct Emitter {
         switch (info.callee) {
             case Callee::BoundMethod: case Callee::Indirect: llvm_unreachable("invalid indirect call plan");
             case Callee::TaskCancelled: case Callee::TaskCheckCancellation: llvm_unreachable("static task call already emitted");
-            case Callee::AwaitOutcome: return awaitOutcome(id, args[0]);
+            case Callee::AwaitOutcome: return awaitOutcome(id, args[0], call.name.span);
             case Callee::PtrAllocate: {
                 auto* pointer = builder.getPtrTy();
                 auto allocate = module.getOrInsertFunction("lyraPtrAllocate", pointer, builder.getInt64Ty(), pointer);
@@ -2252,7 +2253,7 @@ std::unique_ptr<llvm::Module> lower(const CheckedModule& program, const std::vec
     if (commandLine) builder.CreateCall(module->getOrInsertFunction("lyraIoSetArgs", builder.getVoidTy(), builder.getInt32Ty(), builder.getPtrTy()), {main->getArg(0), main->getArg(1)});
     if (root.syntax.isAsync) {
         auto result = NativeExceptions{builder}.created(builder.CreateCall(functions[entry]), sources[root.syntax.file], root.syntax.name.span);
-        builder.CreateRet(asyncEntry(builder, result, root.result == Type::Unit ? nullptr : layouts.native(builder, root.result),
+        builder.CreateRet(asyncEntry(builder, result, layouts.typeToken(builder, taskCycleError), root.result == Type::Unit ? nullptr : layouts.native(builder, root.result),
             root.result.kind == Type::Result && program.sumTypes[root.result.id].failure == Type::Error));
     } else {
         auto slot = NativeExceptions{builder}.slot();

@@ -64,8 +64,8 @@ export llvm::Value* asyncAwait(llvm::IRBuilder<>& builder, llvm::Type* result, l
     return marker(builder, "lyra.await", result, {task, errorSlot});
 }
 
-export llvm::Value* asyncAwaitOutcome(llvm::IRBuilder<>& builder, llvm::Value* task) {
-    return marker(builder, "lyra.awaitOutcome", builder.getInt32Ty(), {task});
+export llvm::Value* asyncAwaitOutcome(llvm::IRBuilder<>& builder, llvm::Value* task, llvm::Value* errorSlot) {
+    return marker(builder, "lyra.awaitOutcome", builder.getInt32Ty(), {task, errorSlot});
 }
 
 export llvm::Value* asyncSpawn(llvm::IRBuilder<>& builder, llvm::Value* task, bool parallel = false) {
@@ -88,8 +88,9 @@ export llvm::Value* nativeExitCode(llvm::IRBuilder<>& builder, llvm::Value* resu
     return builder.CreateCall(runtime(builder, "lyraExitCode", builder.getInt32Ty(), {builder.getInt64Ty()}), {result});
 }
 
-export llvm::Value* asyncEntry(llvm::IRBuilder<>& builder, llvm::Value* coldRoot, llvm::Type* resultType, bool commonError) {
-    auto* status = builder.CreateCall(runtime(builder, "lyraTaskRunRoot", builder.getInt32Ty(), {builder.getPtrTy()}), {coldRoot});
+export llvm::Value* asyncEntry(llvm::IRBuilder<>& builder, llvm::Value* coldRoot, llvm::Value* cycleType, llvm::Type* resultType, bool commonError) {
+    auto* pointer = builder.getPtrTy();
+    auto* status = builder.CreateCall(runtime(builder, "lyraTaskRunRoot", builder.getInt32Ty(), {pointer, pointer}), {coldRoot, cycleType});
     if (!resultType) return status;
     auto* start = builder.GetInsertBlock();
     auto* main = start->getParent();
@@ -323,27 +324,25 @@ export void lowerAsync(llvm::Function& factory, llvm::Function& body, llvm::Allo
         auto* index = builder.getInt32(++state);
         branch->addCase(index, site.resume);
         builder.CreateStore(index, pc);
-        if (wait->arg_size() == 1) {
-            auto* status = builder.CreateCall(runtime(builder, "lyraTaskAwaitOutcome", integer, {pointer, pointer}), {task, target});
+        auto* errorSlot = wait->getArgOperand(1);
+        if (wait->getCalledFunction()->getFnAttribute("lyra.suspension").getValueAsString() == "lyra.awaitOutcome") {
+            auto* status = builder.CreateCall(runtime(builder, "lyraTaskAwaitOutcome", integer, {pointer, pointer, pointer}), {task, target, errorSlot});
             builder.CreateCondBr(builder.CreateIsNull(status), yield, site.read);
             wait->replaceAllUsesWith(status);
             eraseMarker(wait);
             continue;
         }
-        auto* errorSlot = wait->getArgOperand(1);
-        auto* status = builder.CreateCall(runtime(builder, "lyraTaskAwaitValue", integer, {pointer, pointer}), {task, target});
+        auto* status = builder.CreateCall(runtime(builder, "lyraTaskAwaitValue", integer, {pointer, pointer, pointer}), {task, target, errorSlot});
         auto* success = llvm::BasicBlock::Create(context, "await.success", step);
         auto* failure = llvm::BasicBlock::Create(context, "await.failure", step);
         auto* outcome = builder.CreateSwitch(status, yield, 2);
         outcome->addCase(builder.getInt32(1), success);
         outcome->addCase(builder.getInt32(2), failure);
         builder.SetInsertPoint(success);
-        builder.CreateStore(llvm::ConstantPointerNull::get(pointer), errorSlot);
         auto* box = builder.CreateCall(runtime(builder, "lyraTaskOutcome", pointer, {pointer}), {target});
         auto* result = builder.CreateLoad(wait->getType(), box);
         builder.CreateBr(site.read);
         builder.SetInsertPoint(failure);
-        builder.CreateStore(builder.CreateCall(runtime(builder, "lyraTaskException", pointer, {pointer}), {target}), errorSlot);
         builder.CreateBr(site.read);
         builder.SetInsertPoint(&*site.read->getFirstInsertionPt());
         auto* value = builder.CreatePHI(wait->getType(), 2);
