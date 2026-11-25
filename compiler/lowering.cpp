@@ -2187,10 +2187,14 @@ struct Emitter {
 }
 
 std::unique_ptr<llvm::Module> lower(const CheckedModule& program, const std::vector<Source>& sources,
-        llvm::LLVMContext& context, bool optimized, bool symbols) {
+        llvm::LLVMContext& context, const llvm::DataLayout& layout, bool optimized, bool symbols) {
     auto module = std::make_unique<llvm::Module>("lyra", context);
     module->setTargetTriple(nativeTriple);
-    module->setDataLayout(nativeDataLayout);
+    module->setDataLayout(layout);
+    if constexpr (!windows) {
+        module->setPICLevel(llvm::PICLevel::BigPIC);
+        module->setPIELevel(llvm::PIELevel::Large);
+    }
     Builder builder(context);
     Layouts layouts(program, builder);
     std::optional<DebugInfo> debug;

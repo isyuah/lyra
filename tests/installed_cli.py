@@ -15,7 +15,7 @@ import tempfile
 import threading
 import unittest
 
-from platform_cli import assert_linkage, c_archive, executable, running
+from platform_cli import LINKER, assert_linkage, c_archive, executable, isolated_environment, running
 
 
 EXAMPLES = Path(__file__).resolve().parents[1] / 'examples'
@@ -50,8 +50,9 @@ class Installed(unittest.TestCase):
             cache = root / '独立缓存 private'
             environment = {**os.environ, 'LYRA_CACHE': str(cache), 'NO_PROXY': '127.0.0.1', 'no_proxy': '127.0.0.1'}
 
-            def run(*args, good=True):
-                process = subprocess.run(args, cwd=root, env=environment, capture_output=True, text=True, timeout=60)
+            def run(*args, good=True, online=False):
+                env = environment if online else isolated_environment(environment)
+                process = subprocess.run(args, cwd=root, env=env, capture_output=True, text=True, timeout=60)
                 self.assertEqual(process.returncode == 0, good, f'{args}\n{process.stdout}{process.stderr}')
                 return process
 
@@ -100,7 +101,7 @@ class Installed(unittest.TestCase):
             self.addCleanup(server.shutdown)
             origin = f'http://127.0.0.1:{server.server_port}'
             manifest(app, dependencies={'catalog': {'name': 'release/catalog', 'version': '^0.1.0', 'registry': origin}})
-            run(compiler, 'lock', app)
+            run(compiler, 'lock', app, online=True)
 
             lock = app / 'lyra.lock'
             frozen = lock.read_bytes()
@@ -198,7 +199,7 @@ async fn main(): Unit { assert(label() == "relocated: 打包时的标题:v1", "w
                 standalone = executable(root / '独立 standalone')
                 shutil.copy2(program, standalone)
                 isolated = subprocess.run([standalone], cwd=root, capture_output=True, text=True, timeout=10,
-                                          env={**environment, 'PATH': '', 'LIB': '', 'INCLUDE': ''})
+                                          env=isolated_environment(environment))
                 self.assertEqual((isolated.returncode, isolated.stdout.splitlines(), isolated.stderr),
                                  (0, ['trace: banner', 'relocated: 打包时的标题:v1', '42'], ''))
             self.assertEqual(lock.read_bytes(), frozen)
@@ -211,16 +212,16 @@ async fn main(): Unit { assert(label() == "relocated: 打包时的标题:v1", "w
     def test_relocated_sdk_runs_both_application_workspaces(self):
         with tempfile.TemporaryDirectory(prefix='lyra-apps-') as temporary:
             root = Path(temporary)
-            compiler = executable(self.install(root) / 'bin/lyra')
-            environment = {**os.environ, 'LYRA_CACHE': str(root / '编译 cache')}
-            isolated = {**environment, 'PATH': '', 'LIB': '', 'INCLUDE': ''}
+            sdk = self.install(root)
+            compiler = executable(sdk / 'bin/lyra')
+            isolated = isolated_environment({**os.environ, 'LYRA_CACHE': str(root / '编译 cache')})
             jsonlines = root / 'JSONL 工作区'
             service = root / 'HTTP 工作区'
             for name, destination in (('jsonlines', jsonlines), ('http-sqlite', service)):
                 shutil.copytree(EXAMPLES / name, destination, ignore=shutil.ignore_patterns('build', '.lyra', '__pycache__'))
 
             def run(*args):
-                result = subprocess.run([compiler, *args, '--locked', '--offline'], cwd=root, env=environment,
+                result = subprocess.run([compiler, *args, '--locked', '--offline'], cwd=root, env=isolated,
                                         capture_output=True, text=True, timeout=60)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 return result.stdout
@@ -255,8 +256,19 @@ async fn main(): Unit { assert(label() == "relocated: 打包时的标题:v1", "w
                                     self.assertEqual(json.loads(body), {'id': 7, 'name': 'Ada'})
                         self.assertIsNone(process.poll())
                     assert_linkage(self, cli)
-                    assert_linkage(self, server, 'libsqlite3.so.0')
+                    assert_linkage(self, server, 'libm.so.6')
                     verified.append(profile)
+            linker = sdk / 'libexec' / 'lyra' / LINKER
+            linker.rename(linker.with_suffix('.disabled'))
+            artifact = executable(root / 'deploy' / 'debug' / 'stats')
+            original = artifact.read_bytes()
+            result = subprocess.run([compiler, 'build', jsonlines / 'stats', '--locked', '--offline', '--diagnostics=json', '-o', artifact],
+                                    cwd=root, capture_output=True, text=True, timeout=30)
+            self.assertNotEqual(result.returncode, 0)
+            diagnostic, = json.loads(result.stderr)
+            self.assertEqual(diagnostic['code'], 'LYB0002')
+            self.assertIn(LINKER, diagnostic['message'])
+            self.assertEqual(artifact.read_bytes(), original)
             if OPTIONS.deployment_bundle is not None and len(verified) == len(profiles):
                 bundle = OPTIONS.deployment_bundle
                 bundle.mkdir(parents=True)

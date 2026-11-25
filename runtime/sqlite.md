@@ -1,4 +1,4 @@
-# M6：系统 SQLite 的 C ABI 与源码绑定契约
+# M6：SQLite 的 C ABI 与源码绑定契约
 
 [sqlite.h](sqlite.h) 是运行时内部的 SQLite 句柄接口，不要求编译器识别 SQLite 专用语法。[原生测试](../tests/runtime_sqlite.cpp)直接调用这层，覆盖真实 SQLite 内存库、确定性关闭与阻塞期间取消。公开的 [std.sqlite](../std/sqlite/README.md) 封装由[源码用例](../tests/sqlite_cli.py)和 [HTTP 服务用例](../tests/http_cli.py)另行验收。
 
@@ -17,7 +17,7 @@
 
 ## 复验
 
-Ubuntu 构建包：`libsqlite3-dev`、`libgc-dev`、`libuv1-dev`。SQLite 是系统动态库（`libsqlite3.so.0`），只有真正引用绑定的可执行文件才需要它。运行时构建关闭 C++ 异常；错误走 C ABI，原生程序不用链接 C++ 标准库。
+从源码构建时，Ubuntu 需要 `libsqlite3-dev`、`libgc-dev`、`libuv1-dev`。SDK 仅在应用引用 SQLite 绑定时把它静态链接进产物。运行时构建关闭 C++ 异常；错误走 C ABI。
 
 ```bash
 out=$(mktemp -d)

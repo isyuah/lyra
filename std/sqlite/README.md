@@ -1,6 +1,6 @@
 # std.sqlite：绑定参数查询
 
-`std.sqlite` 在 Linux 上使用 `libsqlite3.so.0`，Windows SDK 静态链接 SQLite。`Connection`、`Statement` 的底层句柄不公开。打开、准备、绑定、推进游标和读取都返回 `Result<T, DbError>`，可用 `?` 传播错误。位置 **1** 起始的 `bindInt` / `bindText` 绑定值；读列的索引从 **0** 开始。`next()` 返回 `Ok(true)` 表示一行可读，`Ok(false)` 表示结束；读取 SQL `NULL` 得到 `Ok(None)`，和 `Ok(Some(""))` 不同。
+`std.sqlite` 在 Windows 与 Linux 都由 SDK 静态链接 SQLite；应用不依赖额外安装 SQLite 动态库。`Connection`、`Statement` 的底层句柄不公开。打开、准备、绑定、推进游标和读取都返回 `Result<T, DbError>`，可用 `?` 传播错误。位置 **1** 起始的 `bindInt` / `bindText` 绑定值；读列的索引从 **0** 开始。`next()` 返回 `Ok(true)` 表示一行可读，`Ok(false)` 表示结束；读取 SQL `NULL` 得到 `Ok(None)`，和 `Ok(Some(""))` 不同。
 
 例如，读取已有 `notes.db` 中的一条留言：
 

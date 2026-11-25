@@ -7,7 +7,7 @@ import sys
 import tempfile
 import unittest
 
-from platform_cli import CLANG, RUNTIME_ARCHIVE, WINDOWS, assert_linkage, c_archive, executable, running
+from platform_cli import WINDOWS, assert_linkage, c_archive, executable, running
 
 
 COMPILER = Path(sys.argv.pop(1)).resolve()
@@ -105,7 +105,7 @@ class Frontend(PackageTest):
         self.assertIn(f'{start["line"]}:{start["column"]}', text.stderr)
         self.assertIn(diagnostic["hint"], text.stderr)
 
-    def test_cc002_check_without_clang(self):
+    def test_cc002_check_without_build_tools(self):
         self.fixture("pass")
         result = self.cli("check", env={**os.environ, "PATH": ""})
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -340,30 +340,16 @@ fn main(): Unit {
                     self.assertIn("overflow", run.stderr.lower())
                     self.assertIn("main.ly:2:", run.stderr)
 
-    def test_failed_tool_does_not_replace_artifact(self):
-        self.fixture("pass")
-        output = self.package / "existing"
-        output.write_bytes(b"previous artifact")
-        result = self.cli("build", "--diagnostics=json", "-o", output, env={**os.environ, "PATH": ""})
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn(CLANG, json.loads(result.stderr)[0]["message"])
-        self.assertEqual(output.read_bytes(), b"previous artifact")
-
     def test_link_failure_preserves_old_output(self):
-        self.fixture("pass")
-        toolchain = self.package / "toolchain"
-        (toolchain / "bin").mkdir(parents=True)
-        (toolchain / "lib").mkdir()
-        compiler = executable(toolchain / "bin" / "lyra")
-        shutil.copy2(COMPILER, compiler)
-        (toolchain / "lib" / RUNTIME_ARCHIVE).write_bytes(b"not a runtime archive")
+        self.main.write_text('extern fn missingNativeFunction(): Int;\nfn main(): Unit { print(missingNativeFunction()) }\n')
         output = self.package / "existing"
         output.write_bytes(b"previous artifact")
         before = set(self.package.iterdir())
-        result = subprocess.run([compiler, "build", self.package, "--diagnostics=json", "-o", output],
-                                capture_output=True, text=True, timeout=15)
+        result = self.cli("build", "--diagnostics=json", "-o", output)
         self.assertNotEqual(result.returncode, 0)
-        self.assertEqual(json.loads(result.stderr)[0]["code"], "LYB0002")
+        diagnostic, = json.loads(result.stderr)
+        self.assertEqual(diagnostic["code"], "LYB0002")
+        self.assertIn("missingNativeFunction", diagnostic["message"])
         self.assertEqual(output.read_bytes(), b"previous artifact")
         self.assertEqual(set(self.package.iterdir()), before)
 

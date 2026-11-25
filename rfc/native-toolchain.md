@@ -9,8 +9,9 @@
 - 编译模型为 LLVM 后端的 AOT 原生编译。
 - 用户程序不得依赖 JVM、CLR 或 Lyra 托管虚拟机；程序可以携带语言 Runtime。应用与 Runtime 的代码被本机 linker 链接。
 - Windows 开发机可直接构建 Windows x64 程序。给 Linux 服务器构建时仍用 Linux 或 WSL；当前不做跨目标链接和 sysroot 管理。
-- 首个验收目标是 Linux x86-64/glibc，以 Ubuntu 22.04 x86-64 为最低测试镜像，用相应目标库链接。[部署验收](../tests/jammy-smoke.sh)检查 ELF 的动态依赖：整数、对象、标准 I/O 和 JSONL 样例只需系统 libc；SQLite 与 HTTP/SQLite 样例另需 `libsqlite3.so.0`。
-- Windows 目标为 x64 MSVC ABI。GC、libuv、Jansson、llhttp、tomlc17、SQLite 和 C Runtime 静态链接进使用它们的应用。Windows 测试检查 PE 只导入系统 DLL，并从搬迁后的 SDK 离线编译，在无构建工具 `PATH`、`LIB`、`INCLUDE` 的进程中运行独立产物。通过外部导入库引入的 DLL 由应用另行部署。
+- Linux x86-64 以 Ubuntu 22.04/glibc 2.35 为发布基线。[部署验收](../tests/jammy-smoke.sh)检查 ELF 的动态依赖：整数、对象、标准 I/O 和 JSONL 样例只需系统 `libc.so.6`；SQLite 与 HTTP/SQLite 样例静态链接 SQLite，另用系统 `libm.so.6`。
+- Windows 使用 x64 C ABI，通过 LLVM-MinGW 的开放启动代码和导入库链接系统 UCRT。GC、libuv、Jansson、llhttp、tomlc17 和 SQLite 静态链接进使用它们的应用。PE 默认只导入系统 DLL；通过外部导入库引入的 DLL 由应用另行部署。
+- 预编译 SDK 本身包含编译器、私有 LLD、链接库和标准库。`new`、`check`、`test`、`build` 和 `run` 不需要另外安装 Clang、LLVM、VS Build Tools、VC Redistributable 或 C 开发库，也不会在首次构建时联网安装工具。仅 `import-c` 显式加载 SDK 自带的 Clang 前端。未缓存的远程包另走现有注册中心下载流程；本地或冻结离线构建不用 `curl`。
 - 类 Go `scratch` 的零基础镜像/全静态交付是后续优化目标，不是首期门槛。不得以支持 scratch 为由让第一版构建链无法运行。
 
 程序包大小与常驻内存分别看待。目标是内置 Runtime/GC 但不用虚拟机、单程序易分发且能够在服务器上多进程运行；目前不设与 Go 对比的硬 MB 上限。建立可执行服务后，再以等价负载与 Go 对照报告多进程总内存、二进制大小、启动时间、吞吐和尾延迟。
@@ -24,7 +25,7 @@
 | PSS | 9,770 KiB | 按实际映射数分摊共享页；单进程 2,417–2,479 KiB。 |
 | RSS | 21,072 KiB | 每个进程都计入其常驻共享页，直接相加会重复计算。 |
 
-复现：用[部署验收脚本](../tests/jammy-smoke.sh)的 `build` 模式生成应用和数据库，把输出放在干净运行环境的 `apps/`，在该目录的上级执行以下 Bash。`stdbuf` 仅让样例通过管道及时宣布端口，测量和复现都使用它。
+复现该历史样本时，在上述提交上用部署验收脚本的 `build` 模式生成应用和数据库，把输出放在干净运行环境的 `apps/`，在该目录的上级执行以下 Bash。`stdbuf` 仅让样例通过管道及时宣布端口。
 
 ```bash
 set -eu
@@ -47,7 +48,7 @@ for pid in "${pids[@]}"; do cat "/proc/$pid/smaps_rollup"; done |
 
 ### 首个编译器的实现选择
 
-编译器和运行时使用 **C++23、Clang、CMake 与 Ninja 1.11+**。源码诊断、语法、类型检查、LLVM lowering 和构建驱动通过 C++ 命名模块暴露接口，CMake `FILE_SET CXX_MODULES` 与宿主 Clang 配套的 `clang-scan-deps` 跟踪依赖，不要求工具链提供 `import std`。`check` 和 `build` 共用前端，前端不调用 Clang。后端用 LLVM 18.1 的 `IRBuilder` 构造模块，验证后用 Clang 将临时 IR 编译为本机目标文件，再链接具有 C ABI 的静态运行时。Linux 使用 `clang-18`；Windows 用 `PATH` 中的 `clang.exe` 和 `lld-link.exe`。
+编译器和运行时使用 **C++23、Clang、CMake 与 Ninja 1.11+**。CMake `FILE_SET CXX_MODULES` 与宿主 Clang 配套的 `clang-scan-deps` 跟踪编译器的命名模块依赖，不要求工具链提供 `import std`。编译 Lyra 程序时，LLVM 18.1 构造并验证内存中的 IR，再按目标布局直接发射 COFF/ELF 目标文件。Release 使用 LLVM 的 O2 pipeline。链接时只启动 `libexec/lyra/` 下的 LLD，使用 SDK 内的目标库；不从系统 `PATH` 查找链接器。Linux 的 `bin/lyra` 启动器为编译器和子进程设置随工具链携带的 LLVM 共享库路径；Linux SDK 还带有编译器和链接器所需的非 glibc 共享库。Windows SDK 的编译器和链接器使用应用本地的官方 VC Redistributable DLL，生成的应用不需要这些 DLL。
 
 ### 调试原生程序
 
@@ -59,19 +60,26 @@ for pid in "${pids[@]}"; do cat "/proc/$pid/smaps_rollup"; done |
 
 1. 准备 CMake、Ninja、Python 3（测试）、Git 和 Visual Studio Build Tools 的 C++ 桌面开发组件。打开 **x64 Developer PowerShell**，确保 `LIB` 中有 x64 CRT 和 Windows SDK 的 `um`、`ucrt` 库目录。原生构建已使用 CMake 4.5、Ninja 1.13、Clang 23 和 VS 2026 的 MSVC 工具集；较新的 MSVC STL 需要与它兼容的 Clang，宿主 Clang 不必与嵌入的 LLVM 库同版本。
 2. 下载 LLVM 官方 [18.1.8 Windows x64 MSVC 完整归档](https://github.com/llvm/llvm-project/releases/tag/llvmorg-18.1.8)中的 `clang+llvm-18.1.8-x86_64-pc-windows-msvc.tar.xz`，解压到独立目录。`LLVM_DIR` 指向其中的 `lib/cmake/llvm`，仅有 Clang 的安装包不含编译 Lyra 所需的开发库。官方归档链接的 DIA 库从当前 Visual Studio 查找；自定义布置可传 `-DLYRA_DIA_GUIDS=<完整路径>`。
-3. 用 vcpkg 从仓库的 `vcpkg.json` 安装固定版本的原生库，再从同一个 PowerShell 配置与验收。下面假设 `vcpkg`、用于宿主编译的 `clang++`、配套的 `clang-scan-deps` 和 `lld-link` 在 `PATH` 中；将 `$llvm` 改为实际解压目录：
+3. 下载并解压 [LLVM-MinGW 20261117 的 x86_64 UCRT 包](https://github.com/mstorsjo/llvm-mingw/releases/tag/20261117) `llvm-mingw-20261117-ucrt-x86_64.zip`，用它构建应用运行时及 `vcpkg.json` 中的第三方库。下面假设 `vcpkg`、宿主 `clang++` 和配套的 `clang-scan-deps` 在 `PATH` 中；将两个工具链路径改为实际解压目录：
 
    ```powershell
    $llvm = 'E:/tools/clang+llvm-18.1.8-x86_64-pc-windows-msvc'
-   $ports = Join-Path $PWD 'build/windows-ports'
-   vcpkg install --triplet x64-windows-static "--x-install-root=$ports"
-   cmake --preset windows-release "-DLLVM_DIR=$llvm/lib/cmake/llvm" "-DCMAKE_PREFIX_PATH=$ports/x64-windows-static"
+   $mingw = 'E:/tools/llvm-mingw-20261117-ucrt-x86_64'
+   $ports = Join-Path $PWD 'build/windows-mingw-ports'
+   $hostPath = $env:PATH
+   try {
+       $env:PATH = "$mingw/bin;$hostPath"
+       vcpkg install --triplet x64-mingw-static --host-triplet x64-windows "--x-install-root=$ports"
+       if ($LASTEXITCODE -ne 0) { throw 'vcpkg install failed' }
+   } finally { $env:PATH = $hostPath }
+   cmake --preset windows-release "-DLLVM_DIR=$llvm/lib/cmake/llvm" "-DLYRA_WINDOWS_SYSROOT=$mingw" `
+       "-DLYRA_WINDOWS_TARGET_PORTS=$ports/x64-mingw-static"
    cmake --build --preset windows-release
    ctest --preset windows-release
    cmake --install build/windows-release --prefix build/sdk-windows
    ```
 
-   调试版改用 `windows-dev`。安装树包含标准库和静态库，并为 `import-c` 提供 `libclang` 与内建头文件；运行编译器仍需要 Visual C++ Redistributable，该环境通常由 VS Build Tools 提供。构建和运行源码的命令示例见[仓库说明](../README.md)。外部 C 静态库若也希望随应用单文件交付，使用 x64 MSVC ABI 和静态 CRT（`/MT`）。
+   调试版改用 `windows-dev`。CMake 从 Developer PowerShell 的 `VCToolsRedistDir` 取应用本地运行库；自定义位置可传 `-DLYRA_WINDOWS_REDIST=<x64 CRT DLL 目录>`。SDK 不打包 Visual Studio/Windows SDK 的开发 `.lib`，也不打包 `clang` 命令；只为 `import-c` 携带 `libclang` 及其内建头文件。Windows C 静态库推荐用同一 LLVM-MinGW UCRT 目标构建；依赖 MSVC 私有 CRT 的库通过预编译 DLL 的 C 接口接入。
 
 ### 打包与复验 SDK
 
@@ -91,20 +99,20 @@ cmake --install build/release --prefix "build/dist/staging/$name"
 tar -czf "build/dist/$name.tar.gz" -C build/dist/staging "$name"
 ```
 
-解包后在对应平台从仓库根目录运行 `python tests/installed_cli.py --sdk <解包后的SDK目录>`。测试会搬迁安装树，在仓库外检查锁定源码包和 C ABI，并从解包的 SDK 构建、运行双包 JSONL 与 HTTP/SQLite 应用。Windows 需在 x64 Developer PowerShell 中执行，Linux 可用 `python3`。部署环境只运行生成的应用；Jammy 的独立运行验收见[部署验收脚本](../tests/jammy-smoke.sh)。VSIX 打包和桌面联调见[扩展说明](../editors/vscode/README.md#真实编辑器验收)。
+解包后在对应平台从仓库根目录运行 `python tests/installed_cli.py --sdk <解包后的SDK目录>`。该验收用开发机预编译 C 适配器，然后清空 `PATH` 和 SDK/库搜索环境，从搬迁后的 SDK 构建、测试并运行依赖包与两个双包应用。Windows 的 Developer PowerShell 仅用于编译测试用的 C 适配器。Ubuntu 裸系统的构建和独立运行分别走[容器验收](../tests/jammy.Dockerfile)的两个阶段。VSIX 打包与联调见[扩展说明](../editors/vscode/README.md#真实编辑器验收)。
 
 Windows 的解包验收可加 `--deployment-bundle build/dist/windows-apps`，将两种构建的应用、测试数据库和验证脚本放进新目录。把该目录放到部署机，在目录里运行 `powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\verify.ps1`。脚本只用系统 PowerShell，检查 JSONL 正常行与坏行的结果，以及 SQLite 服务的 `200` 和 `404` 响应。
 
 ### 开发机准备：WSL 2 + Ubuntu 24.04
 
-只构建 Linux 版本时，在 WSL/Linux 中安装 LLVM 18.1 开发包和 Clang 18 即可，不需要另准备 Windows SDK。最低版本验收在 22.04 目标环境构建，再放入只装运行依赖的 22.04 镜像执行。
+只构建 Linux 版本时，在 WSL/Linux 中准备 Clang、LLVM 18.1 开发包、LLD 和下列原生开发库，不需要 Windows SDK。发布用 SDK 在 Ubuntu 22.04 构建，验收时把 SDK 和独立应用分别放入裸系统。
 
 1. 在 PowerShell 运行 `wsl -l -v`。已有 `Ubuntu-24.04`（版本 2）就直接 `wsl -d Ubuntu-24.04`；新开发机没有该发行版时才运行 `wsl --install -d Ubuntu-24.04`，按系统提示完成首次启动。
 2. 进入 **Ubuntu 终端**后，先运行 `clang-18 --version`、`llvm-config-18 --version --host-target --cmakedir` 和 `cmake --version`。头文件、库和 `LLVMConfig.cmake` 来自开发包，不能只验证 `clang`。缺包时才安装：
 
    ```sh
    sudo apt update
-   sudo apt install build-essential clang-18 clang-tools-18 llvm-18-dev libclang-18-dev cmake ninja-build python3 libgc-dev libuv1-dev libsqlite3-dev libjansson-dev curl
+   sudo apt install build-essential clang-18 clang-tools-18 llvm-18-dev libclang-18-dev lld-18 cmake ninja-build python3 libgc-dev libuv1-dev libsqlite3-dev libjansson-dev curl
    ```
 
 3. 在同一 Ubuntu 终端做一次冒烟检查。`LLVMConfig.cmake` 应可读；IR 编译链接出的程序应返回 `42`：
@@ -138,7 +146,7 @@ LLVM 是代码生成后端，不是语言运行时或 GC。Lyra Runtime 实现�
 
 数值类型按位宽与符号对应 C 的 `intN_t` / `uintN_t`，`Float32` 对应 `float`，`Float64` 对应 `double`。Linux 上使用浮点 `%` 的程序可能另依赖系统 `libm.so.6`；整数和不用该运算的程序无需引入它。
 
-项目自己的 C 库可在 `lyra build`、`run`、`test` 上重复传 `--link /path/to/libexample.a`（也可传目标文件或共享库）。输入按命令行顺序交给 Clang，不执行包内脚本。`check` 只检查签名；链接阶段验证符号能否解析。`Int` 对应 `int64_t`，`Bool` 对应 `uint8_t`，`CPtr` 对应不透明指针；Lyra `String` 和 `Bytes` 都是带长度的运行时句柄，不是裸字节指针。使用共享库时要在目标机提供相同 ABI；`lyra.lock` 锁定 Lyra 源码包，不代为分发原生库。
+项目自己的 C 库可在 `lyra build`、`run`、`test` 上重复传 `--link /path/to/libexample.a`（也可传目标文件、ELF 共享库或 Windows 的 DLL 导入库）。输入按命令行顺序交给 SDK 的 LLD，不执行包内脚本，不编译用户的 C 源文件。`check` 只检查签名；链接阶段验证符号能否解析。`Int` 对应 `int64_t`，`Bool` 对应 `uint8_t`，`CPtr` 对应不透明指针；Lyra `String` 和 `Bytes` 都是带长度的运行时句柄，不是裸字节指针。使用共享库时要在目标机提供相同 ABI；`lyra.lock` 锁定 Lyra 源码包，不代为分发原生库。
 
 用安装树的 `include/` 编译 C 适配器即可读取 `String`。例如，Lyra 声明 `extern fn writeText(text: String): Int;`，C 实现如下：
 
@@ -216,7 +224,7 @@ lyra build . --link /path/to/libapi.a
 - 同步 SQLite 调用不阻塞串行异步执行域 Worker；SQLite 的外部资源可确定性关闭。
 - 任务暂停期间仅由异步状态帧持有的对象仍能通过 GC 压力测试。
 - 异步异常报告能沿源调用链回溯到 `await` 和原始任务创建位置。
-- 有/无动态 SQLite 依赖的交付行为显式区分；未来支持 scratch 时通过独立目标配置声明。
+- 官方 SDK 在 Windows 和 Ubuntu 22.04 不依赖宿主开发工具。应用仅链接用到的 SQLite 代码；未来支持 scratch 时通过独立目标配置声明。
 - [FFI 命令行验收](../tests/ffi_cli.py)链接独立 C 库，在 Debug/Release 应用中核对定宽读写、外部线程回调期间的 GC 保活、异常隔离和注销；用搬迁后的 SDK 在清空 `PATH` 的环境下导入头文件，再链接运行生成的绑定。
 
 ## 仍开放

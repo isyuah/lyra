@@ -20,16 +20,13 @@ export namespace lyra {
 #ifdef _WIN32
 inline constexpr bool windows = true;
 inline constexpr auto nativeTriple = "x86_64-pc-windows-msvc";
-inline constexpr auto nativeDataLayout = "e-m:w-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128";
-inline constexpr auto nativeDriver = "clang";
 inline constexpr auto nativeEntry = "wmain";
 #else
 inline constexpr bool windows = false;
 inline constexpr auto nativeTriple = "x86_64-pc-linux-gnu";
-inline constexpr auto nativeDataLayout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128";
-inline constexpr auto nativeDriver = "clang-18";
 inline constexpr auto nativeEntry = "main";
 #endif
+inline constexpr std::string_view linuxLoader = "/lib64/ld-linux-x86-64.so.2";
 
 std::filesystem::path fromUtf8(std::string_view text) {
     return std::filesystem::path(std::u8string(text.begin(), text.end()));

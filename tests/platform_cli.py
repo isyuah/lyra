@@ -8,7 +8,14 @@ import threading
 
 WINDOWS = os.name == 'nt'
 CLANG = 'clang' if WINDOWS else 'clang-18'
-RUNTIME_ARCHIVE = 'lyraRuntime.lib' if WINDOWS else 'liblyraRuntime.a'
+LINKER = 'lld-link.exe' if WINDOWS else 'ld.lld'
+
+
+def isolated_environment(environment):
+    tool_variables = {'PATH', 'LIB', 'INCLUDE', 'LIBPATH', 'LIBRARY_PATH', 'LINK', '_LINK_', 'LD_LIBRARY_PATH', 'LD_PRELOAD'}
+    result = {key: value for key, value in environment.items() if key.upper() not in tool_variables}
+    result['PATH'] = ''
+    return result
 
 
 def executable(path):
@@ -34,7 +41,7 @@ def assert_linkage(test, program, *linux_libraries):
             'ntdll.dll', 'ole32.dll', 'psapi.dll', 'shell32.dll', 'user32.dll', 'userenv.dll', 'ws2_32.dll',
         }
         test.assertIn('kernel32.dll', libraries)
-        test.assertEqual(libraries - system_libraries, set())
+        test.assertEqual({name for name in libraries - system_libraries if not name.startswith('api-ms-win-crt-')}, set())
     else:
         output = subprocess.check_output(['readelf', '-dW', program], text=True)
         test.assertEqual(set(re.findall(r'\(NEEDED\).*?\[(.*?)\]', output)), {'libc.so.6', *linux_libraries})

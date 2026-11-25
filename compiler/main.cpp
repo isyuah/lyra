@@ -65,7 +65,8 @@ Options options(const std::vector<std::string_view>& args, const std::vector<std
             auto name = pathText(path.filename());
             auto extension = pathText(path.extension());
             if constexpr (windows) {
-                if (extension != ".obj" && extension != ".lib") throw Diagnostic{"LYC0001", "--link 只接受 .obj、静态库或导入库 .lib：" + name};
+                if (extension != ".obj" && extension != ".lib" && extension != ".a")
+                    throw Diagnostic{"LYC0001", "--link 只接受 x64 COFF 目标文件 .obj、静态库或导入库 .lib/.a：" + name};
             } else {
                 auto version = name.rfind(".so.");
                 bool soname = version != name.npos && version + 4 < name.size() && name.find_first_not_of("0123456789.", version + 4) == name.npos;

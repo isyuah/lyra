@@ -103,7 +103,7 @@ fn main(): Unit {
                     self.assertEqual(built.returncode, 0, built.stderr.decode())
                     result = subprocess.run([app], cwd=package, capture_output=True, timeout=10)
                     self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "李\0Ada\n".encode(), b""))
-                    assert_linkage(self, app, 'libsqlite3.so.0')
+                    assert_linkage(self, app, 'libm.so.6')
 
 
 if __name__ == "__main__":

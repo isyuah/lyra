@@ -1178,7 +1178,7 @@ Runtime 调度器在迁移 Task 时不得改变其上下文语义。
 | P0-05 | [C1 已定：`?` 复用普通 `implicit`](rfc/errors-and-resources.md#c1-conversions)，保留原错误与原因链；`Exception` 为普通异常根，`throws` 仅作文档提示 | 错误系统、Runtime |
 | P0-06 | JSON/TOML 显式派生；普通可空字段的缺失、未知键和字段可见性已定；特殊类型另议 | Macro、标准库 |
 | P0-07 | GC 供应商选择、Root Tracking 与 LLVM 优化协议 | Runtime、Backend |
-| P0-08 | x86-64/glibc、Ubuntu 22.04 最低测试镜像、系统 SQLite 动态库、显式 `extern` 已定；实际兼容性待验收 | Build、FFI、部署 |
+| P0-08 | x86-64/glibc、Ubuntu 22.04 最低测试镜像、SDK 自带 LLD 与静态 SQLite、显式 `extern` 已验收；更广泛平台兼容性待验收 | Build、FFI、部署 |
 | P0-09 | [F1 已定：声明宏、表达式宏与具名只读输入](rfc/metaprogramming-data.md#f1-macro-inputs)。外部准备和在线检查独立授权，沙箱实现待验证 | 编译器、构建系统 |
 | P0-10 | 精确与 `^` 版本约束、普通撤回和既有锁、公开名称删除的破坏性已定；签名及私有中心后置 | Package Manager |
 

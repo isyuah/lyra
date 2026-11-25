@@ -2,6 +2,12 @@
 #include <cstdio>
 #include <cstdlib>
 
+#if defined(_WIN32) && !defined(_MSC_VER)
+extern "C" {
+int _fltused = 0x9875;
+}
+#endif
+
 extern "C" void lyraPrintInt(std::int64_t value) {
     std::printf("%" PRId64 "\n", value);
     std::fflush(stdout);

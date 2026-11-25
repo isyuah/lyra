@@ -1,22 +1,56 @@
-function(lyra_windows_runtime runtime)
-    set(CMAKE_MAP_IMPORTED_CONFIG_DEBUG Release)
-    find_package(BDWgc CONFIG REQUIRED)
-    find_package(libuv CONFIG REQUIRED)
-    find_package(jansson CONFIG REQUIRED)
-    find_package(unofficial-sqlite3 CONFIG REQUIRED)
-    foreach(library IN ITEMS BDWgc::gc libuv::uv_a jansson::jansson unofficial::sqlite3::sqlite3)
-        get_target_property(archive ${library} IMPORTED_LOCATION_RELEASE)
-        get_filename_component(filename "${archive}" NAME)
-        configure_file("${archive}" "lib/${filename}" COPYONLY)
-        install(FILES "${CMAKE_BINARY_DIR}/lib/${filename}" DESTINATION lib)
+include(ExternalProject)
+
+function(lyra_stage_windows_sdk)
+    set(LYRA_WINDOWS_SYSROOT "$ENV{LYRA_WINDOWS_SYSROOT}" CACHE PATH "Root of the x86-64 LLVM-MinGW UCRT toolchain")
+    set(LYRA_WINDOWS_TARGET_PORTS "$ENV{LYRA_WINDOWS_TARGET_PORTS}" CACHE PATH "vcpkg x64-mingw-static installation prefix")
+    if(NOT DEFINED LYRA_WINDOWS_REDIST AND DEFINED ENV{VCToolsRedistDir})
+        file(GLOB redistCandidates "$ENV{VCToolsRedistDir}/x64/Microsoft.VC*.CRT")
+        list(SORT redistCandidates COMPARE NATURAL ORDER DESCENDING)
+        if(redistCandidates)
+            list(GET redistCandidates 0 redist)
+        endif()
+    endif()
+    set(LYRA_WINDOWS_REDIST "${redist}" CACHE PATH "Redistributable x64 VC CRT DLL directory")
+    set(bin "${LYRA_WINDOWS_SYSROOT}/bin")
+    set(cc "${bin}/x86_64-w64-mingw32-clang.exe")
+    set(cxx "${bin}/x86_64-w64-mingw32-clang++.exe")
+    if(NOT EXISTS "${cc}" OR NOT EXISTS "${cxx}" OR NOT IS_DIRECTORY "${LYRA_WINDOWS_TARGET_PORTS}")
+        message(FATAL_ERROR "Set LYRA_WINDOWS_SYSROOT to LLVM-MinGW UCRT and LYRA_WINDOWS_TARGET_PORTS to the vcpkg x64-mingw-static prefix (see the Windows build instructions).")
+    endif()
+    find_program(LYRA_LLD NAMES lld-link HINTS "${LLVM_TOOLS_BINARY_DIR}" REQUIRED)
+    lyra_stage_linker("${LYRA_LLD}" lld-link.exe)
+    foreach(dll IN ITEMS msvcp140.dll vcruntime140.dll vcruntime140_1.dll)
+        lyra_stage_sdk_input("${LYRA_WINDOWS_REDIST}/${dll}" "bin/${dll}")
+        lyra_stage_sdk_input("${LYRA_WINDOWS_REDIST}/${dll}" "libexec/lyra/${dll}")
     endforeach()
-    get_target_property(gcArchive BDWgc::gc IMPORTED_LOCATION_RELEASE)
-    get_filename_component(dependencies "${gcArchive}/../.." ABSOLUTE)
-    foreach(port IN ITEMS bdwgc libuv jansson sqlite3)
-        install(FILES "${dependencies}/share/${port}/copyright" DESTINATION "share/lyra/licenses/${port}")
+
+    set(syslib "${LYRA_WINDOWS_SYSROOT}/x86_64-w64-mingw32/lib")
+    foreach(input IN ITEMS crt2u.o crtbegin.o crtend.o libc++.a libunwind.a libmingw32.a libmingwex.a libmoldname.a libmsvcrt.a
+            libws2_32.a libiphlpapi.a libuserenv.a libpsapi.a libadvapi32.a libuser32.a libdbghelp.a libole32.a libshell32.a libkernel32.a)
+        lyra_stage_sdk_input("${syslib}/${input}" "lib/lyra/target/${input}")
     endforeach()
-    target_compile_definitions(${runtime} PRIVATE GC_NOT_DLL)
-    target_link_libraries(${runtime} PUBLIC BDWgc::gc libuv::uv_a jansson::jansson unofficial::sqlite3::sqlite3 dbghelp)
+    execute_process(COMMAND "${cc}" --print-libgcc-file-name OUTPUT_VARIABLE builtins OUTPUT_STRIP_TRAILING_WHITESPACE COMMAND_ERROR_IS_FATAL ANY)
+    lyra_stage_sdk_input("${builtins}" lib/lyra/target/libclang_rt.builtins.a)
+    install(FILES "${LYRA_WINDOWS_SYSROOT}/LICENSE.TXT" DESTINATION share/lyra/licenses/llvm-mingw)
+    install(DIRECTORY "${LYRA_WINDOWS_SYSROOT}/x86_64-w64-mingw32/share/mingw32/" DESTINATION share/lyra/licenses/mingw-w64
+        FILES_MATCHING PATTERN "COPYING*")
+
+    ExternalProject_Add(lyraRuntime
+        SOURCE_DIR "${CMAKE_SOURCE_DIR}/runtime"
+        BINARY_DIR "${CMAKE_BINARY_DIR}/windows-runtime"
+        INSTALL_DIR "${CMAKE_BINARY_DIR}"
+        CMAKE_ARGS "-DCMAKE_MAKE_PROGRAM=${CMAKE_MAKE_PROGRAM}" "-DCMAKE_C_COMPILER=${cc}" "-DCMAKE_CXX_COMPILER=${cxx}"
+            "-DCMAKE_PREFIX_PATH=${LYRA_WINDOWS_TARGET_PORTS}" "-DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}"
+            "-DBUILD_TESTING=${BUILD_TESTING}" "-DLYRA_LLHTTP_SOURCE_DIR=${LYRA_LLHTTP_SOURCE_DIR}"
+            "-DLYRA_LLHTTP_OFFLINE=${LYRA_LLHTTP_OFFLINE}" "-DFETCHCONTENT_SOURCE_DIR_LYRA_TOMLC17=${FETCHCONTENT_SOURCE_DIR_LYRA_TOMLC17}"
+            "-DFETCHCONTENT_FULLY_DISCONNECTED=${FETCHCONTENT_FULLY_DISCONNECTED}" "-DCMAKE_INSTALL_PREFIX=<INSTALL_DIR>"
+        BUILD_ALWAYS TRUE)
+    foreach(archive IN ITEMS liblyraRuntime.a libllhttp.a libgc.a libuv.a libjansson.a libsqlite3.a)
+        install(FILES "${CMAKE_BINARY_DIR}/lib/${archive}" DESTINATION lib)
+    endforeach()
+    foreach(port IN ITEMS bdwgc libuv jansson sqlite3 llhttp tomlc17)
+        install(DIRECTORY "${CMAKE_BINARY_DIR}/share/lyra/licenses/${port}" DESTINATION share/lyra/licenses)
+    endforeach()
 endfunction()
 
 function(lyra_relocate_llvm_dia)

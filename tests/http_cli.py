@@ -109,7 +109,7 @@ class HTTP(unittest.TestCase):
                         empty.execute("CREATE TABLE unrelated(id INTEGER PRIMARY KEY)")
                     self.assertEqual(exchange(port, "GET", "/users/7")[0], 500)
                     self.assertIsNone(process.poll())
-                assert_linkage(self, app, 'libsqlite3.so.0')
+                assert_linkage(self, app, 'libm.so.6')
 
     def test_users_library_without_http(self):
         library = self.root / 'users'

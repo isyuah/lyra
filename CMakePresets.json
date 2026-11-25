@@ -20,8 +20,7 @@
       "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Windows" },
       "cacheVariables": {
         "CMAKE_C_COMPILER": "clang",
-        "CMAKE_CXX_COMPILER": "clang++",
-        "VCPKG_TARGET_TRIPLET": "x64-windows-static"
+        "CMAKE_CXX_COMPILER": "clang++"
       }
     },
     { "name": "windows-dev", "inherits": "windows", "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug" } },

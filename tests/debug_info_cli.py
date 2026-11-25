@@ -67,8 +67,10 @@ class DebugInfoTest(unittest.TestCase):
             symbols = self.inspect(executable)
             self.assertIn("lyra.fn.compute", symbols)
             if WINDOWS:
-                for fragment in ("main.ly", "line 2", "`value`", "`result`"):
+                for fragment in ("main.ly", "`value`", "`result`"):
                     self.assertIn(fragment, symbols)
+                lines = symbols.split('line/column/addr entries = ', 1)[1].split('\n\n', 1)[0]
+                self.assertRegex(lines, r'\b2 [0-9A-Fa-f]{8} !')
             else:
                 for fragment in ("DW_TAG_subprogram", 'name: "main.ly"', "      2 ", 'DW_AT_name\t("value")', 'DW_AT_name\t("result")'):
                     self.assertIn(fragment, symbols)

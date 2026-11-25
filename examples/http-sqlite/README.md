@@ -1,6 +1,6 @@
 # 有界并发 HTTP 与 SQLite 服务
 
-应用示例在 Windows 和 Linux 都原生编译。Windows SDK 静态链接 SQLite；Linux 开发机需要 SQLite 开发库，部署机需要系统的 `libsqlite3.so.0`。运行已编译的应用无需 Lyra、LLVM 或准备脚本。服务启动后输出临时 loopback 端口。
+应用示例在 Windows 和 Linux 都原生编译，预编译 Lyra SDK 自带链接器和静态 SQLite。部署时只需应用和数据库，无需 Lyra、LLVM 或额外安装 SQLite。服务启动后输出临时 loopback 端口。
 
 工作区包含两个包：根目录的 `example/http-sqlite` 负责监听、路由和状态码；`users/` 下的 `example/users` 负责 SQLite 查询与 JSON 数据类型。应用通过本地依赖调用 `findUser(path, id)` 获取 `Result<User?, DbError>`，并复用库公开的 `JsonCodec<T>` 工厂。
 

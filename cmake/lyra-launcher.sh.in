@@ -1,0 +1,8 @@
+#!/bin/sh
+case $0 in
+    */*) directory=${0%/*} ;;
+    *) executable=$(command -v "$0"); directory=${executable%/*} ;;
+esac
+directory=$(CDPATH= cd -- "$directory" && pwd)
+export LD_LIBRARY_PATH="$directory/../lib/lyra/host${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+exec "$directory/lyra.real" "$@"
