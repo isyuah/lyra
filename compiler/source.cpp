@@ -117,13 +117,17 @@ static void reportText(const Diagnostic& error, bool warning) {
 }
 
 void report(const Diagnostic& error, bool json) {
-    if (json) llvm::errs() << llvm::formatv("{0}\n", llvm::json::Value(llvm::json::Array{jsonDiagnostic(error)}));
-    else reportText(error, false);
+    reportDiagnostics({}, &error, json);
 }
 
 void reportWarnings(const std::vector<Diagnostic>& warnings, bool json) {
+    reportDiagnostics(warnings, nullptr, json);
+}
+
+void reportDiagnostics(const std::vector<Diagnostic>& warnings, const Diagnostic* error, bool json) {
     if (!json) {
         for (const auto& warning : warnings) reportText(warning, true);
+        if (error) reportText(*error, false);
         return;
     }
     llvm::json::Array diagnostics;
@@ -132,6 +136,7 @@ void reportWarnings(const std::vector<Diagnostic>& warnings, bool json) {
         item["severity"] = "warning";
         diagnostics.push_back(std::move(item));
     }
+    if (error) diagnostics.push_back(jsonDiagnostic(*error));
     llvm::errs() << llvm::formatv("{0}\n", llvm::json::Value(std::move(diagnostics)));
 }
 

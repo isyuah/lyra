@@ -10,6 +10,7 @@ module;
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <unordered_map>
 #include <utility>
 #include <variant>
@@ -466,8 +467,6 @@ struct Symbols {
                 return supported;
             };
             if (auto implementation = valueOverride(type, operation)) {
-                if (!equality && !valueOverride(type, ValueOperation::Equal))
-                    return reject(typeName(module, type) + " 手写了 hashCode，需要配套的 equals 才能满足 Hash");
                 result.overrides.emplace_back(type, *implementation);
                 return true;
             }
@@ -633,7 +632,7 @@ struct Symbols {
         const auto& definition = sources[file];
         auto nameOf = [&](Type type) { return typeName(module, type); };
         for (const auto& bound : bounds) {
-            if (bound.trait.text != "Eq" || types[bound.parameter].kind != Type::Record) continue;
+            if (bound.trait.text != "Eq") continue;
             if (!std::ranges::any_of(bounds, [&](const Bound& other) { return other.parameter == bound.parameter && other.trait.text == "Hash"; })) continue;
             if (auto mismatch = valuePairMismatch(types[bound.parameter]))
                 throw at(use, site, "LYG0005", nameOf(types[bound.parameter]) + " 不满足 Eq + Hash：" + *mismatch);
@@ -1045,6 +1044,13 @@ Diagnostic uncoveredPattern(const Source& source, Span site, PatternUse use, con
 }
 
 struct Checker {
+    struct ValueJoin {
+        const Checker* owner;
+        std::vector<std::pair<Type, Span>> types{};
+        std::vector<ExprId> numbers{};
+        std::optional<Diagnostic> missingContext{};
+        bool nullable{};
+    };
     CheckedFunction& fn;
     const Source& source;
     CheckedModule& module;
@@ -1052,17 +1058,25 @@ struct Checker {
     std::vector<Names> scopes;
     std::span<const Type> variables{};
     unsigned loops = 0;
-    struct WorkerScope { ExprId id; std::size_t firstLocal; std::optional<Type> result; };
+    struct WorkerScope { ExprId id; std::size_t firstLocal; std::optional<Type> result; ValueJoin* returns{}; };
     std::vector<WorkerScope> workers{};
     std::vector<std::optional<ExprId>> catchOwners{};
     std::map<ExprId, std::vector<std::optional<Type>>> lambdaHints{};
     std::optional<std::size_t> receiverSlot{};
     std::vector<std::optional<ExprId>> implicitReceivers{};
     bool probing{};
-    std::optional<Type>* inferredReturn{};
-    using Present = std::set<std::size_t>;
-    Present present{};
+    ValueJoin* inferredReturn{};
+    using Facts = std::map<std::size_t, std::optional<Type>>;
+    Facts present{};
     unsigned unsafeDepth{};
+    std::optional<std::pair<ExprId, ValueJoin*>> collectingTail{};
+    bool reachable{true};
+
+    Checker trial(CheckedFunction& body) const {
+        return {body, source, module, symbols, scopes, variables, loops, workers,
+            catchOwners, lambdaHints, receiverSlot, implicitReceivers, true, inferredReturn,
+            present, unsafeDepth, collectingTail, reachable};
+    }
 
     void requireUnsafe(Span site) const {
         if (!unsafeDepth) throw at(source, site, "LYF0002", "此原生操作必须写在 unsafe { ... } 内");
@@ -1091,7 +1105,7 @@ struct Checker {
     }
     std::optional<Type> returnType() const {
         if (!workers.empty()) return workers.back().result;
-        return inferredReturn ? *inferredReturn : std::optional(fn.result);
+        return inferredReturn ? std::nullopt : std::optional(fn.result);
     }
 
     std::string localKey(const Identifier& name) const {
@@ -1119,9 +1133,9 @@ struct Checker {
         referLocal(name, slot);
         auto& info = fn.expressions[id];
         info.target = slot;
-        info.narrowed = present.contains(slot);
-        auto type = fn.locals[slot].type;
-        return info.narrowed ? module.sumTypes[type.id].success : type;
+        info.narrowed.reset();
+        if (auto fact = present.find(slot); fact != present.end()) info.narrowed = fact->second;
+        return info.narrowed.value_or(fn.locals[slot].type);
     }
 
     std::optional<std::size_t> lookupLocal(const Identifier& name) const {
@@ -1131,43 +1145,52 @@ struct Checker {
         return {};
     }
 
-    std::optional<std::size_t> stableOption(ExprId id) const {
+    std::optional<std::size_t> stableLocal(ExprId id, Type::Kind kind) const {
         const auto* name = std::get_if<Identifier>(&fn.syntax.expressions[id].node);
-        if (auto slot = name ? lookupLocal(*name) : std::nullopt; slot && !fn.locals[*slot].writable && fn.locals[*slot].type.kind == Type::Option)
+        if (auto slot = name ? lookupLocal(*name) : std::nullopt; slot && !fn.locals[*slot].writable && fn.locals[*slot].type.kind == kind)
             return slot;
         return {};
     }
 
-    Type inspectOption(ExprId id, std::optional<Type> hint = {}) {
-        auto slot = stableOption(id);
-        if (!slot || !present.erase(*slot)) return inspect(id, hint);
+    Type inspectOriginal(ExprId id, Type::Kind kind, std::optional<Type> hint = {}) {
+        auto slot = stableLocal(id, kind);
+        if (!slot) return inspect(id, hint);
+        auto fact = present.extract(*slot);
         auto type = inspect(id, hint);
-        present.insert(*slot);
+        if (!fact.empty()) present.insert(std::move(fact));
         return type;
     }
 
-    static Present bothPaths(const Present& left, const Present& right) {
-        Present result;
-        for (auto slot : left) if (right.contains(slot)) result.insert(slot);
+    Type inspectOption(ExprId id, std::optional<Type> hint = {}) { return inspectOriginal(id, Type::Option, hint); }
+
+    static Facts bothPaths(const Facts& left, const Facts& right) {
+        Facts result;
+        for (const auto& [slot, type] : left)
+            if (auto match = right.find(slot); match != right.end() && match->second == type) result.emplace(slot, type);
         return result;
     }
 
-    Present definitelyPresent(ExprId id, bool outcome) const {
+    Facts conditionFacts(ExprId id, bool outcome) const {
         const auto& condition = fn.syntax.expressions[id].node;
-        if (auto* unary = std::get_if<Unary>(&condition); unary && unary->op == Op::Not) return definitelyPresent(unary->operand, !outcome);
+        if (const auto* test = std::get_if<TypeOperation>(&condition); test && test->op == TypeOperator::Is && outcome) {
+            auto slot = stableLocal(test->value, Type::Any);
+            auto tested = fn.expressions[id].testedType;
+            if (slot && tested && *tested != Type::Any) return {{*slot, tested}};
+        }
+        if (auto* unary = std::get_if<Unary>(&condition); unary && unary->op == Op::Not) return conditionFacts(unary->operand, !outcome);
         const auto* binary = std::get_if<Binary>(&condition);
         if (!binary) return {};
         if (binary->op == Op::And || binary->op == Op::Or) {
             auto required = binary->op == Op::And;
-            auto left = definitelyPresent(binary->left, required);
-            auto right = definitelyPresent(binary->right, outcome);
+            auto left = conditionFacts(binary->left, required);
+            auto right = conditionFacts(binary->right, outcome);
             left.merge(right);
-            return outcome == required ? std::move(left) : bothPaths(left, definitelyPresent(binary->left, outcome));
+            return outcome == required ? std::move(left) : bothPaths(left, conditionFacts(binary->left, outcome));
         }
-        if ((binary->op == Op::Ne && outcome) || (binary->op == Op::Eq && !outcome)) {
+        if (binary->op == Op::Eq || binary->op == Op::Ne) {
             auto empty = [&](ExprId expr) { return std::holds_alternative<EmptyOption>(fn.syntax.expressions[expr].node); };
-            auto slot = empty(binary->left) ? stableOption(binary->right) : empty(binary->right) ? stableOption(binary->left) : std::nullopt;
-            if (slot) return {*slot};
+            auto slot = empty(binary->left) ? stableLocal(binary->right, Type::Option) : empty(binary->right) ? stableLocal(binary->left, Type::Option) : std::nullopt;
+            if (slot) return {{*slot, outcome == (binary->op == Op::Ne) ? std::optional(module.sumTypes[fn.locals[*slot].type.id].success) : std::nullopt}};
         }
         return {};
     }
@@ -1235,19 +1258,136 @@ struct Checker {
     }
 
     Type inferResult() {
-        std::optional<Type> result;
-        inferredReturn = &result;
+        ValueJoin values{this};
+        inferredReturn = &values;
         enterFunction();
-        auto tail = visit(fn.syntax.body);
-        return result.value_or(tail == Type::Never ? Type{Type::Unit} : tail);
+        yield(fn.syntax.body, {}, false, &values);
+        return joinType(values).value_or(Type::Unit);
     }
 
     Type visit(ExprId id, std::optional<Type> expected = {}, bool discard = false) {
         auto type = inspect(id, expected, discard);
-        return fit(id, type, expected);
+        type = fit(id, type, expected);
+        if (discard && reachable && !probing && !inferredReturn && (type.kind == Type::Task || type.kind == Type::Result)) {
+            const auto& [site, node] = fn.syntax.expressions[id];
+            const auto* task = std::get_if<TaskOp>(&node);
+            const auto* block = std::get_if<AsyncBlock>(&node);
+            if (!(task && task->spawn) && !(block && block->kind == AsyncBlock::Parallel)) {
+                auto warning = at(source, site, "LYW0001", "丢弃了 " + typeName(module, type) + " 的结果");
+                warning.hint = type.kind == Type::Task ? "等待任务完成，或用 val _ = ... 明确忽略它。" : "处理 Result，或用 val _ = ... 明确忽略它。";
+                module.warnings.push_back(std::move(warning));
+            }
+        }
+        return type;
+    }
+
+    ValueJoin* collecting(ExprId id) const {
+        return collectingTail && collectingTail->first == id ? collectingTail->second : nullptr;
+    }
+
+    bool branchJoin(ExprId id) const {
+        const auto& node = fn.syntax.expressions[id].node;
+        if (const auto* match = std::get_if<Match>(&node)) return match->optional == OptionalForm::None;
+        return std::holds_alternative<Conditional>(node) || std::holds_alternative<Attempt>(node) || std::holds_alternative<Select>(node);
+    }
+
+    Type yield(ExprId id, std::optional<Type> expected, bool discard, ValueJoin* values) {
+        if (!values || discard) return visit(id, expected, discard);
+        const auto& [site, node] = fn.syntax.expressions[id];
+        if (branchJoin(id) || std::holds_alternative<Block>(node) || std::holds_alternative<UnsafeBlock>(node)) {
+            auto previous = std::exchange(collectingTail, std::pair{id, values});
+            auto result = visit(id);
+            collectingTail = previous;
+            return result;
+        }
+        if (std::holds_alternative<IntegerLiteral>(node) || (std::holds_alternative<RealLiteral>(node) && !std::get<RealLiteral>(node).width)) {
+            values->numbers.push_back(id);
+            return Type::Unit;
+        }
+        auto requireContext = [&](const char* code, const char* reason) {
+            if (!values->missingContext) values->missingContext = at(source, site, code, reason);
+            return Type{Type::Unit};
+        };
+        if (untypedOption(id)) {
+            values->nullable |= std::holds_alternative<EmptyOption>(node);
+            return requireContext("LYT0010", "None/null 需要明确的 Option 目标类型");
+        }
+        if (const auto* call = std::get_if<Call>(&node); call && !call->receiver && !call->function && !call->typeOwner && !lookupLocal(call->name) && !implicitMember(call->name, true)) {
+            auto name = linkedName(call->name);
+            if (name == "Ok" || name == "Err") return requireContext("LYT0010", "Ok/Err 需要明确的 Result 目标类型");
+        }
+        if (const auto* items = std::get_if<ListLiteral>(&node); items && items->elements.empty())
+            return requireContext("LYT0014", "空列表需要明确的 List<T> 目标类型");
+        if (const auto* lambda = std::get_if<Lambda>(&node); lambda && (lambda->implicit || std::ranges::any_of(lambda->parameters, [](const auto& param) { return !param.type; })))
+            return requireContext("LYT0015", "无法推断 lambda 形参类型，需要明确的函数目标类型");
+        auto type = visit(id);
+        if (type != Type::Never) values->types.emplace_back(type, site);
+        return type;
+    }
+
+    std::optional<Type> joinType(const ValueJoin& values) {
+        std::optional<Type> result;
+        for (auto [type, site] : values.types) if (type.kind == Type::Option && (!result || module.sumTypes[type.id].success == *result)) result = type;
+        for (auto [type, site] : values.types) {
+            if (!result) result = type;
+            else if (*result != type) {
+                if (result->kind == Type::Option && module.sumTypes[result->id].success == type) continue;
+                if (auto common = commonInteger(*result, type)) result = *common;
+                else if (result->kind == Type::Real && type.kind == Type::Real) result = number(Type::Real, std::max(numberWidth(*result), numberWidth(type)));
+                else if (result->kind == Type::Exception && type.kind == Type::Exception) result = Type::Exception;
+                else throw mismatch(module, source, site, *result, type);
+            }
+        }
+        if (!values.numbers.empty()) {
+            auto real = std::ranges::any_of(values.numbers, [&](auto id) { return std::holds_alternative<RealLiteral>(fn.syntax.expressions[id].node); });
+            Type fallback = real ? Type::Real : Type::Int;
+            if (!result) result = fallback;
+            auto target = result->kind == Type::Option ? module.sumTypes[result->id].success : *result;
+            auto fits = [&](Type candidate) {
+                return std::ranges::all_of(values.numbers, [&](auto id) {
+                    const auto& node = fn.syntax.expressions[id].node;
+                    if (const auto* literal = std::get_if<IntegerLiteral>(&node)) return represents(candidate, *literal);
+                    return false;
+                });
+            };
+            if (!(target.kind == Type::Real || (!real && integerType(target))))
+                throw mismatch(module, source, fn.syntax.expressions[values.numbers.front()].span, *result, fallback);
+            if (!values.types.empty() && result->kind != Type::Option && integerType(target) && !fits(target)) {
+                for (auto width : {16U, 32U, 64U}) {
+                    auto candidate = number(target.kind, width);
+                    if (!losslessNumber(target, candidate) || !fits(candidate)) candidate = number(Type::Int, width);
+                    if (losslessNumber(target, candidate) && fits(candidate)) { result = candidate; break; }
+                }
+            }
+        }
+        if (!result && values.missingContext) throw *values.missingContext;
+        if (values.nullable && result && result->kind != Type::Option) result = symbols.sum(Type::Option, *result);
+        return result;
+    }
+
+    template<class Collect>
+    std::optional<Type> probeValues(Span site, Collect collect) {
+        std::optional<std::string> annotation;
+        {
+            Symbols::TypeTrial transaction{symbols};
+            auto body = fn;
+            auto probe = trial(body);
+            ValueJoin values{&probe};
+            collect(probe, values);
+            if (auto type = probe.joinType(values)) annotation = typeName(module, *type, true);
+        }
+        return annotation ? std::optional(symbols.resolve(fn.syntax, {*annotation, site}, variables)) : std::nullopt;
+    }
+
+    std::optional<Type> probeJoin(ExprId id, bool returns = false) {
+        return probeValues(fn.syntax.expressions[id].span, [&](Checker& probe, ValueJoin& values) {
+            if (returns) probe.workers.back().returns = &values;
+            probe.yield(id, {}, false, &values);
+        });
     }
 
     Type inspect(ExprId id, std::optional<Type> hint, bool discard = false) {
+        if (!hint && !discard && !collecting(id) && branchJoin(id)) hint = probeJoin(id);
         resolveReceiver(id);
         const auto& expr = fn.syntax.expressions[id];
         return fn.expressions[id].type = std::visit([&](const auto& node) { return infer(id, node, hint, discard); }, expr.node);
@@ -1297,7 +1437,7 @@ struct Checker {
 
     Type infer(ExprId id, const TypeOperation& operation, auto, bool) {
         auto target = symbols.resolve(fn.syntax, operation.type, variables);
-        auto actual = visit(operation.value);
+        auto actual = operation.op == TypeOperator::InterfaceCast ? visit(operation.value) : inspectOriginal(operation.value, Type::Any);
         if (actual == Type::Never) return actual;
         fn.expressions[id].testedType = target;
         if (operation.op == TypeOperator::InterfaceCast) {
@@ -1418,8 +1558,9 @@ struct Checker {
 
     Type infer(ExprId id, const Attempt& attempt, std::optional<Type> expected, bool discard) {
         auto entry = present;
-        auto result = visit(attempt.body, discard ? std::nullopt : expected, discard);
-        auto exits = result == Type::Never ? std::optional<Present>{} : std::optional(present);
+        auto* values = collecting(id);
+        auto result = yield(attempt.body, discard ? std::nullopt : expected, discard, values);
+        auto exits = result == Type::Never ? std::optional<Facts>{} : std::optional(present);
         std::set<Type> covered;
         for (const auto& arm : attempt.arms) {
             present = entry;
@@ -1442,10 +1583,10 @@ struct Checker {
             catchOwners.push_back(currentWorker());
             bool reaches = !arm.guard || visit(*arm.guard, Type::Bool) != Type::Never;
             if (arm.guard && reaches) {
-                auto facts = definitelyPresent(*arm.guard, true);
+                auto facts = conditionFacts(*arm.guard, true);
                 present.insert(facts.begin(), facts.end());
             }
-            auto recovered = visit(arm.body, discard ? std::nullopt : result != Type::Never ? std::optional(result) : expected, discard);
+            auto recovered = yield(arm.body, discard || !reaches ? std::nullopt : expected, discard || !reaches, values);
             catchOwners.pop_back();
             scopes.pop_back();
             if (reaches && recovered != Type::Never) {
@@ -1461,11 +1602,15 @@ struct Checker {
         if (expected && expected->kind == Type::Option) expected = module.sumTypes[expected->id].success;
         std::optional<Type> element;
         if (expected && expected->kind == Type::List) element = module.listElements[expected->id];
+        if (!element && !literal.elements.empty()) {
+            element = probeValues(fn.syntax.expressions[id].span, [&](Checker& probe, ValueJoin& values) {
+                for (auto item : literal.elements) if (probe.yield(item, {}, false, &values) == Type::Never) break;
+            });
+        }
         bool exits = false;
         for (auto item : literal.elements) {
             auto value = visit(item, element);
             if (value == Type::Never) exits = true;
-            else if (!element) element = value;
         }
         if (exits) return Type::Never;
         if (!element) throw at(source, fn.syntax.expressions[id].span, "LYT0014", "空列表需要明确的 List<T> 目标类型");
@@ -1690,6 +1835,12 @@ struct Checker {
     }
 
     CheckedPattern checkPattern(const Pattern& pattern, Type subject) {
+        auto checked = patternNode(pattern, subject);
+        checked.site = pattern.span;
+        return checked;
+    }
+
+    CheckedPattern patternNode(const Pattern& pattern, Type subject) {
         const auto& node = pattern.node;
         if (std::holds_alternative<PatternAlternatives>(node)) return alternativesPattern(pattern, subject);
         if (const auto* list = std::get_if<PatternList>(&node)) {
@@ -1733,16 +1884,36 @@ struct Checker {
         return {std::get<StringLiteral>(node)};
     }
 
+    static bool hasConstant(const CheckedPattern& pattern) {
+        return std::holds_alternative<PatternConstant>(pattern.node) || std::ranges::any_of(pattern.parts, hasConstant);
+    }
+
     void checkExhaustiveness(Type subject, Span site, std::span<const CheckedPattern* const> patterns, PatternUse use) {
-        auto hasConstant = [&](auto&& self, const CheckedPattern& pattern) -> bool {
-            return std::holds_alternative<PatternConstant>(pattern.node) ||
-                std::ranges::any_of(pattern.parts, [&](const auto& part) { return self(self, part); });
-        };
-        if (std::ranges::any_of(patterns, [&](const auto* pattern) { return hasConstant(hasConstant, *pattern); })) {
+        if (std::ranges::any_of(patterns, [&](const auto* pattern) { return hasConstant(*pattern); })) {
             std::vector<CheckedPattern> deferred;
             for (const auto* pattern : patterns) deferred.push_back(*pattern);
             module.deferredPatternChecks.push_back({fn.syntax.file, site, subject, std::move(deferred), use});
         } else if (auto missing = missingPattern(module, subject, patterns, use)) throw uncoveredPattern(source, site, use, *missing);
+    }
+
+    static bool optionPattern(const Pattern& pattern) {
+        if (const auto* tag = std::get_if<SumTag>(&pattern.node)) return optionTag(*tag);
+        return std::holds_alternative<PatternAlternatives>(pattern.node) && std::ranges::any_of(pattern.parts, optionPattern);
+    }
+
+    static bool matchesTag(const CheckedPattern& pattern, SumTag wanted) {
+        if (const auto* key = std::get_if<PatternConstructor>(&pattern.node)) return *key == PatternConstructor(wanted);
+        if (std::holds_alternative<CheckedAlternatives>(pattern.node))
+            return std::ranges::any_of(pattern.parts, [&](const auto& part) { return matchesTag(part, wanted); });
+        return true;
+    }
+
+    bool coversTag(const CheckedPattern& pattern, Type option, SumTag wanted) const {
+        if (hasConstant(pattern)) return false;
+        CheckedPattern other{PatternConstructor(wanted == SumTag::None ? SumTag::Some : SumTag::None)};
+        if (wanted == SumTag::None) other.parts.emplace_back();
+        const CheckedPattern* rows[] = {&pattern, &other};
+        return !missingPattern(module, option, rows, PatternUse::Match);
     }
 
     Type infer(ExprId id, const Match& match, std::optional<Type> expected, bool discard) {
@@ -1757,7 +1928,8 @@ struct Checker {
             }
             subjectHint = symbols.sum(Type::Option, *element);
         }
-        auto subject = match.optional == OptionalForm::None ? inspect(match.subject, subjectHint) : inspectOption(match.subject, subjectHint);
+        bool testsOption = match.optional != OptionalForm::None || std::ranges::any_of(match.arms, [](const auto& arm) { return optionPattern(arm.pattern); });
+        auto subject = testsOption ? inspectOption(match.subject, subjectHint) : inspect(match.subject, subjectHint);
         if (subject == Type::Never) return subject;
         if (match.optional != OptionalForm::None && subject.kind != Type::Option)
             throw at(source, match.operation, "LYT0010", "可空运算符需要 Option，实际是 " + typeName(module, subject));
@@ -1767,13 +1939,33 @@ struct Checker {
         std::vector<const CheckedPattern*> patterns;
         std::optional<Type> result;
         auto entry = present;
+        auto remaining = std::optional(entry);
+        std::optional<Facts> exits;
+        auto local = subject.kind == Type::Option ? stableLocal(match.subject, Type::Option) : std::nullopt;
+        const auto payload = local ? std::optional(module.sumTypes[subject.id].success) : std::nullopt;
         for (const auto& arm : match.arms) {
-            present = entry;
+            present = remaining.value_or(entry);
             scopes.emplace_back();
             checked.push_back(checkPattern(arm.pattern, subject));
             if (!arm.guard) patterns.push_back(&checked.back());
+            bool canReach = remaining.has_value();
+            if (local) {
+                auto known = present.find(*local);
+                bool possibleSome = known == present.end() || known->second.has_value();
+                bool possibleNone = known == present.end() || !known->second;
+                bool some = possibleSome && matchesTag(checked.back(), SumTag::Some);
+                bool none = possibleNone && matchesTag(checked.back(), SumTag::None);
+                canReach &= some || none;
+                if (some != none) present[*local] = some ? payload : std::nullopt;
+                if (remaining && !arm.guard) {
+                    possibleSome &= !coversTag(checked.back(), subject, SumTag::Some);
+                    possibleNone &= !coversTag(checked.back(), subject, SumTag::None);
+                    if (!possibleSome && !possibleNone) remaining.reset();
+                    else if (possibleSome != possibleNone) (*remaining)[*local] = possibleSome ? payload : std::nullopt;
+                }
+            }
             bool mayEnter = !arm.guard || visit(*arm.guard, Type::Bool) != Type::Never;
-            if (arm.guard && mayEnter) present.merge(definitelyPresent(*arm.guard, true));
+            if (arm.guard && mayEnter) present.merge(conditionFacts(*arm.guard, true));
             auto hint = result ? result : expected;
             auto ignoreValue = discardArms || !mayEnter;
             Type value;
@@ -1784,12 +1976,19 @@ struct Checker {
                 if (!hint || hint->kind != Type::Option) hint = symbols.sum(Type::Option, Type::Unit);
                 value = visit(arm.value, hint);
             } else if (fallback && &arm == &match.arms.back()) value = *fallback;
-            else value = visit(arm.value, ignoreValue ? std::nullopt : hint, ignoreValue);
+            else value = yield(arm.value, ignoreValue ? std::nullopt : (match.optional == OptionalForm::None ? expected : hint), ignoreValue, collecting(id));
             if (mayEnter && value != Type::Never && !result) result = discardArms ? Type::Unit : value;
+            if (canReach && mayEnter && value != Type::Never) exits = exits ? bothPaths(*exits, present) : present;
             scopes.pop_back();
         }
-        present = std::move(entry);
+        present = exits.value_or(std::move(entry));
         checkExhaustiveness(subject, fn.syntax.expressions[id].span, patterns, PatternUse::Match);
+        if (!probing && !inferredReturn && match.optional == OptionalForm::None) {
+            MatchCoverage coverage{fn.syntax.file, subject, {}};
+            for (std::size_t index = 0; index < match.arms.size(); ++index)
+                coverage.arms.push_back({checked[index], match.arms[index].guard.has_value()});
+            module.matchCoverage.push_back(std::move(coverage));
+        }
         return discard && match.optional != OptionalForm::None ? Type{Type::Unit} : result.value_or(Type::Never);
     }
 
@@ -1920,9 +2119,9 @@ struct Checker {
             declare(name, slot);
             fn.expressions[id].argumentSlots.push_back(slot);
         }
-        auto tail = visit(lambda.body, result);
-        result = workers.back().result.value_or(tail);
-        fit(lambda.body, tail, result);
+        if (!result) result = probeJoin(lambda.body, true).value_or(Type::Never);
+        workers.back().result = result;
+        visit(lambda.body, result);
         scopes.pop_back();
         workers.pop_back();
         present = std::move(entry);
@@ -2261,14 +2460,13 @@ struct Checker {
             const auto& item = symbols.callables[index];
             const auto& syntax = symbols.declaration(item);
             Symbols::TypeTrial transaction{symbols};
-            auto trial = fn;
-            auto returnHint = inferredReturn ? *inferredReturn : std::optional<Type>{};
-            Checker checker{trial, source, module, symbols, scopes, variables, loops, workers, catchOwners, lambdaHints, receiverSlot, implicitReceivers, true, inferredReturn ? &returnHint : nullptr, present, unsafeDepth};
+            auto body = fn;
+            auto checker = trial(body);
             try {
-                const auto& trialCall = std::get<Call>(trial.syntax.expressions[id].node);
+                const auto& trialCall = std::get<Call>(body.syntax.expressions[id].node);
                 checker.declaredCall(index, id, trialCall, expected, ownerTypes(index), true);
                 OverloadMatch match{index, {}, syntax.typeParameters.size() > symbols.enclosingParameters(syntax), !syntax.parameters.empty() && syntax.parameters.back().variadic,
-                    trial.expressions[id].omittedDefaults.size()};
+                    body.expressions[id].omittedDefaults.size()};
                 for (const auto& argument : trialCall.arguments) match.arguments.push_back(checker.argumentMatch(argument.value));
                 matches.push_back(std::move(match));
             } catch (const Diagnostic& error) {
@@ -2704,6 +2902,7 @@ struct Checker {
         auto entry = present;
         auto& slots = fn.expressions[id].selectSlots;
         std::optional<Type> result;
+        std::optional<Facts> exits;
         for (std::size_t index = 0; index < selection.arms.size(); ++index) {
             const auto& arm = selection.arms[index];
             present = entry;
@@ -2715,11 +2914,14 @@ struct Checker {
                 declare(*arm.binding, slot);
                 slots.back() = slot;
             }
-            auto value = visit(arm.value, discard ? std::nullopt : result ? result : expected, discard);
-            if (value != Type::Never && !result) result = discard ? Type::Unit : value;
+            auto value = yield(arm.value, discard ? std::nullopt : expected, discard, collecting(id));
+            if (value != Type::Never) {
+                if (!result) result = discard ? Type::Unit : value;
+                exits = exits ? bothPaths(*exits, present) : present;
+            }
             scopes.pop_back();
         }
-        present = std::move(entry);
+        present = exits.value_or(std::move(entry));
         return result.value_or(Type::Never);
     }
 
@@ -2727,13 +2929,13 @@ struct Checker {
         workers.push_back({id, fn.locals.size(), hint});
         unsigned previous = std::exchange(loops, 0);
         auto entry = present;
-        auto body = visit(bodyId, hint);
-        auto result = workers.back().result.value_or(body);
-        fit(bodyId, body, result);
+        if (!hint) hint = probeJoin(bodyId, true).value_or(Type::Never);
+        workers.back().result = hint;
+        visit(bodyId, hint);
         workers.pop_back();
         present = std::move(entry);
         loops = previous;
-        return result;
+        return *hint;
     }
 
     Type infer(ExprId id, const Blocking& worker, std::optional<Type> expected, bool) {
@@ -2808,9 +3010,11 @@ struct Checker {
         if (binary.op == Op::And || binary.op == Op::Or) {
             auto type = visit(binary.left, Type::Bool);
             auto entry = present;
-            present.merge(definitelyPresent(binary.left, binary.op == Op::And));
-            visit(binary.right, Type::Bool);
-            present = std::move(entry);
+            auto takesRight = binary.op == Op::And;
+            present.merge(conditionFacts(binary.left, takesRight));
+            auto right = visit(binary.right, Type::Bool);
+            entry.merge(conditionFacts(binary.left, !takesRight));
+            present = right == Type::Never ? std::move(entry) : bothPaths(present, entry);
             return type;
         }
         bool equality = binary.op == Op::Eq || binary.op == Op::Ne;
@@ -2864,23 +3068,25 @@ struct Checker {
 
     Type infer(ExprId id, const Block& block, std::optional<Type> expected, bool discard) {
         if (id != fn.syntax.body) scopes.emplace_back();
-        auto returnHint = id == fn.syntax.body ? inferredReturn : nullptr;
+        auto* values = collecting(id);
+        auto entered = reachable;
         bool live = true;
         Type type = Type::Unit;
         Span site = block.end;
         bool semiFix = false;
         for (const auto& statement : block.statements) {
             bool tail = !discard && &statement == &block.statements.back() && !statement.semicolon && live;
-            auto wanted = returnHint ? *returnHint : expected;
-            auto value = visit(statement.expression, tail ? wanted : std::nullopt, !tail);
+            reachable = entered && live;
+            auto value = yield(statement.expression, tail ? expected : std::nullopt, !tail, tail ? values : nullptr);
             live &= value != Type::Never;
             type = statement.semicolon ? Type::Unit : value;
             site = statement.semicolon.value_or(fn.syntax.expressions[statement.expression].span);
             semiFix = statement.semicolon && expected == value;
         }
+        reachable = entered;
         if (id != fn.syntax.body) scopes.pop_back();
         if (!live) return Type::Never;
-        if (returnHint) expected = *returnHint;
+        if (values && (block.statements.empty() || block.statements.back().semicolon)) values->types.emplace_back(Type::Unit, site);
         if (expected && *expected != type) {
             auto error = mismatch(module, source, site, *expected, type);
             if (semiFix) error.hint = "去掉末尾分号，让最后的表达式成为返回值。";
@@ -2889,9 +3095,9 @@ struct Checker {
         return discard ? Type::Unit : type;
     }
 
-    Type infer(ExprId, const UnsafeBlock& block, std::optional<Type> expected, bool discard) {
+    Type infer(ExprId id, const UnsafeBlock& block, std::optional<Type> expected, bool discard) {
         ++unsafeDepth;
-        auto result = visit(block.body, expected, discard);
+        auto result = yield(block.body, expected, discard, collecting(id));
         --unsafeDepth;
         return result;
     }
@@ -2901,11 +3107,12 @@ struct Checker {
         if (!branch.no && !discard && expected != Type::Unit) throw at(source, fn.syntax.expressions[id].span, "LYT0005", "值位置的 if 需要 else 分支");
         bool ignore = discard || !branch.no;
         auto entry = present;
-        present.merge(definitelyPresent(branch.condition, true));
-        auto yes = visit(branch.yes, ignore ? std::nullopt : expected, ignore);
+        auto* values = condition == Type::Never ? nullptr : collecting(id);
+        present.merge(conditionFacts(branch.condition, true));
+        auto yes = yield(branch.yes, ignore ? std::nullopt : expected, ignore, values);
         auto yesFacts = std::exchange(present, std::move(entry));
-        present.merge(definitelyPresent(branch.condition, false));
-        auto no = branch.no ? visit(*branch.no, !ignore && yes != Type::Never ? std::optional(yes) : expected, ignore) : Type::Unit;
+        present.merge(conditionFacts(branch.condition, false));
+        auto no = branch.no ? yield(*branch.no, ignore ? std::nullopt : expected, ignore, values) : Type::Unit;
         if (condition == Type::Never || (yes == Type::Never && no == Type::Never)) return Type::Never;
         if (no == Type::Never) present = std::move(yesFacts);
         else if (yes != Type::Never) present = bothPaths(present, yesFacts);
@@ -2918,19 +3125,23 @@ struct Checker {
             return Type::Never;
         }
         auto target = returnType();
+        if (!target) {
+            auto* values = workers.empty() ? inferredReturn : workers.back().returns;
+            if (reachable && values && values->owner == this) {
+                if (ret.value) yield(*ret.value, {}, false, values);
+                else values->types.emplace_back(Type::Unit, fn.syntax.expressions[id].span);
+            }
+            return Type::Never;
+        }
         auto value = ret.value ? visit(*ret.value, target) : Type{Type::Unit};
         if (target && value != Type::Never && *target != value) throw mismatch(module, source, fn.syntax.expressions[id].span, *target, value);
-        if (!target && value != Type::Never) {
-            if (workers.empty()) *inferredReturn = value;
-            else workers.back().result = value;
-        }
         return Type::Never;
     }
 
     Type infer(ExprId, const While& loop, auto, bool) {
         auto condition = visit(loop.condition, Type::Bool);
         auto entry = present;
-        present.merge(definitelyPresent(loop.condition, true));
+        present.merge(conditionFacts(loop.condition, true));
         ++loops;
         visit(loop.body, {}, true);
         --loops;
@@ -3347,6 +3558,15 @@ CheckedModule check(Module module, const std::vector<Source>& sources, bool requ
         if (auto missing = missingPattern(checked, deferred.subject, patterns, deferred.use))
             throw uncoveredPattern(sources[deferred.file], deferred.site, deferred.use, *missing);
     }
+    for (const auto& match : checked.matchCoverage) for (auto site : redundantPatterns(checked, match))
+        checked.warnings.push_back(at(sources[match.file], site, "LYW0002", "此模式已被前面的无守卫模式覆盖，或无法匹配任何值"));
+    auto warningKey = [](const Diagnostic& diagnostic) {
+        return std::tuple(std::string_view(diagnostic.site->file), diagnostic.site->start.offset, diagnostic.site->end.offset, std::string_view(diagnostic.code));
+    };
+    std::ranges::stable_sort(checked.warnings, {}, warningKey);
+    auto duplicates = std::ranges::unique(checked.warnings, {}, warningKey);
+    checked.warnings.erase(duplicates.begin(), duplicates.end());
+    checked.matchCoverage.clear();
     return checked;
 }
 

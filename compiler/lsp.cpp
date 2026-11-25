@@ -39,6 +39,7 @@ struct Document { fs::path path; std::string uri, text; std::int64_t version{}; 
 struct Workspace {
     std::vector<Source> sources;
     std::vector<NameReference> references;
+    std::vector<Diagnostic> warnings;
     std::set<std::string> names;
     std::map<std::pair<std::size_t, std::size_t>, std::size_t> throwsEnds;
 };
@@ -181,6 +182,7 @@ Workspace loadWorkspace(const fs::path& root, const SourceOverlay& overlays, con
         auto program = loadProgram(*graph, graph->entry, {}, &overlays, &parseCache);
         rememberThrows(program.syntax, program.sources);
         auto checked = check(program.syntax, program.sources, false);
+        workspace.warnings = std::move(checked.warnings);
         workspace.sources = std::move(program.sources);
         workspace.references = std::move(program.references);
         workspace.references.insert(workspace.references.end(), checked.references.begin(), checked.references.end());
@@ -190,6 +192,7 @@ Workspace loadWorkspace(const fs::path& root, const SourceOverlay& overlays, con
         auto syntax = parse(sources);
         rememberThrows(syntax, sources);
         auto checked = check(std::move(syntax), sources, false);
+        workspace.warnings = std::move(checked.warnings);
         workspace.sources = std::move(sources);
         workspace.references = std::move(checked.references);
     }
@@ -846,7 +849,7 @@ private:
             else roots.try_emplace(std::move(root), &document);
         }
         std::erase_if(snapshots, [&](const auto& entry) { return !roots.contains(entry.first); });
-        auto append = [&](const Diagnostic& error, const Document& owner) {
+        auto append = [&](const Diagnostic& error, const Document& owner, int severity = 1) {
             const Document* target = &owner;
             Span span{0, 0};
             if (error.site) {
@@ -856,12 +859,14 @@ private:
                 span = {error.site->start.offset, error.site->end.offset};
             }
             auto source = sourceText(target->path, target->text, {});
-            json::Value item = json::Object{{"severity", 1}, {"code", error.code}, {"message", error.message}, {"range", jsonRange(source, span)}};
+            json::Value item = json::Object{{"severity", severity}, {"code", error.code}, {"message", error.message}, {"range", jsonRange(source, span)}};
             auto& diagnostics = byUri[target->uri];
             if (std::ranges::find(diagnostics, item) == diagnostics.end()) diagnostics.push_back(std::move(item));
         };
         for (const auto& [root, owner] : roots) {
-            try { static_cast<void>(analyze(root)); }
+            try {
+                for (const auto& warning : analyze(root).warnings) append(warning, *owner, 2);
+            }
             catch (const Diagnostic& error) { append(error, *owner); }
             catch (const PackageError& error) { append({error.code, error.message}, *owner); }
             catch (const fs::filesystem_error& error) { append({"LYI0001", error.what()}, *owner); }

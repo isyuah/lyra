@@ -80,8 +80,9 @@ Options options(const std::vector<std::string_view>& args, const std::vector<std
     return result;
 }
 
-int compile(const Options& opts, Compilation program, bool library, fs::path output) {
+int compile(const Options& opts, Compilation program, bool library, fs::path output, std::vector<Diagnostic>& warnings) {
     auto module = check(std::move(program.syntax), program.sources, !library);
+    warnings.insert(warnings.end(), module.warnings.begin(), module.warnings.end());
     if (opts.command == "check") return 0;
     if (library) throw Diagnostic{"LYC0002", "库没有可执行入口；使用 lyra check 或 lyra test 检查库"};
     if (fs::exists(output)) for (const auto& input : program.macroInputs) {
@@ -91,14 +92,14 @@ int compile(const Options& opts, Compilation program, bool library, fs::path out
     return opts.command == "build" ? 0 : execute(output, opts.arguments);
 }
 
-int project(const Options& opts, bool json) {
+int project(const Options& opts, bool json, std::vector<Diagnostic>& warnings) {
     auto binary = [&](const fs::path& root) { return opts.output.value_or(executablePath(root / "build" / (opts.native.release ? "release" : "debug") / "app")); };
     if (!fs::exists(opts.directory / "lyra.json5")) {
         if (opts.packages.locked || opts.packages.offline || opts.command == "test") throw Diagnostic{"LYK0001", "此操作需要包清单 lyra.json5"};
         auto sources = loadSources(opts.directory);
         auto module = parse(sources);
         if (!module.imports.empty()) throw at(sources[module.imports.front().file], module.imports.front().path.front().span, "LYN0003", "使用 import 需要包清单 lyra.json5");
-        return compile(opts, {std::move(sources), std::move(module)}, false, binary(opts.directory));
+        return compile(opts, {std::move(sources), std::move(module)}, false, binary(opts.directory), warnings);
     }
     auto graph = resolvePackages(opts.directory, opts.packages);
     if (!json) for (const auto& warning : graph.warnings) std::cerr << "warning: " << warning << '\n';
@@ -113,7 +114,7 @@ int project(const Options& opts, bool json) {
     for (const auto& id : entries) {
         const auto& package = *std::ranges::find(graph.packages, id, &ResolvedPackage::id);
         if (opts.command != "test") {
-            auto code = compile(opts, loadProgram(graph, id), package.library, binary(package.root));
+            auto code = compile(opts, loadProgram(graph, id), package.library, binary(package.root), warnings);
             if (code) return code;
             continue;
         }
@@ -128,7 +129,7 @@ int project(const Options& opts, bool json) {
             auto name = path.stem();
             if constexpr (windows) name += ".exe";
             auto output = package.root / "build" / "test" / (opts.native.release ? "release" : "debug") / name;
-            int status = compile(opts, std::move(program), false, output);
+            int status = compile(opts, std::move(program), false, output, warnings);
             if (status) throw Diagnostic{"LYC0003", pathText(path) + " 测试退出码：" + std::to_string(status)};
             ++tests;
             std::cout << "ok " << package.name << '/' << pathText(path.filename()) << '\n';
@@ -157,6 +158,8 @@ int run(std::vector<std::string_view> args) {
     std::vector<std::string_view> arguments;
     if (forwards) { arguments.assign(separator + 1, args.end()); args.erase(separator, args.end()); }
     bool json = std::erase(args, "--diagnostics=json") > 0;
+    std::vector<Diagnostic> warnings;
+    auto failure = [&](const Diagnostic& error) { reportDiagnostics(warnings, &error, json); };
     try {
         if (args.size() == 1 && args[0] == "--version" && !forwards) { std::cout << "lyra " LYRA_TOOLCHAIN_VERSION "\n"; return 0; }
         if (args.size() == 1 && args[0] == "--help") { std::cout << usage << '\n'; return 0; }
@@ -173,12 +176,12 @@ int run(std::vector<std::string_view> args) {
         } else if (args[0] == "new" || args[0] == "lock" || args[0] == "fetch" || args[0] == "pack") {
             if (forwards) throw Diagnostic{"LYC0001", usage};
             code = packageCommand(args);
-        } else code = project(options(args, arguments, forwards), json);
-        if (json) std::cerr << "[]\n";
+        } else code = project(options(args, arguments, forwards), json, warnings);
+        reportWarnings(warnings, json);
         return code;
-    } catch (const Diagnostic& error) { report(error, json); }
-    catch (const PackageError& error) { report({error.code, error.message}, json); }
-    catch (const fs::filesystem_error& error) { report({"LYI0001", error.what()}, json); }
+    } catch (const Diagnostic& error) { failure(error); }
+    catch (const PackageError& error) { failure({error.code, error.message}); }
+    catch (const fs::filesystem_error& error) { failure({"LYI0001", error.what()}); }
     return 1;
 }
 }

@@ -153,6 +153,8 @@ fn main(): Unit {
             ('class Handle {}\nfn main(): Unit { val items = hashSet<Handle>() }', 'Hash'),
             ('struct Key(val id: Int) { fn equals(other: Key): Bool { id == other.id } }\nfn main(): Unit { val items = hashSet<Key>() }', 'hashCode'),
             ('struct Key(val id: Int) { fn hashCode(): Int { id } }\nfn main(): Unit { val items = hashSet<Key>() }', 'equals'),
+            ('struct Key(val id: Int) { fn hashCode(): Int { id } }\nfn main(): Unit { val items = hashSet<Result<Key?,Int>>() }', 'equals'),
+            ('struct Key(val id: Int) { fn hashCode(): Int { id } }\nenum Outer { Found(Key), Missing }\nfn main(): Unit { val items = hashSet<Outer>() }', 'equals'),
         ]
         (self.package / 'lyra.json5').write_text('{name:"test/hash-rejections",version:"0.1.0"}')
         for body, fragment in cases:
@@ -163,6 +165,18 @@ fn main(): Unit {
                 error, = json.loads(check.stderr)
                 self.assertEqual(error['code'], 'LYT0019', error)
                 self.assertIn(fragment, error['message'])
+
+    def test_explicit_hash_is_independent_of_eq(self):
+        self.native('''struct Key(val id: Int, val callback: () -> Int) {
+    fn hashCode(): Int { id }
+}
+fn hash<T: Hash>(value: T): Int { value.hashCode() }
+fn main(): Unit {
+    val key = Key(19, () => { 0 })
+    print(hash(key))
+    print(hash(Some(key)) == Some(key).hashCode())
+}
+''', b'19\ntrue\n')
 
     def test_class_equality_uses_identity(self):
         self.native('''class Handle(val id: Int) {}

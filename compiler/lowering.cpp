@@ -995,8 +995,14 @@ struct Emitter {
             const auto& shape = layouts.program.signatures[rawType(id).id];
             return NativeClosures{builder}.named(functions[*info.functionRef], signature(shape), shape.parameters.size(), syntax.isAsync, syntax.foreignSymbol.has_value());
         }
+        return readNarrowed(info);
+    }
+
+    Value readNarrowed(const CheckedExpr& info) {
         auto value = read(info.target);
-        return info.narrowed ? builder.CreateExtractValue(value, 1) : value;
+        if (!info.narrowed) return value;
+        auto payload = builder.CreateExtractValue(value, 1);
+        return fn.locals[info.target].type == Type::Any ? builder.CreateLoad(layouts.native(builder, *info.narrowed), payload) : payload;
     }
 
     Value emitNode(ExprId id, This) { return read(fn.expressions[id].target); }
@@ -1435,8 +1441,7 @@ struct Emitter {
                     closure = layouts.workers ? sharedRead(builder, builder.getPtrTy(), address) : builder.CreateLoad(builder.getPtrTy(), address);
                 } else closure = builder.CreateExtractValue(object, info.target);
             } else {
-                closure = read(info.target);
-                if (info.narrowed) closure = builder.CreateExtractValue(closure, 1);
+                closure = readNarrowed(info);
             }
             if (!live()) return unit();
             std::vector<Value> args;

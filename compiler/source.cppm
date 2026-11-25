@@ -66,6 +66,7 @@ struct Diagnostic {
 Diagnostic at(const Source& source, Span span, std::string code, std::string message);
 void report(const Diagnostic& error, bool json);
 void reportWarnings(const std::vector<Diagnostic>& warnings, bool json);
+void reportDiagnostics(const std::vector<Diagnostic>& warnings, const Diagnostic* error, bool json);
 std::vector<Source> loadSources(const std::filesystem::path& package);
 Source loadSource(const std::filesystem::path& path, std::string moduleId, const SourceOverlay* overlay = nullptr);
 Source sourceText(const std::filesystem::path& path, std::string text, std::string moduleId);
