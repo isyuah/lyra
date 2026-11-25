@@ -110,6 +110,7 @@ struct Layouts {
             case Type::TaskLocal: return "TaskLocal<" + nested(program.taskLocalValues[type.id]) + ">";
             case Type::Channel: return "Channel<" + nested(program.channelElements[type.id]) + ">";
             case Type::List: return "List<" + nested(program.listElements[type.id]) + ">";
+            case Type::FrozenList: return "FrozenList<" + nested(program.listElements[type.id]) + ">";
             case Type::IntRange: return "Range<Int>";
             case Type::Option: return "Option<" + nested(program.sumTypes[type.id].success) + ">";
             case Type::Result: return "Result<" + nested(program.sumTypes[type.id].success) + ", " + nested(program.sumTypes[type.id].failure) + ">";
@@ -240,7 +241,7 @@ struct Layouts {
         case Type::Bool: return builder.getInt1Ty();
         case Type::Char: return builder.getInt32Ty();
         case Type::Unit: case Type::Never: return builder.getInt8Ty();
-        case Type::String: case Type::Bytes: case Type::Task: case Type::CPtr: case Type::List: case Type::Exception: case Type::Closure: case Type::Error: case Type::TaskLocal: case Type::Channel: case Type::CCallback: return builder.getPtrTy();
+        case Type::String: case Type::Bytes: case Type::Task: case Type::CPtr: case Type::List: case Type::FrozenList: case Type::Exception: case Type::Closure: case Type::Error: case Type::TaskLocal: case Type::Channel: case Type::CCallback: return builder.getPtrTy();
         case Type::Variable: case Type::Projection: llvm_unreachable("abstract type reached LLVM lowering");
         case Type::Any: case Type::Dyn: return llvm::StructType::get(builder.getContext(), {builder.getPtrTy(), builder.getPtrTy()});
         case Type::IntRange: return llvm::StructType::get(builder.getContext(), {builder.getInt64Ty(), builder.getInt64Ty(), builder.getInt1Ty()});
@@ -296,7 +297,7 @@ struct NativeValues {
         auto& module = *builder.GetInsertBlock()->getModule();
         if (auto found = layouts.program.valueOverrides.find({type, operation}); found != layouts.program.valueOverrides.end())
             return {builder.CreateCall(functions[found->second], args), true};
-        if ((type.kind == Type::Record && !layouts.reference(type)) || type.kind == Type::Enum || type.kind == Type::Option || type.kind == Type::Result || type == Type::IntRange)
+        if ((type.kind == Type::Record && !layouts.reference(type)) || type.kind == Type::Enum || type.kind == Type::Option || type.kind == Type::Result || type.kind == Type::FrozenList || type == Type::IntRange)
             return {builder.CreateCall(helper(builder, module, type, operation), args), true};
         auto pointer = builder.getPtrTy();
         bool text = type == Type::String || type == Type::Bytes;
@@ -357,7 +358,45 @@ struct NativeValues {
             builder.CreateRet(equality ? static_cast<Value>(builder.getTrue()) : hash);
         };
         auto* seed = builder.getInt64(valueHashSeed);
-        if (type.kind == Type::Record || type == Type::IntRange) {
+        if (type.kind == Type::FrozenList) {
+            NativeLists lists{builder};
+            auto length = lists.size(left);
+            if (equality) {
+                auto sameLength = label("list.sameLength");
+                builder.CreateCondBr(builder.CreateICmpEQ(length, lists.size(right)), sameLength, failure);
+                builder.SetInsertPoint(sameLength);
+            }
+            auto initial = equality ? nullptr : mix(builder, seed, length);
+            auto entryBlock = builder.GetInsertBlock();
+            auto test = label("list.test"), active = label("list.element"), done = label("list.done");
+            builder.CreateBr(test);
+            builder.SetInsertPoint(test);
+            auto index = builder.CreatePHI(builder.getInt64Ty(), 2);
+            index->addIncoming(builder.getInt64(0), entryBlock);
+            auto hash = equality ? nullptr : builder.CreatePHI(builder.getInt64Ty(), 2);
+            if (hash) hash->addIncoming(initial, entryBlock);
+            builder.CreateCondBr(builder.CreateICmpULT(index, length), active, done);
+            builder.SetInsertPoint(active);
+            auto element = layouts.program.listElements[type.id];
+            auto getter = module.getOrInsertFunction("lyraFrozenListItem", builder.getPtrTy(), builder.getPtrTy(), builder.getInt64Ty());
+            auto load = [&](Value list) { return builder.CreateLoad(layouts.native(builder, element), builder.CreateCall(getter, {list, index})); };
+            auto first = load(left);
+            auto result = emit(builder, element, operation, first, equality ? load(right) : nullptr, error);
+            if (result.mayThrow) {
+                auto success = label("list.returned");
+                builder.CreateCondBr(builder.CreateIsNull(builder.CreateLoad(builder.getPtrTy(), error)), success, failure);
+                builder.SetInsertPoint(success);
+            }
+            if (equality) {
+                auto same = label("list.equal");
+                builder.CreateCondBr(result.value, same, failure);
+                builder.SetInsertPoint(same);
+            } else hash->addIncoming(mix(builder, hash, result.value), builder.GetInsertBlock());
+            index->addIncoming(builder.CreateAdd(index, builder.getInt64(1)), builder.GetInsertBlock());
+            builder.CreateBr(test);
+            builder.SetInsertPoint(done);
+            builder.CreateRet(equality ? static_cast<Value>(builder.getTrue()) : hash);
+        } else if (type.kind == Type::Record || type == Type::IntRange) {
             auto fields = type == Type::IntRange ? std::span<const Type>(rangeFields) : std::span<const Type>(layouts.program.aggregates[type.id].fields);
             parts(fields, seed, [&](Value record, unsigned slot) {
                 return builder.CreateExtractValue(record, slot);
@@ -559,7 +598,7 @@ struct DebugInfo {
             case Type::Char: cached = basic(32, llvm::dwarf::DW_ATE_unsigned_char); break;
             case Type::Unit: cached = basic(8, llvm::dwarf::DW_ATE_unsigned); break;
             case Type::CPtr: cached = pointer(nullptr); break;
-            case Type::String: case Type::Bytes: case Type::Task: case Type::List: case Type::Exception:
+            case Type::String: case Type::Bytes: case Type::Task: case Type::List: case Type::FrozenList: case Type::Exception:
             case Type::Closure: case Type::Error: case Type::TaskLocal: case Type::Channel: case Type::CCallback:
                 cached = pointer(builder.createForwardDecl(llvm::dwarf::DW_TAG_structure_type, name, unit->getFile(), unit->getFile(), 0));
                 break;
@@ -733,7 +772,7 @@ struct Emitter {
         locals.resize(fn.locals.size());
         for (std::size_t slot = 0; slot < fn.locals.size(); ++slot) {
             const auto& local = fn.locals[slot];
-            if (local.worker == worker) {
+            if (local.worker == worker && !local.constant) {
                 locals[slot] = builder.CreateAlloca(local.captured ? builder.getPtrTy() : layouts.native(builder, local.type));
                 if (debug && local.declaration && !local.name.empty()) declareDebugLocal(slot, local);
             }
@@ -974,6 +1013,10 @@ struct Emitter {
             const auto& types = layouts.program.enums[type.id].payloads[variant->index];
             for (std::size_t slot = 0; slot < stored.fields.size(); ++slot) fields.push_back(emitConstant(stored.fields[slot], types[slot], emitted));
             result = makeVariant(type, variant->index, fields);
+        } else if (type.kind == Type::FrozenList) {
+            NativeLists lists{builder};
+            result = lists.create();
+            for (const auto& field : stored.fields) lists.add(result, emitConstant(field, layouts.program.listElements[type.id], emitted));
         } else {
             result = llvm::Constant::getNullValue(representation);
             auto types = type == Type::IntRange ? std::span<const Type>(rangeFields) : std::span<const Type>(layouts.program.aggregates[type.id].fields);
@@ -988,7 +1031,7 @@ struct Emitter {
         const auto& info = fn.expressions[id];
         if (info.constantRef) {
             std::map<std::size_t, Value> emitted;
-            return emitConstant(*layouts.program.constants[*info.constantRef], rawType(id), emitted);
+            return emitConstant(*constantValue(layouts.program, *info.constantRef), rawType(id), emitted);
         }
         if (info.functionRef) {
             const auto& syntax = layouts.program.functions[*info.functionRef].syntax;
@@ -1173,7 +1216,7 @@ struct Emitter {
         if (!live()) return unit();
         auto* result = layouts.native(builder, rawType(id));
         auto owner = fn.expressions[index.receiver].type;
-        if (owner.kind == Type::List) return builder.CreateLoad(result, NativeLists{builder}.get(receiver, offset, source, index.site));
+        if (owner.kind == Type::List || owner.kind == Type::FrozenList) return builder.CreateLoad(result, NativeLists{builder}.get(receiver, offset, source, index.site));
         auto site = source.origin ? *source.origin : source.site(index.site);
         auto pointer = builder.getPtrTy(); auto integer = builder.getInt64Ty();
         auto access = module.getOrInsertFunction(owner == Type::String ? "lyraStringIndex" : "lyraBytesIndex", result, pointer, integer, pointer, integer, integer);
@@ -1231,7 +1274,7 @@ struct Emitter {
         }
         else if (auto* constant = std::get_if<PatternConstant>(&pattern.node)) {
             std::map<std::size_t, Value> emitted;
-            auto expected = emitConstant(*layouts.program.constants[constant->target], constant->type, emitted);
+            auto expected = emitConstant(*constantValue(layouts.program, constant->target), constant->type, emitted);
             matchTest(valueOperation(constant->type, ValueOperation::Equal, subject, expected, site), miss);
         }
         else if (auto* number = std::get_if<std::uint64_t>(&pattern.node))
@@ -1388,7 +1431,7 @@ struct Emitter {
     Value emitNode(ExprId id, const QualifiedMember&) { return makeVariant(id); }
 
     Value collectionSize(Type owner, Value value, bool byteCount = false) {
-        if (owner.kind == Type::List) return NativeLists{builder}.size(value);
+        if (owner.kind == Type::List || owner.kind == Type::FrozenList) return NativeLists{builder}.size(value);
         auto symbol = owner == Type::String && !byteCount ? "lyraStringScalarCount" : "lyraStringLength";
         return builder.CreateCall(module.getOrInsertFunction(symbol, builder.getInt64Ty(), builder.getPtrTy()), {value});
     }
@@ -1407,7 +1450,7 @@ struct Emitter {
         if (fn.expressions[id].callee == Callee::ExtensionProperty)
             return callFunction(fn.expressions[id].target, {object}, member.name.span);
         auto owner = fn.expressions[member.receiver].type;
-        if (owner.kind == Type::List || owner == Type::String || owner == Type::Bytes)
+        if (owner.kind == Type::List || owner.kind == Type::FrozenList || owner == Type::String || owner == Type::Bytes)
             return collectionSize(owner, object, member.name.text == "byteSize");
         if (owner == Type::IntRange) return builder.CreateExtractValue(object, static_cast<unsigned>(fn.expressions[id].target));
         if (owner == Type::Char) return object;
@@ -1442,6 +1485,7 @@ struct Emitter {
     }
 
     Value emitNode(ExprId id, const Binding& binding) {
+        if (binding.constant) return unit();
         auto value = emit(binding.value);
         if (live()) initialize(fn.expressions[id].target, value);
         return unit();
@@ -1688,6 +1732,7 @@ struct Emitter {
                 return unit();
             case Callee::ListAdd: lists.add(args[0], args[1]); return unit();
             case Callee::ListSlice: return lists.sliceRange(receiver, args[1], source, call.name.span);
+            case Callee::FreezeList: return lists.slice(args[0], builder.getInt64(0));
             case Callee::Size: return collectionSize(fn.expressions[*call.receiver].type, receiver);
             case Callee::ValueEqual: case Callee::ValueHash:
                 return valueOperation(fn.expressions[*call.receiver].type,

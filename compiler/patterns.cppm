@@ -101,8 +101,8 @@ std::optional<CheckedPattern> constantPattern(const CheckedModule& module, const
 CheckedPattern normalize(const CheckedModule& module, const CheckedPattern& pattern, Type type, PatternUse use) {
     if (use != PatternUse::Match && plainDestructure(pattern)) return {};
     if (const auto* constant = std::get_if<PatternConstant>(&pattern.node))
-        if (module.constants[constant->target])
-            if (auto resolved = constantPattern(module, *module.constants[constant->target], constant->type)) {
+        if (const auto& value = constantValue(module, constant->target); value)
+            if (auto resolved = constantPattern(module, *value, constant->type)) {
                 resolved->site = pattern.site;
                 return std::move(*resolved);
             }

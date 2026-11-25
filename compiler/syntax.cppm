@@ -55,7 +55,7 @@ enum class TypeOperator { Is, CheckedCast, InterfaceCast };
 struct TypeOperation { TypeOperator op; ExprId value; Identifier type; Span site; };
 struct Statement { ExprId expression; std::optional<Span> semicolon; };
 struct Block { std::vector<Statement> statements; Span end; };
-struct Binding { Identifier name; bool writable; std::optional<Identifier> annotation; ExprId value; };
+struct Binding { Identifier name; bool writable; std::optional<Identifier> annotation; ExprId value; bool constant{}; };
 struct Conditional { ExprId condition, yes; std::optional<ExprId> no; };
 struct Return { std::optional<ExprId> value; };
 struct Raise { Span site; std::optional<ExprId> value; };

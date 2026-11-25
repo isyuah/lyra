@@ -904,6 +904,15 @@ private:
 
     ExprId statement() {
         auto start = token.span.begin;
+        if (is("const")) {
+            consume();
+            auto name = identifier();
+            require(":");
+            auto annotation = type();
+            require("=");
+            auto value = expression();
+            return add({start, nodes[value].span.end}, Binding{std::move(name), false, std::move(annotation), value, true});
+        }
         if (is("defer")) {
             consume();
             auto body = expression();

@@ -37,6 +37,99 @@ class Constants(unittest.TestCase):
         self.assertIn(fragment, diagnostic['message'])
         return diagnostic
 
+    def test_block_constants_are_scoped_and_instantiated_with_generic_types(self):
+        self.write('app/src/main.ly', '''const Base: Int = 7
+fn empty<T>(): FrozenList<T> {
+    const Empty: FrozenList<T> = FrozenList<T>([])
+    Empty
+}
+fn delta() {
+    const Local: Int = Base + 1
+    val read = () => { Local }
+    const Chosen: Bool = { val candidate = Local; candidate > 0 }
+    match true { Chosen => read(), false => 0 }
+}
+const Count: Int = delta()
+fn main(): Unit {
+    print(Count)
+    print(empty<Int>().size())
+    print(empty<String>().size())
+    const Base: Int = Count + 1
+    if true { const Base: Int = Base + 1; print(Base) }
+    print(Base)
+}
+''')
+        result = self.cli('run', self.app)
+        self.assertEqual((result.returncode, result.stdout.splitlines()), (0, ['8', '0', '0', '10', '9']), result.stderr)
+
+    def test_frozen_list_is_a_shallow_snapshot_and_hashes_like_ctfe(self):
+        self.write('app/src/main.ly', '''struct Item(val count: Int)
+class Cell(var number: Int)
+fn snapshot(): FrozenList<Item> {
+    val input = [Item(3), Item(4)]
+    val frozen = FrozenList(input)
+    input[0] = Item(9)
+    input.add(Item(10))
+    frozen
+}
+const Items: FrozenList<Item> = snapshot()
+const Digest: Int = Items.hashCode()
+const Equal: Bool = Items == FrozenList([Item(3), Item(4)])
+const Sum: Int = {
+    var total = 0
+    for Item(count: count) in Items { total += count }
+    total
+}
+fn main(): Unit {
+    print(Items == snapshot())
+    print(Items != FrozenList([Item(4), Item(3)]))
+    print(Items != FrozenList([Item(3)]))
+    print(Digest == snapshot().hashCode())
+    print(Equal)
+    print(Sum)
+    print(Items[0].count)
+    val cell = Cell(1)
+    val source = [cell]
+    val view = FrozenList(source)
+    cell.number = 2
+    source[0] = Cell(3)
+    print(view[0].number)
+}
+''')
+        for mode in ([], ['--release']):
+            result = self.cli('run', self.app, *mode)
+            self.assertEqual((result.returncode, result.stdout.splitlines()), (0, ['true'] * 5 + ['7', '3', '2']), result.stderr)
+
+    def test_block_constant_cannot_capture_or_escape_mutable_values(self):
+        cases = [
+            ('fn bad(value: Int): Unit { const Local: Int = value }', 'LYCT0001', '运行时绑定'),
+            ('class Holder(val value: Int) { fn bad(): Unit { const Local: Int = value } }', 'LYCT0001', 'this'),
+            ('fn bad(): Unit { const Local: Int = 1; Local = 2 }', 'LYT0004', '赋值'),
+            ('fn bad(): Unit { const Local: Int = { print(1); 2 } }', 'LYCT0001', 'print'),
+            ('fn bad(): Unit { const Local: Int = Local }', 'LYN0001', 'Local'),
+            ('fn bad(): Unit { val frozen = FrozenList([1]); frozen[0] = 2 }', 'LYT0004', '赋值'),
+            ('const Bad: FrozenList<List<Int>> = FrozenList([[1]])', 'LYCT0001', 'List'),
+            ('class Item(val value: Int)\nconst Bad: FrozenList<Item?> = FrozenList([Some(Item(1))])', 'LYCT0001', 'Class'),
+            ('const Bad: FrozenList<() -> Int> = FrozenList([() => { 1 }])', 'LYCT0001', '函数值'),
+            ('class Item(val value: Int)\nfn bad(): Int { FrozenList([Item(1)]).hashCode() }', 'LYT0006', 'Hash'),
+        ]
+        for source, code, message in cases:
+            with self.subTest(source=source):
+                self.write('app/src/main.ly', source + '\nfn main(): Unit {}')
+                self.diagnose(self.app, code, message)
+
+    def test_structural_hash_charges_each_visited_element_to_the_budget(self):
+        self.write('app/src/main.ly', '''enum Tree { Leaf, Node(FrozenList<Tree>) }
+fn tree(): Tree {
+    var node = Tree.Leaf
+    for ignored in 0..<20 { node = Tree.Node(FrozenList([node, node])) }
+    node
+}
+const Digest: Int = tree().hashCode()
+fn main(): Unit {}
+''')
+        self.diagnose(self.app, 'LYCT0004', '步数')
+
     def test_bitwise_and_pattern_loops_have_native_ctfe_parity(self):
         self.write('app/src/main.ly', '''struct Pair(val value: Int8)
 const fn bits(): Int8 {

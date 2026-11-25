@@ -67,7 +67,7 @@ struct SyntaxArena {
             } else if constexpr (std::is_same_v<Node, Return> || std::is_same_v<Node, Raise>) {
                 optional(node.value); return std::is_same_v<Node, Return> ? "return" : "throw";
             } else if constexpr (std::is_same_v<Node, Binding>) {
-                named("name", node.name); if (node.annotation) named("type", *node.annotation); child(node.value); return node.writable ? "var" : "val";
+                named("name", node.name); if (node.annotation) named("type", *node.annotation); child(node.value); return node.constant ? "const" : node.writable ? "var" : "val";
             } else if constexpr (std::is_same_v<Node, PatternBinding>) {
                 children.push_back(input("pattern", node.pattern.span)); if (node.annotation) named("type", *node.annotation); child(node.value); return "val";
             } else if constexpr (std::is_same_v<Node, Conditional>) {

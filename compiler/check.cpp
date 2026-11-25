@@ -43,7 +43,7 @@ std::optional<Type> hiddenType(const CheckedModule& module, Type type) {
             const auto& item = module.enums[type.id];
             return item.syntax.isPublic ? arguments(item.arguments) : std::optional(type);
         }
-        case Type::List: return hiddenType(module, module.listElements[type.id]);
+        case Type::List: case Type::FrozenList: return hiddenType(module, module.listElements[type.id]);
         case Type::Task: return hiddenType(module, module.taskResults[type.id]);
         case Type::TaskLocal: return hiddenType(module, module.taskLocalValues[type.id]);
         case Type::Channel: return hiddenType(module, module.channelElements[type.id]);
@@ -65,6 +65,12 @@ std::optional<Type> hiddenType(const CheckedModule& module, Type type) {
         }
         default: return {};
     }
+}
+
+const std::optional<ConstValue>& constantValue(const CheckedModule& module, ConstantUse target) {
+    static const std::optional<ConstValue> uninstantiated;
+    if (target.kind == ConstantUse::Uninstantiated) return uninstantiated;
+    return target.kind == ConstantUse::Block ? module.blockConstants[target.index].value : module.constants[target.index];
 }
 
 namespace {
@@ -141,6 +147,7 @@ std::string typeName(const CheckedModule& module, Type type, bool canonical) {
         case Type::TaskLocal: return "TaskLocal<" + name(module.taskLocalValues[type.id]) + ">";
         case Type::Channel: return "Channel<" + name(module.channelElements[type.id]) + ">";
         case Type::List: return "List<" + name(module.listElements[type.id]) + ">";
+        case Type::FrozenList: return "FrozenList<" + name(module.listElements[type.id]) + ">";
         case Type::IntRange: return "Range<Int>";
         case Type::Option: return "Option<" + name(module.sumTypes[type.id].success) + ">";
         case Type::Result: return "Result<" + name(module.sumTypes[type.id].success) + "," + name(module.sumTypes[type.id].failure) + ">";
@@ -511,6 +518,7 @@ struct Symbols {
                     }
                     return true;
                 }
+                case Type::FrozenList: return child(module.listElements[type.id], "FrozenList 元素");
                 case Type::Option: return child(module.sumTypes[type.id].success, "Some");
                 case Type::Result:
                     return child(module.sumTypes[type.id].success, "Ok") && child(module.sumTypes[type.id].failure, "Err");
@@ -546,7 +554,7 @@ struct Symbols {
                 const auto& shape = module.sumTypes[type.id];
                 pending.push_back(shape.success);
                 if (type.kind == Type::Result) pending.push_back(shape.failure);
-            }
+            } else if (type.kind == Type::FrozenList) pending.push_back(module.listElements[type.id]);
         }
         return {};
     }
@@ -565,7 +573,7 @@ struct Symbols {
 
     std::optional<BuiltinMember> builtinMember(Type type, std::string_view name) {
         auto noArgs = [](Callee callee, Type result) { return BuiltinMember{callee, {{}, {}, result, false}}; };
-        if (name == "size" && (type.kind == Type::List || type == Type::String || type == Type::Bytes)) return noArgs(Callee::Size, Type::Int);
+        if (name == "size" && (type.kind == Type::List || type.kind == Type::FrozenList || type == Type::String || type == Type::Bytes)) return noArgs(Callee::Size, Type::Int);
         if (name == "add" && type.kind == Type::List) return BuiltinMember{Callee::ListAdd, {{"value"}, {module.listElements[type.id]}, Type::Unit, false}};
         if (name == "slice" && type.kind == Type::List) return BuiltinMember{Callee::ListSlice, {{"range"}, {Type::IntRange}, type, false}};
         if (type.kind == Type::Channel) {
@@ -726,6 +734,7 @@ struct Symbols {
     Type taskLocal(Type value) const { return unaryType(Type::TaskLocal, module.taskLocalValues, value); }
     Type channel(Type element) const { return unaryType(Type::Channel, module.channelElements, element); }
     Type list(Type element) const { return unaryType(Type::List, module.listElements, element); }
+    Type frozenList(Type element) const { return unaryType(Type::FrozenList, module.listElements, element); }
 
     Type dynamicType(std::size_t trait, std::vector<Type> bindings) const {
         DynamicType shape{trait, std::move(bindings)};
@@ -778,6 +787,7 @@ struct Symbols {
         if (name == "TaskLocal" && value.kind == Type::TaskLocal && slot == 0) return module.taskLocalValues[value.id];
         if (name == "Channel" && value.kind == Type::Channel && slot == 0) return module.channelElements[value.id];
         if (name == "List" && value.kind == Type::List && slot == 0) return module.listElements[value.id];
+        if (name == "FrozenList" && value.kind == Type::FrozenList && slot == 0) return module.listElements[value.id];
         if (name == "Range" && value == Type::IntRange && slot == 0) return Type::Int;
         if (name == "Option" && value.kind == Type::Option && slot == 0) return module.sumTypes[value.id].success;
         if (name == "Result" && value.kind == Type::Result && slot < 2) return slot ? module.sumTypes[value.id].failure : module.sumTypes[value.id].success;
@@ -816,7 +826,7 @@ struct Symbols {
             case Type::Task: return abstract(module.taskResults[type.id]);
             case Type::TaskLocal: return abstract(module.taskLocalValues[type.id]);
             case Type::Channel: return abstract(module.channelElements[type.id]);
-            case Type::List: return abstract(module.listElements[type.id]);
+            case Type::List: case Type::FrozenList: return abstract(module.listElements[type.id]);
             case Type::Option: return abstract(module.sumTypes[type.id].success);
             case Type::Result: return abstract(module.sumTypes[type.id].success) || abstract(module.sumTypes[type.id].failure);
             case Type::Dyn: return std::ranges::any_of(module.dynamicTypes[type.id].bindings, [&](Type binding) { return abstract(binding); });
@@ -1021,6 +1031,7 @@ struct Symbols {
         if (arguments.size() == 1 && form.name == "TaskLocal") return taskLocal(arguments[0]);
         if (arguments.size() == 1 && form.name == "Channel") return channel(arguments[0]);
         if (arguments.size() == 1 && form.name == "List") return list(arguments[0]);
+        if (arguments.size() == 1 && form.name == "FrozenList") return frozenList(arguments[0]);
         if (form.name == "Range") {
             if (arguments.size() == 1 && arguments.front() == Type::Int) return Type::IntRange;
             throw at(source, span, "LYT0003", "区间类型目前只支持 Range<Int>");
@@ -1125,7 +1136,7 @@ struct Checker {
     std::vector<Names> scopes;
     std::span<const Type> variables{};
     unsigned loops = 0;
-    struct WorkerScope { ExprId id; std::size_t firstLocal; std::optional<Type> result; ValueJoin* returns{}; };
+    struct WorkerScope { ExprId id; std::size_t firstLocal; std::optional<Type> result; ValueJoin* returns{}; bool compileTime{}; };
     std::vector<WorkerScope> workers{};
     std::vector<std::optional<ExprId>> catchOwners{};
     std::map<ExprId, std::vector<std::optional<Type>>> lambdaHints{};
@@ -1138,6 +1149,7 @@ struct Checker {
     unsigned unsafeDepth{};
     std::optional<std::pair<ExprId, ValueJoin*>> collectingTail{};
     bool reachable{true};
+    std::optional<std::size_t> functionIndex{};
 
     Checker trial(CheckedFunction& body) const {
         return {body, source, module, symbols, scopes, variables, loops, workers,
@@ -1199,7 +1211,11 @@ struct Checker {
     Type readLocal(ExprId id, const Identifier& name, std::size_t slot) {
         referLocal(name, slot);
         auto& info = fn.expressions[id];
-        info.target = slot;
+        if (auto constant = fn.locals[slot].constant) {
+            info.constantRef = constant;
+            return fn.locals[slot].type;
+        }
+        info.target = captureSlot(slot, name.span);
         info.narrowed.reset();
         if (auto fact = present.find(slot); fact != present.end()) info.narrowed = fact->second;
         return info.narrowed.value_or(fn.locals[slot].type);
@@ -1214,7 +1230,7 @@ struct Checker {
 
     std::optional<std::size_t> stableLocal(ExprId id, Type::Kind kind) const {
         const auto* name = std::get_if<Identifier>(&fn.syntax.expressions[id].node);
-        if (auto slot = name ? lookupLocal(*name) : std::nullopt; slot && !fn.locals[*slot].writable && fn.locals[*slot].type.kind == kind)
+        if (auto slot = name ? lookupLocal(*name) : std::nullopt; slot && !fn.locals[*slot].writable && !fn.locals[*slot].constant && fn.locals[*slot].type.kind == kind)
             return slot;
         return {};
     }
@@ -1691,7 +1707,7 @@ struct Checker {
         if (owner == Type::Never || offset == Type::Never) return Type::Never;
         if (owner == Type::String) return Type::Char;
         if (owner == Type::Bytes) return number(Type::UInt, 8);
-        if (owner.kind != Type::List) throw at(source, index.site, "LYT0014", "下标需要 List、String 或 Bytes，实际是 " + typeName(module, owner));
+        if (owner.kind != Type::List && owner.kind != Type::FrozenList) throw at(source, index.site, "LYT0014", "下标需要 List、FrozenList、String 或 Bytes，实际是 " + typeName(module, owner));
         return module.listElements[owner.id];
     }
 
@@ -1836,6 +1852,13 @@ struct Checker {
             return result;
         }
         if (!named.escaped) {
+            if (auto slot = lookupLocal(name); slot && fn.locals[*slot].constant) {
+                auto type = fn.locals[*slot].type;
+                if (subject != type) throw mismatch(module, source, pattern.span, subject, type);
+                requireValueOperation(type, ValueOperation::Equal, pattern.span);
+                referLocal(name, *slot);
+                return {PatternConstant{*fn.locals[*slot].constant, type}};
+            }
             auto candidates = symbols.visibleFunctions(source, name);
             for (auto candidate : candidates) {
                 const auto& declaration = symbols.declaration(symbols.callables[candidate]);
@@ -1845,7 +1868,7 @@ struct Checker {
                 if (subject != type) throw mismatch(module, source, pattern.span, subject, type);
                 requireValueOperation(type, ValueOperation::Equal, pattern.span);
                 refer(name, declaration.file, declaration.name.span);
-                return {PatternConstant{target, type}};
+                return {PatternConstant{{ConstantUse::Global, target}, type}};
             }
         }
         auto slot = fn.locals.size();
@@ -1956,7 +1979,13 @@ struct Checker {
         return std::holds_alternative<PatternConstant>(pattern.node) || std::ranges::any_of(pattern.parts, hasConstant);
     }
 
+    static bool hasUninstantiatedConstant(const CheckedPattern& pattern) {
+        auto constant = std::get_if<PatternConstant>(&pattern.node);
+        return (constant && constant->target.kind == ConstantUse::Uninstantiated) || std::ranges::any_of(pattern.parts, hasUninstantiatedConstant);
+    }
+
     void checkExhaustiveness(Type subject, Span site, std::span<const CheckedPattern* const> patterns, PatternUse use) {
+        if (std::ranges::any_of(patterns, [](const auto* pattern) { return hasUninstantiatedConstant(*pattern); })) return;
         if (std::ranges::any_of(patterns, [&](const auto* pattern) { return hasConstant(*pattern); })) {
             std::vector<CheckedPattern> deferred;
             for (const auto* pattern : patterns) deferred.push_back(*pattern);
@@ -2060,8 +2089,9 @@ struct Checker {
         return discard && match.optional != OptionalForm::None ? Type{Type::Unit} : result.value_or(Type::Never);
     }
 
-    std::size_t captureSlot(std::size_t slot) {
+    std::size_t captureSlot(std::size_t slot, Span site) {
         for (const auto& worker : workers) if (slot < worker.firstLocal) {
+            if (worker.compileTime) throw at(source, site, "LYCT0001", "块内 const 不能引用运行时绑定或 this");
             fn.locals[slot].captured = true;
             auto& captures = fn.expressions[worker.id].captures;
             if (std::ranges::find(captures, slot) == captures.end()) captures.push_back(slot);
@@ -2069,14 +2099,9 @@ struct Checker {
         return slot;
     }
 
-    std::optional<std::size_t> localSlot(const Identifier& name) {
-        if (auto slot = lookupLocal(name)) return captureSlot(*slot);
-        return {};
-    }
-
     Type infer(ExprId id, This, auto, bool) {
         if (!receiverSlot) throw at(source, fn.syntax.expressions[id].span, "LYT0018", "this 只能用于实例方法或 init");
-        fn.expressions[id].target = captureSlot(*receiverSlot);
+        fn.expressions[id].target = captureSlot(*receiverSlot, fn.syntax.expressions[id].span);
         return fn.locals[*receiverSlot].type;
     }
 
@@ -2143,7 +2168,7 @@ struct Checker {
     }
 
     Type infer(ExprId id, const Identifier& name, std::optional<Type> expected, bool) {
-        if (auto slot = localSlot(name)) return readLocal(id, name, *slot);
+        if (auto slot = lookupLocal(name)) return readLocal(id, name, *slot);
         auto candidates = symbols.visibleFunctions(source, name);
         if (candidates.empty()) throw at(source, name.span, "LYN0001", "找不到绑定：" + name.text);
         if (expected && expected->kind == Type::Option) expected = module.sumTypes[expected->id].success;
@@ -2152,7 +2177,7 @@ struct Checker {
         const auto& syntax = symbols.declaration(item);
         refer(name, syntax.file, syntax.name.span);
         if (syntax.constant == ConstKind::Value) {
-            fn.expressions[id].constantRef = item.target;
+            fn.expressions[id].constantRef = ConstantUse{ConstantUse::Global, item.target};
             return module.functions[item.target].result;
         }
         auto [type, types] = functionValue(index, name, expected);
@@ -2225,6 +2250,28 @@ struct Checker {
     Type infer(ExprId id, const Binding& binding, auto, bool) {
         std::optional<Type> annotation;
         if (binding.annotation) annotation = symbols.resolve(fn.syntax, *binding.annotation, variables);
+        if (binding.constant) {
+            auto type = annotation.value();
+            workers.push_back({id, fn.locals.size(), type, {}, true});
+            auto previous = std::exchange(loops, 0U);
+            auto entry = std::move(present);
+            present.clear();
+            scopes.emplace_back();
+            visit(binding.value, type);
+            scopes.pop_back();
+            present = std::move(entry);
+            loops = previous;
+            workers.pop_back();
+            auto slot = fn.locals.size();
+            auto& local = fn.locals.emplace_back(type, false, currentWorker());
+            local.constant = ConstantUse{ConstantUse::Uninstantiated};
+            if (materializing()) {
+                local.constant = ConstantUse{ConstantUse::Block, module.blockConstants.size()};
+                module.blockConstants.push_back({functionIndex.value(), binding.value, type, binding.name});
+            }
+            declare(binding.name, slot);
+            return Type::Unit;
+        }
         auto value = visit(binding.value, annotation);
         auto slot = fn.locals.size();
         fn.locals.push_back({annotation.value_or(value), binding.writable, currentWorker()});
@@ -2373,7 +2420,7 @@ struct Checker {
         if (const auto* item = enumNamespace(member.receiver)) return variant(id, TypeQualifier{*item}, Call{member.name, {}}, expected, true);
         auto owner = visit(member.receiver);
         if (owner == Type::Never) return owner;
-        if (owner.kind == Type::List && member.name.text == "size") return Type::Int;
+        if ((owner.kind == Type::List || owner.kind == Type::FrozenList) && member.name.text == "size") return Type::Int;
         if (owner == Type::IntRange) {
             for (std::size_t slot = 0; slot < std::size(rangeFields); ++slot) if (member.name.text == rangeFieldNames[slot]) {
                 fn.expressions[id].target = slot;
@@ -2638,7 +2685,7 @@ struct Checker {
         };
         if (call.function) return invoke(visit(*call.function));
         const auto& key = call.name.linked.empty() ? call.name.text : call.name.linked;
-        if (!call.receiver && !call.typeOwner) if (auto local = localSlot(call.name)) return invoke(readLocal(id, call.name, *local));
+        if (!call.receiver && !call.typeOwner) if (auto local = lookupLocal(call.name)) return invoke(readLocal(id, call.name, *local));
         if (call.receiver && !call.typeOwner) {
             const auto* qualifier = std::get_if<Identifier>(&fn.syntax.expressions[*call.receiver].node);
             auto builtin = qualifier && !lookupLocal(*qualifier) && !implicitMember(*qualifier) ? std::string_view(linkedName(*qualifier)) : std::string_view{};
@@ -2946,6 +2993,19 @@ struct Checker {
             auto type = fn.expressions[arg].type;
             if (!exits && !builtInDisplay(type)) throw at(source, fn.syntax.expressions[arg].span, "LYT0001", "print 需要数值、Bool、Char 或 String，实际是 " + typeName(module, type));
             return exits ? Type::Never : Type::Unit;
+        } else if (key == "FrozenList") {
+            if (call.typeArguments.size() > 1) throw at(source, call.name.span, "LYG0001", "FrozenList 只接受一个类型实参");
+            if (expected && expected->kind == Type::Option) expected = module.sumTypes[expected->id].success;
+            std::optional<Type> element;
+            if (!call.typeArguments.empty()) element = symbols.resolve(fn.syntax, call.typeArguments.front(), variables);
+            else if (expected && expected->kind == Type::FrozenList) element = module.listElements[expected->id];
+            info.callee = Callee::FreezeList;
+            if (arguments(id, call, 1, [](auto) { return "items"; }, [&](auto) -> std::optional<Type> { return element ? std::optional(symbols.list(*element)) : std::nullopt; }))
+                return Type::Never;
+            auto value = call.arguments.front().value;
+            auto items = fn.expressions[value].type;
+            if (items.kind != Type::List) throw at(source, fn.syntax.expressions[value].span, "LYT0014", "FrozenList 需要 List，实际是 " + typeName(module, items));
+            return symbols.frozenList(module.listElements[items.id]);
         } else if (key == "awaitOutcome") {
             noTypeArgs();
             if (!inAsync()) throw at(source, call.name.span, "LYT0008", "awaitOutcome 只能在异步执行体中调用");
@@ -3359,7 +3419,7 @@ struct Checker {
             if (iterator.function && next.function) methods = IteratorPlan{*iterator.function, *next.function, option};
         } else if (input == Type::IntRange) {
             element = Type::Int;
-        } else if (input.kind == Type::List) {
+        } else if (input.kind == Type::List || input.kind == Type::FrozenList) {
             element = module.listElements[input.id];
         } else if (input == Type::String) {
             element = Type::Char;
@@ -3443,7 +3503,7 @@ CheckedModule check(Module module, const std::vector<Source>& sources, bool requ
         for (Type builtin : scalarTypes) {
             if (name == typeName(checked, builtin)) throw at(sources[decl.file], decl.name.span, "LYN0002", "类型名与内置类型冲突：" + std::string(name));
         }
-        if (name == "Never" || name == "TaskLocal" || name == "Range" || name == "Eq" || name == "Hash" || name == "Channel" || name == "TaskOutcome") throw at(sources[decl.file], decl.name.span, "LYN0002", "类型名与内置类型冲突：" + std::string(name));
+        if (name == "Never" || name == "TaskLocal" || name == "Range" || name == "Eq" || name == "Hash" || name == "Channel" || name == "TaskOutcome" || name == "FrozenList") throw at(sources[decl.file], decl.name.span, "LYN0002", "类型名与内置类型冲突：" + std::string(name));
         if (decl.name.text == "print" || decl.name.text == "gcCollect" || !names.emplace(declaration, index).second) throw at(sources[decl.file], decl.name.span, "LYN0002", "类型名称已声明：" + decl.name.text);
     };
     for (auto& decl : module.aggregates) {
@@ -3737,7 +3797,9 @@ CheckedModule check(Module module, const std::vector<Source>& sources, bool requ
     }
     for (std::size_t index = 0; index < checked.functions.size(); ++index) {
         auto& fn = checked.functions[index];
-        Checker{fn, sources[fn.syntax.file], checked, symbols, {}}.run();
+        auto checker = Checker{fn, sources[fn.syntax.file], checked, symbols, {}};
+        checker.functionIndex = index;
+        checker.run();
         rememberReferences(fn);
     }
     for (const auto& callable : symbols.callables) if (callable.inferredResult) {

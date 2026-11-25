@@ -383,7 +383,7 @@ struct DeclarationTypes {
             if (!symbol && !dynamic) {
                 if (form.arguments.empty() && (numberType(name) || name == "Bool" || name == "String" || name == "Char" || name == "Bytes" || name == "Unit" || name == "Never" || name == "CPtr" || name == "CCallback" || name == "Exception" || name == "ChannelClosed" || name == "Any" || name == "Error"))
                     return make("builtin", name);
-                if (form.arguments.size() == 1 && (name == "List" || name == "Option" || name == "Range" || name == "Task" || name == "TaskLocal" || name == "Channel" || name == "TaskOutcome"))
+                if (form.arguments.size() == 1 && (name == "List" || name == "FrozenList" || name == "Option" || name == "Range" || name == "Task" || name == "TaskLocal" || name == "Channel" || name == "TaskOutcome"))
                     return make("builtin", name);
                 if (form.arguments.size() == 2 && name == "Result") return make("builtin", name);
             }

@@ -13,7 +13,7 @@ export import lyra.syntax;
 
 export namespace lyra {
 struct Type {
-    enum Kind { Unit, Int, UInt, Real, Bool, String, Char, Bytes, Never, Record, Enum, Variable, Task, CPtr, Option, Result, List, Exception, Closure, Any, Dyn, Error, TaskLocal, Projection, IntRange, Channel, CCallback };
+    enum Kind { Unit, Int, UInt, Real, Bool, String, Char, Bytes, Never, Record, Enum, Variable, Task, CPtr, Option, Result, List, Exception, Closure, Any, Dyn, Error, TaskLocal, Projection, IntRange, Channel, CCallback, FrozenList };
     Kind kind;
     std::size_t id{};
     constexpr Type(Kind kind = Unit, std::size_t id = 0) : kind(kind), id(id) {}
@@ -23,12 +23,13 @@ inline constexpr Type rangeFields[] = {Type::Int, Type::Int, Type::Bool};
 inline constexpr const char* rangeFieldNames[] = {"start", "end", "inclusive"};
 inline constexpr Type channelClosed{Type::Exception, 1};
 inline constexpr std::size_t firstDeclaredException = channelClosed.id + 1;
-struct Local { Type type; bool writable; std::optional<ExprId> worker{}; bool captured{}; std::optional<Span> declaration{}; std::string name{}; };
-enum class Callee { Function, Constructor, Variant, Print, Collect, Sum, ListAdd, ListSlice, TaskCancel, TaskCancelled, TaskCheckCancellation, AwaitOutcome, Exception, Indirect, ToReal, ToIntegerChecked, ToString, ToBytes, DecodeUtf8, Dynamic, BusinessError, ErrorSuppress, FailureInfo, LocalKey, LocalGet, WithLocal, ExtensionProperty, BoundMethod, ReflectTypeName, ReflectFieldCount, ReflectFieldName, ReflectField, Size, ValueEqual, ValueHash, ChannelCreate, ChannelIterator, ChannelSend, ChannelReceive, ChannelClose, Sleep, PtrAllocate, PtrNull, PtrIsNull, PtrFree, PtrOffset, PtrRead, PtrWrite, CallbackRegister, CallbackContext, CallbackFunction, CallbackClose, CallbackTakeError };
+struct ConstantUse { enum Kind { Global, Block, Uninstantiated }; Kind kind; std::size_t index{}; };
+struct Local { Type type; bool writable; std::optional<ExprId> worker{}; bool captured{}; std::optional<Span> declaration{}; std::string name{}; std::optional<ConstantUse> constant{}; };
+enum class Callee { Function, Constructor, Variant, Print, Collect, Sum, ListAdd, ListSlice, FreezeList, TaskCancel, TaskCancelled, TaskCheckCancellation, AwaitOutcome, Exception, Indirect, ToReal, ToIntegerChecked, ToString, ToBytes, DecodeUtf8, Dynamic, BusinessError, ErrorSuppress, FailureInfo, LocalKey, LocalGet, WithLocal, ExtensionProperty, BoundMethod, ReflectTypeName, ReflectFieldCount, ReflectFieldName, ReflectField, Size, ValueEqual, ValueHash, ChannelCreate, ChannelIterator, ChannelSend, ChannelReceive, ChannelClose, Sleep, PtrAllocate, PtrNull, PtrIsNull, PtrFree, PtrOffset, PtrRead, PtrWrite, CallbackRegister, CallbackContext, CallbackFunction, CallbackClose, CallbackTakeError };
 enum class ValueOperation { Equal, Hash };
 struct PatternSlot { std::size_t local; };
 struct PatternListRest { std::size_t local; };
-struct PatternConstant { std::size_t target; Type type; };
+struct PatternConstant { ConstantUse target; Type type; };
 struct PatternProduct { bool operator==(const PatternProduct&) const = default; };
 struct PatternClass { std::size_t owner; bool operator==(const PatternClass&) const = default; };
 struct ListTag { bool cons; Type element; Type list; bool operator==(const ListTag&) const = default; };
@@ -50,7 +51,7 @@ struct CheckedCatch { Type type; std::optional<std::size_t> local; };
 struct ErrorDisplay { std::optional<std::size_t> method; std::string fallback; };
 enum class ErrorMember { Message, Original, Cause, Suppressed };
 enum class ExceptionMember { Message, TaskFailures, CleanupFailures };
-struct CheckedExpr { Type type; std::size_t target{}; std::vector<std::size_t> argumentSlots{}; Callee callee{}; std::optional<Type> sourceType{}; std::vector<std::size_t> captures{}; std::vector<std::size_t> omittedDefaults{}; std::optional<std::size_t> conversion{}, errorConversion{}, functionRef{}, constantRef{}; std::optional<Type> callableType{}; std::optional<CheckedIteration> iteration{}; std::vector<CheckedPattern> patterns{}; std::optional<double> realLiteral{}; std::optional<Type> narrowed{}; std::optional<std::string> boundTrait{}; std::optional<Type> testedType{}; bool boxedSpread{}; std::vector<std::size_t> interfaceMethods{}; bool interfaceAsync{}; std::vector<CheckedCatch> catches{}; ErrorDisplay errorDisplay{}, errorPromotion{}; std::vector<std::optional<std::size_t>> selectSlots{}; };
+struct CheckedExpr { Type type; std::size_t target{}; std::vector<std::size_t> argumentSlots{}; Callee callee{}; std::optional<Type> sourceType{}; std::vector<std::size_t> captures{}; std::vector<std::size_t> omittedDefaults{}; std::optional<std::size_t> conversion{}, errorConversion{}, functionRef{}; std::optional<ConstantUse> constantRef{}; std::optional<Type> callableType{}; std::optional<CheckedIteration> iteration{}; std::vector<CheckedPattern> patterns{}; std::optional<double> realLiteral{}; std::optional<Type> narrowed{}; std::optional<std::string> boundTrait{}; std::optional<Type> testedType{}; bool boxedSpread{}; std::vector<std::size_t> interfaceMethods{}; bool interfaceAsync{}; std::vector<CheckedCatch> catches{}; ErrorDisplay errorDisplay{}, errorPromotion{}; std::vector<std::optional<std::size_t>> selectSlots{}; };
 struct CheckedFunction {
     Function syntax;
     Type result;
@@ -71,9 +72,11 @@ struct ConstRef { std::size_t index; bool operator==(const ConstRef&) const = de
 using ConstValue = std::variant<ConstScalar, ConstRef>;
 using ConstTag = std::variant<std::monostate, SumTag, VariantTag>;
 struct ConstComposite { Type type; ConstTag tag; std::vector<ConstValue> fields; unsigned height{}; };
+struct BlockConstant { std::size_t function; ExprId initializer; Type type; Identifier name; std::optional<ConstValue> value{}; };
 struct TypeProjection { Type owner; std::string member; bool operator==(const TypeProjection&) const = default; };
 struct DynamicType { std::size_t trait; std::vector<Type> bindings; bool operator==(const DynamicType&) const = default; };
-struct CheckedModule { std::deque<CheckedFunction> functions; std::optional<std::size_t> entry; std::deque<CheckedAggregate> aggregates; std::vector<std::string> variableNames; std::vector<Type> taskResults; std::vector<SumTypes> sumTypes; std::vector<Type> listElements; std::deque<FunctionShape> signatures{}; std::deque<CheckedEnum> enums{}; std::vector<NameReference> references{}; std::vector<Trait> traits{}; std::vector<ExceptionType> exceptions{}; std::vector<Type> taskLocalValues{}; std::vector<std::optional<ConstValue>> constants{}; std::vector<TypeProjection> projections{}; std::deque<ConstComposite> constantComposites{}; std::map<std::pair<Type, ValueOperation>, std::size_t> valueOverrides{}; std::vector<DeferredPatternCheck> deferredPatternChecks{}; std::vector<Type> channelElements{}; std::vector<DynamicType> dynamicTypes{}; std::vector<MatchCoverage> matchCoverage{}; std::vector<Diagnostic> warnings{}; };
+struct CheckedModule { std::deque<CheckedFunction> functions; std::optional<std::size_t> entry; std::deque<CheckedAggregate> aggregates; std::vector<std::string> variableNames; std::vector<Type> taskResults; std::vector<SumTypes> sumTypes; std::vector<Type> listElements; std::deque<FunctionShape> signatures{}; std::deque<CheckedEnum> enums{}; std::vector<NameReference> references{}; std::vector<Trait> traits{}; std::vector<ExceptionType> exceptions{}; std::vector<Type> taskLocalValues{}; std::vector<std::optional<ConstValue>> constants{}; std::vector<TypeProjection> projections{}; std::deque<ConstComposite> constantComposites{}; std::map<std::pair<Type, ValueOperation>, std::size_t> valueOverrides{}; std::vector<DeferredPatternCheck> deferredPatternChecks{}; std::vector<Type> channelElements{}; std::vector<DynamicType> dynamicTypes{}; std::vector<MatchCoverage> matchCoverage{}; std::vector<Diagnostic> warnings{}; std::vector<BlockConstant> blockConstants{}; };
+const std::optional<ConstValue>& constantValue(const CheckedModule& module, ConstantUse target);
 std::string typeName(const CheckedModule& module, Type type, bool canonical = false);
 std::optional<Type> hiddenType(const CheckedModule& module, Type type);
 CheckedModule check(Module module, const std::vector<Source>& sources, bool requireEntry = true);

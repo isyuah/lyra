@@ -95,6 +95,8 @@ const void* lyraListGet(const LyraList* list, std::int64_t index, const char* fi
     return list->items[index];
 }
 
+const void* lyraFrozenListItem(const LyraList* list, std::uint64_t index) { return list->items[index]; }
+
 void lyraListSet(LyraList* list, std::int64_t index, const void* boxed) {
     lyraRuntime::Lock guard(listLocks[stripe(list)]);
     list->items[index] = boxed;

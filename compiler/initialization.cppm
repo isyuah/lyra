@@ -164,7 +164,7 @@ struct Flow {
     bool walk(ExprId id, const AsyncBlock&, State& state, bool) const { capture(id, state); return true; }
     bool walk(ExprId, const UnsafeBlock& node, State& state, bool restricted) const { return eval(node.body, state, restricted); }
     bool walk(ExprId id, const Deferred&, State& state, bool) const { capture(id, state); return true; }
-    bool walk(ExprId, const Binding& binding, State& state, bool restricted) const { return eval(binding.value, state, restricted); }
+    bool walk(ExprId, const Binding& binding, State& state, bool restricted) const { return binding.constant || eval(binding.value, state, restricted); }
     bool walk(ExprId, const PatternBinding& binding, State& state, bool restricted) const { return eval(binding.value, state, restricted); }
     bool walk(ExprId, const Unary& unary, State& state, bool restricted) const { return eval(unary.operand, state, restricted); }
     bool walk(ExprId, const RangeValue& range, State& state, bool restricted) const { return eval(range.start, state, restricted) && eval(range.end, state, restricted); }

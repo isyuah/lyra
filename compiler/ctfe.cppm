@@ -59,7 +59,7 @@ struct ValueTypes {
                 const auto& shape = module.sumTypes[part.id];
                 pending.push_back(shape.success);
                 if (part.kind == Type::Result) pending.push_back(shape.failure);
-            } else if (temporary && part.kind == Type::List) {
+            } else if (part.kind == Type::FrozenList || (temporary && part.kind == Type::List)) {
                 pending.push_back(module.listElements[part.id]);
             } else if (temporary && part.kind == Type::Closure) {
                 const auto& shape = module.signatures[part.id];
@@ -110,13 +110,43 @@ struct Validator {
         state.pending.push_back(index);
     }
 
+    void validateValueOperation(Type root, ValueOperation operation, Span site) const {
+        std::vector<Type> pending{root};
+        std::set<Type> visited;
+        while (!pending.empty()) {
+            auto type = pending.back();
+            pending.pop_back();
+            if (!visited.insert(type).second) continue;
+            if (auto found = state.module.valueOverrides.find({type, operation}); found != state.module.valueOverrides.end()) {
+                validateFunction(found->second, site);
+                continue;
+            }
+            auto append = [&](const auto& fields) { pending.insert(pending.end(), fields.begin(), fields.end()); };
+            if (type.kind == Type::Record && !state.module.aggregates[type.id].syntax.reference) append(state.module.aggregates[type.id].fields);
+            else if (type.kind == Type::Enum) for (const auto& fields : state.module.enums[type.id].payloads) append(fields);
+            else if (type.kind == Type::FrozenList) pending.push_back(state.module.listElements[type.id]);
+            else if (type.kind == Type::Option || type.kind == Type::Result) {
+                const auto& shape = state.module.sumTypes[type.id];
+                pending.push_back(shape.success);
+                if (type.kind == Type::Result) pending.push_back(shape.failure);
+            }
+        }
+    }
+
+    void validatePattern(const CheckedPattern& pattern) const {
+        if (const auto* constant = std::get_if<PatternConstant>(&pattern.node))
+            validateValueOperation(constant->type, ValueOperation::Equal, pattern.site);
+        for (const auto& part : pattern.parts) validatePattern(part);
+    }
+
     void visit(ExprId id) const {
         const auto& expr = fn.syntax.expressions[id];
         const auto& info = fn.expressions[id];
         if (info.conversion || info.errorConversion) reject(expr.span, "编译期计算不能调用用户隐式转换");
         if (!state.types.supports(info.type) || !state.types.supports(rawType(fn, id)))
-            reject(expr.span, "类型不能用于编译期计算：仅支持标量、Range<Int>、Struct、Class、Enum、Option、Result、List 和同步函数值");
+            reject(expr.span, "类型不能用于编译期计算：仅支持标量、Range<Int>、Struct、Class、Enum、Option、Result、List、FrozenList 和同步函数值");
         if (info.functionRef) validateFunction(*info.functionRef, expr.span);
+        for (const auto& pattern : info.patterns) validatePattern(pattern);
         const auto descend = [&](ExprId child) { visit(child); };
         std::visit([&](const auto& node) {
             using Node = std::decay_t<decltype(node)>;
@@ -132,11 +162,10 @@ struct Validator {
                 }
                 if (info.callee == Callee::ToString || info.callee == Callee::ToReal || info.callee == Callee::ToBytes ||
                     info.callee == Callee::ToIntegerChecked || info.callee == Callee::Sum || info.callee == Callee::Variant ||
-                    info.callee == Callee::ListAdd || info.callee == Callee::ListSlice || info.callee == Callee::Size) return;
+                    info.callee == Callee::ListAdd || info.callee == Callee::ListSlice || info.callee == Callee::Size || info.callee == Callee::FreezeList) return;
                 if (info.callee == Callee::ValueEqual || info.callee == Callee::ValueHash) {
                     auto operation = info.callee == Callee::ValueEqual ? ValueOperation::Equal : ValueOperation::Hash;
-                    auto found = state.module.valueOverrides.find({fn.expressions[*node.receiver].type, operation});
-                    if (found != state.module.valueOverrides.end()) validateFunction(found->second, node.name.span);
+                    validateValueOperation(fn.expressions[*node.receiver].type, operation, node.name.span);
                     return;
                 }
                 if (info.callee == Callee::Constructor) {
@@ -155,38 +184,15 @@ struct Validator {
             } else if constexpr (std::is_same_v<Node, Binary>) {
                 descend(node.left);
                 descend(node.right);
-                if (node.op == Op::Eq || node.op == Op::Ne) {
-                    std::vector<Type> pending{fn.expressions[node.left].type};
-                    std::set<Type> visited;
-                    while (!pending.empty()) {
-                        auto type = pending.back();
-                        pending.pop_back();
-                        if (!visited.insert(type).second) continue;
-                        if (auto found = state.module.valueOverrides.find({type, ValueOperation::Equal}); found != state.module.valueOverrides.end())
-                            validateFunction(found->second, node.site);
-                        if (type.kind == Type::Record && !state.module.aggregates[type.id].syntax.reference) {
-                            const auto& fields = state.module.aggregates[type.id].fields;
-                            pending.insert(pending.end(), fields.begin(), fields.end());
-                        } else if (type.kind == Type::Enum) {
-                            for (const auto& fields : state.module.enums[type.id].payloads) pending.insert(pending.end(), fields.begin(), fields.end());
-                        } else if (type.kind == Type::Option || type.kind == Type::Result) {
-                            const auto& fields = state.module.sumTypes[type.id];
-                            pending.push_back(fields.success);
-                            if (type.kind == Type::Result) pending.push_back(fields.failure);
-                        }
-                    }
-                }
-                if (node.op == Op::Eq || node.op == Op::Ne) {
-                    auto found = state.module.valueOverrides.find({fn.expressions[node.left].type, ValueOperation::Equal});
-                    if (found != state.module.valueOverrides.end()) validateFunction(found->second, node.site);
-                }
+                if (node.op == Op::Eq || node.op == Op::Ne) validateValueOperation(fn.expressions[node.left].type, ValueOperation::Equal, node.site);
             } else if constexpr (std::is_same_v<Node, RangeValue>) {
                 descend(node.start);
                 descend(node.end);
             } else if constexpr (std::is_same_v<Node, DisplayValue>) {
                 descend(node.value);
                 if (fn.expressions[node.value].type.kind == Type::Record) validateFunction(info.target, expr.span);
-            } else if constexpr (std::is_same_v<Node, Binding> || std::is_same_v<Node, PatternBinding>) descend(node.value);
+            } else if constexpr (std::is_same_v<Node, Binding>) { if (!node.constant) descend(node.value); }
+            else if constexpr (std::is_same_v<Node, PatternBinding>) descend(node.value);
             else if constexpr (std::is_same_v<Node, Lambda>) {
                 if (node.isAsync) reject(expr.span, "编译期计算不支持异步 lambda");
                 descend(node.body);
@@ -309,7 +315,13 @@ struct Evaluation {
         }
     }
 
-    bool equal(const EvalValue& left, const EvalValue& right, Type type, const CheckedFunction& caller, Span site) {
+    void valueStep(const CheckedFunction& fn, Span site, unsigned level) {
+        step(fn, site);
+        if (level > 128) error(sources, fn, site, "LYCT0004", "编译期结构相等或哈希的嵌套深度超出预算（128）");
+    }
+
+    bool equal(const EvalValue& left, const EvalValue& right, Type type, const CheckedFunction& caller, Span site, unsigned level = 0) {
+        valueStep(caller, site, level);
         if (auto override = module.valueOverrides.find({type, ValueOperation::Equal}); override != module.valueOverrides.end()) {
             auto result = invoke(module.functions[override->second], {left, right}, caller, site);
             return std::get<bool>(scalarValue(result, caller, site));
@@ -320,8 +332,14 @@ struct Evaluation {
             const auto& first = composite(left).fields;
             const auto& second = composite(right).fields;
             for (std::size_t slot = 0; slot < fields.size(); ++slot)
-                if (!equal(first[slot], second[slot], fields[slot], caller, site)) return false;
+                if (!equal(first[slot], second[slot], fields[slot], caller, site, level + 1)) return false;
             return true;
+        }
+        if (type.kind == Type::FrozenList) {
+            const auto& first = composite(left).fields;
+            const auto& second = composite(right).fields;
+            auto element = module.listElements[type.id];
+            return std::ranges::equal(first, second, [&](const auto& lhs, const auto& rhs) { return equal(lhs, rhs, element, caller, site, level + 1); });
         }
         if (type.kind == Type::Enum) {
             const auto& first = composite(left);
@@ -330,7 +348,7 @@ struct Evaluation {
             auto tag = std::get<VariantTag>(first.tag);
             const auto& fields = module.enums[type.id].payloads[tag.index];
             for (std::size_t slot = 0; slot < fields.size(); ++slot)
-                if (!equal(first.fields[slot], second.fields[slot], fields[slot], caller, site)) return false;
+                if (!equal(first.fields[slot], second.fields[slot], fields[slot], caller, site, level + 1)) return false;
             return true;
         }
         if (type.kind == Type::Option || type.kind == Type::Result) {
@@ -341,12 +359,13 @@ struct Evaluation {
             if (tag == SumTag::None) return true;
             const auto& shape = module.sumTypes[type.id];
             auto field = successTag(tag) ? shape.success : shape.failure;
-            return equal(first.fields.front(), second.fields.front(), field, caller, site);
+            return equal(first.fields.front(), second.fields.front(), field, caller, site, level + 1);
         }
         return left == right;
     }
 
-    std::uint64_t hash(const EvalValue& value, Type type, const CheckedFunction& caller, Span site) {
+    std::uint64_t hash(const EvalValue& value, Type type, const CheckedFunction& caller, Span site, unsigned level = 0) {
+        valueStep(caller, site, level);
         if (auto override = module.valueOverrides.find({type, ValueOperation::Hash}); override != module.valueOverrides.end()) {
             auto result = invoke(module.functions[override->second], {value}, caller, site);
             return integer(Type::Int, scalarValue(result, caller, site)).getZExtValue();
@@ -368,12 +387,18 @@ struct Evaluation {
         if (type.kind == Type::Bool) return combine(valueHashSeed, std::get<bool>(scalarValue(value, caller, site)));
         if (type.kind == Type::Char) return combine(valueHashSeed, std::get<std::uint64_t>(scalarValue(value, caller, site)));
         if (type == Type::Unit) return combine(valueHashSeed, 0);
+        if (type.kind == Type::FrozenList) {
+            const auto& fields = composite(value).fields;
+            auto result = combine(valueHashSeed, fields.size());
+            for (const auto& item : fields) result = combine(result, hash(item, module.listElements[type.id], caller, site, level + 1));
+            return result;
+        }
         if (type.kind == Type::Record || type == Type::IntRange) {
             if (type.kind == Type::Record && module.aggregates[type.id].syntax.reference) error(sources, caller, site, "LYCT0001", "Class 按身份比较，但没有默认 Hash");
             auto result = valueHashSeed;
             auto fields = type == Type::IntRange ? std::span<const Type>(rangeFields) : std::span<const Type>(module.aggregates[type.id].fields);
             for (std::size_t slot = 0; slot < fields.size(); ++slot)
-                result = combine(result, hash(composite(value).fields[slot], fields[slot], caller, site));
+                result = combine(result, hash(composite(value).fields[slot], fields[slot], caller, site, level + 1));
             return result;
         }
         if (type.kind == Type::Enum) {
@@ -381,7 +406,7 @@ struct Evaluation {
             auto tag = std::get<VariantTag>(item.tag);
             auto result = combine(valueHashSeed, tag.index);
             const auto& fields = module.enums[type.id].payloads[tag.index];
-            for (std::size_t slot = 0; slot < fields.size(); ++slot) result = combine(result, hash(item.fields[slot], fields[slot], caller, site));
+            for (std::size_t slot = 0; slot < fields.size(); ++slot) result = combine(result, hash(item.fields[slot], fields[slot], caller, site, level + 1));
             return result;
         }
         if (type.kind == Type::Option || type.kind == Type::Result) {
@@ -391,7 +416,7 @@ struct Evaluation {
             if (tag != SumTag::None) {
                 const auto& shape = module.sumTypes[type.id];
                 auto field = successTag(tag) ? shape.success : shape.failure;
-                result = combine(result, hash(item.fields.front(), field, caller, site));
+                result = combine(result, hash(item.fields.front(), field, caller, site, level + 1));
             }
             return result;
         }
@@ -537,15 +562,18 @@ struct Evaluation {
         return stored;
     }
 
-    EvalValue invoke(const CheckedFunction& fn, std::vector<EvalValue> args, const CheckedFunction& caller, Span call, const Closure* closure = nullptr) {
+    EvalValue invoke(const CheckedFunction& fn, std::vector<EvalValue> args, const CheckedFunction& caller, Span call, const Closure* closure = nullptr, const BlockConstant* block = nullptr) {
         if (++depth > 16) error(sources, caller, call, "LYCT0004", "编译期调用深度超出预算（16）");
         const auto frameBytes = fn.locals.size() * sizeof(EvalSlot);
         charge(caller, call, frameBytes);
         Frame frame{std::vector<EvalSlot>(fn.locals.size()), fn.result};
         auto body = fn.syntax.body;
         const auto receiver = fn.syntax.parameters.size();
-        const auto initializer = !closure && fn.syntax.initializer;
-        if (closure) {
+        const auto initializer = !closure && !block && fn.syntax.initializer;
+        if (block) {
+            body = block->initializer;
+            frame.result = block->type;
+        } else if (closure) {
             auto lambda = *closure->lambda;
             const auto& info = fn.expressions[lambda];
             for (std::size_t index = 0; index < info.captures.size(); ++index) frame.slots[info.captures[index]] = closure->captures[index];
@@ -570,13 +598,15 @@ struct Evaluation {
         return initializer ? frame.cell(receiver) : std::move(result);
     }
 
-    EvalValue value(std::size_t index, const CheckedFunction& caller, Span site) {
-        auto& cached = module.constants[index];
+    EvalValue value(ConstantUse target, const CheckedFunction& caller, Span site) {
+        auto block = target.kind == ConstantUse::Block ? &module.blockConstants[target.index] : nullptr;
+        auto& cached = block ? block->value : module.constants[target.index];
         if (cached) return transfer(*cached, module.constantComposites, composites, loaded, caller, site);
-        const auto& fn = module.functions[index];
-        if (active[index]) error(sources, caller, site, "LYCT0002", "编译期常量存在依赖环：" + fn.syntax.name.text);
+        const auto& fn = module.functions[block ? block->function : target.index];
+        auto index = block ? module.functions.size() + target.index : target.index;
+        if (active[index]) error(sources, caller, site, "LYCT0002", "编译期常量存在依赖环：" + (block ? block->name.text : fn.syntax.name.text));
         active[index] = true;
-        auto evaluated = invoke(fn, {}, caller, site);
+        auto evaluated = invoke(fn, {}, caller, site, nullptr, block);
         cached = transfer(evaluated, composites, module.constantComposites, saved, caller, site);
         if (auto stored = std::get_if<ConstRef>(&*cached)) {
             auto local = std::get<ConstRef>(evaluated);
@@ -759,7 +789,7 @@ struct Evaluation {
                 return info.narrowed ? composite(local).fields.front() : local;
             }
             else if constexpr (std::is_same_v<Node, This>) return frame.cell(info.target);
-            else if constexpr (std::is_same_v<Node, Binding>) initialize(fn, site, frame, info.target, sub(item.value));
+            else if constexpr (std::is_same_v<Node, Binding>) { if (!item.constant) initialize(fn, site, frame, info.target, sub(item.value)); }
             else if constexpr (std::is_same_v<Node, PatternBinding>) {
                 auto value = sub(item.value);
                 PatternBindings bindings;
@@ -795,7 +825,7 @@ struct Evaluation {
                 if (info.callee == Callee::ExtensionProperty) return invoke(module.functions[info.target], {std::move(receiver)}, fn, site);
                 auto owner = fn.expressions[item.receiver].type;
                 if (owner.kind == Type::Record || owner == Type::IntRange) return composite(receiver).fields[info.target];
-                if (owner.kind == Type::List) return static_cast<std::uint64_t>(composite(receiver).fields.size());
+                if (owner.kind == Type::List || owner.kind == Type::FrozenList) return static_cast<std::uint64_t>(composite(receiver).fields.size());
                 if (item.name.text == "codePoint") return receiver;
                 auto& text = std::get<std::string>(scalarValue(receiver, fn, site));
                 if (item.name.text == "byteSize" || fn.expressions[item.receiver].type == Type::Bytes) return static_cast<std::uint64_t>(text.size());
@@ -819,7 +849,7 @@ struct Evaluation {
                 auto receiver = sub(item.receiver);
                 auto indexValue = sub(item.offset);
                 auto owner = fn.expressions[item.receiver].type;
-                if (owner.kind == Type::List) return composite(receiver).fields[listIndex(receiver, indexValue, fn, item.site)];
+                if (owner.kind == Type::List || owner.kind == Type::FrozenList) return composite(receiver).fields[listIndex(receiver, indexValue, fn, item.site)];
                 auto offset = integer(Type::Int, scalarValue(indexValue, fn, site)).getSExtValue();
                 const auto& text = std::get<std::string>(scalarValue(receiver, fn, site));
                 if (offset < 0) error(sources, fn, site, "LYCT0003", "编译期索引越界");
@@ -903,7 +933,7 @@ struct Evaluation {
                         auto& option = composite(next);
                         if (std::get<SumTag>(option.tag) == SumTag::None || !iterate(option.fields.front())) break;
                     }
-                } else if (fn.expressions[item.input].type.kind == Type::List) {
+                } else if (fn.expressions[item.input].type.kind == Type::List || fn.expressions[item.input].type.kind == Type::FrozenList) {
                     auto count = composite(input).fields.size();
                     for (std::size_t index = 0; index < count; ++index)
                         if (!iterate(composite(input).fields[index])) break;
@@ -955,6 +985,10 @@ struct Evaluation {
                     return operation(fn, item.site, op, type, left, right);
                 }
             } else if constexpr (std::is_same_v<Node, Call>) {
+                if (info.callee == Callee::FreezeList) {
+                    auto source = sub(item.arguments.front().value);
+                    return makeComposite(fn, site, rawType(fn, id), std::monostate{}, composite(source).fields);
+                }
                 if (item.receiver && info.callee != Callee::Variant && fn.expressions[*item.receiver].type == Type::Never) return sub(*item.receiver);
                 if (info.callee == Callee::Indirect) {
                     auto value = item.function ? sub(*item.function) : item.receiver ? composite(sub(*item.receiver)).fields[info.target] : frame.cell(info.target);
@@ -973,7 +1007,7 @@ struct Evaluation {
                     if (info.callee == Callee::ValueEqual || info.callee == Callee::ValueHash || info.callee == Callee::Size) {
                         if (info.callee == Callee::ValueHash) return hash(receiver, from, fn, item.name.span);
                         if (info.callee == Callee::ValueEqual) return equal(receiver, sub(item.arguments.front().value), from, fn, item.name.span);
-                        if (from.kind == Type::List) return static_cast<std::uint64_t>(composite(receiver).fields.size());
+                        if (from.kind == Type::List || from.kind == Type::FrozenList) return static_cast<std::uint64_t>(composite(receiver).fields.size());
                         const auto& text = std::get<std::string>(scalarValue(receiver, fn, site));
                         if (from == Type::Bytes) return static_cast<std::uint64_t>(text.size());
                         std::uint64_t count = 0;
@@ -1084,15 +1118,25 @@ void evaluateConstants(CheckedModule& module, const std::vector<Source>& sources
         const auto& fn = module.functions[index];
         if (fn.syntax.constant != ConstKind::None) Validator{state, fn}.validateFunction(index, fn.syntax.name.span);
     }
+    for (const auto& block : module.blockConstants) {
+        const auto& fn = module.functions[block.function];
+        if (!state.types.supports(block.type, false))
+            error(sources, fn, block.name.span, "LYCT0001", "块内常量必须保存不可变值；List、Class 和函数值只能暂存");
+        Validator{state, fn}.visit(block.initializer);
+    }
     for (std::size_t cursor = 0; cursor < state.pending.size(); ++cursor) {
         const auto index = state.pending[cursor];
         Validator{state, module.functions[index]}.run();
     }
     module.constants.resize(module.functions.size());
-    std::vector<bool> active(module.functions.size());
+    std::vector<bool> active(module.functions.size() + module.blockConstants.size());
     for (std::size_t index = 0; index < module.functions.size(); ++index) {
         const auto& fn = module.functions[index];
-        if (fn.syntax.constant == ConstKind::Value) Evaluation{module, sources, active}.value(index, fn, fn.syntax.name.span);
+        if (fn.syntax.constant == ConstKind::Value) Evaluation{module, sources, active}.value({ConstantUse::Global, index}, fn, fn.syntax.name.span);
+    }
+    for (std::size_t index = 0; index < module.blockConstants.size(); ++index) {
+        const auto& block = module.blockConstants[index];
+        Evaluation{module, sources, active}.value({ConstantUse::Block, index}, module.functions[block.function], block.name.span);
     }
 }
 
