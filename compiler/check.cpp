@@ -3,6 +3,7 @@ module;
 #include <charconv>
 #include <compare>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <optional>
 #include <set>
@@ -310,6 +311,7 @@ struct Symbols {
     Names aliases{};
     std::vector<TypeAlias> aliasDeclarations{};
     std::vector<std::string> resolvingAliases{};
+    std::function<void(std::size_t)> checkGeneric{};
 
     struct TypeTrial {
         Symbols& symbols;
@@ -1088,6 +1090,7 @@ struct Symbols {
         for (auto type : arguments) key.arguments.push_back(typeName(module, type, true));
         if (auto found = specializations.find(key); found != specializations.end()) return found->second;
         if (specializations.size() >= 4096) throw at(source, site, "LYG0004", "此编译单元的泛型函数实例超过 4096 个");
+        if (checkGeneric) checkGeneric(declaration);
         auto index = module.functions.size();
         const auto& callable = callables[declaration];
         auto syntax = *callable.generic;
@@ -2267,6 +2270,7 @@ struct Checker {
             local.constant = ConstantUse{ConstantUse::Uninstantiated};
             if (materializing()) {
                 local.constant = ConstantUse{ConstantUse::Block, module.blockConstants.size()};
+                fn.expressions[id].target = local.constant->index;
                 module.blockConstants.push_back({functionIndex.value(), binding.value, type, binding.name});
             }
             declare(binding.name, slot);
@@ -3456,6 +3460,7 @@ struct Checker {
 const Identifier& Symbols::resultAnnotation(const Callable& candidate, const Source& use, Span site) {
     const auto& syntax = declaration(candidate);
     if (!syntax.result.text.empty()) return syntax.result;
+    if (syntax.pendingExpansion) throw at(use, site, "LYM0004", "编译期阶段环：宏依赖的函数需要展开后才能推断返回类型：" + syntax.name.text);
     if (candidate.inferredResult) return *candidate.inferredResult;
     if (candidate.inferring) throw at(use, site, "LYT0020", "递归函数需要标注返回类型：" + declarationSite(syntax));
     candidate.inferring = true;
@@ -3473,7 +3478,7 @@ const Identifier& Symbols::resultAnnotation(const Callable& candidate, const Sou
 
 }
 
-CheckedModule check(Module module, const std::vector<Source>& sources, bool requireEntry) {
+CheckedModule check(Module module, const std::vector<Source>& sources, bool requireEntry, MacroExecution* macro) {
     if (!module.expansions.empty()) {
         auto& use = module.expansions.front();
         throw at(sources[use.file], use.name.span, "LYM0001", "声明前缀未展开：" + use.name.text);
@@ -3768,13 +3773,16 @@ CheckedModule check(Module module, const std::vector<Source>& sources, bool requ
         auto& calls = dependencies[{fn.syntax.file, fn.syntax.name.span.begin}];
         for (const auto& call : fn.calls) calls.emplace_back(call.file, call.span.begin);
     };
-    for (const auto& callable : symbols.callables) {
+    if (!macro) for (const auto& callable : symbols.callables) {
         const auto& syntax = symbols.declaration(callable);
-        if (!syntax.result.text.empty()) continue;
+        if (!syntax.result.text.empty() || syntax.pendingExpansion) continue;
         const auto& annotation = symbols.resultAnnotation(callable, sources[syntax.file], syntax.name.span);
         if (!callable.generic) checked.functions[callable.target].result = symbols.resolve(syntax, annotation, {});
     }
-    for (auto& callable : symbols.callables) if (callable.generic) {
+    std::set<std::size_t> checkedGenerics;
+    auto checkGeneric = [&](std::size_t declaration) {
+        auto& callable = symbols.callables[declaration];
+        if (!callable.generic || (macro && callable.generic->pendingExpansion) || !checkedGenerics.insert(declaration).second) return;
         auto rememberContracts = [&](const CheckedFunction& fn) {
             for (ExprId id = 0; id < callable.generic->expressions.size(); ++id) {
                 if (const auto& bound = fn.expressions[id].boundTrait)
@@ -3794,19 +3802,32 @@ CheckedModule check(Module module, const std::vector<Source>& sources, bool requ
         Checker{body, sources[body.syntax.file], checked, symbols, {}, callable.variables}.run();
         rememberContracts(body);
         rememberReferences(body);
-    }
-    for (std::size_t index = 0; index < checked.functions.size(); ++index) {
+    };
+    if (macro) symbols.checkGeneric = checkGeneric;
+    else for (std::size_t index = 0; index < symbols.callables.size(); ++index) checkGeneric(index);
+    auto checkBody = [&](std::size_t index) {
         auto& fn = checked.functions[index];
+        if (macro && fn.syntax.result.text.empty() && !fn.syntax.pendingExpansion) {
+            const auto& callable = *std::ranges::find_if(symbols.callables, [&](const auto& item) { return !item.generic && item.target == index; });
+            const auto& result = symbols.resultAnnotation(callable, sources[fn.syntax.file], fn.syntax.name.span);
+            fn.result = symbols.resolve(fn.syntax, result, {});
+        }
         auto checker = Checker{fn, sources[fn.syntax.file], checked, symbols, {}};
         checker.functionIndex = index;
         checker.run();
         rememberReferences(fn);
-    }
+    };
+    if (macro) {
+        auto entry = symbols.callables[symbols.functionCallables[macro->declaration]].target;
+        evaluateMacro(checked, sources, *macro, entry, checkBody);
+    } else for (std::size_t index = 0; index < checked.functions.size(); ++index) checkBody(index);
     for (const auto& callable : symbols.callables) if (callable.inferredResult) {
         const auto& syntax = symbols.declaration(callable);
         FunctionSite root{syntax.file, syntax.name.span.begin};
         std::set<FunctionSite> visited{root};
-        auto work = dependencies.at(root);
+        auto rootCalls = dependencies.find(root);
+        if (rootCalls == dependencies.end()) continue;
+        auto work = rootCalls->second;
         for (std::size_t index = 0; index < work.size(); ++index) {
             auto target = work[index];
             if (target == root) throw at(sources[syntax.file], syntax.name.span, "LYT0020", "递归函数需要标注返回类型");
@@ -3837,14 +3858,14 @@ CheckedModule check(Module module, const std::vector<Source>& sources, bool requ
     for (std::size_t id = 0; id < checked.aggregates.size(); ++id) layout(layout, id);
     validateForeignDeclarations(checked, sources);
     if (requireEntry && !checked.entry) throw Diagnostic{"LYN0001", "可执行包缺少入口 fn main(): Unit"};
-    evaluateConstants(checked, sources);
+    if (!macro) evaluateConstants(checked, sources);
     for (const auto& deferred : checked.deferredPatternChecks) {
         std::vector<const CheckedPattern*> patterns;
         for (const auto& pattern : deferred.patterns) patterns.push_back(&pattern);
         if (auto missing = missingPattern(checked, deferred.subject, patterns, deferred.use))
             throw uncoveredPattern(sources[deferred.file], deferred.site, deferred.use, *missing);
     }
-    for (const auto& match : checked.matchCoverage) for (auto site : redundantPatterns(checked, match))
+    for (const auto& match : checked.matchCoverage) if (!macro) for (auto site : redundantPatterns(checked, match))
         checked.warnings.push_back(at(sources[match.file], site, "LYW0002", "此模式已被前面的无守卫模式覆盖，或无法匹配任何值"));
     auto warningKey = [](const Diagnostic& diagnostic) {
         return std::tuple(std::string_view(diagnostic.site->file), diagnostic.site->start.offset, diagnostic.site->end.offset, std::string_view(diagnostic.code));

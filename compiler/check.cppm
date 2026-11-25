@@ -2,9 +2,12 @@ module;
 #include <compare>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <map>
 #include <optional>
+#include <span>
 #include <string>
+#include <string_view>
 #include <variant>
 #include <vector>
 
@@ -68,6 +71,9 @@ struct CheckedEnum { Enumeration syntax; std::vector<std::vector<Type>> payloads
 struct SumTypes { Type success, failure; bool operator==(const SumTypes&) const = default; };
 struct FunctionShape { std::vector<Type> parameters; Type result; bool operator==(const FunctionShape&) const = default; };
 using ConstScalar = std::variant<std::monostate, bool, std::uint64_t, double, std::string>;
+using MacroValue = std::variant<std::monostate, bool, std::int64_t, std::string, SyntaxRef>;
+using MacroHost = std::function<MacroValue(std::string_view, std::span<const MacroValue>)>;
+struct MacroExecution { std::size_t declaration, prelude; std::string target, argument; MacroHost host; SyntaxRef output{}; };
 struct ConstRef { std::size_t index; bool operator==(const ConstRef&) const = default; };
 using ConstValue = std::variant<ConstScalar, ConstRef>;
 using ConstTag = std::variant<std::monostate, SumTag, VariantTag>;
@@ -79,5 +85,5 @@ struct CheckedModule { std::deque<CheckedFunction> functions; std::optional<std:
 const std::optional<ConstValue>& constantValue(const CheckedModule& module, ConstantUse target);
 std::string typeName(const CheckedModule& module, Type type, bool canonical = false);
 std::optional<Type> hiddenType(const CheckedModule& module, Type type);
-CheckedModule check(Module module, const std::vector<Source>& sources, bool requireEntry = true);
+CheckedModule check(Module module, const std::vector<Source>& sources, bool requireEntry = true, MacroExecution* macro = nullptr);
 }

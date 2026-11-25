@@ -434,6 +434,32 @@ class LanguageServer(unittest.TestCase):
             self.assertEqual(len(references), 2)
             self.assertEqual(references[1]['range']['start'], {'line': 1, 'character': character})
 
+    def test_editing_a_nested_imported_macro_refreshes_the_callers_diagnostics(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / 'app/src/main.ly'
+            macro = root / 'kit/src/tools/.expressions/value.ly'
+            source.parent.mkdir(parents=True)
+            macro.parent.mkdir(parents=True)
+            (root / 'app/lyra.json5').write_text('{name:"app",version:"0.1.0",dependencies:{kit:{name:"kit",version:"^0.1.0",path:"../kit"}}}', encoding='utf-8')
+            (root / 'kit/lyra.json5').write_text('{name:"kit",version:"0.1.0",kind:"lib"}', encoding='utf-8')
+            text = 'import macro kit.tools.value\nfn main(): Unit { val result: Int = #value() }\n'
+            implementation = 'pub fn value(target: String, argument: String): Syntax { quote { 1 } }'
+            source.write_text(text, encoding='utf-8')
+            macro.write_text(implementation, encoding='utf-8')
+            change = {'jsonrpc': '2.0', 'method': 'textDocument/didChange', 'params': {
+                'textDocument': {'uri': uri(macro), 'version': 2},
+                'contentChanges': [{'text': implementation.replace('quote { 1 }', 'quote { false }')}],
+            }}
+            output = run_server([(source, text), (macro, implementation)], [change,
+                {'jsonrpc': '2.0', 'method': 'textDocument/didClose', 'params': {'textDocument': {'uri': uri(macro)}}},
+            ])
+            diagnostics = [item['params']['diagnostics'] for item in output if item.get('method') == 'textDocument/publishDiagnostics'
+                           and item['params']['uri'] == uri(source)]
+            error, = diagnostics[-2]
+            self.assertEqual(error['code'], 'LYT0001')
+            self.assertEqual(diagnostics[-1], [])
+
     def test_unsaved_standard_library_overlay_is_used(self):
         with tempfile.TemporaryDirectory() as temporary:
             package = Path(temporary) / 'app'

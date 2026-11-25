@@ -1,5 +1,6 @@
 module;
 #include <algorithm>
+#include <array>
 #include <filesystem>
 #include <map>
 #include <optional>
@@ -7,6 +8,7 @@ module;
 #include <span>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -46,6 +48,37 @@ struct Space {
     std::map<std::string, Import> imports{};
 };
 
+struct ImportTarget { std::string package, module; fs::path directory; };
+using SymbolDependencies = std::map<std::string, std::set<std::string>>;
+
+const std::string& declarationGroup(const Function& function) {
+    return function.owner ? function.owner->text : function.extensionGroup ? function.extensionGroup->text : function.name.text;
+}
+
+ImportTarget importTarget(const Source& source, const ResolvedPackage& from, const Import& use,
+    const std::map<std::string, std::string>& prefixes) {
+    const auto& first = use.path.front();
+    if (use.path.size() < 2) throw at(source, first.span, "LYN0003", "import 需要包、可选模块路径和声明名");
+    auto package = from.id;
+    std::size_t firstDir = 1;
+    if (first.text == "std" && use.path.size() >= 3) {
+        package = "$std/" + use.path[1].text;
+        firstDir = 2;
+    } else if (first.text != "self") {
+        auto found = from.dependencies.find(first.text);
+        if (found == from.dependencies.end()) throw at(source, first.span, "LYN0003", "清单没有此依赖简称：" + first.text);
+        package = found->second;
+    }
+    auto prefix = prefixes.find(package);
+    if (prefix == prefixes.end()) throw at(source, first.span, "LYN0003", "导入的包不在当前编译阶段：" + package);
+    ImportTarget target{std::move(package), prefix->second, {}};
+    for (auto index = firstDir; index + 1 < use.path.size(); ++index) {
+        target.module += '/' + use.path[index].text;
+        target.directory /= fromUtf8(use.path[index].text);
+    }
+    return target;
+}
+
 struct Linker {
     const std::vector<Source>& sources;
     std::map<std::string, Space>& spaces;
@@ -53,6 +86,7 @@ struct Linker {
     std::string entry;
     std::vector<NameReference>& references;
     bool indexing;
+    bool macroPhase{};
 
     void declare(std::size_t file, Identifier& id, bool visible, bool rewriteName, SymbolKind kind = SymbolKind::Type) {
         auto scope = sources[file].moduleId;
@@ -72,24 +106,10 @@ struct Linker {
     Symbol resolve(const Import& use, std::set<const Import*>& active) const {
         const auto& source = sources[use.file];
         if (!active.insert(&use).second) throw at(source, use.alias.span, "LYN0004", "重导出形成循环：" + use.alias.text);
-        const auto& from = *spaces.at(source.moduleId).package;
-        const auto& first = use.path.front();
-        if (use.path.size() < 2) throw at(source, first.span, "LYN0003", "import 需要包、可选模块路径和声明名");
-        auto package = from.id;
-        std::size_t firstDir = 1;
-        if (first.text == "std" && use.path.size() >= 3) {
-            package = "$std/" + use.path[1].text;
-            firstDir = 2;
-        } else if (first.text != "self") {
-            auto found = from.dependencies.find(first.text);
-            if (found == from.dependencies.end()) throw at(source, first.span, "LYN0003", "清单没有此依赖简称：" + first.text);
-            package = found->second;
-        }
-        auto target = prefixes.at(package);
-        for (auto index = firstDir; index + 1 < use.path.size(); ++index) target += '/' + use.path[index].text;
+        auto target = importTarget(source, *spaces.at(source.moduleId).package, use, prefixes);
         auto& name = use.path.back();
-        auto found = spaces.find(target);
-        if (found == spaces.end()) throw at(source, name.span, "LYN0003", "导入的源码模块不存在");
+        auto found = spaces.find(target.module);
+        if (found == spaces.end()) throw at(source, name.span, macroPhase ? "LYM0004" : "LYN0003", "导入的手写源码模块不存在");
         auto& space = found->second;
         if (auto hit = space.definitions.find(name.text); hit != space.definitions.end() && hit->second.visible && !hit->second.imported) {
             auto result = hit->second;
@@ -105,7 +125,7 @@ struct Linker {
                 symbol.renameTarget = SourceAnchor{alias->second.file, alias->second.alias.span};
             return symbol;
         }
-        throw at(source, name.span, "LYN0003", "目标模块没有公开声明：" + name.text);
+        throw at(source, name.span, macroPhase ? "LYM0004" : "LYN0003", "目标模块没有可用的公开声明：" + name.text);
     }
 
     Symbol import(const Import& use) {
@@ -132,6 +152,7 @@ struct Linker {
         for (auto& fn : syntax.functions) if (!fn.owner && !fn.extensionGroup)
             declare(fn.file, fn.name, fn.isPublic, rewriteNames, fn.constant == ConstKind::Value ? SymbolKind::Constant : SymbolKind::Callable);
         for (const auto& use : syntax.imports) {
+            if (use.kind != ImportKind::Runtime) continue;
             const auto& source = sources[use.file];
             if (source.origin) continue;
             auto& space = spaces.at(source.moduleId);
@@ -141,15 +162,25 @@ struct Linker {
         }
     }
 
-    void rewrite(Module& syntax) {
+    void rewrite(Module& syntax, SymbolDependencies* dependencies = nullptr) {
         collect(syntax, true);
+        if (macroPhase) {
+            auto& scope = spaces.at("$macroImplementation");
+            for (const auto& [name, symbol] : spaces.at("$macroPrelude").definitions)
+                if (scope.imports.contains(name) || !scope.definitions.emplace(name, symbol).second)
+                    throw at(sources[1], {0, 0}, "LYM0002", "宏预定义名称不能被重定义：" + name);
+        }
         std::map<std::size_t, std::map<std::string, const Import*>> generatedImports;
-        for (const auto& use : syntax.imports) if (const auto& source = sources[use.file]; source.origin) {
+        for (const auto& use : syntax.imports) if (const auto& source = sources[use.file]; use.kind == ImportKind::Runtime && source.origin) {
             if (!generatedImports[use.file].emplace(use.alias.text, &use).second) throw at(source, use.alias.span, "LYN0002", "生成代码中重复的导入名称：" + use.alias.text);
         }
         for (auto& [moduleId, space] : spaces) {
             for (const auto& [name, use] : space.imports) {
-                space.definitions.emplace(name, import(use));
+                try { space.definitions.emplace(name, import(use)); }
+                catch (const Diagnostic&) {
+                    if (!macroPhase || use.file < 2) throw;
+                    space.definitions.emplace(name, Symbol{"$unexpanded::" + name, SymbolKind::Callable, false, true});
+                }
             }
         }
         std::map<std::size_t, std::map<std::string, Symbol>> generatedScopes;
@@ -161,6 +192,11 @@ struct Linker {
             auto generated = generatedScopes.find(file);
             return generated == generatedScopes.end() ? spaces.at(sources[file].moduleId).definitions : generated->second;
         };
+        std::set<std::string>* needs{};
+        auto group = [&](const auto& name) { if (dependencies) needs = &(*dependencies)[name]; };
+        std::map<std::string, std::vector<std::string>> moduleExtensions;
+        if (dependencies) for (const auto& extension : syntax.extensions)
+            moduleExtensions[sources[extension.file].moduleId].push_back(extension.name.text);
         auto renameTypeIn = [&](std::size_t file, Identifier& type, std::span<const Identifier> parameters = {}) {
             const auto& scope = scopeOf(file);
             if (indexing && type.span.end > type.span.begin) {
@@ -182,7 +218,10 @@ struct Linker {
             }
             type.text = mapTypeNames(typeForm(type.text), [&](const std::string& name) {
                 if (std::ranges::any_of(parameters, [&](const auto& parameter) { return parameter.text == name; })) return name;
-                auto found = scope.find(name); return found == scope.end() ? name : found->second.name;
+                auto found = scope.find(name);
+                if (found == scope.end()) return name;
+                if (needs) needs->insert(found->second.name);
+                return found->second.name;
             });
         };
         syntax.importedExtensions.resize(sources.size());
@@ -198,22 +237,34 @@ struct Linker {
             }
         };
         for (auto& extension : syntax.extensions) {
+            group(extension.name.text);
             renameTypeIn(extension.file, extension.receiver, extension.typeParameters);
             renameBounds(extension, extension.bounds);
         }
         for (auto& record : syntax.aggregates) {
+            group(record.name.text);
             renameBounds(record, record.bounds);
-            for (auto& field : record.fields) renameTypeIn(record.file, field.type, record.typeParameters);
+            for (auto& field : record.fields) {
+                renameTypeIn(record.file, field.type, record.typeParameters);
+                if (needs && field.defaultValue) needs->insert(syntax.functions[field.defaultValue->function].name.text);
+            }
             for (auto& member : record.associated) renameTypeIn(record.file, member.type, record.typeParameters);
         }
         for (auto& item : syntax.enums) {
+            group(item.name.text);
             renameBounds(item, item.bounds);
             for (auto& entry : item.cases) for (auto& field : entry.fields) renameTypeIn(item.file, field.type, item.typeParameters);
         }
-        for (auto& alias : syntax.aliases) renameTypeIn(alias.file, alias.target, alias.typeParameters);
-        for (auto& trait : syntax.traits) for (auto& method : trait.methods) {
-            renameTypeIn(trait.file, method.result, trait.associated);
-            for (auto& parameter : method.parameters) renameTypeIn(trait.file, parameter.type, trait.associated);
+        for (auto& alias : syntax.aliases) {
+            group(alias.name.text);
+            renameTypeIn(alias.file, alias.target, alias.typeParameters);
+        }
+        for (auto& trait : syntax.traits) {
+            group(trait.name.text);
+            for (auto& method : trait.methods) {
+                renameTypeIn(trait.file, method.result, trait.associated);
+                for (auto& parameter : method.parameters) renameTypeIn(trait.file, parameter.type, trait.associated);
+            }
         }
         for (auto& fn : syntax.functions) {
             const auto& scope = scopeOf(fn.file);
@@ -225,6 +276,12 @@ struct Linker {
             };
             if (fn.owner) rename(*fn.owner);
             if (fn.extensionGroup) rename(*fn.extensionGroup);
+            group(declarationGroup(fn));
+            if (needs) {
+                for (const auto& name : syntax.importedExtensions[fn.file]) needs->insert(name);
+                if (auto found = moduleExtensions.find(sources[fn.file].moduleId); found != moduleExtensions.end())
+                    needs->insert(found->second.begin(), found->second.end());
+            }
             renameBounds(fn, fn.bounds);
             if (!fn.result.text.empty()) renameType(fn.result);
             for (auto& type : fn.throwsTypes) renameType(type);
@@ -235,6 +292,7 @@ struct Linker {
                     name.linked = found->second.name;
                     name.exportedOnly = found->second.imported;
                     name.renameTarget = found->second.renameTarget;
+                    if (needs) needs->insert(found->second.name);
                 }
                 else if (!kind && name.text == "main") name.linked = sources[fn.file].moduleId + "::main";
             };
@@ -458,6 +516,198 @@ void appendCachedSyntax(Module& target, const Module& cached, std::size_t file) 
     }
 }
 
+struct MacroImports {
+    const std::vector<Source>& sources;
+    const std::map<std::string, Space>& spaces;
+    const std::map<std::string, const ResolvedPackage*>& packages;
+    const std::map<std::string, std::string>& prefixes;
+    const SourceOverlay* overlays;
+    std::map<std::tuple<std::string, ImportKind, std::string>, const Import*> aliases{};
+    std::map<std::pair<const Import*, MacroKind>, std::optional<MacroOrigin>> bindings{};
+    std::map<fs::path, bool> exports{};
+
+    static ImportKind family(MacroKind kind) { return kind == MacroKind::Decorator ? ImportKind::Decorator : ImportKind::Macro; }
+
+    bool present(const fs::path& path) const { return (overlays && overlays->contains(path)) || fs::is_regular_file(path); }
+
+    std::optional<MacroOrigin> definition(const ResolvedPackage& package, const fs::path& directory, const Source& source,
+        const Identifier& name, MacroKind kind, bool imported) {
+        auto path = package.root / "src" / directory / ('.' + std::string(macroDirectory(kind))) / (name.text + ".ly");
+        if (!present(path)) return {};
+        auto relative = fs::weakly_canonical(path).lexically_relative(fs::canonical(package.root));
+        if (relative.empty() || *relative.begin() == "..") throw at(source, name.span, "LYM0002", "宏实现必须位于声明包内");
+        if (imported) {
+            auto found = exports.find(path);
+            if (found == exports.end()) {
+                auto size = overlays && overlays->contains(path) ? overlays->at(path).size() : fs::file_size(path);
+                if (size > macroInputByteLimit) throw at(source, name.span, "LYM0002", "宏实现超过大小限制");
+                auto implementation = loadSource(path, {}, overlays);
+                Module code;
+                std::vector<ExpressionExpansion> calls;
+                parseFile(code, implementation, 0, &calls, true);
+                bool visible = std::ranges::any_of(code.functions, [&](const auto& fn) {
+                    return !fn.owner && !fn.extensionGroup && fn.name.text == name.text && fn.isPublic;
+                });
+                found = exports.emplace(path, visible).first;
+            }
+            if (!found->second) return {};
+        }
+        return MacroOrigin{std::move(path), package.id, name.text, imported};
+    }
+
+    std::optional<MacroOrigin> resolve(const Import& use, MacroKind kind, std::set<const Import*>& active) {
+        auto key = std::pair{&use, kind};
+        if (auto bound = bindings.find(key); bound != bindings.end()) return bound->second;
+        const auto& source = sources[use.file];
+        if (!active.insert(&use).second) throw at(source, use.alias.span, "LYM0004", "编译期宏重导出形成依赖环：" + use.alias.text);
+        auto target = importTarget(source, *spaces.at(source.moduleId).package, use, prefixes);
+        const auto& name = use.path.back();
+        std::optional<MacroOrigin> origin;
+        if (auto alias = aliases.find({target.module, use.kind, name.text}); alias != aliases.end() && alias->second->isPublic)
+            origin = resolve(*alias->second, kind, active);
+        else if (auto provider = packages.find(target.package); provider != packages.end())
+            origin = definition(*provider->second, target.directory, source, name, kind, true);
+        active.erase(&use);
+        return bindings.emplace(key, std::move(origin)).first->second;
+    }
+
+    void collect(const Module& syntax) {
+        for (const auto& use : syntax.imports) if (use.kind != ImportKind::Runtime) {
+            const auto& source = sources[use.file];
+            if (!aliases.emplace(std::tuple{source.moduleId, use.kind, use.alias.text}, &use).second)
+                throw at(source, use.alias.span, "LYN0002", "宏或装饰器导入名称已被使用：" + use.alias.text);
+        }
+        for (const auto& [name, use] : aliases) {
+            std::set<const Import*> active;
+            bool found = false;
+            for (auto kind : {MacroKind::Declaration, MacroKind::Expression, MacroKind::Decorator})
+                if (family(kind) == use->kind) found |= resolve(*use, kind, active).has_value();
+            if (!found) throw at(sources[use->file], use->path.back().span, "LYM0001", "找不到以 pub fn 导出的宏或装饰器：" + use->path.back().text);
+        }
+    }
+
+    MacroOrigin resolve(const Source& source, const Identifier& name, MacroKind kind) {
+        auto fail = [&] { return at(source, name.span, "LYM0001", "找不到此位置所需的" + std::string(kind == MacroKind::Decorator ? "装饰器 @" : kind == MacroKind::Expression ? "表达式宏 #" : "声明宏 #") + name.text); };
+        if (auto alias = aliases.find({source.moduleId, family(kind), name.text}); alias != aliases.end()) {
+            if (const auto& origin = bindings.at({alias->second, kind})) return *origin;
+            throw fail();
+        }
+        const auto& package = *spaces.at(source.moduleId).package;
+        auto directory = source.path.parent_path().lexically_relative(package.root / "src");
+        if (!directory.empty() && directory != "." && *directory.begin() != "..")
+            if (auto local = definition(package, directory, source, name, kind, false)) return *local;
+        if (auto local = definition(package, {}, source, name, kind, false)) return *local;
+        auto bundled = sdkRoot() / "share/lyra/std/meta" / macroDirectory(kind) / (name.text + ".ly");
+        if (!present(bundled)) {
+            if (kind == MacroKind::Decorator && name.text == "derive")
+                throw at(source, name.span, "LYM0001", "derive 是声明宏；请写 #derive(Json)");
+            throw fail();
+        }
+        return {std::move(bundled), package.id, name.text, false};
+    }
+};
+
+void keepMacroDependencies(Module& syntax, const SymbolDependencies& dependencies) {
+    std::set<std::string> kept;
+    std::vector<std::string> work;
+    for (const auto& [name, needs] : dependencies)
+        if (name.starts_with("$macroImplementation::") || name.starts_with("$macroPrelude::")) work.push_back(name);
+    for (std::size_t index = 0; index < work.size(); ++index) {
+        const auto& name = work[index];
+        if (kept.insert(name).second) if (auto found = dependencies.find(name); found != dependencies.end())
+            work.insert(work.end(), found->second.begin(), found->second.end());
+    }
+    auto remove = [&](auto& declarations) { std::erase_if(declarations, [&](const auto& item) { return !kept.contains(item.name.text); }); };
+    remove(syntax.aggregates); remove(syntax.enums); remove(syntax.aliases); remove(syntax.traits); remove(syntax.exceptions); remove(syntax.extensions);
+    std::vector<std::size_t> relocated(syntax.functions.size());
+    std::vector<Function> functions;
+    for (std::size_t index = 0; index < syntax.functions.size(); ++index) {
+        auto& fn = syntax.functions[index];
+        if (fn.file < 2 || kept.contains(declarationGroup(fn))) {
+            relocated[index] = functions.size();
+            functions.push_back(std::move(fn));
+        }
+    }
+    syntax.functions = std::move(functions);
+    for (auto& item : syntax.aggregates) for (auto& field : item.fields) if (field.defaultValue)
+        field.defaultValue->function = relocated[field.defaultValue->function];
+    for (auto& extension : syntax.extensions) for (auto& property : extension.properties) property.getter = relocated[property.getter];
+    for (auto& groups : syntax.importedExtensions) std::erase_if(groups, [&](const auto& name) { return !kept.contains(name); });
+    syntax.expansions.clear();
+}
+
+struct MacroDependencies {
+    const std::vector<Source>& sources;
+    const std::vector<Module>& files;
+    const std::map<std::string, Space>& spaces;
+    const std::map<std::string, const ResolvedPackage*>& packages;
+    const std::map<std::string, std::string>& prefixes;
+    const SourceOverlay* overlays;
+
+    std::string link(const MacroOrigin& origin, Module& syntax, std::vector<Source>& code) const {
+        auto package = packages.at(origin.package);
+        std::map<std::string, Space> scopes{{"$macroPrelude", {package}}, {"$macroImplementation", {package}}};
+        auto names = prefixes;
+        std::map<std::string, ResolvedPackage> bundled;
+        std::set<std::string> read;
+        auto append = [&](const Source& source, const Module& parsed) {
+            code.push_back(source);
+            appendCachedSyntax(syntax, parsed, code.size() - 1);
+        };
+        for (std::size_t index = 0; index < syntax.imports.size(); ++index) {
+            const auto use = syntax.imports[index];
+            if (use.kind != ImportKind::Runtime) continue;
+            const auto& source = code[use.file];
+            const auto& from = *scopes.at(source.moduleId).package;
+            if (use.path.size() >= 3 && use.path.front().text == "std") {
+                auto name = use.path[1].text;
+                auto key = "$std/" + name;
+                if (!names.contains(key)) {
+                    auto root = sdkRoot() / "share/lyra/std" / name;
+                    if (fs::is_directory(root / "src")) {
+                        auto& stdPackage = bundled.emplace(key, ResolvedPackage{key, name, "builtin", root, {}, true}).first->second;
+                        names.emplace(key, key);
+                        scopes.emplace(key, Space{&stdPackage});
+                        read.insert(key);
+                        for (auto input : loadSources(root)) {
+                            input.moduleId = key;
+                            if (overlays && overlays->contains(input.path)) input = loadSource(input.path, key, overlays);
+                            Module parsed;
+                            std::vector<ExpressionExpansion> calls;
+                            parseFile(parsed, input, 0, &calls);
+                            append(input, parsed);
+                        }
+                    }
+                }
+            }
+            std::optional<ImportTarget> target;
+            try { target = importTarget(code[use.file], from, use, names); }
+            catch (const Diagnostic&) { if (use.file == 1) throw; }
+            if (!target || !read.insert(target->module).second) continue;
+            auto space = spaces.find(target->module);
+            if (space == spaces.end()) continue;
+            scopes.emplace(target->module, Space{space->second.package});
+            for (std::size_t file = 0; file < sources.size(); ++file)
+                if (sources[file].moduleId == target->module) append(sources[file], files[file]);
+        }
+        llvm::SHA256 hash;
+        auto text = [&](std::string_view value) { hash.update(std::to_string(value.size()) + ':'); hash.update(value); };
+        for (const auto& [name, space] : scopes) {
+            text(name); text(space.package->id);
+            for (const auto& [alias, target] : space.package->dependencies) { text(alias); text(target); }
+        }
+        for (std::size_t file = 2; file < code.size(); ++file) {
+            text(code[file].moduleId); text(pathText(code[file].path)); text(code[file].text);
+        }
+        std::vector<NameReference> references;
+        SymbolDependencies dependencies;
+        Linker{code, scopes, names, "$macroImplementation", references, false, true}.rewrite(syntax, &dependencies);
+        keepMacroDependencies(syntax, dependencies);
+        auto digest = hash.final();
+        return {reinterpret_cast<const char*>(digest.data()), digest.size()};
+    }
+};
+
 }
 
 Compilation loadProgram(const PackageGraph& graph, const std::string& entry, const std::optional<fs::path>& testFile, const SourceOverlay* overlays, ParseCache* parseCache) {
@@ -506,31 +756,34 @@ Compilation loadProgram(const PackageGraph& graph, const std::string& entry, con
         spaces.emplace(root, Space{packages.at(entry)});
         program.sources.push_back(loadSource(*testFile, root, overlays));
     }
-    std::map<std::string, MacroPackage> macroPackages;
-    auto macroCache = overlays ? fs::path{} : cacheOverride();
-    if (!overlays) macroCache = (macroCache.empty() ? graph.workspace / ".lyra" / "cache" : macroCache) / "compiler" / "macros";
-    for (const auto& [module, space] : spaces) macroPackages.emplace(module, MacroPackage{space.package->root, space.package->macroInputs, overlays, macroCache});
-    for (std::size_t file = 0; file < program.sources.size(); ++file) {
-        auto& source = program.sources[file];
-        if (source.text.find_first_of("#@") == std::string::npos) {
-            if (parseCache) appendCachedSyntax(program.syntax, cachedFileSyntax(source, *parseCache), file);
-            else parseFile(program.syntax, source, file);
-        }
-        else parsePackageFile(program.syntax, source, file, macroPackages.at(source.moduleId), program.macroInputs);
-    }
+    Module authored;
+    std::vector<Module> fileSyntax;
+    std::vector<bool> expressionMacros;
+    auto parseAuthored = [&](std::size_t file) {
+        const auto& source = program.sources[file];
+        std::vector<ExpressionExpansion> calls;
+        Module syntax;
+        if (parseCache && source.text.find_first_of("#@") == std::string::npos) syntax = cachedFileSyntax(source, *parseCache);
+        else parseFile(syntax, source, file, &calls);
+        appendCachedSyntax(authored, syntax, file);
+        fileSyntax.push_back(std::move(syntax));
+        expressionMacros.push_back(!calls.empty());
+    };
+    for (std::size_t file = 0; file < program.sources.size(); ++file) parseAuthored(file);
     std::map<std::string, ResolvedPackage> bundled;
     auto standard = sdkRoot() / "share" / "lyra" / "std";
     std::size_t loadedImports = 0;
-    auto loadBundled = [&] {
-        for (; loadedImports < program.syntax.imports.size(); ++loadedImports) {
-            const auto& use = program.syntax.imports[loadedImports];
-            if (use.path.size() < 3 || use.path[0].text != "std") continue;
+    auto loadBundled = [&](Module& syntax, bool handwritten) {
+        for (; loadedImports < syntax.imports.size(); ++loadedImports) {
+            const auto& use = syntax.imports[loadedImports];
+            if (use.kind != ImportKind::Runtime || use.path.size() < 3 || use.path[0].text != "std") continue;
             auto name = use.path[1].text;
             auto key = "$std/" + name;
             if (bundled.contains(key)) continue;
             auto packageRoot = standard / name;
             if (!fs::is_directory(packageRoot / "src")) throw at(program.sources[use.file], use.path[1].span, "LYN0003", "找不到随工具链安装的标准包：" + name);
             auto& package = bundled.emplace(key, ResolvedPackage{key, name, "builtin", packageRoot, {}, true}).first->second;
+            packages.emplace(key, &package);
             prefixes.emplace(key, key);
             spaces.emplace(key, Space{&package});
             for (auto source : loadSources(packageRoot)) {
@@ -539,21 +792,46 @@ Compilation loadProgram(const PackageGraph& graph, const std::string& entry, con
                     source = sourceText(source.path, found->second, key);
                 program.sources.push_back(std::move(source));
                 auto file = program.sources.size() - 1;
-                if (parseCache && program.sources.back().text.find_first_of("#@") == std::string::npos)
+                if (handwritten) parseAuthored(file);
+                else if (parseCache && program.sources.back().text.find_first_of("#@") == std::string::npos)
                     appendCachedSyntax(program.syntax, cachedFileSyntax(program.sources.back(), *parseCache), file);
                 else parseFile(program.syntax, program.sources.back(), file);
             }
         }
     };
-    loadBundled();
+    loadBundled(authored, true);
+    auto hasExpressions = std::ranges::any_of(expressionMacros, [](bool present) { return present; });
+    if (!hasExpressions && authored.expansions.empty() && std::ranges::none_of(authored.imports, [](const auto& use) { return use.kind != ImportKind::Runtime; })) {
+        program.syntax = std::move(authored);
+        Linker{program.sources, spaces, prefixes, root, program.references, overlays != nullptr}.rewrite(program.syntax);
+        return program;
+    }
+    const auto authoredSources = program.sources;
+    MacroImports imports{authoredSources, spaces, packages, prefixes, overlays};
+    imports.collect(authored);
+    MacroDependencies dependencies{authoredSources, fileSyntax, spaces, packages, prefixes, overlays};
+    const MacroResolver resolveMacro = [&](const auto& source, const auto& name, auto kind) { return imports.resolve(source, name, kind); };
+    const MacroLinker linkMacro = [&](const auto& origin, auto& syntax, auto& sources) { return dependencies.link(origin, syntax, sources); };
+    const MacroEnvironment environment{resolveMacro, linkMacro};
+    std::map<std::string, MacroPackage> macroPackages;
+    auto macroCache = overlays ? fs::path{} : cacheOverride();
+    if (!overlays) macroCache = (macroCache.empty() ? graph.workspace / ".lyra" / "cache" : macroCache) / "compiler" / "macros";
+    for (const auto& [module, space] : spaces) macroPackages.emplace(module, MacroPackage{space.package->root, space.package->macroInputs, overlays, macroCache});
+    for (std::size_t file = 0; file < program.sources.size(); ++file) {
+        auto& source = program.sources[file];
+        if (expressionMacros[file]) {
+            expandExpressions(source, file, macroPackages.at(source.moduleId), program.macroInputs, environment);
+            parseFile(program.syntax, source, file);
+        } else appendCachedSyntax(program.syntax, fileSyntax[file], file);
+    }
     if (!program.syntax.expansions.empty()) {
         auto declarations = spaces;
         Linker linker{program.sources, declarations, prefixes, root, program.references, false};
         linker.collect(program.syntax, false);
         DeclarationTypes types(linker, program.syntax);
         expandMacros(program.syntax, program.sources, macroPackages, program.macroInputs,
-            [&](auto file, const auto& annotation, auto parameters) { return types.resolve(file, annotation, parameters); }, types.fingerprint());
-        loadBundled();
+            [&](auto file, const auto& annotation, auto parameters) { return types.resolve(file, annotation, parameters); }, types.fingerprint(), environment);
+        loadBundled(program.syntax, false);
     }
     Linker{program.sources, spaces, prefixes, root, program.references, overlays != nullptr}.rewrite(program.syntax);
     return program;

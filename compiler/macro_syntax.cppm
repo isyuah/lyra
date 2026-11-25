@@ -13,7 +13,6 @@ import lyra.syntax;
 
 export namespace lyra {
 
-struct SyntaxRef { std::size_t index; bool operator==(const SyntaxRef&) const = default; };
 enum class SyntaxForm { Code, Input, Argument, Join, Call, Member, Block, Around, Type };
 struct SyntaxNode {
     SyntaxForm form;
@@ -30,8 +29,12 @@ struct SyntaxArena {
     const Source& source;
     Span site;
     std::vector<SyntaxNode> nodes{};
+    std::size_t bytes{};
 
     SyntaxRef add(SyntaxNode node) {
+        bytes += sizeof(SyntaxNode) + node.kind.size() + node.text.size() + node.canonical.size() + node.module.size() + node.children.size() * sizeof(SyntaxRef);
+        if (nodes.size() == 100000 || bytes > 32 * 1024 * 1024)
+            throw at(source, site, "LYM0002", "宏的语法节点超过预算");
         auto ref = SyntaxRef{nodes.size()};
         nodes.push_back(std::move(node));
         return ref;

@@ -46,6 +46,172 @@ class Macros(unittest.TestCase):
         (self.src / '.macros/make.ly').write_text('fn fragment(target: String, argument: String): String { ' + source + ' }\n'
                                                   'fn make(target: String, argument: String): Syntax { syntaxCode(fragment(target, argument)) }')
 
+    def library(self, name, **settings):
+        package = self.root / name
+        (package / 'src').mkdir(parents=True)
+        (package / 'lyra.json5').write_text(json.dumps({'name': name, 'version': '0.1.0', 'kind': 'lib', **settings}))
+        return package
+
+    @staticmethod
+    def dependency(name):
+        return {'name': name, 'version': '^0.1.0', 'path': '../' + name}
+
+    def test_imported_macro_reexport_ctfe_and_cache_follow_the_provider(self):
+        provider = self.library('provider', macroInputs={'emitValue': {'amount': 'own.txt'}})
+        facade = self.library('facade', dependencies={'provider': self.dependency('provider')})
+        (provider / 'own.txt').write_text('unused provider input')
+        expressions = provider / 'src/tools/.expressions'
+        expressions.mkdir(parents=True)
+        (expressions / 'emitValue.ly').write_text('''import self.calc.offset
+pub fn emitValue(target: String, argument: String): Syntax {
+    const Base: Int = offset(4)
+    val value = syntaxArgument(0)
+    val extra = syntaxInt(Base + macroInput("amount").size())
+    quote { { val value = 2; splice(value) + splice(extra) + value } }
+}
+''')
+        calc = provider / 'src/calc'
+        calc.mkdir()
+        helper = calc / 'math.ly'
+        code = '''enum Input { Amount(Int), Empty }
+const Extra: Int = 1
+fn identity<T>(value: T): T { value }
+extension IntOffsets for Int { fn addExtra(): Int { this + Extra } }
+pub fn offset(value: Int): Int {
+    val values = FrozenList([Input.Amount(identity(value)), Input.Empty])
+    var total = 0
+    for entry in values { total += match entry { Input.Amount(amount) => amount, Input.Empty => 0 } }
+    total.addExtra()
+}
+'''
+        helper.write_text(code)
+        (facade / 'src/exports.ly').write_text('pub import macro provider.tools.emitValue as addExtra\n')
+        self.manifest(dependencies={'facade': self.dependency('facade')}, macroInputs={'sugar': {'amount': 'amount.txt'}})
+        snapshot = self.pkg / 'amount.txt'
+        snapshot.write_text('x')
+        source = '''import macro facade.addExtra as sugar
+fn main(): Unit { val value = 10; print(#sugar(value)) }
+'''
+        self.native(source, ['18'])
+        helper.write_text(code.replace('Extra: Int = 1', 'Extra: Int = 3'))
+        self.native(source, ['20'])
+        snapshot.write_text('xxxx')
+        self.native(source, ['23'])
+        self.manifest(dependencies={'facade': self.dependency('facade')})
+        self.diagnostic('LYM0002', '未获得只读输入')
+
+    def test_imported_declaration_macro_needs_a_public_entry_and_explicit_exports(self):
+        provider = self.library('provider')
+        macros = provider / 'src/.macros'
+        macros.mkdir()
+        implementation = macros / 'makeApi.ly'
+        code = '''pub fn makeApi(target: String, argument: String): Syntax {
+    val result = syntaxInt(42)
+    quote { pub fn api(): Int { splice(result) } }
+}
+'''
+        implementation.write_text(code)
+        self.manifest(dependencies={'provider': self.dependency('provider')})
+        source = '''import macro provider.makeApi as materialize
+#materialize(export api)
+fn main(): Unit { print(api()) }
+'''
+        self.native(source, ['42'])
+        (self.src / 'main.ly').write_text(source.replace('(export api)', ''))
+        self.diagnostic('LYM0002', '公开声明')
+        (self.src / 'main.ly').write_text(source)
+        implementation.write_text(code.removeprefix('pub '))
+        self.diagnostic('LYM0001', 'pub fn')
+
+    def test_macro_phase_rejects_generated_and_decorated_dependencies(self):
+        provider = self.library('provider')
+        expressions = provider / 'src/.expressions'
+        expressions.mkdir()
+        (expressions / 'current.ly').write_text('''import self.answer
+pub fn current(target: String, argument: String): Syntax { syntaxInt(answer()) }
+''')
+        (provider / 'src/.macros').mkdir()
+        (provider / 'src/.macros/make.ly').write_text('fn make(target: String, argument: String): Syntax { quote { pub struct Generated(pub val number: Int) } }')
+        self.manifest(dependencies={'provider': self.dependency('provider')})
+        main = self.src / 'main.ly'
+        main.write_text('import macro provider.current\nfn main(): Unit { print(#current()) }')
+        functions = provider / 'src/answer.ly'
+        generated = '#make(export Generated)\nfn marker(): Unit {}\n'
+        functions.write_text(generated + 'pub fn notUsed(value: Generated): Int { print(value.number); 0 }\npub fn answer(): Int { 4 }')
+        result = self.cli('run', self.pkg)
+        self.assertEqual((result.returncode, result.stdout.splitlines()), (0, [b'4']), result.stderr.decode())
+        for body, fragment in (('@trace\npub fn answer(): Int { 4 }', '尚未展开或装饰'),
+                               (generated + 'pub fn answer(): Int { Generated(4).number }', 'Generated'),
+                               ('pub fn answer(): Int { if false { print(1) }; 4 }', 'print')):
+            with self.subTest(body=body):
+                functions.write_text(body)
+                error = self.diagnostic('LYM0002' if fragment == 'print' else 'LYM0004', fragment)
+                self.assertEqual(Path(error['file']), main)
+        (provider / 'src/nested').mkdir()
+        functions.write_text('pub import macro self.nested.second as current')
+        (provider / 'src/nested/api.ly').write_text('pub import macro self.current as second')
+        self.diagnostic('LYM0004', '重导出')
+
+    def test_instance_decorators_preserve_receiver_overloads_defaults_and_cold_tasks(self):
+        provider = self.library('provider')
+        decorators = provider / 'src/.decorators'
+        decorators.mkdir()
+        (decorators / 'observe.ly').write_text('''pub fn observe(target: String, label: String): Syntax {
+    val tag = syntaxString(label)
+    val failure = if label == "failure " { quote { throw Exception("hook failure"); } }
+                  else { quote { print(exception.message); } }
+    syntaxAround(
+        quote { print(splice(tag) + this.name); },
+        quote { print((result as? Int) ?? 0); },
+        failure
+    )
+}
+''')
+        self.manifest(dependencies={'provider': self.dependency('provider')})
+        self.native('''import decorator provider.observe as traceMember
+exception Original
+class Box<T>(val name: String, val item: T) {
+    @traceMember("outer ")
+    @traceMember("inner ")
+    async fn read(number: Int = 7): Int {
+        if number < 0 { throw Exception("bad") }
+        number
+    }
+    fn read(text: String): String { text + this.name }
+    @traceMember("failure ")
+    fn fail(): Int { throw Original("original") }
+    @trace
+    fn identity<U>(value: U) { value }
+}
+async fn main(): Unit {
+    val box = Box("box", 0)
+    val pending = box.read()
+    print("cold")
+    print(await pending)
+    print(await pending)
+    val bound: (Int) -> Task<Int> = box.read
+    try { val _ = await bound(-1) } catch e: Exception { print(e.message) }
+    print(box.read("sync "))
+    print(box.identity("generic"))
+    try { val _ = box.fail() } catch e: Original { print(e.message); print(e.cleanupFailures[0].message) }
+}
+''', ['cold', 'outer box', 'inner box', '7', '7', '7', '7', 'outer box', 'inner box', 'bad', 'bad', 'bad',
+      'sync box', 'trace: identity', 'generic', 'failure box', 'original', 'hook failure'])
+
+    def test_quote_splice_diagnostics_keep_the_argument_range(self):
+        expressions = self.src / '.expressions'
+        expressions.mkdir()
+        (expressions / 'increment.ly').write_text('''fn increment(target: String, argument: String): Syntax {
+    quote { requireInt(splice(syntaxArgument(0))) }
+}
+''')
+        main = self.src / 'main.ly'
+        source = 'fn requireInt(value: Int): Int { value }\nfn main(): Unit { val label = "值🙂"; print(#increment(label)) }'
+        main.write_text(source, encoding='utf-8', newline='\n')
+        error = self.diagnostic('LYT0001', '实际是 String')
+        self.assertEqual(Path(error['file']), main)
+        self.assertEqual(error['range']['start']['offset'], source.encode('utf-8').rfind(b'label'))
+
     def test_declared_input_and_cold_decorator(self):
         self.manifest(macroInputs={'make': {'greeting': 'inputs/message.txt'}})
         (self.pkg / 'inputs').mkdir()

@@ -128,6 +128,7 @@ struct Function {
     ConstKind constant{};
     bool property{};
     std::vector<Identifier> throwsTypes{};
+    std::optional<Span> pendingExpansion{};
 };
 
 struct FieldDefault { std::size_t function; bool emptyOption; };
@@ -151,15 +152,17 @@ Identifier nominalAnnotation(const auto& declaration) {
     result.text += '>';
     return result;
 }
-struct Import { std::size_t file; bool isPublic; std::vector<Identifier> path; Identifier alias; };
+enum class ImportKind { Runtime, Macro, Decorator };
+struct Import { std::size_t file; bool isPublic; std::vector<Identifier> path; Identifier alias; ImportKind kind{}; };
 enum class ExpansionTarget { Function, Aggregate, Enumeration };
 struct Expansion { std::size_t file; Identifier name; std::optional<Identifier> argument; bool decorator; ExpansionTarget kind; std::size_t target; std::vector<Identifier> exports{}; };
 struct MacroArgument { Span span; std::optional<std::string> literal; };
 struct ExpressionExpansion { Identifier name; Span span, argumentsSpan; std::vector<MacroArgument> arguments; };
+struct SyntaxRef { std::size_t index; };
 struct SyntaxToken { Span span; std::string kind; };
 struct Module { std::vector<Function> functions; std::vector<Aggregate> aggregates; std::vector<Import> imports; std::vector<Expansion> expansions; std::vector<Trait> traits{}; std::vector<Enumeration> enums{}; std::vector<Extension> extensions{}; std::vector<std::vector<std::string>> importedExtensions{}; std::vector<ExceptionType> exceptions{}; std::vector<TypeAlias> aliases{}; };
 Module parse(const std::vector<Source>& sources);
-void parseFile(Module& module, const Source& source, std::size_t file, std::vector<ExpressionExpansion>* expressions = nullptr);
+void parseFile(Module& module, const Source& source, std::size_t file, std::vector<ExpressionExpansion>* expressions = nullptr, bool macroImplementation = false);
 void validateMacroExpression(const Source& generated);
 std::vector<SyntaxToken> syntaxTokens(const Source& source, bool comments = false, bool partial = false);
 

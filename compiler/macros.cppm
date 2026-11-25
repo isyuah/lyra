@@ -4,7 +4,6 @@ module;
 #include <filesystem>
 #include <fstream>
 #include <functional>
-#include <limits>
 #include <map>
 #include <memory>
 #include <optional>
@@ -24,30 +23,44 @@ module;
 export module lyra.macros;
 import lyra.check;
 import lyra.macro_syntax;
-import lyra.numbers;
 import lyra.platform;
 
 export namespace lyra {
 inline constexpr std::size_t macroInputByteLimit = 1024 * 1024;
 using MacroFiles = std::map<std::string, std::map<std::string, std::filesystem::path>>;
 struct MacroPackage { std::filesystem::path root; MacroFiles inputs; const SourceOverlay* overlays{}; std::filesystem::path cache{}; };
+enum class MacroKind { Declaration, Expression, Decorator };
+struct MacroOrigin { std::filesystem::path path; std::string package, name; bool imported; };
+using MacroResolver = std::function<MacroOrigin(const Source&, const Identifier&, MacroKind)>;
+using MacroLinker = std::function<std::string(const MacroOrigin&, Module&, std::vector<Source>&)>;
+struct MacroEnvironment { const MacroResolver& resolve; const MacroLinker& link; };
 struct MacroType { std::string kind, name, module; std::vector<MacroType> arguments{}; };
 using MacroTypeResolver = std::function<MacroType(std::size_t, const Identifier&, std::span<const Identifier>)>;
 void expandMacros(Module& syntax, std::vector<Source>& sources, const std::map<std::string, MacroPackage>& packages,
-    std::vector<std::filesystem::path>& inputs, const MacroTypeResolver& resolveType, std::string_view typeEnvironment);
-void parsePackageFile(Module& syntax, Source& source, std::size_t file, const MacroPackage& package, std::vector<std::filesystem::path>& inputs);
+    std::vector<std::filesystem::path>& inputs, const MacroTypeResolver& resolveType, std::string_view typeEnvironment, const MacroEnvironment& environment);
+void expandExpressions(Source& source, std::size_t file, const MacroPackage& package, std::vector<std::filesystem::path>& inputs,
+    const MacroEnvironment& environment);
+std::string_view macroDirectory(MacroKind kind);
 }
 
 namespace lyra {
 namespace fs = std::filesystem;
+
+std::string_view macroDirectory(MacroKind kind) {
+    switch (kind) {
+        case MacroKind::Declaration: return "macros";
+        case MacroKind::Expression: return "expressions";
+        case MacroKind::Decorator: return "decorators";
+    }
+    std::unreachable();
+}
+
 namespace {
 namespace json = llvm::json;
-using Value = std::variant<std::monostate, bool, std::int64_t, std::string, SyntaxRef>;
-struct Returned { Value value; };
 constexpr auto byteLimit = macroInputByteLimit;
 constexpr std::size_t cacheByteLimit = 16 * byteLimit;
 constexpr std::size_t checksumLength = 64;
-constexpr auto prelude = R"(struct Syntax(val handle: Int)
+constexpr auto prelude = R"(pub struct Syntax(val handle: Int)
 fn fieldCount(): Int { 0 }
 fn fieldName(index: Int): String { "" }
 fn fieldType(index: Int): String { "" }
@@ -90,6 +103,8 @@ fn syntaxMember(receiver: Syntax, name: String): Syntax { receiver }
 fn syntaxBlock(statements: Syntax): Syntax { statements }
 fn syntaxAround(before: Syntax, after: Syntax, failure: Syntax): Syntax { before }
 fn syntaxError(node: Syntax, message: String): Syntax { node }
+fn quoteText(text: String): Syntax { Syntax(0) }
+fn quoteJoin(left: Syntax, right: Syntax): Syntax { left }
 fn optionInner(typeName: String): String { "" }
 fn listElement(typeName: String): String { "" }
 fn macroQuote(text: String): String { "" }
@@ -162,7 +177,7 @@ const std::string& compilerFingerprint() {
 }
 
 std::string cacheKey(const Source& source, const Expansion& prefix, const Source& code, const Identifier* target,
-                     std::string_view kind, const InputSnapshot& inputs, std::string_view typeEnvironment) {
+                     std::string_view kind, const InputSnapshot& inputs, std::string_view typeEnvironment, std::string_view dependencies) {
     llvm::SHA256 hash;
     auto text = [&](std::string_view value) {
         hash.update(std::to_string(value.size()));
@@ -171,13 +186,14 @@ std::string cacheKey(const Source& source, const Expansion& prefix, const Source
     };
     auto number = [&](std::size_t value) { text(std::to_string(value)); };
     auto span = [&](Span value) { number(value.begin); number(value.end); };
-    text("lyra-macro-cache-2");
+    text("lyra-macro-cache-3");
     text(nativeTriple);
     text(compilerFingerprint());
     text(pathText(code.path));
     text(code.text);
     text(kind);
     text(typeEnvironment);
+    text(dependencies);
     text(prefix.name.text);
     span(prefix.name.span);
     number(prefix.decorator);
@@ -324,8 +340,7 @@ std::string quote(const std::string& text) {
     return result + '"';
 }
 
-struct Machine {
-    const CheckedModule& program;
+struct MacroContext {
     const Source& use;
     const Expansion& expansion;
     const std::vector<Field>& fields;
@@ -339,17 +354,11 @@ struct Machine {
     std::span<const Identifier> parameters{};
     std::span<const Bound> bounds{};
     std::optional<SyntaxRef> target{}, body{};
-    unsigned fuel = 50000, depth = 0;
-    std::size_t bytes = 0;
     std::map<std::string, std::string> inputs{};
     std::set<std::size_t> defaultFields{};
 
     [[noreturn]] void error(const std::string& message) const { throw at(use, expansion.name.span, "LYM0002", message); }
-    void budget(std::size_t size) {
-        bytes += size;
-        if (size > byteLimit || bytes > 32 * byteLimit) error("宏展开超出字节预算");
-    }
-    Value input(const std::string& key) {
+    MacroValue input(const std::string& key) {
         if (auto saved = inputs.find(key); saved != inputs.end()) return saved->second;
         auto grants = package.inputs.find(expansion.name.text);
         if (grants == package.inputs.end() || !grants->second.contains(key)) error("宏未获得只读输入：" + key);
@@ -358,7 +367,7 @@ struct Machine {
         return inputs.emplace(key, std::move(value.text)).first->second;
     }
 
-    Value host(const std::string& name, const std::vector<Value>& args) {
+    MacroValue host(std::string_view name, std::span<const MacroValue> args) {
         if (name == "fieldCount") return static_cast<std::int64_t>(fields.size());
         if (name == "targetKind") return kind;
         if (name == "typeParameterCount") return static_cast<std::int64_t>(parameters.size());
@@ -385,7 +394,7 @@ struct Machine {
         }
         if (name == "syntaxTarget" || name == "syntaxBody") {
             auto ref = name == "syntaxTarget" ? target : body;
-            if (!ref) error("此位置没有 " + name + " 所需的语法节点");
+            if (!ref) error("此位置没有 " + std::string(name) + " 所需的语法节点");
             return *ref;
         }
         if (name == "optionInner" || name == "listElement") {
@@ -397,6 +406,8 @@ struct Machine {
         if (name == "macroQuote") return quote(std::get<std::string>(args.front()));
         if (name == "macroContains") return std::get<std::string>(args[0]).find(std::get<std::string>(args[1])) != std::string::npos;
         if (name == "macroInput") return input(std::get<std::string>(args.front()));
+        if (name == "$quoteText") return arena.add({SyntaxForm::Code, "quote", std::get<std::string>(args[0])});
+        if (name == "$quoteJoin") return arena.add({SyntaxForm::Join, "quote", {}, {std::get<SyntaxRef>(args[0]), std::get<SyntaxRef>(args[1])}});
         if (name == "argumentCount" || name == "syntaxArgument" || name == "argumentString") {
             if (!expression) error("此查询仅适用于表达式宏");
             if (name == "argumentCount") return static_cast<std::int64_t>(expression->arguments.size());
@@ -497,115 +508,6 @@ struct Machine {
         return field.isPublic;
     }
 
-    Value invoke(const CheckedFunction& fn, const std::vector<Value>& args) {
-        if (fn.syntax.file == 0) return host(fn.syntax.name.text, args);
-        if (++depth > 64) error("宏调用深度超过 64");
-        std::vector<Value> locals(fn.locals.size());
-        std::copy(args.begin(), args.end(), locals.begin());
-        Value result;
-        try { result = eval(fn, fn.syntax.body, locals); } catch (Returned& ret) { result = std::move(ret.value); }
-        --depth;
-        return result;
-    }
-
-    Value math(Op op, const Value& left, const Value& right) {
-        if (op == Op::Eq || op == Op::Ne) return op == Op::Eq ? left == right : left != right;
-        if (op == Op::Add && std::holds_alternative<std::string>(left)) return std::get<std::string>(left) + std::get<std::string>(right);
-        auto first = std::get<std::int64_t>(left), second = std::get<std::int64_t>(right);
-        std::int64_t result;
-        switch (op) {
-            case Op::Add: if (!__builtin_add_overflow(first, second, &result)) return result; break;
-            case Op::Sub: if (!__builtin_sub_overflow(first, second, &result)) return result; break;
-            case Op::Mul: if (!__builtin_mul_overflow(first, second, &result)) return result; break;
-            case Op::Div: if (second && !(first == std::numeric_limits<std::int64_t>::min() && second == -1)) return first / second; break;
-            case Op::Rem: if (second == -1) return std::int64_t{0}; if (second) return first % second; break;
-            case Op::Lt: return first < second;
-            case Op::Le: return first <= second;
-            case Op::Gt: return first > second;
-            case Op::Ge: return first >= second;
-            case Op::BitAnd: return first & second;
-            case Op::BitXor: return first ^ second;
-            case Op::BitOr: return first | second;
-            case Op::Shl: case Op::Shr:
-                if (second < 0 || second >= 64) error("宏中位移量超出范围");
-                return op == Op::Shl ? first << second : first >> second;
-            default: error("此运算不能用于编译期宏");
-        }
-        error("宏中整数溢出或除零");
-    }
-
-    std::string display(Value value) {
-        if (auto integer = std::get_if<std::int64_t>(&value)) return std::to_string(*integer);
-        if (auto boolean = std::get_if<bool>(&value)) return *boolean ? "true" : "false";
-        return std::get<std::string>(std::move(value));
-    }
-
-    Value eval(const CheckedFunction& fn, ExprId id, std::vector<Value>& locals) {
-        if (!fuel--) error("宏展开超过执行步数预算");
-        auto sub = [&](ExprId child) { return eval(fn, child, locals); };
-        const auto& info = fn.expressions[id];
-        const auto& node = fn.syntax.expressions[id].node;
-        Value result;
-        if (auto value = std::get_if<IntegerLiteral>(&node)) result = static_cast<std::int64_t>(integerBits(*value));
-        else if (auto value = std::get_if<bool>(&node)) result = *value;
-        else if (auto str = std::get_if<StringLiteral>(&node)) result = str->bytes;
-        else if (auto item = std::get_if<DisplayValue>(&node)) result = display(sub(item->value));
-        else if (auto text = std::get_if<TextTemplate>(&node)) {
-            std::string combined;
-            for (auto part : text->parts) {
-                combined += std::get<std::string>(sub(part));
-                budget(combined.size());
-            }
-            result = std::move(combined);
-        }
-        else if (std::holds_alternative<Identifier>(node)) result = locals[info.target];
-        else if (auto binding = std::get_if<Binding>(&node)) locals[info.target] = sub(binding->value);
-        else if (auto block = std::get_if<Block>(&node)) {
-            for (auto& statement : block->statements) { result = sub(statement.expression); if (statement.semicolon) result = {}; }
-        } else if (auto branch = std::get_if<Conditional>(&node)) {
-            if (std::get<bool>(sub(branch->condition))) result = sub(branch->yes);
-            else if (branch->no) result = sub(*branch->no);
-        } else if (auto loop = std::get_if<While>(&node)) {
-            if (loop->pattern) error("宏中的 while 暂不支持模式");
-            while (std::get<bool>(sub(loop->condition))) {
-                try { sub(loop->body); } catch (Jump jump) { if (jump == Jump::Break) break; }
-            }
-        } else if (auto jump = std::get_if<Jump>(&node)) throw *jump;
-        else if (auto ret = std::get_if<Return>(&node)) throw Returned{ret->value ? sub(*ret->value) : Value{}};
-        else if (auto unary = std::get_if<Unary>(&node)) {
-            auto operand = sub(unary->operand);
-            if (unary->op == Op::Not) result = !std::get<bool>(operand);
-            else if (unary->op == Op::Complement) result = ~std::get<std::int64_t>(operand);
-            else result = math(Op::Sub, std::int64_t{0}, operand);
-        } else if (auto binary = std::get_if<Binary>(&node)) {
-            auto op = binary->op;
-            if (assignment(op)) {
-                if (!std::holds_alternative<Identifier>(fn.syntax.expressions[binary->left].node)) error("宏中只能写入局部绑定");
-                auto slot = fn.expressions[binary->left].target;
-                auto left = locals[slot];
-                auto right = sub(binary->right);
-                locals[slot] = op == Op::Set ? right : math(compoundOperator(op), left, right);
-                if (auto str = std::get_if<std::string>(&locals[slot])) budget(str->size());
-            } else {
-                auto left = sub(binary->left);
-                if (op == Op::And) result = std::get<bool>(left) && std::get<bool>(sub(binary->right));
-                else if (op == Op::Or) result = std::get<bool>(left) || std::get<bool>(sub(binary->right));
-                else result = math(op, left, sub(binary->right));
-            }
-        } else if (auto call = std::get_if<Call>(&node)) {
-            if (info.callee == Callee::ToString) result = display(sub(*call->receiver));
-            else {
-                if (info.callee != Callee::Function || call->receiver) error("编译期不能调用运行时函数：" + call->name.text);
-                const auto& callee = program.functions[info.target];
-                if (call->arguments.size() != callee.syntax.parameters.size()) error("编译期宏调用需要显式传入每个形参");
-                std::vector<Value> args(call->arguments.size());
-                for (std::size_t index = 0; index < args.size(); ++index) args[info.argumentSlots[index]] = sub(call->arguments[index].value);
-                result = invoke(callee, args);
-            }
-        } else error("此表达式不属于受限的编译期 Lyra 子集");
-        if (auto str = std::get_if<std::string>(&result)) budget(str->size());
-        return result;
-    }
 };
 
 struct MacroDeclaration {
@@ -616,59 +518,71 @@ struct MacroDeclaration {
     std::string_view typeEnvironment{};
 };
 
-ExpandedMacro expand(const Source& source, const Expansion& prefix, const MacroPackage& package, const Identifier* target, const std::vector<Field>& fields, const std::string& kind, std::vector<fs::path>& files, const ExpressionExpansion* expression = nullptr, MacroDeclaration declaration = {}) {
-    auto directory = expression ? "expressions" : prefix.decorator ? "decorators" : "macros";
-    auto file = prefix.name.text + ".ly";
-    auto path = package.root / "src" / (std::string(".") + directory) / file;
+ExpandedMacro expand(const Source& source, const Expansion& prefix, const MacroPackage& package, const Identifier* target,
+    const std::vector<Field>& fields, const std::string& kind, std::vector<fs::path>& files, const MacroEnvironment& environment,
+    const ExpressionExpansion* expression = nullptr, MacroDeclaration declaration = {}) {
+    auto origin = environment.resolve(source, prefix.name, expression ? MacroKind::Expression : prefix.decorator ? MacroKind::Decorator : MacroKind::Declaration);
+    const auto& path = origin.path;
     auto overlaid = package.overlays && package.overlays->contains(path);
-    if (overlaid || fs::is_regular_file(path)) {
-        auto relative = fs::weakly_canonical(path).lexically_relative(fs::canonical(package.root));
-        if (relative.empty() || *relative.begin() == "..") throw at(source, prefix.name.span, "LYM0002", "宏实现必须位于声明包内");
-    } else {
-        path = sdkRoot() / "share/lyra/std/meta" / directory / file;
-    }
-    if (!overlaid && !fs::is_regular_file(path)) throw at(source, prefix.name.span, "LYM0001", "找不到" + std::string(expression ? "表达式宏 #" : prefix.decorator ? "装饰器 @" : "声明宏 #") + prefix.name.text);
     if ((overlaid ? package.overlays->at(path).size() : fs::file_size(path)) > byteLimit) throw at(source, prefix.name.span, "LYM0002", "宏实现超过大小限制");
     files.push_back(path);
-    auto implementation = loadSource(path, {}, overlaid ? package.overlays : nullptr);
+    std::vector<Source> code{sourceText("<macro-prelude>", prelude, "$macroPrelude"), loadSource(path, "$macroImplementation", overlaid ? package.overlays : nullptr)};
+    Module parsed;
+    parseFile(parsed, code[0], 0);
+    for (auto& fn : parsed.functions) {
+        fn.isPublic = true;
+        if (fn.name.text == "quoteText" || fn.name.text == "quoteJoin") fn.name.text.insert(0, "$");
+    }
+    auto start = parsed.functions.size();
+    std::vector<ExpressionExpansion> calls;
+    parseFile(parsed, code[1], 1, &calls, true);
+    if (!calls.empty() || !parsed.expansions.empty() || std::ranges::any_of(parsed.imports, [](const auto& use) { return use.kind != ImportKind::Runtime; }))
+        throw at(source, prefix.name.span, "LYM0004", "编译期阶段环：宏实现不能调用其他宏或装饰器");
+    std::optional<std::size_t> entry;
+    for (auto index = start; index < parsed.functions.size(); ++index) {
+        const auto& fn = parsed.functions[index];
+        if (fn.isAsync || fn.foreignSymbol || fn.conversion)
+            throw at(source, prefix.name.span, "LYM0002", "宏实现不能声明异步、extern 或 implicit 函数");
+        if (fn.owner || fn.extensionGroup || fn.name.text != origin.name) continue;
+        if (entry || fn.constant == ConstKind::Value || !fn.typeParameters.empty() ||
+            fn.result.text.empty() || std::ranges::any_of(fn.parameters, [](const auto& param) { return param.variadic || param.defaultValue; }))
+            throw at(source, prefix.name.span, "LYM0002", "宏入口必须是无重载、泛型、默认实参或变长形参的同步函数");
+        entry = index;
+    }
+    if (!entry) throw at(source, prefix.name.span, "LYM0002", "宏实现缺少入口 fn " + origin.name + "(target: String, argument: String): Syntax");
+    if (origin.imported && !parsed.functions[*entry].isPublic)
+        throw at(source, prefix.name.span, "LYM0001", "导入的宏或装饰器入口必须是 pub fn：" + origin.name);
+    auto dependencies = environment.link(origin, parsed, code);
     std::optional<InputSnapshot> prepared;
     fs::path cache;
     if (!package.cache.empty() && !compilerFingerprint().empty()) prepared = snapshotInputs(source, prefix, package);
     if (prepared) {
-        cache = package.cache / fromUtf8(cacheKey(source, prefix, implementation, target, kind, *prepared, declaration.typeEnvironment) + ".expansion");
+        cache = package.cache / fromUtf8(cacheKey(source, prefix, code[1], target, kind, *prepared, declaration.typeEnvironment, dependencies) + ".expansion");
         if (auto hit = loadExpansion(cache, source, fields, *prepared)) {
             for (const auto& key : hit->inputKeys) files.push_back(prepared->at(key).path);
             return std::move(*hit);
         }
     }
-    std::vector<Source> code{sourceText("<macro-prelude>", prelude, {}), std::move(implementation)};
-    Module parsed;
-    parseFile(parsed, code[0], 0);
-    parseFile(parsed, code[1], 1);
-    if (!parsed.imports.empty() || parsed.aggregates.size() != 1 || !parsed.expansions.empty() || !parsed.traits.empty() || !parsed.enums.empty() || !parsed.extensions.empty() || !parsed.exceptions.empty()) throw at(source, prefix.name.span, "LYM0002", "宏实现只能声明同步的纯计算函数");
-    for (const auto& fn : parsed.functions) if (fn.isAsync || fn.foreignSymbol || fn.conversion || !fn.typeParameters.empty() || fn.constant != ConstKind::None) throw at(source, prefix.name.span, "LYM0002", "宏不能使用 extern、异步、泛型入口、隐式转换或 const 声明");
-    auto checked = check(std::move(parsed), code, false);
-    const auto syntaxType = Type{Type::Record, 0};
-    auto scalar = [&](Type type) { return type == Type::Int || type == Type::Bool || type == Type::String || type == Type::Unit || type == Type::Never || type == syntaxType; };
-    for (const auto& fn : checked.functions) {
-        if (!scalar(fn.result) || !std::ranges::all_of(fn.locals, [&](const auto& local) { return scalar(local.type); }) ||
-            !std::ranges::all_of(fn.expressions, [&](const auto& expr) { return scalar(expr.type) && (!expr.sourceType || scalar(*expr.sourceType)); })) {
-            throw at(source, prefix.name.span, "LYM0002", "编译期宏只可计算 Int、Bool、String、Unit 和 Syntax");
-        }
-    }
-    auto it = std::find_if(checked.functions.begin(), checked.functions.end(), [&](const auto& fn) { return fn.syntax.file == 1 && fn.syntax.name.text == prefix.name.text; });
-    if (it == checked.functions.end() || it->result != syntaxType || it->syntax.parameters.size() != 2 || it->locals[0].type != Type::String || it->locals[1].type != Type::String) {
-        throw at(source, prefix.name.span, "LYM0002", "宏入口应为 fn " + prefix.name.text + "(target: String, argument: String): Syntax");
-    }
-    auto [function, aggregate, enumeration, resolveType, environment] = declaration;
-    Machine machine{checked, source, prefix, fields, kind, package, files, expression, {source, prefix.name.span}, prepared ? &*prepared : nullptr, resolveType};
+    auto [function, aggregate, enumeration, resolveType, typeEnvironment] = declaration;
+    MacroContext machine{source, prefix, fields, kind, package, files, expression, {source, prefix.name.span}, prepared ? &*prepared : nullptr, resolveType};
     auto generics = [&](const auto& item) { machine.parameters = item.typeParameters; machine.bounds = item.bounds; };
     if (function) generics(*function);
     if (aggregate) generics(*aggregate);
     if (enumeration) generics(*enumeration);
     if (function && !function->foreignSymbol) machine.body = machine.arena.expression(*function, function->body);
     if (target) machine.target = machine.arena.declaration(*target, fields, function, aggregate, enumeration, machine.body);
-    auto output = std::get<SyntaxRef>(machine.invoke(*it, {target ? target->text : std::string{}, prefix.argument ? prefix.argument->text : std::string{}}));
+    MacroExecution execution{*entry, 0, target ? target->text : std::string{}, prefix.argument ? prefix.argument->text : std::string{},
+        [&](auto name, auto arguments) { return machine.host(name, arguments); }};
+    try { check(std::move(parsed), code, false, &execution); }
+    catch (const Diagnostic& failure) {
+        if (failure.code == "LYM0002" && failure.site && failure.site->file == source.userSite(prefix.name.span).file) throw;
+        auto phase = failure.code == "LYM0004" || failure.code == "LYN0001" || failure.code == "LYT0003";
+        auto diagnostic = at(source, prefix.name.span, phase ? "LYM0004" : "LYM0002",
+            (phase ? "宏的编译期依赖必须是手写且已可用的声明：" : "宏求值失败：") + failure.message);
+        if (failure.site) diagnostic.generated = failure.site;
+        throw diagnostic;
+    }
+    auto output = execution.output;
     ExpandedMacro result{{}, std::move(machine.defaultFields), {}, std::move(cache)};
     for (const auto& [key, text] : machine.inputs) result.inputKeys.push_back(key);
     if (machine.arena.get(output).form != SyntaxForm::Around) result.output.code = machine.arena.render(output);
@@ -700,7 +614,8 @@ Source generatedSource(const Source& source, const Expansion& prefix, const std:
 }
 }
 
-void parsePackageFile(Module& syntax, Source& source, std::size_t file, const MacroPackage& package, std::vector<fs::path>& inputs) {
+void expandExpressions(Source& source, std::size_t file, const MacroPackage& package, std::vector<fs::path>& inputs,
+    const MacroEnvironment& environment) {
     const auto limit = source.text.size() + 4 * byteLimit;
     for (unsigned depth = 0; source.text.find('#') != std::string::npos; ++depth) {
         Module scratch;
@@ -725,7 +640,7 @@ void parsePackageFile(Module& syntax, Source& source, std::size_t file, const Ma
             auto argument = call.argumentsSpan;
             auto wrapper = call.arguments.empty() ? call.name.span : call.argumentsSpan;
             Expansion prefix{file, call.name, Identifier{std::string(original.substr(argument.begin, argument.end - argument.begin)), argument}, false, ExpansionTarget::Function, 0};
-            auto generated = expand(source, prefix, package, nullptr, {}, "expression", inputs, &call);
+            auto generated = expand(source, prefix, package, nullptr, {}, "expression", inputs, environment, &call);
             std::string skeleton;
             for (const auto& piece : generated.output.code) skeleton += piece.copied && piece.text.contains('#') ? "0" : piece.text;
             auto output = sourceText(fromUtf8(pathText(source.path) + "(#" + call.name.text + ")"), std::move(skeleton), source.moduleId);
@@ -748,16 +663,14 @@ void parsePackageFile(Module& syntax, Source& source, std::size_t file, const Ma
         next.pieces = std::move(pieces);
         source = std::move(next);
     }
-    parseFile(syntax, source, file);
 }
 
 void expandMacros(Module& syntax, std::vector<Source>& sources, const std::map<std::string, MacroPackage>& packages,
-    std::vector<fs::path>& inputs, const MacroTypeResolver& resolveType, std::string_view typeEnvironment) {
+    std::vector<fs::path>& inputs, const MacroTypeResolver& resolveType, std::string_view typeEnvironment, const MacroEnvironment& environment) {
     auto prefixes = std::exchange(syntax.expansions, {});
     std::vector<std::pair<Expansion, ExpandedMacro>> decorators;
     for (const auto& prefix : prefixes) {
         const auto& source = sources[prefix.file];
-        if (prefix.decorator && prefix.name.text == "derive") throw at(source, prefix.name.span, "LYM0001", "derive 是声明宏；请写 #derive(Json)");
         std::vector<Field> fields;
         MacroDeclaration declaration{.resolveType = &resolveType, .typeEnvironment = typeEnvironment};
         if (prefix.kind == ExpansionTarget::Aggregate) {
@@ -768,16 +681,21 @@ void expandMacros(Module& syntax, std::vector<Source>& sources, const std::map<s
         } else {
             declaration.function = &syntax.functions[prefix.target];
             if (prefix.decorator && (declaration.function->foreignSymbol || declaration.function->conversion)) throw at(source, prefix.name.span, "LYM0002", "装饰器需要普通函数体");
-            for (const auto& param : declaration.function->parameters) fields.push_back({param.name, param.type, false, true, param.attributes});
+            for (auto slot = static_cast<std::size_t>(declaration.function->hasReceiver); slot < declaration.function->parameters.size(); ++slot) {
+                const auto& param = declaration.function->parameters[slot];
+                fields.push_back({param.name, param.type, false, true, param.attributes});
+            }
         }
         const auto& name = declaration.enumeration ? declaration.enumeration->name : declaration.aggregate ? declaration.aggregate->name : declaration.function->name;
         auto kind = declaration.enumeration ? "enum" : declaration.aggregate ? declaration.aggregate->reference ? "class" : "struct" : "fn";
-        auto generated = expand(source, prefix, packages.at(source.moduleId), &name, fields, kind, inputs, nullptr, declaration);
+        auto generated = expand(source, prefix, packages.at(source.moduleId), &name, fields, kind, inputs, environment, nullptr, declaration);
         if (prefix.decorator) {
             if (prefix.kind == ExpansionTarget::Aggregate) {
                 if (generated.output.hooks) throw at(source, prefix.name.span, "LYM0002", "类型装饰器应生成辅助声明，不能返回 syntaxAround");
             } else {
                 if (!prefix.exports.empty()) throw at(source, prefix.name.span, "LYM0002", "函数装饰器不能生成公开声明");
+                if (declaration.function->owner && !declaration.function->hasReceiver)
+                    throw at(source, prefix.name.span, "LYM0002", "成员装饰器只适用于实例方法");
                 if (!generated.output.hooks) throw at(source, prefix.name.span, "LYM0002", "函数装饰器应返回 syntaxAround(before, after, failure)");
                 decorators.emplace_back(prefix, std::move(generated));
                 continue;
@@ -817,7 +735,7 @@ void expandMacros(Module& syntax, std::vector<Source>& sources, const std::map<s
         };
         publishAll(syntax.traits, traits); publishAll(syntax.aggregates, records); publishAll(syntax.enums, enums);
         publishAll(syntax.extensions, extensions); publishAll(syntax.exceptions, exceptions); publishAll(syntax.aliases, aliases);
-        if (!syntax.expansions.empty() || std::any_of(syntax.imports.begin() + imports, syntax.imports.end(), [](const auto& use) { return use.isPublic; })) reject();
+        if (!syntax.expansions.empty() || std::any_of(syntax.imports.begin() + imports, syntax.imports.end(), [](const auto& use) { return use.isPublic || use.kind != ImportKind::Runtime; })) reject();
         for (const auto& request : prefix.exports) if (!allowed.at(request.text))
             throw at(original, request.span, "LYM0002", "宏没有生成所请求的公开声明：" + request.text);
         storeExpansion(generated);
@@ -826,6 +744,13 @@ void expandMacros(Module& syntax, std::vector<Source>& sources, const std::map<s
         auto& [prefix, generated] = *item;
         auto site = prefix.name.span;
         auto start = std::to_string(syntax.functions.size());
+        auto hidden = syntax.functions[prefix.target];
+        std::size_t enclosing = 0;
+        if (hidden.owner) {
+            auto owns = [&](const auto& type) { return type.name.text == hidden.owner->text && sources[type.file].moduleId == sources[prefix.file].moduleId; };
+            if (auto aggregate = std::ranges::find_if(syntax.aggregates, owns); aggregate != syntax.aggregates.end()) enclosing = aggregate->typeParameters.size();
+            else enclosing = std::ranges::find_if(syntax.enums, owns)->typeParameters.size();
+        }
         bool enabled[] = {false, false, false};
         const std::string parameters[] = {"", "result: Any", "exception: Exception"};
         std::string hooks[3];
@@ -845,31 +770,54 @@ void expandMacros(Module& syntax, std::vector<Source>& sources, const std::map<s
             enabled[slot] = true;
             hooks[slot] = "$decoratorHook" + start + "_" + std::to_string(slot);
             hook.name.text = hooks[slot];
+            if (hidden.hasReceiver) {
+                hook.owner = Identifier{hidden.owner->text, {}};
+                hook.hasReceiver = true;
+                hook.parameters.insert(hook.parameters.begin(), Parameter{{"$this", hook.name.span}, {hidden.parameters.front().type.text, {}}});
+                hook.typeParameters = hidden.typeParameters;
+                for (auto& type : hook.typeParameters) type.span = {};
+                hook.bounds = hidden.bounds;
+                for (auto& bound : hook.bounds) {
+                    bound.trait.span = {};
+                    for (auto& binding : bound.bindings) binding.member.span = binding.type.span = {};
+                }
+            }
             sources.push_back(std::move(source));
             syntax.functions.push_back(std::move(hook));
         }
-        auto hidden = syntax.functions[prefix.target];
         hidden.name.text = "$decorated" + start;
+        hidden.name.span = site;
         hidden.isPublic = false;
+        hidden.pendingExpansion.reset();
         for (auto& param : hidden.parameters) param.defaultValue.reset();
         auto name = hidden.name.text;
         syntax.functions.push_back(std::move(hidden));
         auto& fn = syntax.functions[prefix.target];
+        fn.pendingExpansion.reset();
         auto add = [&](auto node) {
             fn.expressions.push_back({site, std::move(node)});
             return fn.expressions.size() - 1;
         };
         auto block = [&](std::vector<Statement> statements) { return add(Block{std::move(statements), site}); };
-        auto call = [&](const std::string& name, std::vector<Argument> args) { return add(Call{{name, site}, std::move(args)}); };
+        auto call = [&](const std::string& name, std::vector<Argument> args) {
+            auto receiver = fn.hasReceiver ? std::optional(add(This{})) : std::nullopt;
+            std::vector<Identifier> types;
+            if (receiver || name.starts_with("$decorated")) types.assign(fn.typeParameters.begin() + enclosing, fn.typeParameters.end());
+            return add(Call{{name, site}, std::move(args), receiver, std::move(types)});
+        };
         std::vector<Argument> args;
-        for (const auto& param : fn.parameters) args.push_back({{}, add(Identifier{param.name.text, param.name.span}), param.variadic ? std::optional(site) : std::nullopt});
-        auto value = add(Call{{name, site}, std::move(args), {}, fn.typeParameters});
+        for (auto slot = static_cast<std::size_t>(fn.hasReceiver); slot < fn.parameters.size(); ++slot) {
+            const auto& param = fn.parameters[slot];
+            args.push_back({{}, add(Identifier{param.name.text, param.name.span}), param.variadic ? std::optional(site) : std::nullopt});
+        }
+        auto value = call(name, std::move(args));
         if (fn.isAsync) value = add(TaskOp{false, site, value});
         if (enabled[2]) {
             auto exception = Identifier{"$decoratorException", site};
             auto failure = call(hooks[2], {{{}, add(exception)}});
             auto rethrow = add(Raise{site, std::nullopt});
-            auto handler = block({{failure, site}, {rethrow, {}}});
+            auto observe = add(Deferred{block({{failure, site}})});
+            auto handler = block({{observe, site}, {rethrow, {}}});
             value = add(Attempt{block({{value, {}}}), {{site, CatchBinding{exception, {"Exception", site}}, {}, handler}}});
         }
         std::vector<Statement> statements;

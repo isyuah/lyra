@@ -1,6 +1,6 @@
 # 编译期 Lyra
 
-Lyra 宏以 Lyra 编写，入口返回 `Syntax`；编译器解析并检查生成物，运行程序时不加载宏实现。包私有的声明宏、表达式宏和装饰器分别放在 `src/.macros/`、`src/.expressions/` 和 `src/.decorators/`。同名宏和装饰器由使用位置区分：声明前写 `#name` 或 `@name`，表达式位置写 `#name(...)`。
+Lyra 宏以 Lyra 编写，入口返回 `Syntax`；编译器解析并检查生成物，运行程序时不加载宏实现。声明宏、表达式宏和装饰器分别放在源码模块的 `.macros/`、`.expressions/` 和 `.decorators/`。同名入口由使用位置区分：声明前写 `#name` 或 `@name`，表达式位置写 `#name(...)`。公开入口用 `pub fn`，下游包可以写 `import macro kit.name as nameHere` 或 `import decorator kit.trace`；加 `pub import` 可重导出。
 
 ```lyra
 fn banner(target: String, argument: String): Syntax {
@@ -8,7 +8,7 @@ fn banner(target: String, argument: String): Syntax {
 }
 ```
 
-宏实现本身先通过普通 parser 和类型检查，再由受限编译期求值器执行；它不会链接进业务程序。表达式宏的 `target` 为空，`argument` 是完整实参文本；声明宏和装饰器的 `target` 是目标名称，`argument` 是标记参数。调用程序使用的外部文件必须在清单的 `macroInputs` 中按宏名称显式授权。展开只读取这些快照，不联网、不启动准备脚本，也不能自行读取其他文件、环境变量或子进程。
+宏实现本身先通过普通 parser 和类型检查，再由编译期求值器执行。可导入手写的纯同步函数、常量和类型；不能依赖生成声明或装饰后的函数体。表达式宏的 `target` 为空，`argument` 是完整实参文本；声明宏和装饰器的 `target` 是目标名称，`argument` 是标记参数。宏读取的外部文件必须由调用包在 `macroInputs` 中按使用处名称显式授权；改用别名时用别名配置。展开只读取这些快照，不联网、不启动准备脚本，也不读取其他宿主文件或环境变量。
 
 ## 语法节点
 
@@ -18,11 +18,20 @@ fn banner(target: String, argument: String): Syntax {
 
 使用 `syntaxCode(text)` 创建可信的 Lyra 源码片段；使用 `syntaxName`、`syntaxString`、`syntaxInt`、`syntaxCall`、`syntaxMember`、`syntaxBlock`、`syntaxJoin`、`syntaxConcat` 和 `syntaxArgs` 从节点构造输出。`syntaxArgument` 代表一个安全的语法插槽：只有将它放进输出代码，该实参才会在对应位置求值；映射括号也保留实参的来源位置。`syntaxError(node, message)` 把自定义错误指向被选中的源节点。生成代码进入正常名称解析、可见性、类型和泛型检查，因此宏不能绕过语言规则。
 
+也可用 `quote` 写模板，用 `splice` 插入节点。模板自己引入的局部名称与调用处隔离，插入的调用实参保留原绑定和位置。
+
+```lyra
+pub fn increment(target: String, argument: String): Syntax {
+    val input = syntaxArgument(0)
+    quote { splice(input) + 1 }
+}
+```
+
 声明宏可通过 `#derive(Json)` 生成私有辅助实现；若希望生成公开 API，必须在调用处写 `#name(export apiName)`，且生成内容必须恰好提供该公开名称。不能通过生成物发布未点名的 API、`extern`、新的宏或公开重导出。宏能查看目标函数体，但不接收全程序类型检查后的 AST。标准库 JSON 和 TOML 派生器分别见 [`std.json`](../json/README.md) 与 [`std.toml`](../toml/README.md)。
 
 ## 装饰器
 
-函数装饰器可返回 `syntaxAround(before, after, failure)`：`before` 在调用时先运行，`after` 只在返回成功后执行并可读取 `result: Any`，`failure` 只在异常时执行并可读取 `exception: Exception`，随后原样重抛。多层装饰器从外向内进入，按内向外处理返回值和异常。对异步函数，包装保留冷 `Task`：构造任务时不运行钩子，首次等待时执行包装体。
+函数和实例方法装饰器可返回 `syntaxAround(before, after, failure)`：`before` 先运行，`after` 只在成功后执行并可读取 `result: Any`，`failure` 可读取 `exception: Exception`。包装器重抛原异常，异常钩子自身失败时附加到 `cleanupFailures`。方法钩子可通过 `this` 读取接收者。多层装饰器从外向内进入，按内向外处理返回值和异常。对异步函数，包装保留冷 `Task`：构造任务时不运行钩子，首次激活时执行包装体。
 
 类型装饰器附着于 `struct` 或 `class`，读取其字段信息并生成同模块辅助声明；它不能修改原类型。若生成公开 API，调用处必须逐名授权，例如 `@makeBuilder(export buildUser)`；生成代码仍经过普通名称解析和类型检查。类型装饰器返回辅助声明代码，不使用函数装饰器的 `syntaxAround`。
 

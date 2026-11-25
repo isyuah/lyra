@@ -302,19 +302,28 @@ void recordTree(AnalysisInputs& inputs, const fs::path& directory, bool packaged
 }
 
 void recordMacroSources(AnalysisInputs& inputs, const fs::path& package, std::vector<fs::path>& overlayPaths) {
-    for (const auto* name : {".macros", ".expressions", ".decorators"}) {
-        auto directory = package / "src" / name;
-        if (!recordInput(inputs, directory, InputContents::Metadata, package)) continue;
-        trackTree(inputs, directory, "*.ly");
-        if (!fs::is_directory(directory)) continue;
-        for (const auto& item : fs::directory_iterator(directory)) {
-            const auto& path = item.path();
-            if (path.extension() != ".ly" || !recordInput(inputs, path, InputContents::Macro, package)) continue;
-            overlayPaths.push_back(path);
-            auto resolved = fs::weakly_canonical(path);
-            if (resolved.parent_path() != fs::weakly_canonical(directory)) {
-                inputs.watchedFiles.insert(resolved);
-                inputs.watchers.insert(watchFile(resolved));
+    auto src = package / "src";
+    std::vector<fs::path> modules{src};
+    if (fs::is_directory(src)) for (auto item = fs::recursive_directory_iterator(src); item != fs::recursive_directory_iterator{}; ++item) {
+        if (!item->is_directory()) continue;
+        if (pathText(item->path().filename()).starts_with('.')) item.disable_recursion_pending();
+        else if (!item->is_symlink()) modules.push_back(item->path());
+    }
+    for (const auto& module : modules) {
+        for (const auto* name : {".macros", ".expressions", ".decorators"}) {
+            auto directory = module / name;
+            if (!recordInput(inputs, directory, InputContents::Metadata, package)) continue;
+            trackTree(inputs, directory, "*.ly");
+            if (!fs::is_directory(directory)) continue;
+            for (const auto& item : fs::directory_iterator(directory)) {
+                const auto& path = item.path();
+                if (path.extension() != ".ly" || !recordInput(inputs, path, InputContents::Macro, package)) continue;
+                overlayPaths.push_back(path);
+                auto resolved = fs::weakly_canonical(path);
+                if (resolved.parent_path() != fs::weakly_canonical(directory)) {
+                    inputs.watchedFiles.insert(resolved);
+                    inputs.watchers.insert(watchFile(resolved));
+                }
             }
         }
     }

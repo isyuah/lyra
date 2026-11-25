@@ -6,6 +6,7 @@ module;
 #include <cstdint>
 #include <cstdlib>
 #include <deque>
+#include <functional>
 #include <llvm/ADT/APFloat.h>
 #include <llvm/ADT/APInt.h>
 #include <lyra/list_slice.hpp>
@@ -26,6 +27,8 @@ import lyra.numbers;
 
 export namespace lyra {
 void evaluateConstants(CheckedModule& module, const std::vector<Source>& sources);
+void evaluateMacro(CheckedModule& module, const std::vector<Source>& sources, MacroExecution& macro, std::size_t entry,
+    const std::function<void(std::size_t)>& checkBody);
 }
 
 namespace lyra {
@@ -89,6 +92,8 @@ struct Validation {
     ValueTypes types;
     std::vector<bool> visited;
     std::vector<std::size_t> pending;
+    const MacroExecution* macro{};
+    std::set<std::size_t> blocks{};
 };
 
 struct Validator {
@@ -102,9 +107,13 @@ struct Validator {
     void validateFunction(std::size_t index, Span site) const {
         const auto& target = state.module.functions[index];
         const auto& syntax = target.syntax;
+        if (state.macro && syntax.file == state.macro->prelude) return;
+        if (syntax.pendingExpansion)
+            throw at(state.sources[fn.syntax.file], site, "LYM0004", "编译期阶段环：依赖尚未展开或装饰的函数：" + syntax.name.text);
         if (syntax.isAsync || syntax.foreignSymbol || syntax.conversion ||
             (!syntax.parameters.empty() && syntax.parameters.back().variadic))
             reject(site, "编译期不能调用异步、外部、隐式转换或变长函数：" + syntax.name.text);
+        if (state.visited.size() < state.module.functions.size()) state.visited.resize(state.module.functions.size());
         if (state.visited[index]) return;
         state.visited[index] = true;
         state.pending.push_back(index);
@@ -133,9 +142,23 @@ struct Validator {
         }
     }
 
+    void validateConstant(ConstantUse target, Span site) const {
+        if (!state.macro) return;
+        if (target.kind == ConstantUse::Global) validateFunction(target.index, site);
+        else if (state.blocks.insert(target.index).second) {
+            const auto& block = state.module.blockConstants[target.index];
+            const auto& owner = state.module.functions[block.function];
+            if (!state.types.supports(block.type, false))
+                error(state.sources, owner, block.name.span, "LYCT0001", "块内常量必须保存不可变值；List、Class 和函数值只能暂存");
+            Validator{state, owner}.visit(block.initializer);
+        }
+    }
+
     void validatePattern(const CheckedPattern& pattern) const {
-        if (const auto* constant = std::get_if<PatternConstant>(&pattern.node))
+        if (const auto* constant = std::get_if<PatternConstant>(&pattern.node)) {
             validateValueOperation(constant->type, ValueOperation::Equal, pattern.site);
+            validateConstant(constant->target, pattern.site);
+        }
         for (const auto& part : pattern.parts) validatePattern(part);
     }
 
@@ -146,6 +169,7 @@ struct Validator {
         if (!state.types.supports(info.type) || !state.types.supports(rawType(fn, id)))
             reject(expr.span, "类型不能用于编译期计算：仅支持标量、Range<Int>、Struct、Class、Enum、Option、Result、List、FrozenList 和同步函数值");
         if (info.functionRef) validateFunction(*info.functionRef, expr.span);
+        if (info.constantRef) validateConstant(*info.constantRef, expr.span);
         for (const auto& pattern : info.patterns) validatePattern(pattern);
         const auto descend = [&](ExprId child) { visit(child); };
         std::visit([&](const auto& node) {
@@ -191,7 +215,10 @@ struct Validator {
             } else if constexpr (std::is_same_v<Node, DisplayValue>) {
                 descend(node.value);
                 if (fn.expressions[node.value].type.kind == Type::Record) validateFunction(info.target, expr.span);
-            } else if constexpr (std::is_same_v<Node, Binding>) { if (!node.constant) descend(node.value); }
+            } else if constexpr (std::is_same_v<Node, Binding>) {
+                if (node.constant) validateConstant({ConstantUse::Block, info.target}, node.name.span);
+                else descend(node.value);
+            }
             else if constexpr (std::is_same_v<Node, PatternBinding>) descend(node.value);
             else if constexpr (std::is_same_v<Node, Lambda>) {
                 if (node.isAsync) reject(expr.span, "编译期计算不支持异步 lambda");
@@ -278,6 +305,8 @@ struct Evaluation {
     std::deque<EvalValue> cells{};
     std::map<std::size_t, Closure> closures{};
     std::map<std::size_t, ConstRef> saved{}, loaded{};
+    const MacroExecution* macro{};
+    Type syntaxType{};
 
     void step(const CheckedFunction& fn, Span site) {
         if (!remaining--) error(sources, fn, site, "LYCT0004", "编译期计算超出执行步数预算");
@@ -563,7 +592,29 @@ struct Evaluation {
     }
 
     EvalValue invoke(const CheckedFunction& fn, std::vector<EvalValue> args, const CheckedFunction& caller, Span call, const Closure* closure = nullptr, const BlockConstant* block = nullptr) {
-        if (++depth > 16) error(sources, caller, call, "LYCT0004", "编译期调用深度超出预算（16）");
+        if (macro && fn.syntax.file == macro->prelude) {
+            auto name = std::string_view(fn.syntax.name.text);
+            if (auto separator = name.rfind("::"); separator != name.npos) name.remove_prefix(separator + 2);
+            std::vector<MacroValue> values;
+            for (std::size_t slot = 0; slot < args.size(); ++slot) {
+                auto type = fn.locals[slot].type;
+                if (type == syntaxType) values.emplace_back(SyntaxRef{std::get<std::uint64_t>(scalarValue(composite(args[slot]).fields.front(), caller, call))});
+                else {
+                    const auto& value = scalarValue(args[slot], caller, call);
+                    if (type == Type::Int) values.emplace_back(std::bit_cast<std::int64_t>(std::get<std::uint64_t>(value)));
+                    else if (type == Type::Bool) values.emplace_back(std::get<bool>(value));
+                    else values.emplace_back(std::get<std::string>(value));
+                }
+            }
+            auto result = macro->host(name, values);
+            if (fn.result == syntaxType)
+                return makeComposite(caller, call, syntaxType, std::monostate{}, {ConstScalar{static_cast<std::uint64_t>(std::get<SyntaxRef>(result).index)}});
+            if (fn.result == Type::Int) return std::bit_cast<std::uint64_t>(std::get<std::int64_t>(result));
+            if (fn.result == Type::Bool) return std::get<bool>(result);
+            if (fn.result == Type::String) return std::get<std::string>(std::move(result));
+            return {};
+        }
+        if (++depth > (macro ? 64U : 16U)) error(sources, caller, call, "LYCT0004", "编译期调用深度超出预算（" + std::to_string(macro ? 64 : 16) + "）");
         const auto frameBytes = fn.locals.size() * sizeof(EvalSlot);
         charge(caller, call, frameBytes);
         Frame frame{std::vector<EvalSlot>(fn.locals.size()), fn.result};
@@ -991,7 +1042,8 @@ struct Evaluation {
                 }
                 if (item.receiver && info.callee != Callee::Variant && fn.expressions[*item.receiver].type == Type::Never) return sub(*item.receiver);
                 if (info.callee == Callee::Indirect) {
-                    auto value = item.function ? sub(*item.function) : item.receiver ? composite(sub(*item.receiver)).fields[info.target] : frame.cell(info.target);
+                    auto value = item.function ? sub(*item.function) : item.receiver ? composite(sub(*item.receiver)).fields[info.target]
+                        : info.constantRef ? this->value(*info.constantRef, fn, site) : frame.cell(info.target);
                     if (info.narrowed) value = composite(value).fields.front();
                     const auto& closure = closures.at(std::get<ConstRef>(value).index);
                     auto skip = static_cast<std::size_t>(closure.receiver.has_value());
@@ -1138,6 +1190,38 @@ void evaluateConstants(CheckedModule& module, const std::vector<Source>& sources
         const auto& block = module.blockConstants[index];
         Evaluation{module, sources, active}.value({ConstantUse::Block, index}, module.functions[block.function], block.name.span);
     }
+}
+
+void evaluateMacro(CheckedModule& module, const std::vector<Source>& sources, MacroExecution& macro, std::size_t entry,
+    const std::function<void(std::size_t)>& checkBody) {
+    const auto& fn = module.functions[entry];
+    auto syntax = fn.result;
+    if (syntax.kind != Type::Record || module.aggregates[syntax.id].syntax.file != macro.prelude ||
+        !module.aggregates[syntax.id].syntax.name.text.ends_with("::Syntax") || fn.locals.size() != 2 ||
+        fn.locals[0].type != Type::String || fn.locals[1].type != Type::String)
+        error(sources, fn, fn.syntax.name.span, "LYM0002", "宏入口需要签名 (target: String, argument: String): Syntax");
+    Validation state{module, sources, ValueTypes{module, {}}, {}, {}, &macro};
+    Validator{state, fn}.validateFunction(entry, fn.syntax.name.span);
+    for (std::size_t cursor = 0; cursor < state.pending.size(); ++cursor) {
+        auto index = state.pending[cursor];
+        checkBody(index);
+        Validator{state, module.functions[index]}.run();
+    }
+    module.constants.resize(module.functions.size());
+    std::vector<bool> active(module.functions.size() + module.blockConstants.size());
+    Evaluation evaluation{module, sources, active, 50000};
+    evaluation.macro = &macro;
+    evaluation.syntaxType = syntax;
+    for (auto index : state.pending) {
+        const auto& item = module.functions[index];
+        if (item.syntax.constant == ConstKind::Value) evaluation.value({ConstantUse::Global, index}, item, item.syntax.name.span);
+    }
+    for (auto index : state.blocks) {
+        const auto& block = module.blockConstants[index];
+        evaluation.value({ConstantUse::Block, index}, module.functions[block.function], block.name.span);
+    }
+    auto result = evaluation.invoke(fn, {ConstScalar{macro.target}, ConstScalar{macro.argument}}, fn, fn.syntax.name.span);
+    macro.output.index = std::get<std::uint64_t>(std::get<ConstScalar>(evaluation.composite(result).fields.front()));
 }
 
 }

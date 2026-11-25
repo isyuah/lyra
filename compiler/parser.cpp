@@ -258,30 +258,12 @@ constexpr Infix infix[] = {
 
 class Parser {
 public:
-    Parser(const Source& source, std::size_t file, std::vector<ExpressionExpansion>* expressions = nullptr) : source(source), file(file), lexer(source), token(lexer.next()), next(lexer.next()), macros(expressions) {}
+    Parser(const Source& source, std::size_t file, std::vector<ExpressionExpansion>* expressions = nullptr, bool macroImplementation = false)
+        : source(source), file(file), lexer(source), token(lexer.next()), next(lexer.next()), macros(expressions), macroImplementation(macroImplementation) {}
 
     void appendTo(Module& module) {
         while (token.kind != Kind::End) {
-            auto firstPrefix = module.expansions.size();
-            while (is("#") || is("@")) {
-                bool decorator = text(consume()) == "@";
-                auto name = identifier();
-                std::optional<Identifier> argument;
-                std::vector<Identifier> extra, exports;
-                if (is("(")) {
-                    consume();
-                    if (!is(")") && !is("export")) argument = metadataValue();
-                    while (!is(")")) {
-                        if (argument || !exports.empty()) require(",");
-                        if (is("export")) { consume(); exports.push_back(identifier()); }
-                        else if (!decorator && name.text == "derive" && exports.empty()) extra.push_back(metadataValue());
-                        else throw at(source, token.span, "LYM0001", "此处需要 export name 或结束宏实参");
-                    }
-                    require(")");
-                }
-                module.expansions.push_back({file, name, std::move(argument), decorator, ExpansionTarget::Function, 0, exports});
-                for (auto& item : extra) module.expansions.push_back({file, name, std::move(item), decorator, ExpansionTarget::Function, 0, exports});
-            }
+            auto firstPrefix = prefixes(module);
             bool pub = visibility();
             if (is("const")) {
                 if (firstPrefix != module.expansions.size()) throw at(source, module.expansions[firstPrefix].name.span, "LYM0001", "不能修饰 const 声明");
@@ -303,6 +285,7 @@ public:
                     else if (token.kind != Kind::End && !token.newlineBefore) throw at(source, token.span, "LYP0001", "常量声明后需要换行或分号");
                     Function constant{file, std::move(name), {}, std::move(annotation), std::exchange(nodes, {}), initializer, {}, pub};
                     constant.constant = ConstKind::Value;
+                    constant.pendingExpansion = std::exchange(pendingExpansion, {});
                     module.functions.push_back(std::move(constant));
                 }
                 continue;
@@ -357,15 +340,18 @@ public:
             }
             if (is("import")) {
                 consume();
+                auto kind = ImportKind::Runtime;
+                if ((is("macro") || is("decorator")) && text(next) != ".")
+                    kind = text(consume()) == "macro" ? ImportKind::Macro : ImportKind::Decorator;
                 std::vector<Identifier> path{identifier()};
                 while (is(".")) { consume(); path.push_back(identifier()); }
                 auto alias = path.back();
                 if (is("as")) { consume(); alias = identifier(); }
-                module.imports.push_back({file, pub, std::move(path), std::move(alias)});
+                module.imports.push_back({file, pub, std::move(path), std::move(alias), kind});
                 if (is(";")) consume();
                 else if (token.kind != Kind::End && !token.newlineBefore) throw at(source, token.span, "LYP0001", "导入后需要换行或分号");
             } else if (is("struct") || is("class")) aggregate(module, pub);
-            else module.functions.push_back(function({}, pub));
+            else appendFunction(module, function({}, pub), firstPrefix);
         }
     }
 
@@ -380,11 +366,46 @@ private:
     Lexer lexer;
     Token token, next;
     std::vector<ExpressionExpansion>* macros;
+    bool macroImplementation;
     std::vector<Expr> nodes;
+    std::optional<Span> pendingExpansion;
     std::string selfType;
 
     struct Lookahead {};
-    Parser(const Parser& parser, Lookahead) : source(parser.source), file(parser.file), lexer(parser.lexer), token(parser.token), next(parser.next), macros(nullptr), selfType(parser.selfType) {}
+    Parser(const Parser& parser, Lookahead) : source(parser.source), file(parser.file), lexer(parser.lexer), token(parser.token), next(parser.next), macros(nullptr), macroImplementation(parser.macroImplementation), selfType(parser.selfType) {}
+
+    std::size_t prefixes(Module& module, bool method = false) {
+        auto first = module.expansions.size();
+        while (is("@") || (!method && is("#"))) {
+            bool decorator = text(consume()) == "@";
+            auto name = identifier();
+            std::optional<Identifier> argument;
+            std::vector<Identifier> extra, exports;
+            if (is("(")) {
+                consume();
+                if (!is(")") && !is("export")) argument = metadataValue();
+                while (!is(")")) {
+                    if (argument || !exports.empty()) require(",");
+                    if (is("export")) { consume(); exports.push_back(identifier()); }
+                    else if (!decorator && name.text == "derive" && exports.empty()) extra.push_back(metadataValue());
+                    else throw at(source, token.span, "LYM0001", "此处需要 export name 或结束宏实参");
+                }
+                require(")");
+            }
+            module.expansions.push_back({file, name, std::move(argument), decorator, ExpansionTarget::Function, 0, exports});
+            for (auto& item : extra) module.expansions.push_back({file, name, std::move(item), decorator, ExpansionTarget::Function, 0, exports});
+        }
+        return first;
+    }
+
+    void appendFunction(Module& module, Function fn, std::size_t firstPrefix) {
+        for (auto index = firstPrefix; index < module.expansions.size(); ++index) {
+            auto& prefix = module.expansions[index];
+            prefix.target = module.functions.size();
+            if (prefix.decorator) fn.pendingExpansion = prefix.name.span;
+        }
+        module.functions.push_back(std::move(fn));
+    }
 
     Token consume() {
         auto previous = token;
@@ -647,9 +668,10 @@ private:
         if (is(";")) {
             consume();
             while (!is("}")) {
+                auto firstPrefix = prefixes(module, true);
                 auto publicMember = visibility();
                 if (!is("fn") && !is("async")) throw at(source, token.span, "LYP0001", "enum 分支之后只允许实例方法");
-                module.functions.push_back(function(result.name, publicMember, result.typeParameters, false, false, result.bounds));
+                appendFunction(module, function(result.name, publicMember, result.typeParameters, false, false, result.bounds), firstPrefix);
                 if (is(";")) consume();
                 else if (!is("}") && !token.newlineBefore) throw at(source, token.span, "LYP0001", "成员之间需要换行或分号");
             }
@@ -677,6 +699,7 @@ private:
             member.defaultValue = FieldDefault{module.functions.size(), std::holds_alternative<EmptyOption>(nodes[body].node)};
             Identifier helper{fieldDefaultName(record.name.text, member.name.text), member.name.span};
             module.functions.push_back({file, std::move(helper), {}, member.type, std::exchange(nodes, {}), body, {}, false, record.typeParameters, false, {}, false, record.bounds});
+            module.functions.back().pendingExpansion = std::exchange(pendingExpansion, {});
         }
         record.fields.push_back(std::move(member));
     }
@@ -728,8 +751,11 @@ private:
         if (!primary || is("{")) {
             require("{");
             while (!is("}")) {
+                auto firstPrefix = prefixes(module, true);
                 auto marks = attributes();
                 bool publicMember = visibility();
+                if (firstPrefix != module.expansions.size() && !is("fn") && !is("async"))
+                    throw at(source, module.expansions[firstPrefix].name.span, "LYM0001", "成员装饰器只适用于实例方法");
                 if (is("type")) {
                     if (!marks.empty()) throw at(source, marks.front().name.span, "LYM0003", "此处的标记只适用于字段和形参");
                     consume();
@@ -746,7 +772,7 @@ private:
                     if (!marks.empty()) throw at(source, marks.front().name.span, "LYM0003", "此处的标记只适用于字段和形参");
                     bool staticMember = is("static");
                     if (staticMember) consume();
-                    module.functions.push_back(function(decl.name, publicMember, decl.typeParameters, false, staticMember, decl.bounds));
+                    appendFunction(module, function(decl.name, publicMember, decl.typeParameters, false, staticMember, decl.bounds), firstPrefix);
                 } else field(module, decl, publicMember, std::move(marks), false);
                 if (is(";")) consume();
                 else if (!is("}") && !token.newlineBefore) throw at(source, token.span, "LYP0001", "成员之间需要换行或分号");
@@ -770,6 +796,7 @@ private:
             generics, false, {}, false, bounds};
         function.hasReceiver = true;
         function.property = true;
+        function.pendingExpansion = std::exchange(pendingExpansion, {});
         return function;
     }
 
@@ -878,6 +905,7 @@ private:
         auto body = block();
         Function decl{file, std::move(name), std::move(parameters), std::move(result), std::exchange(nodes, {}), body, std::move(owner), pub, std::move(generics), isAsync, {}, conversion, std::move(bounds), initializer, hasReceiver, extension ? std::optional(extension->name) : std::nullopt};
         decl.throwsTypes = std::move(throwsTypes);
+        decl.pendingExpansion = std::exchange(pendingExpansion, {});
         return decl;
     }
 
@@ -1346,13 +1374,53 @@ private:
         auto close = require(")").span;
         expansion.argumentsSpan.end = close.begin;
         expansion.span.end = close.end;
+        if (!pendingExpansion) pendingExpansion = expansion.name.span;
         macros->push_back(std::move(expansion));
         return add({begin, close.end}, IntegerLiteral{});
+    }
+
+    ExprId quotedSyntax() {
+        auto site = consume().span;
+        auto start = require("{").span.end;
+        std::optional<ExprId> result;
+        auto host = [&](std::string name, std::vector<Argument> args, Span span) {
+            return add(span, Call{{std::move(name), site}, std::move(args)});
+        };
+        auto append = [&](ExprId part) {
+            result = result ? host("$quoteJoin", {{{}, *result}, {{}, part}}, site) : part;
+        };
+        auto literal = [&](std::size_t end) {
+            if (end == start && result) return;
+            auto text = add({start, end}, StringLiteral{source.text.substr(start, end - start)});
+            append(host("$quoteText", {{{}, text}}, {start, end}));
+        };
+        unsigned braces = 0, splices = 0;
+        while (token.kind != Kind::End) {
+            if (is("}") && !braces) {
+                auto end = consume().span;
+                literal(end.begin);
+                nodes[*result].span = {site.begin, end.end};
+                return *result;
+            }
+            if (is("splice") && text(next) == "(") {
+                if (++splices > 64) throw at(source, token.span, "LYM0002", "单个 quote 的 splice 数量超过预算（64）");
+                literal(consume().span.begin);
+                require("(");
+                append(expression(true));
+                start = require(")").span.end;
+                continue;
+            }
+            if (is("{")) ++braces;
+            else if (is("}")) --braces;
+            consume();
+        }
+        throw at(source, site, "LYM0002", "quote 缺少结束花括号");
     }
 
     ExprId atom(bool inParens, bool trailingBlock) {
         auto start = token.span.begin;
         if (is("#")) return macroExpression();
+        if (macroImplementation && is("quote") && text(next) == "{") return quotedSyntax();
         if (is("async")) {
             auto site = consume().span;
             if (token.newlineBefore || (!is("{") && !is("("))) throw at(source, site, "LYP0001", "异步表达式需要同行的块或 lambda");
@@ -1510,8 +1578,8 @@ Module parse(const std::vector<Source>& sources) {
     return functions;
 }
 
-void parseFile(Module& module, const Source& source, std::size_t file, std::vector<ExpressionExpansion>* expressions) {
-    Parser(source, file, expressions).appendTo(module);
+void parseFile(Module& module, const Source& source, std::size_t file, std::vector<ExpressionExpansion>* expressions, bool macroImplementation) {
+    Parser(source, file, expressions, macroImplementation).appendTo(module);
 }
 
 void validateMacroExpression(const Source& generated) {
