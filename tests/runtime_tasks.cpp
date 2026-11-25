@@ -558,6 +558,78 @@ void checkParallel(LyraDomain *origin) {
     checkFailures(failed, failure.causes[0], failure.causes[1]);
 }
 
+void checkChannels(LyraDomain* origin, LyraDomain* other) {
+    int initial{11}, removed{22}, last{33};
+    unsigned closedType{};
+    const LyraException* error{};
+    auto* buffered = lyraChannelCreate(1, &closedType, &error);
+    auto receive = [](LyraChannel* channel) { return lyraChannelReceive(channel, [](void* value) { return value; }); };
+    auto start = [](LyraDomain* domain, LyraTask* task) { lyraTaskStart(domain, task); return task; };
+    start(origin, lyraChannelSend(buffered, &initial));
+    auto* abandoned = start(origin, lyraChannelSend(buffered, &removed));
+    auto* waiting = start(origin, lyraChannelSend(buffered, &last));
+    lyraDomainRun(origin);
+    check(lyraTaskState(abandoned) == LYRA_TASK_SUSPENDED && lyraTaskState(waiting) == LYRA_TASK_SUSPENDED,
+        "full channel did not apply backpressure");
+    lyraTaskRequestCancel(abandoned);
+    auto* first = start(other, receive(buffered));
+    lyraDomainRun(other);
+    lyraDomainRun(origin);
+    check(lyraTaskState(abandoned) == LYRA_TASK_CANCELLED && lyraTaskState(waiting) == LYRA_TASK_COMPLETED && lyraTaskOutcome(first) == &initial,
+        "cancelling a sender lost a buffered value or admitted the wrong waiting sender");
+    lyraChannelClose(buffered);
+    lyraChannelClose(buffered);
+    auto* second = start(origin, receive(buffered));
+    auto* empty = start(origin, receive(buffered));
+    auto* rejected = start(origin, lyraChannelSend(buffered, &removed));
+    lyraDomainRun(origin);
+    check(lyraTaskOutcome(second) == &last && lyraTaskOutcome(empty) == nullptr, "closed channel did not drain in FIFO order");
+    check(lyraTaskState(rejected) == LYRA_TASK_FAILED && lyraExceptionType(lyraTaskException(rejected)) == &closedType,
+        "sending to a closed channel did not report the typed exception");
+
+    auto* firstChannel = lyraChannelCreate(0, &closedType, &error);
+    auto* secondChannel = lyraChannelCreate(0, &closedType, &error);
+    auto selectReceive = [&] {
+        auto* choose = lyraTaskSelect(2);
+        lyraTaskSelectArm(choose, 0, receive(firstChannel));
+        lyraTaskSelectArm(choose, 1, receive(secondChannel));
+        return start(origin, choose);
+    };
+    auto* cancelled = selectReceive();
+    lyraDomainRun(origin);
+    check(lyraTaskState(cancelled) == LYRA_TASK_SUSPENDED, "select did not wait for a matching message");
+    lyraTaskRequestCancel(cancelled);
+    auto* committed = selectReceive();
+    lyraDomainRun(origin);
+    lyraGcCollect();
+    auto* sender = start(other, lyraChannelSend(secondChannel, &last));
+    lyraDomainRun(other);
+    check(lyraTaskState(cancelled) == LYRA_TASK_CANCELLED && lyraTaskState(sender) == LYRA_TASK_COMPLETED &&
+        lyraTaskState(committed) == LYRA_TASK_READY, "a cancelled select stole the rendezvous");
+    lyraTaskRequestCancel(committed);
+    lyraDomainRun(origin);
+    auto* choice = static_cast<LyraSelection*>(lyraTaskOutcome(committed));
+    check(choice->arm == 1 && choice->outcome == &last, "a committed receive lost its message before its domain resumed");
+    sender = start(other, lyraChannelSend(firstChannel, &initial));
+    lyraDomainRun(other);
+    check(lyraTaskState(sender) == LYRA_TASK_SUSPENDED, "losing select arm stayed in the receive queue");
+    first = start(origin, receive(firstChannel));
+    lyraDomainRun(origin);
+    lyraDomainRun(other);
+    check(lyraTaskOutcome(first) == &initial && lyraTaskState(sender) == LYRA_TASK_COMPLETED, "rendezvous duplicated or discarded a message");
+
+    auto* conflicting = lyraTaskSelect(2);
+    lyraTaskSelectArm(conflicting, 0, receive(firstChannel));
+    lyraTaskSelectArm(conflicting, 1, lyraChannelSend(firstChannel, &removed));
+    start(origin, conflicting);
+    lyraDomainRun(origin);
+    check(lyraTaskState(conflicting) == LYRA_TASK_SUSPENDED, "a select exchanged a message with its own losing arm");
+    lyraChannelClose(firstChannel);
+    lyraDomainRun(origin);
+    choice = static_cast<LyraSelection*>(lyraTaskOutcome(conflicting));
+    check(choice->arm == 0 && !choice->outcome, "close ignored source order when both arms became ready");
+}
+
 void checkSingleWorker() {
     check(uv_os_setenv("LYRA_PARALLEL_WORKERS", "1") == 0, "cannot set parallel Worker limit");
     auto caller = std::this_thread::get_id();
@@ -683,6 +755,7 @@ int main(int argc, char **argv) {
     lyraDomainRun(origin);
     check(group.cleaned == 1, "group cleanup was lost");
     checkFailures(parent, group.causes[0], group.causes[1]);
+    checkChannels(origin, other);
     checkParallel(origin);
     lyraDomainDestroy(other);
     lyraDomainDestroy(origin);

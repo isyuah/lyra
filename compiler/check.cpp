@@ -45,6 +45,7 @@ std::optional<Type> hiddenType(const CheckedModule& module, Type type) {
         case Type::List: return hiddenType(module, module.listElements[type.id]);
         case Type::Task: return hiddenType(module, module.taskResults[type.id]);
         case Type::TaskLocal: return hiddenType(module, module.taskLocalValues[type.id]);
+        case Type::Channel: return hiddenType(module, module.channelElements[type.id]);
         case Type::Option: return hiddenType(module, module.sumTypes[type.id].success);
         case Type::Result: {
             const auto& sum = module.sumTypes[type.id];
@@ -52,7 +53,7 @@ std::optional<Type> hiddenType(const CheckedModule& module, Type type) {
             return hiddenType(module, sum.failure);
         }
         case Type::Dyn: return module.traits[type.id].isPublic ? std::nullopt : std::optional(type);
-        case Type::Exception: return !type.id || module.exceptions[type.id - 1].isPublic ? std::nullopt : std::optional(type);
+        case Type::Exception: return type.id < firstDeclaredException || module.exceptions[type.id - firstDeclaredException].isPublic ? std::nullopt : std::optional(type);
         case Type::Closure: {
             const auto& shape = module.signatures[type.id];
             if (auto hidden = arguments(shape.parameters)) return hidden;
@@ -69,7 +70,7 @@ using Overloads = std::unordered_map<std::string, std::vector<std::size_t>>;
 
 const std::string& linkedName(const Identifier& name) { return name.linked.empty() ? name.text : name.linked; }
 
-constexpr Type scalarTypes[] = {Type::Bool, Type::String, Type::Char, Type::Bytes, Type::Unit, Type::CPtr, Type::Exception, Type::Any, Type::Error};
+constexpr Type scalarTypes[] = {Type::Bool, Type::String, Type::Char, Type::Bytes, Type::Unit, Type::CPtr, Type::Exception, channelClosed, Type::Any, Type::Error};
 
 bool builtInDisplay(Type type) { return numericType(type) || type == Type::Bool || type == Type::String || type == Type::Char; }
 
@@ -85,7 +86,8 @@ std::string typeName(const CheckedModule& module, Type type, bool canonical = fa
         case Type::Bytes: return "Bytes";
         case Type::Exception: {
             if (!type.id) return "Exception";
-            const auto& full = module.exceptions[type.id - 1].name.text;
+            if (type == channelClosed) return "ChannelClosed";
+            const auto& full = module.exceptions[type.id - firstDeclaredException].name.text;
             auto separator = full.rfind("::");
             return canonical || separator == full.npos ? full : full.substr(separator + 2);
         }
@@ -118,6 +120,7 @@ std::string typeName(const CheckedModule& module, Type type, bool canonical = fa
         }
         case Type::Task: return "Task<" + name(module.taskResults[type.id]) + ">";
         case Type::TaskLocal: return "TaskLocal<" + name(module.taskLocalValues[type.id]) + ">";
+        case Type::Channel: return "Channel<" + name(module.channelElements[type.id]) + ">";
         case Type::List: return "List<" + name(module.listElements[type.id]) + ">";
         case Type::IntRange: return "Range<Int>";
         case Type::Option: return "Option<" + name(module.sumTypes[type.id].success) + ">";
@@ -283,7 +286,7 @@ struct Symbols {
         Symbols& symbols;
         std::size_t aggregates = symbols.module.aggregates.size(), enums = symbols.module.enums.size(), tasks = symbols.module.taskResults.size(),
             sums = symbols.module.sumTypes.size(), lists = symbols.module.listElements.size(), signatures = symbols.module.signatures.size(),
-            taskLocals = symbols.module.taskLocalValues.size(), projections = symbols.module.projections.size(),
+            taskLocals = symbols.module.taskLocalValues.size(), channels = symbols.module.channelElements.size(), projections = symbols.module.projections.size(),
             deferredPatterns = symbols.module.deferredPatternChecks.size();
         unsigned expanding = symbols.expandingNominal;
         std::size_t nominal = symbols.nominalChecks.size(), nextNominal = symbols.nextNominalCheck;
@@ -302,6 +305,7 @@ struct Symbols {
             symbols.nextNominalCheck = nextNominal;
             symbols.module.taskResults.resize(tasks);
             symbols.module.taskLocalValues.resize(taskLocals);
+            symbols.module.channelElements.resize(channels);
             symbols.module.sumTypes.resize(sums);
             symbols.module.listElements.resize(lists);
             symbols.module.signatures.resize(signatures);
@@ -480,7 +484,7 @@ struct Symbols {
                 case Type::Result:
                     return child(module.sumTypes[type.id].success, "Ok") && child(module.sumTypes[type.id].failure, "Err");
                 case Type::Task: case Type::List: case Type::CPtr:
-                case Type::TaskLocal: case Type::Exception:
+                case Type::TaskLocal: case Type::Exception: case Type::Channel:
                     if (equality) return true;
                     break;
                 default: break;
@@ -532,6 +536,12 @@ struct Symbols {
         if (name == "size" && (type.kind == Type::List || type == Type::String || type == Type::Bytes)) return noArgs(Callee::Size, Type::Int);
         if (name == "add" && type.kind == Type::List) return BuiltinMember{Callee::ListAdd, {{"value"}, {module.listElements[type.id]}, Type::Unit, false}};
         if (name == "slice" && type.kind == Type::List) return BuiltinMember{Callee::ListSlice, {{"range"}, {Type::IntRange}, type, false}};
+        if (type.kind == Type::Channel) {
+            auto element = module.channelElements[type.id];
+            if (name == "send") return BuiltinMember{Callee::ChannelSend, {{"value"}, {element}, task(Type::Unit), false}};
+            if (name == "receive") return noArgs(Callee::ChannelReceive, task(sum(Type::Option, element)));
+            if (name == "close") return noArgs(Callee::ChannelClose, Type::Unit);
+        }
         if (name == "toBytes" && type == Type::String) return noArgs(Callee::ToBytes, Type::Bytes);
         if (name == "toString") {
             if (builtInDisplay(type)) return noArgs(Callee::ToString, Type::String);
@@ -673,6 +683,7 @@ struct Symbols {
 
     Type task(Type result) const { return unaryType(Type::Task, module.taskResults, result); }
     Type taskLocal(Type value) const { return unaryType(Type::TaskLocal, module.taskLocalValues, value); }
+    Type channel(Type element) const { return unaryType(Type::Channel, module.channelElements, element); }
     Type list(Type element) const { return unaryType(Type::List, module.listElements, element); }
 
     Type closure(std::vector<Type> parameters, Type result) const {
@@ -707,6 +718,7 @@ struct Symbols {
         }
         if (name == "Task" && value.kind == Type::Task && slot == 0) return module.taskResults[value.id];
         if (name == "TaskLocal" && value.kind == Type::TaskLocal && slot == 0) return module.taskLocalValues[value.id];
+        if (name == "Channel" && value.kind == Type::Channel && slot == 0) return module.channelElements[value.id];
         if (name == "List" && value.kind == Type::List && slot == 0) return module.listElements[value.id];
         if (name == "Range" && value == Type::IntRange && slot == 0) return Type::Int;
         if (name == "Option" && value.kind == Type::Option && slot == 0) return module.sumTypes[value.id].success;
@@ -745,6 +757,7 @@ struct Symbols {
             case Type::Enum: return module.enums[type.id].abstract;
             case Type::Task: return abstract(module.taskResults[type.id]);
             case Type::TaskLocal: return abstract(module.taskLocalValues[type.id]);
+            case Type::Channel: return abstract(module.channelElements[type.id]);
             case Type::List: return abstract(module.listElements[type.id]);
             case Type::Option: return abstract(module.sumTypes[type.id].success);
             case Type::Result: return abstract(module.sumTypes[type.id].success) || abstract(module.sumTypes[type.id].failure);
@@ -862,7 +875,7 @@ struct Symbols {
                 return Type{Type::Dyn, trait->second};
             }
             for (Type type : scalarTypes) if (form.name == typeName(module, type)) return type;
-            if (auto exception = exceptionTypes.find(form.name); exception != exceptionTypes.end()) return Type{Type::Exception, exception->second + 1};
+            if (auto exception = exceptionTypes.find(form.name); exception != exceptionTypes.end()) return Type{Type::Exception, exception->second + firstDeclaredException};
             if (auto alias = aliases.find(form.name); alias != aliases.end()) {
                 if (std::ranges::find(resolvingAliases, form.name) != resolvingAliases.end())
                     throw at(source, span, "LYT0003", "透明类型别名形成循环：" + form.name);
@@ -886,6 +899,7 @@ struct Symbols {
         }
         if (arguments.size() == 1 && form.name == "Task") return task(arguments[0]);
         if (arguments.size() == 1 && form.name == "TaskLocal") return taskLocal(arguments[0]);
+        if (arguments.size() == 1 && form.name == "Channel") return channel(arguments[0]);
         if (arguments.size() == 1 && form.name == "List") return list(arguments[0]);
         if (form.name == "Range") {
             if (arguments.size() == 1 && arguments.front() == Type::Int) return Type::IntRange;
@@ -1344,8 +1358,8 @@ struct Checker {
             if (!arm.guard) covered.insert(type);
             std::optional<std::size_t> local;
             if (arm.binding) {
-                if (type.id) {
-                    const auto& declaration = module.exceptions[type.id - 1];
+                if (type.id >= firstDeclaredException) {
+                    const auto& declaration = module.exceptions[type.id - firstDeclaredException];
                     refer(arm.binding->type, declaration.file, declaration.name.span);
                 }
                 local = fn.locals.size();
@@ -2417,6 +2431,20 @@ struct Checker {
             info.argumentSlots.push_back(0);
             if (value == Type::Never) return value;
             return expected ? *expected : symbols.sum(kind, value);
+        } else if (key == "Channel") {
+            std::optional<Type> type;
+            if (call.typeArguments.size() == 1) type = symbols.channel(symbols.resolve(fn.syntax, call.typeArguments.front(), variables));
+            else if (call.typeArguments.empty()) {
+                if (expected && expected->kind == Type::Option) expected = module.sumTypes[expected->id].success;
+                if (expected && expected->kind == Type::Channel) type = expected;
+            }
+            if (!type) throw at(source, call.name.span, "LYG0001", "Channel 需要一个类型实参或明确的 Channel<T> 目标类型");
+            info.callee = Callee::ChannelCreate;
+            return arguments(id, call, 1, [](auto) { return "capacity"; }, [](auto) { return Type{Type::Int}; }) ? Type{Type::Never} : *type;
+        } else if (key == "sleepMs") {
+            noTypeArgs();
+            info.callee = Callee::Sleep;
+            return arguments(id, call, 1, [](auto) { return "milliseconds"; }, [](auto) { return Type{Type::Int}; }) ? Type{Type::Never} : symbols.task(Type::Unit);
         } else if (key == "TaskLocal") {
             if (!call.arguments.empty()) throw at(source, call.name.span, "LYT0002", "TaskLocal 不接收值实参");
             info.callee = Callee::LocalKey;
@@ -2450,16 +2478,16 @@ struct Checker {
             if (type == Type::Error) throw at(source, fn.syntax.expressions[value].span, "LYE0003", "已有 Error 值无需再次包装");
             info.errorDisplay = displayError(type, fn.syntax.expressions[value].span, true);
             return Type::Error;
-        } else if (key == "Exception") {
+        } else if (key == "Exception" || key == "ChannelClosed") {
             noTypeArgs();
             info.callee = Callee::Exception;
-            return arguments(id, call, 1, [](auto) { return "message"; }, [](auto) { return Type{Type::String}; }) ? Type::Never : Type::Exception;
+            return arguments(id, call, 1, [](auto) { return "message"; }, [](auto) { return Type{Type::String}; }) ? Type{Type::Never} : key == "ChannelClosed" ? channelClosed : Type::Exception;
         } else if (auto named = symbols.exceptionTypes.find(key); named != symbols.exceptionTypes.end()) {
             noTypeArgs();
             const auto& type = module.exceptions[named->second];
             refer(call.name, type.file, type.name.span);
             info.callee = Callee::Exception;
-            return arguments(id, call, 1, [](auto) { return "message"; }, [](auto) { return Type{Type::String}; }) ? Type{Type::Never} : Type{Type::Exception, named->second + 1};
+            return arguments(id, call, 1, [](auto) { return "message"; }, [](auto) { return Type{Type::String}; }) ? Type{Type::Never} : Type{Type::Exception, named->second + firstDeclaredException};
         } else if (key == "print") {
             noTypeArgs();
             info.callee = Callee::Print;
@@ -2517,6 +2545,40 @@ struct Checker {
         if (operand.kind == Type::Never) return operand;
         if (operand.kind != Type::Task) throw at(source, fn.syntax.expressions[op.operand].span, "LYT0008", "此处需要 Task，实际是 " + typeName(module, operand));
         return op.spawn ? operand : module.taskResults[operand.id];
+    }
+
+    Type infer(ExprId id, const Select& selection, std::optional<Type> expected, bool discard) {
+        if (!inAsync()) throw at(source, selection.site, "LYT0008", "await select 只能在异步执行体中使用");
+        std::vector<Type> outcomes;
+        for (const auto& arm : selection.arms) {
+            auto task = inspect(arm.operation, {});
+            auto callee = fn.expressions[arm.operation].callee;
+            if (!std::holds_alternative<Call>(fn.syntax.expressions[arm.operation].node) ||
+                (callee != Callee::ChannelSend && callee != Callee::ChannelReceive && callee != Callee::Sleep))
+                throw at(source, fn.syntax.expressions[arm.operation].span, "LYT0008", "select 分支必须直接调用 Channel.send、Channel.receive 或 sleepMs");
+            if (task == Type::Never) return task;
+            outcomes.push_back(module.taskResults[task.id]);
+        }
+        auto entry = present;
+        auto& slots = fn.expressions[id].selectSlots;
+        std::optional<Type> result;
+        for (std::size_t index = 0; index < selection.arms.size(); ++index) {
+            const auto& arm = selection.arms[index];
+            present = entry;
+            scopes.emplace_back();
+            slots.emplace_back();
+            if (arm.binding) {
+                auto slot = fn.locals.size();
+                fn.locals.push_back({outcomes[index], false, currentWorker()});
+                declare(*arm.binding, slot);
+                slots.back() = slot;
+            }
+            auto value = visit(arm.value, discard ? std::nullopt : result ? result : expected, discard);
+            if (value != Type::Never && !result) result = discard ? Type::Unit : value;
+            scopes.pop_back();
+        }
+        present = std::move(entry);
+        return result.value_or(Type::Never);
     }
 
     Type taskBlock(ExprId id, ExprId bodyId, std::optional<Type> hint) {
@@ -2833,7 +2895,7 @@ CheckedModule check(Module module, const std::vector<Source>& sources, bool requ
         for (Type builtin : scalarTypes) {
             if (name == typeName(checked, builtin)) throw at(sources[decl.file], decl.name.span, "LYN0002", "类型名与内置类型冲突：" + std::string(name));
         }
-        if (name == "Never" || name == "TaskLocal" || name == "Range" || name == "Eq" || name == "Hash") throw at(sources[decl.file], decl.name.span, "LYN0002", "类型名与内置类型冲突：" + std::string(name));
+        if (name == "Never" || name == "TaskLocal" || name == "Range" || name == "Eq" || name == "Hash" || name == "Channel") throw at(sources[decl.file], decl.name.span, "LYN0002", "类型名与内置类型冲突：" + std::string(name));
         if (decl.name.text == "print" || decl.name.text == "gcCollect" || !names.emplace(declaration, index).second) throw at(sources[decl.file], decl.name.span, "LYN0002", "类型名称已声明：" + decl.name.text);
     };
     for (auto& decl : module.aggregates) {

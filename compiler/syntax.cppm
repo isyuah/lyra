@@ -83,11 +83,13 @@ struct PatternBinding { Pattern pattern; std::optional<Identifier> annotation; E
 struct MatchArm { Pattern pattern; ExprId value; std::optional<ExprId> guard{}; };
 enum class OptionalForm { None, Access, Default };
 struct Match { ExprId subject; std::vector<MatchArm> arms; OptionalForm optional{}; Span operation{}; };
+struct SelectArm { std::optional<Identifier> binding; ExprId operation, value; };
+struct Select { Span site; std::vector<SelectArm> arms; };
 enum class Jump { Break, Continue };
 
 struct Expr {
     Span span;
-    std::variant<IntegerLiteral, RealLiteral, bool, StringLiteral, BytesLiteral, CharLiteral, DisplayValue, TextTemplate, Identifier, This, Call, Member, QualifiedMember, Unary, Binary, RangeValue, TypeOperation, Block, Binding, PatternBinding, Conditional, While, For, Return, Raise, Attempt, Jump, TaskOp, Blocking, AsyncBlock, Deferred, EmptyOption, Propagate, Match, ListLiteral, Index, Lambda> node;
+    std::variant<IntegerLiteral, RealLiteral, bool, StringLiteral, BytesLiteral, CharLiteral, DisplayValue, TextTemplate, Identifier, This, Call, Member, QualifiedMember, Unary, Binary, RangeValue, TypeOperation, Block, Binding, PatternBinding, Conditional, While, For, Return, Raise, Attempt, Jump, TaskOp, Blocking, AsyncBlock, Deferred, EmptyOption, Propagate, Match, Select, ListLiteral, Index, Lambda> node;
 };
 
 struct Parameter { Identifier name, type; bool variadic{}; std::optional<ExprId> defaultValue{}; std::vector<Attribute> attributes{}; };

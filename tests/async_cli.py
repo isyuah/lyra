@@ -32,6 +32,65 @@ class Async(unittest.TestCase):
                 run = subprocess.run([app], capture_output=True, timeout=15, env=env)
                 self.assertEqual((run.returncode, run.stdout.decode(), run.stderr), (0, expected, b""))
 
+    def test_channel_cold_tasks_cross_domains_and_preserve_nested_option(self):
+        self.run_source('''class Entry(val number: Int)
+async fn publish<T>(values: Channel<T>, item: T): Unit {
+    await values.send(item)
+    values.close()
+}
+async fn main(): Unit {
+    val values: Channel<Entry?> = Channel(capacity: 1)
+    val cold = values.send(None)
+    val timed = await select { values.receive() => "early", sleepMs(0) => "cold" }
+    print(timed)
+    await cold
+    await cold
+    print(await values.receive() == Some(None))
+    val worker = parallel { await publish(values, Some(Entry(81))); }
+    val result = await select {
+        val item = values.receive() => match item { Some(Some(entry)) => entry.number, _ => -1 },
+        sleepMs(5000) => -2,
+    }
+    print(result)
+    await worker
+    print(await values.receive() == None)
+    try { await values.send(None) } catch closed: ChannelClosed { print(closed.message) }
+    try { Channel<Int>(-1); } catch reason: Exception { print("invalid capacity") }
+}''', 'cold\ntrue\n81\ntrue\nsend on closed channel\ninvalid capacity\n')
+
+    def test_select_commits_only_the_chosen_arm_in_source_order(self):
+        self.run_source('''fn mark(value: Int): Int { print(value); value }
+async fn main(): Unit {
+    val values = Channel<Int>(1)
+    val where = await select {
+        values.send(mark(17)) => "first",
+        values.send(mark(32)) => "second",
+        sleepMs(0) => "timer",
+    }
+    print(where)
+    print((await values.receive()) ?? -1)
+    print(await select { values.receive() => 0, sleepMs(2) => 1 })
+    values.close()
+    print(await select { sleepMs(0) => "expired", values.send(9) => "invalid" })
+    try {
+        await select { values.send(9) => print("sent"), sleepMs(0) => print("wrong timer") }
+    } catch problem: ChannelClosed { print("closed arm") }
+}''', '17\n32\nfirst\n17\n1\nexpired\nclosed arm\n')
+
+    def test_select_rejects_arbitrary_tasks_and_arm_bindings_do_not_escape(self):
+        cases = (
+            ('fn main(): Unit { await select { sleepMs(0) => 0 }; }', 'LYT0008', 'await select'),
+            ('async fn other(): Unit {}\nasync fn main(): Unit { await select { other() => 0 }; }', 'LYT0008', 'other() =>'),
+            ('async fn main(): Unit { await select { val timer = sleepMs(0) => {}, sleepMs(0) => { print(timer) } } }', 'LYN0001', 'timer) }'),
+        )
+        for source, code, span in cases:
+            with self.subTest(source=source):
+                self.main.write_bytes(source.encode('utf-8'))
+                checked = subprocess.run([COMPILER, 'check', self.package, '--diagnostics=json'], capture_output=True, timeout=10)
+                self.assertNotEqual(checked.returncode, 0)
+                error, = json.loads(checked.stderr)
+                self.assertEqual((error['code'], error['range']['start']['offset']), (code, source.index(span)), error)
+
     def test_cold_arguments_repeated_await_and_spawn(self):
         self.run_source("""
 fn mark(value: Int): Int { print(value); value }

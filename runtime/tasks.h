@@ -10,9 +10,12 @@ extern "C" {
 
 typedef struct LyraDomain LyraDomain;
 typedef struct LyraTask LyraTask;
+typedef struct LyraChannel LyraChannel;
 typedef void (*LyraTaskStep)(LyraTask *task, void *frame);
 typedef void (*LyraNativeWork)(void *nativeData);
 typedef void *(*LyraBlockingBody)(void *environment, const LyraException **error);
+typedef void *(*LyraChannelPack)(void *boxed);
+typedef struct LyraSelection { uint64_t arm; void *outcome; } LyraSelection;
 
 typedef enum LyraTaskState {
     LYRA_TASK_COLD, LYRA_TASK_READY, LYRA_TASK_RUNNING, LYRA_TASK_SUSPENDED,
@@ -31,6 +34,13 @@ void lyraTaskCreatedAt(LyraTask *task, const char *file, uint64_t line, uint64_t
 void lyraTaskKeepCleanups(LyraTask *task, LyraCleanup **stack);
 LyraTask *lyraTaskBlocking(LyraBlockingBody body, void *environment);
 LyraTask *lyraTaskWithLocal(const void *key, void *boxed, LyraTask *body);
+LyraChannel *lyraChannelCreate(int64_t capacity, const void *closedType, const LyraException **error);
+LyraTask *lyraChannelSend(LyraChannel *channel, void *boxed);
+LyraTask *lyraChannelReceive(LyraChannel *channel, LyraChannelPack pack);
+void lyraChannelClose(LyraChannel *channel);
+LyraTask *lyraTaskSleep(int64_t milliseconds);
+LyraTask *lyraTaskSelect(size_t arms);
+void lyraTaskSelectArm(LyraTask *select, size_t index, const LyraTask *operation);
 void lyraTaskSharedCopy(void *destination, const void *source, size_t bytes);
 int lyraTaskWatchDisconnect(uintptr_t monitor);
 void lyraTaskStart(LyraDomain *domain, LyraTask *task);

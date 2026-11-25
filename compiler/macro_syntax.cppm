@@ -84,6 +84,13 @@ struct SyntaxArena {
                 child(node.subject);
                 for (const auto& arm : node.arms) { children.push_back(input("pattern", arm.pattern.span)); optional(arm.guard); child(arm.value); }
                 return "match";
+            } else if constexpr (std::is_same_v<Node, Select>) {
+                for (const auto& arm : node.arms) {
+                    if (arm.binding) named("name", *arm.binding);
+                    child(arm.operation);
+                    child(arm.value);
+                }
+                return "select";
             } else if constexpr (std::is_same_v<Node, Attempt>) {
                 child(node.body);
                 for (const auto& arm : node.arms) { if (arm.binding) named("type", arm.binding->type); optional(arm.guard); child(arm.body); }

@@ -957,8 +957,26 @@ private:
     ExprId taskOperand(bool inParens, bool trailingBlock) {
         if (!is("await") && !is("spawn")) return postfix(inParens, trailingBlock);
         auto op = consume();
+        if (text(op) == "await" && is("select") && text(next) == "{") return select(op.span);
         auto operand = taskOperand(inParens, trailingBlock);
         return add({op.span.begin, nodes[operand].span.end}, TaskOp{text(op) == "spawn", op.span, operand});
+    }
+
+    ExprId select(Span await) {
+        Select selection{{await.begin, require("select").span.end}, {}};
+        require("{");
+        if (is("}")) throw at(source, token.span, "LYP0001", "select 至少需要一个分支");
+        while (!is("}")) {
+            std::optional<Identifier> binding;
+            if (is("val")) { consume(); binding = identifier(); require("="); }
+            auto operation = expression(false, 1, false);
+            require("=>");
+            selection.arms.push_back({std::move(binding), operation, statement()});
+            if (is(",")) consume();
+            else if (!is("}") && !token.newlineBefore) throw at(source, token.span, "LYP0001", "select 分支之间需要换行或逗号");
+        }
+        auto end = consume().span.end;
+        return add({await.begin, end}, std::move(selection));
     }
 
     ExprId postfix(bool inParens, bool trailingBlock) {

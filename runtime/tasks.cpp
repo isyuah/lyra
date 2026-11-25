@@ -2,7 +2,9 @@
 #include "context.h"
 #include "locks.h"
 #include "managed.h"
+#include "strings.h"
 
+#include <algorithm>
 #include <new>
 #include <stdio.h>
 #include <stdlib.h>
@@ -63,6 +65,7 @@ struct ParallelPool { Executor *workers; size_t workerCount, next; };
 
 struct DisconnectWatch;
 struct DeadlineWatch;
+struct WaitSet;
 struct Failure {
     size_t ordinal;
     const LyraException *cause;
@@ -84,6 +87,7 @@ struct LyraTask {
     LyraTask *firstWaiter;
     LyraTask *nextWaiter;
     LyraTask *waitingOn;
+    WaitSet *wait;
     LyraTask *owner, *firstChild, *lastChild, *previousChild, *nextChild;
     size_t ordinal, nextOrdinal;
     Failure *failures, *cancelledCleanups;
@@ -111,6 +115,42 @@ struct DisconnectWatch {
 };
 
 struct DeadlineWatch { uv_timer_t timer; LyraTask *task; LyraDomain *domain; };
+
+enum class WaitKind { Send, Receive, Timer };
+struct WaitChoice;
+struct ChannelQueue { WaitChoice *first, *last; };
+
+struct LyraChannel {
+    const void *closedType;
+    size_t capacity, allocated, head, count, nextTicket;
+    void **items;
+    ChannelQueue senders, receivers;
+    bool closed;
+};
+
+struct WaitChoice {
+    WaitKind kind;
+    LyraChannel *channel;
+    void *boxed;
+    LyraChannelPack pack;
+    int64_t time;
+    const LyraTask *source;
+    WaitSet *set;
+    ChannelQueue *queue;
+    WaitChoice *previous, *next;
+    size_t ticket;
+};
+
+struct WaitTimer { uv_timer_t handle; LyraDomain *domain; WaitSet *set; };
+struct WaitSet {
+    LyraTask *task;
+    WaitChoice *choices, *winner;
+    size_t count;
+    WaitTimer *timer;
+    int64_t deadline;
+    void *result;
+    bool selecting, rejected;
+};
 
 namespace {
 
@@ -355,6 +395,202 @@ void enqueue(LyraTask *task) {
     schedule(domain);
 }
 
+void detachChoices(WaitSet& set) {
+    for (size_t index = 0; index < set.count; ++index) {
+        auto& choice = set.choices[index];
+        auto *queue = choice.queue;
+        if (!queue) continue;
+        if (choice.previous) choice.previous->next = choice.next;
+        else queue->first = choice.next;
+        if (choice.next) choice.next->previous = choice.previous;
+        else queue->last = choice.previous;
+        choice.queue = nullptr;
+        choice.previous = choice.next = nullptr;
+    }
+}
+
+void commitChoice(WaitChoice& choice, void *result = nullptr, bool rejected = false) {
+    auto& set = *choice.set;
+    set.winner = &choice;
+    set.result = result;
+    set.rejected = rejected;
+    detachChoices(set);
+    if (set.task->state == LYRA_TASK_SUSPENDED) enqueue(set.task);
+}
+
+bool cancelled(LyraTask *task) {
+    if (!task->cancelRequested && lyraContextRemaining(task->context) == 0) requestCancel(task);
+    return task->cancelRequested;
+}
+
+bool takeTimer(WaitSet& set, const WaitChoice *limit, int64_t now) {
+    for (auto *choice = set.choices; choice != limit; ++choice) {
+        if (choice->kind == WaitKind::Timer && choice->time <= now) {
+            commitChoice(*choice);
+            return true;
+        }
+    }
+    return false;
+}
+
+bool eligible(WaitChoice& choice, int64_t now) {
+    return !cancelled(choice.set->task) && !takeTimer(*choice.set, &choice, now);
+}
+
+WaitChoice *peer(ChannelQueue& queue, int64_t now) {
+    while (auto *candidate = queue.first) if (eligible(*candidate, now)) return candidate;
+    return nullptr;
+}
+
+void pushMessage(LyraChannel& channel, void *value) {
+    if (channel.count == channel.allocated) {
+        auto slots = std::min(channel.capacity, std::max<size_t>(4, channel.allocated * 2));
+        auto **items = static_cast<void **>(lyraGcAlloc(slots * sizeof(void *)));
+        for (size_t index = 0; index < channel.count; ++index) items[index] = channel.items[(channel.head + index) % channel.allocated];
+        channel.items = items;
+        channel.allocated = slots;
+        channel.head = 0;
+    }
+    channel.items[(channel.head + channel.count++) % channel.allocated] = value;
+}
+
+void *popMessage(LyraChannel& channel) {
+    auto *value = channel.items[channel.head];
+    channel.items[channel.head] = nullptr;
+    channel.head = (channel.head + 1) % channel.allocated;
+    --channel.count;
+    return value;
+}
+
+bool tryChoice(WaitChoice& choice, int64_t now) {
+    if (choice.kind == WaitKind::Timer) {
+        if (choice.time > now) return false;
+        commitChoice(choice);
+        return true;
+    }
+    auto& channel = *choice.channel;
+    if (choice.kind == WaitKind::Send) {
+        if (channel.closed) commitChoice(choice, nullptr, true);
+        else if (auto *receiver = peer(channel.receivers, now)) {
+            commitChoice(*receiver, choice.boxed);
+            commitChoice(choice);
+        } else if (channel.count < channel.capacity) {
+            pushMessage(channel, choice.boxed);
+            commitChoice(choice);
+        } else return false;
+    } else {
+        if (channel.count) {
+            auto *value = popMessage(channel);
+            if (!channel.closed) if (auto *sender = peer(channel.senders, now)) {
+                pushMessage(channel, sender->boxed);
+                commitChoice(*sender);
+            }
+            commitChoice(choice, value);
+        } else if (channel.closed) commitChoice(choice);
+        else if (auto *sender = peer(channel.senders, now)) {
+            commitChoice(choice, sender->boxed);
+            commitChoice(*sender);
+        } else return false;
+    }
+    return true;
+}
+
+void attachChoice(WaitChoice& choice) {
+    auto& channel = *choice.channel;
+    auto& queue = choice.kind == WaitKind::Send ? channel.senders : channel.receivers;
+    choice.queue = &queue;
+    choice.ticket = channel.nextTicket++;
+    choice.previous = queue.last;
+    if (queue.last) queue.last->next = &choice;
+    else queue.first = &choice;
+    queue.last = &choice;
+}
+
+void timerReady(uv_timer_t *timer) {
+    TaskLock lock;
+    auto& set = *static_cast<WaitTimer *>(timer->data)->set;
+    if (set.winner || cancelled(set.task)) return;
+    auto now = lyraContextClock();
+    if (!takeTimer(set, set.choices + set.count, now))
+        require(uv_timer_start(timer, timerReady, static_cast<uint64_t>(set.deadline - now), 0) == 0, "cannot reschedule timer");
+}
+
+void startTimer(WaitSet& set) {
+    auto *timer = allocateRuntime<WaitTimer>("cannot allocate operation timer");
+    auto *domain = set.task->domain;
+    auto& loop = domain->executor->loop;
+    require(uv_timer_init(&loop, &timer->handle) == 0, "cannot initialize operation timer");
+    timer->handle.data = timer;
+    timer->domain = domain;
+    timer->set = &set;
+    set.timer = timer;
+    uv_update_time(&loop);
+    auto delay = std::max<int64_t>(0, set.deadline - lyraContextClock());
+    require(uv_timer_start(&timer->handle, timerReady, static_cast<uint64_t>(delay), 0) == 0, "cannot schedule operation timer");
+    ++domain->loopUsers;
+}
+
+void stopTimer(WaitTimer *timer) {
+    uv_timer_stop(&timer->handle);
+    uv_close(reinterpret_cast<uv_handle_t *>(&timer->handle), [](uv_handle_t *handle) {
+        auto *closing = static_cast<WaitTimer *>(handle->data);
+        auto *domain = closing->domain;
+        free(closing);
+        releaseWatchPin(*domain);
+    });
+}
+
+void finish(TaskLock& lock, LyraTask *task, LyraTaskState state, void *outcome);
+
+void waitStep(LyraTask *task, void *storage) {
+    TaskLock lock;
+    auto& set = *static_cast<WaitSet *>(storage);
+    if (!set.winner && !cancelled(task)) {
+        auto now = lyraContextClock();
+        set.deadline = -1;
+        for (size_t index = 0; index < set.count; ++index) {
+            auto& choice = set.choices[index];
+            if (choice.kind != WaitKind::Timer) continue;
+            choice.time = now + std::clamp<int64_t>(choice.time, 0, INT64_MAX - now);
+            if (set.deadline < 0 || choice.time < set.deadline) set.deadline = choice.time;
+        }
+        for (size_t index = 0; index < set.count; ++index) if (tryChoice(set.choices[index], now)) break;
+        if (!set.winner) {
+            for (size_t index = 0; index < set.count; ++index) if (set.choices[index].channel) attachChoice(set.choices[index]);
+            task->state = LYRA_TASK_SUSPENDED;
+            if (set.deadline >= 0) startTimer(set);
+            return;
+        }
+    }
+    if (set.timer) stopTimer(set.timer);
+    task->wait = nullptr;
+    if (!set.winner) { finish(lock, task, LYRA_TASK_CANCELLED, nullptr); return; }
+    const auto& choice = *set.winner;
+    if (set.rejected) {
+        constexpr char message[] = "send on closed channel";
+        auto *error = lyraExceptionCreateTyped(lyraStringFromBytes(message, sizeof(message) - 1), choice.channel->closedType, "ChannelClosed");
+        const auto *source = choice.source ? choice.source : task;
+        task->error = source->createdFile ? lyraExceptionRaise(error, source->createdFile, source->createdLine, source->createdColumn) : error;
+        finish(lock, task, LYRA_TASK_FAILED, nullptr);
+        return;
+    }
+    static unsigned char unit{};
+    void *result = choice.pack ? choice.pack(set.result) : &unit;
+    if (set.selecting) result = ::new (lyraGcAlloc(sizeof(LyraSelection))) LyraSelection{
+        static_cast<uint64_t>(set.winner - set.choices), result};
+    finish(lock, task, LYRA_TASK_COMPLETED, result);
+}
+
+WaitSet& makeWait(size_t count, bool selecting) {
+    auto *set = ::new (lyraGcAlloc(sizeof(WaitSet))) WaitSet{};
+    set->count = count;
+    set->selecting = selecting;
+    set->choices = static_cast<WaitChoice *>(lyraGcAlloc(count * sizeof(WaitChoice)));
+    set->task = lyraTaskCreate(waitStep, set);
+    set->task->wait = set;
+    return *set;
+}
+
 struct BlockingRequest {
     uv_work_t request;
     LyraTask *task;
@@ -551,11 +787,12 @@ void publish(TaskLock& lock, LyraTask *task) {
 void requestCancel(LyraTask *task) {
     auto *current = task;
     for (;;) {
-        if (!isTerminal(current) && !current->cancelRequested) {
+        if (!isTerminal(current) && !current->cancelRequested && !(current->wait && current->wait->winner)) {
             current->cancelRequested = true;
             if (current->joining && current->pendingState == LYRA_TASK_COMPLETED) current->pendingState = LYRA_TASK_CANCELLED;
             if (current->state == LYRA_TASK_SUSPENDED && !current->joining && !current->blocking) {
                 if (current->waitingOn) detachWaiter(current);
+                if (current->wait) detachChoices(*current->wait);
                 if (current->firstChild) current->resumeAfterChildren = true;
                 else enqueue(current);
             }
@@ -704,6 +941,59 @@ LyraTask *lyraTaskCreate(LyraTaskStep step, void *frame) {
     return task;
 }
 
+LyraChannel *lyraChannelCreate(int64_t capacity, const void *closedType, const LyraException **error) {
+    if (capacity < 0 || static_cast<uint64_t>(capacity) > SIZE_MAX / sizeof(void *)) {
+        constexpr char message[] = "Channel capacity is outside the supported range";
+        *error = lyraExceptionCreate(lyraStringFromBytes(message, sizeof(message) - 1));
+        return nullptr;
+    }
+    auto *channel = ::new (lyraGcAlloc(sizeof(LyraChannel))) LyraChannel{};
+    channel->capacity = static_cast<size_t>(capacity);
+    channel->closedType = closedType;
+    return channel;
+}
+
+LyraTask *lyraChannelSend(LyraChannel *channel, void *boxed) {
+    auto& set = makeWait(1, false);
+    set.choices[0] = {.kind = WaitKind::Send, .channel = channel, .boxed = boxed, .set = &set};
+    return set.task;
+}
+
+LyraTask *lyraChannelReceive(LyraChannel *channel, LyraChannelPack pack) {
+    auto& set = makeWait(1, false);
+    set.choices[0] = {.kind = WaitKind::Receive, .channel = channel, .pack = pack, .set = &set};
+    return set.task;
+}
+
+void lyraChannelClose(LyraChannel *channel) {
+    TaskLock lock;
+    if (channel->closed) return;
+    channel->closed = true;
+    auto now = lyraContextClock();
+    while (channel->senders.first || channel->receivers.first) {
+        auto *sender = channel->senders.first;
+        auto *receiver = channel->receivers.first;
+        if (sender && (!receiver || sender->ticket < receiver->ticket)) {
+            if (eligible(*sender, now)) commitChoice(*sender, nullptr, true);
+        } else if (eligible(*receiver, now)) commitChoice(*receiver, channel->count ? popMessage(*channel) : nullptr);
+    }
+}
+
+LyraTask *lyraTaskSleep(int64_t milliseconds) {
+    auto& set = makeWait(1, false);
+    set.choices[0] = {.kind = WaitKind::Timer, .time = milliseconds, .set = &set};
+    return set.task;
+}
+
+LyraTask *lyraTaskSelect(size_t arms) { return makeWait(arms, true).task; }
+
+void lyraTaskSelectArm(LyraTask *select, size_t index, const LyraTask *operation) {
+    auto& choice = select->wait->choices[index];
+    choice = operation->wait->choices[0];
+    choice.set = select->wait;
+    choice.source = operation;
+}
+
 void lyraTaskKeepCleanups(LyraTask *task, LyraCleanup **stack) {
     TaskLock lock;
     task->cleanups = stack;
@@ -843,7 +1133,7 @@ void lyraTaskSuspend(LyraTask *task) {
 
 void lyraTaskWake(LyraTask *task) {
     TaskLock lock;
-    if (task->state == LYRA_TASK_SUSPENDED && !task->waitingOn && !task->blocking && !task->joining && !task->resumeAfterChildren) enqueue(task);
+    if (task->state == LYRA_TASK_SUSPENDED && !task->waitingOn && !task->wait && !task->blocking && !task->joining && !task->resumeAfterChildren) enqueue(task);
 }
 
 void lyraTaskBlock(LyraTask *task, LyraNativeWork work, void *nativeData) {
@@ -886,8 +1176,7 @@ void lyraTaskRequestCancel(LyraTask *task) {
 
 int lyraTaskCancelRequested(LyraTask *task) {
     TaskLock lock;
-    if (!task->cancelRequested && lyraContextRemaining(task->context) == 0) requestCancel(task);
-    return task->cancelRequested;
+    return cancelled(task);
 }
 
 void lyraTaskFinishCancelled(LyraTask *task) {

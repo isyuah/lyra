@@ -44,6 +44,7 @@ struct Layouts {
     mutable std::set<Type> initializedTypeTokens{};
     mutable std::map<std::vector<std::size_t>, llvm::Constant*> interfaceTables{};
     mutable std::map<std::pair<Type, ValueOperation>, llvm::Function*> valueHelpers{};
+    mutable std::map<Type, llvm::Function*> channelPackers{};
     bool workers{};
 
     Layouts(const CheckedModule& program, Builder& builder) : program(program) {
@@ -85,7 +86,10 @@ struct Layouts {
             case Type::CPtr: return "CPtr";
             case Type::Any: return "Any";
             case Type::Error: return "Error";
-            case Type::Exception: return type.id ? program.exceptions[type.id - 1].name.text : "Exception";
+            case Type::Exception:
+                if (type == Type::Exception) return "Exception";
+                if (type == channelClosed) return "ChannelClosed";
+                return program.exceptions[type.id - firstDeclaredException].name.text;
             case Type::Record: case Type::Enum: {
                 auto full = type.kind == Type::Record ? program.aggregates[type.id].syntax.name.text : program.enums[type.id].syntax.name.text;
                 auto separator = full.rfind("::");
@@ -101,6 +105,7 @@ struct Layouts {
             }
             case Type::Task: return "Task<" + nested(program.taskResults[type.id]) + ">";
             case Type::TaskLocal: return "TaskLocal<" + nested(program.taskLocalValues[type.id]) + ">";
+            case Type::Channel: return "Channel<" + nested(program.channelElements[type.id]) + ">";
             case Type::List: return "List<" + nested(program.listElements[type.id]) + ">";
             case Type::IntRange: return "Range<Int>";
             case Type::Option: return "Option<" + nested(program.sumTypes[type.id].success) + ">";
@@ -232,7 +237,7 @@ struct Layouts {
         case Type::Bool: return builder.getInt1Ty();
         case Type::Char: return builder.getInt32Ty();
         case Type::Unit: case Type::Never: return builder.getInt8Ty();
-        case Type::String: case Type::Bytes: case Type::Task: case Type::CPtr: case Type::List: case Type::Exception: case Type::Closure: case Type::Error: case Type::TaskLocal: return builder.getPtrTy();
+        case Type::String: case Type::Bytes: case Type::Task: case Type::CPtr: case Type::List: case Type::Exception: case Type::Closure: case Type::Error: case Type::TaskLocal: case Type::Channel: return builder.getPtrTy();
         case Type::Variable: case Type::Projection: llvm_unreachable("abstract type reached LLVM lowering");
         case Type::Any: case Type::Dyn: return llvm::StructType::get(builder.getContext(), {builder.getPtrTy(), builder.getPtrTy()});
         case Type::IntRange: return llvm::StructType::get(builder.getContext(), {builder.getInt64Ty(), builder.getInt64Ty(), builder.getInt1Ty()});
@@ -242,6 +247,30 @@ struct Layouts {
         case Type::Result: return llvm::StructType::get(builder.getContext(), {builder.getInt1Ty(), native(builder, program.sumTypes[type.id].success), native(builder, program.sumTypes[type.id].failure), builder.getPtrTy()});
         }
         llvm_unreachable("invalid Lyra type");
+    }
+
+    llvm::Function* channelPacker(Builder& builder, Type option) const {
+        auto [entry, inserted] = channelPackers.try_emplace(option);
+        if (!inserted) return entry->second;
+        auto* pointer = builder.getPtrTy();
+        auto* signature = llvm::FunctionType::get(pointer, {pointer}, false);
+        auto* pack = llvm::Function::Create(signature, llvm::Function::InternalLinkage, "lyra.channel.pack", builder.GetInsertBlock()->getModule());
+        entry->second = pack;
+        auto* start = llvm::BasicBlock::Create(builder.getContext(), "entry", pack);
+        auto* present = llvm::BasicBlock::Create(builder.getContext(), "some", pack);
+        auto* absent = llvm::BasicBlock::Create(builder.getContext(), "none", pack);
+        Builder emit(start);
+        auto* boxed = pack->getArg(0);
+        emit.CreateCondBr(emit.CreateIsNotNull(boxed), present, absent);
+        auto* type = native(emit, option);
+        auto* empty = llvm::Constant::getNullValue(type);
+        emit.SetInsertPoint(absent);
+        emit.CreateRet(NativeLists{emit}.box(empty));
+        emit.SetInsertPoint(present);
+        auto* payload = emit.CreateLoad(native(emit, program.sumTypes[option.id].success), boxed);
+        auto* tagged = emit.CreateInsertValue(empty, emit.getTrue(), 0);
+        emit.CreateRet(NativeLists{emit}.box(emit.CreateInsertValue(tagged, payload, 1)));
+        return pack;
     }
 };
 
@@ -528,7 +557,7 @@ struct DebugInfo {
             case Type::Unit: cached = basic(8, llvm::dwarf::DW_ATE_unsigned); break;
             case Type::CPtr: cached = pointer(nullptr); break;
             case Type::String: case Type::Bytes: case Type::Task: case Type::List: case Type::Exception:
-            case Type::Closure: case Type::Error: case Type::TaskLocal:
+            case Type::Closure: case Type::Error: case Type::TaskLocal: case Type::Channel:
                 cached = pointer(builder.createForwardDecl(llvm::dwarf::DW_TAG_structure_type, name, unit->getFile(), unit->getFile(), 0));
                 break;
             default: cached = builder.createUnspecifiedType(name); break;
@@ -980,9 +1009,50 @@ struct Emitter {
     }
 
     Value awaitValue(ExprId id, Value task, Span site) {
-        auto result = asyncAwait(builder, layouts.native(builder, rawType(id)), task, errorSlot);
+        return awaitValue(layouts.native(builder, rawType(id)), task, site);
+    }
+
+    Value awaitValue(llvm::Type* type, Value task, Span site) {
+        auto result = asyncAwait(builder, type, task, errorSlot);
         guard(builder.CreateLoad(builder.getPtrTy(), errorSlot), handlers.size(), site, "await");
         return result;
+    }
+
+    Value emitNode(ExprId id, const Select& selection) {
+        auto* pointer = builder.getPtrTy();
+        auto* integer = builder.getInt64Ty();
+        auto create = module.getOrInsertFunction("lyraTaskSelect", pointer, integer);
+        auto add = module.getOrInsertFunction("lyraTaskSelectArm", builder.getVoidTy(), pointer, integer, pointer);
+        auto task = builder.CreateCall(create, {builder.getInt64(selection.arms.size())});
+        for (std::size_t index = 0; index < selection.arms.size(); ++index) {
+            auto arm = emit(selection.arms[index].operation);
+            if (!live()) return unit();
+            builder.CreateCall(add, {task, builder.getInt64(index), arm});
+        }
+        auto outcome = awaitValue(llvm::StructType::get(builder.getContext(), {integer, pointer}), task, selection.site);
+        auto invalid = label("select.invalid"), done = label("select.end");
+        auto branch = builder.CreateSwitch(builder.CreateExtractValue(outcome, 0), invalid, selection.arms.size());
+        std::vector<std::pair<Value, Label>> values;
+        for (std::size_t index = 0; index < selection.arms.size(); ++index) {
+            auto chosen = label("select.arm");
+            branch->addCase(builder.getInt64(index), chosen);
+            builder.SetInsertPoint(chosen);
+            if (auto slot = fn.expressions[id].selectSlots[index]) {
+                auto* type = layouts.native(builder, fn.locals[*slot].type);
+                initialize(*slot, builder.CreateLoad(type, builder.CreateExtractValue(outcome, 1)));
+            }
+            auto value = emit(selection.arms[index].value);
+            if (live()) { values.emplace_back(value, builder.GetInsertBlock()); builder.CreateBr(done); }
+        }
+        builder.SetInsertPoint(invalid);
+        builder.CreateUnreachable();
+        if (values.empty()) { done->eraseFromParent(); end(); return unit(); }
+        builder.SetInsertPoint(done);
+        auto result = rawType(id);
+        if (result == Type::Unit) return unit();
+        auto value = builder.CreatePHI(layouts.native(builder, result), values.size());
+        for (auto [incoming, block] : values) value->addIncoming(incoming, block);
+        return value;
     }
 
     std::pair<BlockingCode, std::vector<Value>> closure(ExprId id, Type result, llvm::StringRef suffix) {
@@ -1390,6 +1460,27 @@ struct Emitter {
         switch (info.callee) {
             case Callee::Indirect: llvm_unreachable("indirect call already emitted");
             case Callee::TaskCancelled: case Callee::TaskCheckCancellation: llvm_unreachable("static task call already emitted");
+            case Callee::ChannelCreate: {
+                auto* pointer = builder.getPtrTy();
+                auto create = module.getOrInsertFunction("lyraChannelCreate", pointer, builder.getInt64Ty(), pointer, pointer);
+                builder.CreateStore(NativeExceptions{builder}.none(), errorSlot);
+                auto channel = builder.CreateCall(create, {args[0], layouts.typeToken(builder, channelClosed), errorSlot});
+                guard(builder.CreateLoad(pointer, errorSlot), handlers.size(), call.name.span, "call");
+                return channel;
+            }
+            case Callee::ChannelSend:
+                return NativeExceptions{builder}.created(pointerCall("lyraChannelSend", {receiver, lists.box(args[1])}), source, call.name.span);
+            case Callee::ChannelReceive: {
+                auto pack = layouts.channelPacker(builder, layouts.program.taskResults[rawType(id).id]);
+                return NativeExceptions{builder}.created(pointerCall("lyraChannelReceive", {receiver, pack}), source, call.name.span);
+            }
+            case Callee::ChannelClose:
+                builder.CreateCall(module.getOrInsertFunction("lyraChannelClose", builder.getVoidTy(), builder.getPtrTy()), args);
+                return unit();
+            case Callee::Sleep: {
+                auto sleep = module.getOrInsertFunction("lyraTaskSleep", builder.getPtrTy(), builder.getInt64Ty());
+                return NativeExceptions{builder}.created(builder.CreateCall(sleep, args), source, call.name.span);
+            }
             case Callee::LocalKey: return asyncCell(builder, builder.getInt8Ty());
             case Callee::WithLocal: return NativeExceptions{builder}.created(pointerCall("lyraTaskWithLocal", {args[0], NativeLists{builder}.box(args[1]), args[2]}), source, call.name.span);
             case Callee::LocalGet: {
@@ -1476,7 +1567,7 @@ struct Emitter {
             case Callee::Exception: {
                 auto type = rawType(id);
                 if (!type.id) return NativeExceptions{builder}.create(args.front());
-                const auto& name = layouts.program.exceptions[type.id - 1].name.text;
+                const auto name = layouts.typeName(type);
                 auto separator = name.rfind("::");
                 return NativeExceptions{builder}.create(args.front(), layouts.typeToken(builder, type),
                     std::string_view(name).substr(separator == name.npos ? 0 : separator + 2));

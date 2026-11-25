@@ -59,6 +59,23 @@ Task Context 绑定逻辑 Task，不绑定 Worker 线程。**在首次激活时*
 
 取消为独立、协作式的控制效果。异步执行体可用 `Task.cancelled(): Bool` 检查当前任务是否收到取消请求或已到达截止时间。`Task.checkCancellation(): Unit` 在同样条件下结束当前任务，继续按任务组规则等待子任务和执行[同步清理](errors-and-resources.md)，不经过普通 `catch`。两个接口都不挂起，在 CPU 循环占用当前域、计时器还没机会运行时也能检查截止时间。同域的其他任务仍要等当前任务让出执行权。不检查取消的 CPU 循环及不支持取消的 C 函数不会凭空停止。限时操作可以把自己的超时转为可处理结果，不能顺带把外层请求的取消转为成功。
 
+## 有界通道与 `select`
+
+`Channel<T>(capacity: Int)` 是跨执行域可共享的有界队列。正容量限制已缓冲的消息数，满时发送挂起并按等待顺序获得空位；容量 `0` 时发送与接收直接交接。容量必须是可表示的非负槽位数。`send(value: T): Task<Unit>`、`receive(): Task<Option<T>>` 和 `sleepMs(milliseconds: Int): Task<Unit>` 构造冷 Task，表达式求值时不会收发或启动计时器；非正计时延迟在激活后立即就绪。Struct 消息按值复制，Class 传共享引用。
+
+`close(): Unit` 同步关闭通道，可重复调用。关闭时唤醒等待中的发送者并抛出 `ChannelClosed`；关闭后的发送同样失败。接收先按 FIFO 耗尽缓冲，再返回 `None`。`Channel<T?>` 内的空元素返回 `Some(None)`，不会与结束信号混淆。
+
+```lyra
+val message = await select {
+    val next = jobs.receive() => next,
+    sleepMs(1000) => None,
+}
+```
+
+`await select` 只在异步执行体中使用，分支操作必须直接调用内置 `Channel.send`、`Channel.receive` 或 `sleepMs`，不接受任意已经启动的 Task。各操作的接收者和实参按源码顺序各求值一次；就绪操作以源码顺序择一提交，执行胜出分支的表达式。选中的发送若因关闭失败，按异常传播而不运行分支结果。可选的 `val name =` 只在该分支中绑定操作的结果。一个 `select` 的发送和接收分支不会彼此匹配。
+
+匹配与取消在同一步仲裁：等待被取消时摘除全部未提交的操作；交接已提交时不会撤销或重复收发，结果仍属于该操作 Task。落选分支不占用缓冲、不取出消息，计时器随等待一起注销。取消外层 Task 仍会停止外层的后续代码，不会回滚已完成的收发。[原生门闩测试](../tests/runtime_tasks.cpp)覆盖取消与提交的先后次序和关闭竞争，[源码用例](../tests/async_cli.py)覆盖冷调用、跨域等待、结果绑定和错误位置。
+
 ## 阻塞函数
 
 同步阻塞 C 调用通过 `blocking { ... }` 进入有界阻塞池；池满时挂起调用任务，不阻塞串行执行域的 Worker，也不临时无限增加线程。如果 C API 没有取消支持，取消调用方等待不等于停止底层 C 函数，Task Group 仍需等安全收尾。

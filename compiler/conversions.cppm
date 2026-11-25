@@ -23,7 +23,7 @@ void registerConversion(std::vector<DirectConversion>& table, const CheckedModul
     auto owner = [&](Type type) {
         if (type.kind == Type::Record) return sources[module.aggregates[type.id].syntax.file].moduleId == site.moduleId;
         if (type.kind == Type::Enum) return sources[module.enums[type.id].syntax.file].moduleId == site.moduleId;
-        if (type.kind == Type::Exception && type.id) return sources[module.exceptions[type.id - 1].file].moduleId == site.moduleId;
+        if (type.kind == Type::Exception && type.id >= firstDeclaredException) return sources[module.exceptions[type.id - firstDeclaredException].file].moduleId == site.moduleId;
         return false;
     };
     if (source == target || (!owner(source) && !owner(target))) throw at(site, fn.syntax.name.span, "LYV0001", "implicit 的源或目标类型必须由本模块定义，且不能是同一类型");
