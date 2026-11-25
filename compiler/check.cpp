@@ -571,7 +571,8 @@ struct Symbols {
         if (type.kind == Type::Channel) {
             auto element = module.channelElements[type.id];
             if (name == "send") return BuiltinMember{Callee::ChannelSend, {{"value"}, {element}, task(Type::Unit), false}};
-            if (name == "receive") return noArgs(Callee::ChannelReceive, task(sum(Type::Option, element)));
+            if (name == "receive" || name == "next") return noArgs(Callee::ChannelReceive, task(sum(Type::Option, element)));
+            if (name == "asyncIterator") return noArgs(Callee::ChannelIterator, type);
             if (name == "close") return noArgs(Callee::ChannelClose, Type::Unit);
         }
         if (name == "toBytes" && type == Type::String) return noArgs(Callee::ToBytes, Type::Bytes);
@@ -1188,7 +1189,7 @@ struct Checker {
     }
 
     void refer(const Identifier& name, std::size_t file, Span span) {
-        if (!name.text.starts_with('$')) fn.references.push_back({{fn.syntax.file, name.span}, {file, span}, name.renameTarget});
+        if (span.begin != span.end && !name.text.starts_with('$')) fn.references.push_back({{fn.syntax.file, name.span}, {file, span}, name.renameTarget});
     }
 
     void referLocal(const Identifier& name, std::size_t slot) {
@@ -2945,6 +2946,18 @@ struct Checker {
             auto type = fn.expressions[arg].type;
             if (!exits && !builtInDisplay(type)) throw at(source, fn.syntax.expressions[arg].span, "LYT0001", "print 需要数值、Bool、Char 或 String，实际是 " + typeName(module, type));
             return exits ? Type::Never : Type::Unit;
+        } else if (key == "awaitOutcome") {
+            noTypeArgs();
+            if (!inAsync()) throw at(source, call.name.span, "LYT0008", "awaitOutcome 只能在异步执行体中调用");
+            std::optional<Type> hint;
+            if (expected && expected->kind == Type::Enum && module.enums[expected->id].syntax.name.text == "TaskOutcome")
+                hint = symbols.task(module.enums[expected->id].arguments.front());
+            info.callee = Callee::AwaitOutcome;
+            if (arguments(id, call, 1, [](auto) { return "task"; }, [&](auto) { return hint; })) return Type::Never;
+            auto value = call.arguments.front().value;
+            auto task = fn.expressions[value].type;
+            if (task.kind != Type::Task) throw at(source, fn.syntax.expressions[value].span, "LYT0008", "awaitOutcome 需要 Task，实际是 " + typeName(module, task));
+            return symbols.enumType(symbols.enums.at("TaskOutcome"), {module.taskResults[task.id]}, source, call.name.span);
         } else if (key == "gcCollect") {
             noTypeArgs();
             info.callee = Callee::Collect;
@@ -3002,8 +3015,9 @@ struct Checker {
         for (const auto& arm : selection.arms) {
             auto task = inspect(arm.operation, {});
             auto callee = fn.expressions[arm.operation].callee;
-            if (!std::holds_alternative<Call>(fn.syntax.expressions[arm.operation].node) ||
-                (callee != Callee::ChannelSend && callee != Callee::ChannelReceive && callee != Callee::Sleep))
+            const auto* operation = std::get_if<Call>(&fn.syntax.expressions[arm.operation].node);
+            if (!operation || (callee != Callee::ChannelSend && callee != Callee::Sleep &&
+                    (callee != Callee::ChannelReceive || operation->name.text != "receive")))
                 throw at(source, fn.syntax.expressions[arm.operation].span, "LYT0008", "select 分支必须直接调用 Channel.send、Channel.receive 或 sleepMs");
             if (task == Type::Never) return task;
             outcomes.push_back(module.taskResults[task.id]);
@@ -3301,30 +3315,49 @@ struct Checker {
 
     struct IterationMethod { Type result; std::optional<std::size_t> function; };
 
-    IterationMethod iterationMethod(Type owner, const std::string& name, Span site) {
+    IterationMethod iterationMethod(Type owner, const std::string& name, Span site, bool asynchronous, bool opening) {
+        auto signatureMatches = [&](const RequiredMethod& shape) {
+            return shape.parameters.empty() && (asynchronous && !opening ? shape.asynchronous || shape.result.kind == Type::Task : !shape.asynchronous);
+        };
+        auto resultType = [&](const RequiredMethod& shape) { return shape.asynchronous ? symbols.task(shape.result) : shape.result; };
+        if (auto builtin = symbols.builtinMember(owner, name); builtin && signatureMatches(builtin->shape)) {
+            std::optional<std::size_t> function;
+            if (materializing()) function = symbols.builtinImplementation(owner, name, *builtin, fn.syntax.file, site);
+            return {resultType(builtin->shape), function};
+        }
         if (owner.kind == Type::Variable) {
-            if (auto method = symbols.boundMember(owner, name, source, site); method && method->shape.parameters.empty() && !method->shape.asynchronous)
-                return {method->shape.result, {}};
-        } else if (owner.kind == Type::Record) {
-            const auto& record = module.aggregates[owner.id];
-            auto selected = symbols.shapedMethod(owner, name, source, [](const auto& shape) { return shape.parameters.empty() && !shape.asynchronous; });
+            if (auto method = symbols.boundMember(owner, name, source, site); method && signatureMatches(method->shape))
+                return {resultType(method->shape), {}};
+        } else if (owner.kind == Type::Record || owner.kind == Type::Enum) {
+            auto selected = symbols.shapedMethod(owner, name, source, signatureMatches);
             if (selected) {
                 const auto& entry = symbols.callables[selected->first];
                 std::optional<std::size_t> function;
-                if (materializing()) function = entry.generic ? symbols.instantiate(selected->first, record.arguments, source, site) : entry.target;
-                return {selected->second.result, function};
+                if (materializing()) function = entry.generic ? symbols.instantiate(selected->first, symbols.instanceArguments(owner), source, site) : entry.target;
+                return {resultType(selected->second), function};
             }
         }
-        auto expected = name == "iterator" ? "可见的同步 iterator()，或使用 List、整数区间" : "可见的同步 next(): Option<T>";
-        throw at(source, site, "LYT0014", "for ... in 需要" + std::string(expected) + "，实际是 " + typeName(module, owner));
+        auto expected = asynchronous ? (opening ? "可见的同步 asyncIterator()" : "可见的 next(): Task<Option<T>>") :
+            (opening ? "可见的同步 iterator()，或使用 List、整数区间" : "可见的同步 next(): Option<T>");
+        throw at(source, site, "LYT0014", (asynchronous ? std::string("for await ... in 需要") : std::string("for ... in 需要")) + expected + "，实际是 " + typeName(module, owner));
     }
 
     Type infer(ExprId id, const For& loop, auto, bool) {
+        if (loop.awaitSite && !inAsync()) throw at(source, *loop.awaitSite, "LYT0008", "for await 只能在异步执行体中使用");
         auto input = visit(loop.input);
         auto element = input;
         if (input == Type::Never) return input;
         std::optional<IteratorPlan> methods;
-        if (input == Type::IntRange) {
+        if (loop.awaitSite) {
+            auto site = fn.syntax.expressions[loop.input].span;
+            auto iterator = iterationMethod(input, "asyncIterator", site, true, true);
+            auto next = iterationMethod(iterator.result, "next", site, true, false);
+            auto option = module.taskResults[next.result.id];
+            if (option.kind != Type::Option)
+                throw at(source, site, "LYT0014", "for await ... in 的 next() 必须返回 Task<Option<T>>，实际是 " + typeName(module, next.result));
+            element = module.sumTypes[option.id].success;
+            if (iterator.function && next.function) methods = IteratorPlan{*iterator.function, *next.function, option};
+        } else if (input == Type::IntRange) {
             element = Type::Int;
         } else if (input.kind == Type::List) {
             element = module.listElements[input.id];
@@ -3334,8 +3367,8 @@ struct Checker {
             element = number(Type::UInt, 8);
         } else {
             auto site = fn.syntax.expressions[loop.input].span;
-            auto iterator = iterationMethod(input, "iterator", site);
-            auto next = iterationMethod(iterator.result, "next", site);
+            auto iterator = iterationMethod(input, "iterator", site, false, true);
+            auto next = iterationMethod(iterator.result, "next", site, false, false);
             if (next.result.kind != Type::Option)
                 throw at(source, site, "LYT0014", "for ... in 的 next() 必须返回 Option<T>，实际是 " + typeName(module, next.result));
             element = module.sumTypes[next.result.id].success;
@@ -3410,12 +3443,20 @@ CheckedModule check(Module module, const std::vector<Source>& sources, bool requ
         for (Type builtin : scalarTypes) {
             if (name == typeName(checked, builtin)) throw at(sources[decl.file], decl.name.span, "LYN0002", "类型名与内置类型冲突：" + std::string(name));
         }
-        if (name == "Never" || name == "TaskLocal" || name == "Range" || name == "Eq" || name == "Hash" || name == "Channel") throw at(sources[decl.file], decl.name.span, "LYN0002", "类型名与内置类型冲突：" + std::string(name));
+        if (name == "Never" || name == "TaskLocal" || name == "Range" || name == "Eq" || name == "Hash" || name == "Channel" || name == "TaskOutcome") throw at(sources[decl.file], decl.name.span, "LYN0002", "类型名与内置类型冲突：" + std::string(name));
         if (decl.name.text == "print" || decl.name.text == "gcCollect" || !names.emplace(declaration, index).second) throw at(sources[decl.file], decl.name.span, "LYN0002", "类型名称已声明：" + decl.name.text);
     };
     for (auto& decl : module.aggregates) {
         reserveType(decl, symbols.records, symbols.recordDeclarations.size());
         symbols.recordDeclarations.push_back(std::move(decl));
+    }
+    if (!sources.empty()) {
+        symbols.enums.emplace("TaskOutcome", 0);
+        symbols.enumDeclarations.push_back({0, {"TaskOutcome", {}}, {
+            {{"Completed", {}}, {{Identifier{"value", {}}, {"T", {}}}}},
+            {{"Failed", {}}, {{Identifier{"exception", {}}, {"Exception", {}}}}},
+            {{"Cancelled", {}}, {{Identifier{"cleanupFailures", {}}, {"List<Exception>", {}}}}},
+        }, true, {{"T", {}}}});
     }
     for (auto& decl : module.enums) {
         if (symbols.records.contains(decl.name.text)) throw at(sources[decl.file], decl.name.span, "LYN0002", "类型名称已声明：" + decl.name.text);

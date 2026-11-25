@@ -79,7 +79,7 @@ struct SyntaxArena {
                 const auto* name = std::get_if<PatternName>(&node.item.node);
                 if (name && !name->owner && !name->labels) named("name", name->name);
                 else children.push_back(input("pattern", node.item.span));
-                child(node.input); child(node.body); return "for";
+                child(node.input); child(node.body); return node.awaitSite ? "forAwait" : "for";
             } else if constexpr (std::is_same_v<Node, Member>) {
                 child(node.receiver); named("name", node.name); return "member";
             } else if constexpr (std::is_same_v<Node, QualifiedMember>) {

@@ -24,7 +24,7 @@ inline constexpr const char* rangeFieldNames[] = {"start", "end", "inclusive"};
 inline constexpr Type channelClosed{Type::Exception, 1};
 inline constexpr std::size_t firstDeclaredException = channelClosed.id + 1;
 struct Local { Type type; bool writable; std::optional<ExprId> worker{}; bool captured{}; std::optional<Span> declaration{}; std::string name{}; };
-enum class Callee { Function, Constructor, Variant, Print, Collect, Sum, ListAdd, ListSlice, TaskCancel, TaskCancelled, TaskCheckCancellation, Exception, Indirect, ToReal, ToIntegerChecked, ToString, ToBytes, DecodeUtf8, Dynamic, BusinessError, ErrorSuppress, FailureInfo, LocalKey, LocalGet, WithLocal, ExtensionProperty, BoundMethod, ReflectTypeName, ReflectFieldCount, ReflectFieldName, ReflectField, Size, ValueEqual, ValueHash, ChannelCreate, ChannelSend, ChannelReceive, ChannelClose, Sleep, PtrAllocate, PtrNull, PtrIsNull, PtrFree, PtrOffset, PtrRead, PtrWrite, CallbackRegister, CallbackContext, CallbackFunction, CallbackClose, CallbackTakeError };
+enum class Callee { Function, Constructor, Variant, Print, Collect, Sum, ListAdd, ListSlice, TaskCancel, TaskCancelled, TaskCheckCancellation, AwaitOutcome, Exception, Indirect, ToReal, ToIntegerChecked, ToString, ToBytes, DecodeUtf8, Dynamic, BusinessError, ErrorSuppress, FailureInfo, LocalKey, LocalGet, WithLocal, ExtensionProperty, BoundMethod, ReflectTypeName, ReflectFieldCount, ReflectFieldName, ReflectField, Size, ValueEqual, ValueHash, ChannelCreate, ChannelIterator, ChannelSend, ChannelReceive, ChannelClose, Sleep, PtrAllocate, PtrNull, PtrIsNull, PtrFree, PtrOffset, PtrRead, PtrWrite, CallbackRegister, CallbackContext, CallbackFunction, CallbackClose, CallbackTakeError };
 enum class ValueOperation { Equal, Hash };
 struct PatternSlot { std::size_t local; };
 struct PatternListRest { std::size_t local; };
@@ -44,7 +44,7 @@ struct CheckedPattern {
 enum class PatternUse { Match, Binding, Loop };
 struct DeferredPatternCheck { std::size_t file; Span site; Type subject; std::vector<CheckedPattern> patterns; PatternUse use; };
 struct MatchCoverage { std::size_t file; Type subject; struct Arm { CheckedPattern pattern; bool guarded; }; std::vector<Arm> arms; };
-struct IteratorPlan { std::size_t open, next; };
+struct IteratorPlan { std::size_t open, next; std::optional<Type> awaited{}; };
 struct CheckedIteration { Type element; std::optional<IteratorPlan> methods; };
 struct CheckedCatch { Type type; std::optional<std::size_t> local; };
 struct ErrorDisplay { std::optional<std::size_t> method; std::string fallback; };

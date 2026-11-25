@@ -97,6 +97,79 @@ async fn main(): Unit {
     try { Channel<Int>(-1); } catch reason: Exception { print("invalid capacity") }
 }''', 'cold\ntrue\n81\ntrue\nsend on closed channel\ninvalid capacity\n')
 
+    def test_for_await_uses_the_protocol_and_does_not_close_channels(self):
+        self.run_source('''class Cursor(var index: Int) {
+    async fn next(): Int? {
+        await sleepMs(0)
+        index += 1
+        if index <= 3 { Some(index) } else { None }
+    }
+}
+struct Sequence {
+    fn asyncIterator(): Cursor { print("open"); Cursor(0) }
+}
+async fn main(): Unit {
+    for await value in Sequence() {
+        if value == 2 { continue }
+        print(value)
+    }
+    val channel = Channel<Int?>(0)
+    spawn async {
+        await channel.send(None)
+        await channel.send(Some(42))
+        channel.close()
+    }
+    for await item in channel { print(item == None); break }
+    for await item in channel { print(item ?? -1) }
+    print(await channel.receive() == None)
+}''', 'open\n1\n3\ntrue\n42\ntrue\n')
+
+    def test_await_outcome_observes_failure_and_cancelled_cleanup_snapshots(self):
+        self.run_source('''async fn work(started: Channel<Int>, gate: Channel<Int>): Int {
+    defer { throw Exception("second cleanup") }
+    defer { throw Exception("first cleanup") }
+    await started.send(1)
+    (await gate.receive()) ?? -1
+}
+fn show(outcome: TaskOutcome<Int>): Unit {
+    match outcome {
+        Completed(value) => print(value),
+        Failed(exception) => print(exception.message),
+        Cancelled(cleanups) => {
+            print(cleanups.size)
+            for error in cleanups { print(error.message) }
+            if cleanups.size > 0 { cleanups[0] = Exception("local change") }
+        },
+    }
+}
+async fn main(): Unit {
+    show(awaitOutcome(async { 42 }))
+    val failed: Task<Int> = async { throw Exception("original") }
+    show(awaitOutcome(failed))
+    show(awaitOutcome(failed))
+    val started = Channel<Int>(0)
+    val gate = Channel<Int>(0)
+    val child = spawn work(started, gate)
+    await started.receive();
+    child.cancel()
+    show(awaitOutcome(child))
+    show(awaitOutcome(child))
+}''', '42\noriginal\noriginal\n2\nfirst cleanup\nsecond cleanup\n2\nfirst cleanup\nsecond cleanup\n')
+
+    def test_async_iteration_and_outcome_require_an_async_context(self):
+        for program, name in [
+            ('fn main(): Unit { for await value in Channel<Int>(1) {} }', 'await'),
+            ('fn main(): Unit { val outcome = awaitOutcome(async { 1 }) }', 'awaitOutcome'),
+        ]:
+            with self.subTest(program=program):
+                self.main.write_text(program, encoding='utf-8')
+                result = subprocess.run([COMPILER, 'check', self.package, '--diagnostics=json'], capture_output=True, timeout=10)
+                error, = json.loads(result.stderr)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(error['code'], 'LYT0008', error)
+                span = error['range']
+                self.assertEqual(program[span['start']['offset']:span['end']['offset']], name)
+
     def test_select_commits_only_the_chosen_arm_in_source_order(self):
         self.run_source('''fn mark(value: Int): Int { print(value); value }
 async fn main(): Unit {

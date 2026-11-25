@@ -1,6 +1,7 @@
 #include "tasks.h"
 #include "context.h"
 #include "locks.h"
+#include "lists.h"
 #include "managed.h"
 #include "strings.h"
 
@@ -860,6 +861,7 @@ void localScopeStep(LyraTask *self, void *storage) {
         case LYRA_AWAIT_PENDING: return;
         case LYRA_AWAIT_VALUE: lyraTaskComplete(self, lyraTaskOutcome(scope->body)); return;
         case LYRA_AWAIT_EXCEPTION: lyraTaskFail(self, lyraTaskException(scope->body)); return;
+        case LYRA_AWAIT_CANCELLED: require(false, "ordinary await must propagate cancellation"); return;
     }
 }
 
@@ -1124,6 +1126,14 @@ LyraAwaitStatus lyraTaskAwaitValue(LyraTask *waiter, LyraTask *target) {
     return LYRA_AWAIT_VALUE;
 }
 
+LyraAwaitStatus lyraTaskAwaitOutcome(LyraTask *waiter, LyraTask *target) {
+    TaskLock lock;
+    cancelled(waiter);
+    if (!awaitTask(waiter, target)) return LYRA_AWAIT_PENDING;
+    if (target->state == LYRA_TASK_FAILED) return LYRA_AWAIT_EXCEPTION;
+    return target->state == LYRA_TASK_CANCELLED ? LYRA_AWAIT_CANCELLED : LYRA_AWAIT_VALUE;
+}
+
 void lyraTaskSuspend(LyraTask *task) {
     TaskLock lock;
     require(task->state == LYRA_TASK_RUNNING, "only a running task can suspend");
@@ -1200,4 +1210,12 @@ const LyraException *lyraTaskException(const LyraTask *task) {
     TaskLock lock;
     require(isTerminal(task), "task has not finished cleanup");
     return task->error;
+}
+
+LyraList *lyraTaskCancellationFailures(const LyraTask *task) {
+    TaskLock lock;
+    require(task->state == LYRA_TASK_CANCELLED, "task has not finished cancellation");
+    auto *error = task->error;
+    lock.unlock();
+    return error ? lyraExceptionCleanupFailures(error) : lyraListCreate();
 }

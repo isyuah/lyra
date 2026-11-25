@@ -19,7 +19,7 @@ const LyraException *raised(const char *message) {
 struct Group {
     LyraTask *target{}, *sibling{};
     const LyraException *error = raised("child");
-    bool spawnFirst{}, late{}, publish{}, caught{}, siblingCompleted{};
+    bool spawnFirst{}, late{}, publish{}, caught{}, siblingCompleted{}, outcome{};
 };
 
 void failing(LyraTask *self, void *storage) {
@@ -37,8 +37,9 @@ void sibling(LyraTask *self, void *storage) {
 
 void observe(LyraTask *self, void *storage) {
     auto *group = static_cast<Group *>(storage);
-    if (lyraTaskAwaitValue(self, group->target) == LYRA_AWAIT_PENDING) return;
-    check(lyraTaskAwaitValue(self, group->target) == LYRA_AWAIT_EXCEPTION, "repeat await observed a successful completion");
+    auto await = group->outcome ? lyraTaskAwaitOutcome : lyraTaskAwaitValue;
+    if (await(self, group->target) == LYRA_AWAIT_PENDING) return;
+    check(await(self, group->target) == LYRA_AWAIT_EXCEPTION, "repeat await observed a successful completion");
     check(lyraTaskException(group->target) == group->error, "await changed the task's terminal exception");
     group->caught = true;
     lyraTaskWake(group->sibling);
@@ -56,10 +57,11 @@ void owner(LyraTask *self, void *storage) {
     observe(self, storage);
 }
 
-void ownership(LyraDomain *origin, LyraDomain *other, bool spawnFirst, bool late) {
+void ownership(LyraDomain *origin, LyraDomain *other, bool spawnFirst, bool late, bool outcome = false) {
     Group group{};
     group.spawnFirst = spawnFirst;
     group.late = late;
+    group.outcome = outcome;
     auto *parent = lyraTaskCreate(owner, &group);
     lyraTaskStart(origin, parent);
     lyraDomainRun(origin);
@@ -81,6 +83,40 @@ void ownership(LyraDomain *origin, LyraDomain *other, bool spawnFirst, bool late
     } else {
         check(lyraTaskState(parent) == LYRA_TASK_COMPLETED && group.siblingCompleted, "observed failure was also reported to the group");
     }
+}
+
+void cancelledObservation(LyraDomain *origin, LyraDomain *other) {
+    auto *target = lyraTaskCreate([](LyraTask *self, void *) {
+        if (lyraTaskCancelRequested(self)) lyraTaskFinishCancelled(self);
+        else lyraTaskSuspend(self);
+    }, nullptr);
+    auto *waiter = lyraTaskCreate([](LyraTask *self, void *storage) {
+        if (lyraTaskCancelRequested(self)) { lyraTaskFinishCancelled(self); return; }
+        check(lyraTaskAwaitOutcome(self, static_cast<LyraTask *>(storage)) == LYRA_AWAIT_PENDING, "cancelled observer executed its continuation");
+    }, target);
+    lyraTaskStart(origin, target);
+    lyraTaskStart(other, waiter);
+    lyraDomainRun(origin);
+    lyraDomainRun(other);
+    check(lyraTaskState(waiter) == LYRA_TASK_SUSPENDED, "observer did not park before cancellation");
+    lyraTaskRequestCancel(waiter);
+    lyraDomainRun(other);
+    check(lyraTaskState(waiter) == LYRA_TASK_CANCELLED && lyraTaskState(target) == LYRA_TASK_SUSPENDED, "cancelling a cross-domain observer changed target ownership");
+    lyraTaskRequestCancel(target);
+    auto *observer = lyraTaskCreate([](LyraTask *self, void *storage) {
+        auto *observed = static_cast<LyraTask *>(storage);
+        if (lyraTaskState(observed) != LYRA_TASK_CANCELLED) {
+            check(lyraTaskAwaitOutcome(self, observed) == LYRA_AWAIT_PENDING, "observed cancellation before cleanup completed");
+            return;
+        }
+        check(lyraTaskAwaitOutcome(self, observed) == LYRA_AWAIT_CANCELLED, "target cancellation propagated into observer");
+        lyraTaskComplete(self, nullptr);
+    }, target);
+    lyraTaskStart(other, observer);
+    lyraDomainRun(other);
+    lyraDomainRun(origin);
+    lyraDomainRun(other);
+    check(lyraTaskState(observer) == LYRA_TASK_COMPLETED, "observer did not complete after target cancellation");
 }
 
 struct Cleanup {
@@ -155,6 +191,9 @@ int main() {
     ownership(origin, other, false, false);
     ownership(origin, other, true, false);
     ownership(origin, other, true, true);
+    ownership(origin, other, true, false, true);
+    ownership(origin, other, true, true, true);
+    cancelledObservation(origin, other);
     unwind(origin, LYRA_TASK_COMPLETED);
     unwind(origin, LYRA_TASK_FAILED);
     unwind(origin, LYRA_TASK_CANCELLED);

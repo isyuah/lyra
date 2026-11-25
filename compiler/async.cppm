@@ -64,6 +64,10 @@ export llvm::Value* asyncAwait(llvm::IRBuilder<>& builder, llvm::Type* result, l
     return marker(builder, "lyra.await", result, {task, errorSlot});
 }
 
+export llvm::Value* asyncAwaitOutcome(llvm::IRBuilder<>& builder, llvm::Value* task) {
+    return marker(builder, "lyra.awaitOutcome", builder.getInt32Ty(), {task});
+}
+
 export llvm::Value* asyncSpawn(llvm::IRBuilder<>& builder, llvm::Value* task, bool parallel = false) {
     return marker(builder, parallel ? "lyra.parallel" : "lyra.spawn", builder.getPtrTy(), {task});
 }
@@ -216,7 +220,7 @@ export void lowerAsync(llvm::Function& factory, llvm::Function& body, llvm::Allo
             auto* callee = call->getCalledFunction();
             if (callee && callee->hasFnAttribute("lyra.suspension")) {
                 auto name = callee->getFnAttribute("lyra.suspension").getValueAsString();
-                if (name == "lyra.await") waits.push_back(call);
+                if (name == "lyra.await" || name == "lyra.awaitOutcome") waits.push_back(call);
                 else if (name == "lyra.spawn" || name == "lyra.parallel") spawns.push_back(call);
                 else if (name == "lyra.checkCancellation") cancellationChecks.push_back(call);
                 else if (name == "lyra.taskCancelled") cancellationQueries.push_back(call);
@@ -298,7 +302,6 @@ export void lowerAsync(llvm::Function& factory, llvm::Function& body, llvm::Allo
     for (auto site : sites) {
         auto* wait = site.instruction;
         auto* target = wait->getArgOperand(0);
-        auto* errorSlot = wait->getArgOperand(1);
         site.resume->getTerminator()->eraseFromParent();
         std::vector<llvm::Instruction*> after;
         for (auto* next = wait->getNextNode(); next; next = next->getNextNode()) after.push_back(next);
@@ -307,6 +310,14 @@ export void lowerAsync(llvm::Function& factory, llvm::Function& body, llvm::Allo
         auto* index = builder.getInt32(++state);
         branch->addCase(index, site.resume);
         builder.CreateStore(index, pc);
+        if (wait->arg_size() == 1) {
+            auto* status = builder.CreateCall(runtime(builder, "lyraTaskAwaitOutcome", integer, {pointer, pointer}), {task, target});
+            builder.CreateCondBr(builder.CreateIsNull(status), yield, site.read);
+            wait->replaceAllUsesWith(status);
+            eraseMarker(wait);
+            continue;
+        }
+        auto* errorSlot = wait->getArgOperand(1);
         auto* status = builder.CreateCall(runtime(builder, "lyraTaskAwaitValue", integer, {pointer, pointer}), {task, target});
         auto* success = llvm::BasicBlock::Create(context, "await.success", step);
         auto* failure = llvm::BasicBlock::Create(context, "await.failure", step);

@@ -11,6 +11,7 @@ extern "C" {
 typedef struct LyraDomain LyraDomain;
 typedef struct LyraTask LyraTask;
 typedef struct LyraChannel LyraChannel;
+typedef struct LyraList LyraList;
 typedef void (*LyraTaskStep)(LyraTask *task, void *frame);
 typedef void (*LyraNativeWork)(void *nativeData);
 typedef void *(*LyraBlockingBody)(void *environment, const LyraException **error);
@@ -22,7 +23,7 @@ typedef enum LyraTaskState {
     LYRA_TASK_COMPLETED, LYRA_TASK_FAILED, LYRA_TASK_CANCELLED
 } LyraTaskState;
 
-typedef enum LyraAwaitStatus { LYRA_AWAIT_PENDING, LYRA_AWAIT_VALUE, LYRA_AWAIT_EXCEPTION } LyraAwaitStatus;
+typedef enum LyraAwaitStatus { LYRA_AWAIT_PENDING, LYRA_AWAIT_VALUE, LYRA_AWAIT_EXCEPTION, LYRA_AWAIT_CANCELLED } LyraAwaitStatus;
 
 LyraDomain *lyraDomainCreate(void);
 int64_t lyraTaskParallelism(void);
@@ -46,6 +47,7 @@ int lyraTaskWatchDisconnect(uintptr_t monitor);
 void lyraTaskStart(LyraDomain *domain, LyraTask *task);
 int lyraTaskAwait(LyraTask *waiter, LyraTask *target);
 LyraAwaitStatus lyraTaskAwaitValue(LyraTask *waiter, LyraTask *target);
+LyraAwaitStatus lyraTaskAwaitOutcome(LyraTask *waiter, LyraTask *target);
 LyraTask *lyraTaskSpawn(LyraTask *parent, LyraTask *target);
 LyraTask *lyraTaskParallel(LyraTask *parent, LyraTask *target);
 int lyraTaskRunRoot(LyraTask *task);
@@ -60,6 +62,7 @@ void lyraTaskFinishCancelled(LyraTask *task);
 LyraTaskState lyraTaskState(const LyraTask *task);
 void *lyraTaskOutcome(const LyraTask *task);
 const LyraException *lyraTaskException(const LyraTask *task);
+LyraList *lyraTaskCancellationFailures(const LyraTask *task);
 
 #ifdef __cplusplus
 }

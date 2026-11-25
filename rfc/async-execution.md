@@ -17,6 +17,8 @@ val second = await work
 
 多次等待同一 Task 观察同一次完成、异常或取消，不会重复运行函数体。Struct 结果按值返回，Class 结果共享同一对象身份。`Task<Connection>` 也遵循这条规则：两次 `await` 只打开一次数据库，拿到同一个连接。一方关闭成功后，另一方拿到的是已关闭的连接，不会重新打开或复制 C 句柄。普通 `Task<T>` 不要求 `T: Copy`，也不因返回资源就变成一次性 Task。
 
+异步执行体可写 `awaitOutcome(task)` 直接挂起并观察 `TaskOutcome<T>`：`Completed(value)`、`Failed(exception)` 或 `Cancelled(cleanupFailures)`。失败保留原始异常身份；取消附带独立的 `List<Exception>` 清理记录快照，未发生清理失败时为空。它只把目标 Task 的取消转为值，等待者自己的取消仍走普通取消和收尾流程。首次激活、跨域恢复及失败发布前后的归组责任与 `await` 一致；不预先登记对未来失败的观察。
+
 直接 `await` 冷 Task 由当前作用域激活并负责收尾；等待已启动的 Task 只观察其终态，不改变哪个作用域负责收尾。被创建后丢弃的未启动 Task 不运行函数体，因而体内的 `defer` 尚未登记；调用实参已经发生的副作用不回滚。
 
 ## 执行域与 `spawn`
@@ -66,6 +68,8 @@ Task Context 绑定逻辑 Task，不绑定 Worker 线程。**在首次激活时*
 `Channel<T>(capacity: Int)` 是跨执行域可共享的有界队列。正容量限制已缓冲的消息数，满时发送挂起并按等待顺序获得空位；容量 `0` 时发送与接收直接交接。容量必须是可表示的非负槽位数。`send(value: T): Task<Unit>`、`receive(): Task<Option<T>>` 和 `sleepMs(milliseconds: Int): Task<Unit>` 构造冷 Task，表达式求值时不会收发或启动计时器；非正计时延迟在激活后立即就绪。Struct 消息按值复制，Class 传共享引用。
 
 `close(): Unit` 同步关闭通道，可重复调用。关闭时唤醒等待中的发送者并抛出 `ChannelClosed`；关闭后的发送同样失败。接收先按 FIFO 耗尽缓冲，再返回 `None`。`Channel<T?>` 内的空元素返回 `Some(None)`，不会与结束信号混淆。
+
+`for await item in source { ... }` 只能写在异步执行体。先对 `source` 求值一次，再调用一次同步 `asyncIterator()` 取得游标；每轮调用并等待 `next(): Task<Option<T>>`，也可由 `async fn next(): Option<T>` 提供。`Some(value)` 进入循环，只有外层 `None` 结束；迭代中的失败和取消按普通 `await` 传播。`Channel<T>` 的游标就是通道自身，`next()` 等同接收；`break` 结束循环，不关闭通道，也不预取下一项。
 
 ```lyra
 val message = await select {

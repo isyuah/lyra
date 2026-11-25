@@ -209,6 +209,7 @@ struct Validator {
                 descend(node.condition);
                 if (fn.expressions[node.condition].type != Type::Never) descend(node.body);
             } else if constexpr (std::is_same_v<Node, For>) {
+                if (node.awaitSite) reject(*node.awaitSite, "编译期不能异步遍历");
                 descend(node.input);
                 if (info.iteration && info.iteration->methods) {
                     validateFunction(info.iteration->methods->open, expr.span);

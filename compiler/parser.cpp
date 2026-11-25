@@ -959,12 +959,14 @@ private:
 
     ExprId forLoop() {
         auto site = consume().span;
+        std::optional<Span> awaitSite;
+        if (is("await")) awaitSite = consume().span;
         auto item = pattern();
         if (auto* name = std::get_if<PatternName>(&item.node); name && !name->owner && !name->labels) name->escaped = true;
         require("in");
         auto input = expression(false, 1, false);
         auto body = block();
-        return add({site.begin, nodes[body].span.end}, For{std::move(item), input, body});
+        return add({site.begin, nodes[body].span.end}, For{std::move(item), input, body, awaitSite});
     }
 
     ExprId optional(ExprId subject, Identifier payload, ExprId present, ExprId absent, Span site, Span span, OptionalForm form) {

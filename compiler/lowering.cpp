@@ -1047,6 +1047,35 @@ struct Emitter {
         return result;
     }
 
+    Value awaitOutcome(ExprId id, Value task) {
+        auto status = asyncAwaitOutcome(builder, task);
+        auto type = rawType(id);
+        auto invalid = label("outcome.invalid"), merge = label("outcome.end");
+        auto dispatch = builder.CreateSwitch(status, invalid, 3);
+        auto completed = label("outcome.completed"), failed = label("outcome.failed"), cancelled = label("outcome.cancelled");
+        dispatch->addCase(builder.getInt32(1), completed);
+        dispatch->addCase(builder.getInt32(2), failed);
+        dispatch->addCase(builder.getInt32(3), cancelled);
+        builder.SetInsertPoint(invalid);
+        builder.CreateUnreachable();
+        builder.SetInsertPoint(completed);
+        auto payload = layouts.native(builder, layouts.program.enums[type.id].arguments.front());
+        auto value = makeVariant(type, 0, {builder.CreateLoad(payload, pointerCall("lyraTaskOutcome", {task}))});
+        builder.CreateBr(merge);
+        builder.SetInsertPoint(failed);
+        auto exception = makeVariant(type, 1, {pointerCall("lyraTaskException", {task})});
+        builder.CreateBr(merge);
+        builder.SetInsertPoint(cancelled);
+        auto cleanups = makeVariant(type, 2, {pointerCall("lyraTaskCancellationFailures", {task})});
+        builder.CreateBr(merge);
+        builder.SetInsertPoint(merge);
+        auto result = builder.CreatePHI(layouts.native(builder, type), 3);
+        result->addIncoming(value, completed);
+        result->addIncoming(exception, failed);
+        result->addIncoming(cleanups, cancelled);
+        return result;
+    }
+
     Value emitNode(ExprId id, const Select& selection) {
         auto* pointer = builder.getPtrTy();
         auto* integer = builder.getInt64Ty();
@@ -1506,6 +1535,7 @@ struct Emitter {
         switch (info.callee) {
             case Callee::BoundMethod: case Callee::Indirect: llvm_unreachable("invalid indirect call plan");
             case Callee::TaskCancelled: case Callee::TaskCheckCancellation: llvm_unreachable("static task call already emitted");
+            case Callee::AwaitOutcome: return awaitOutcome(id, args[0]);
             case Callee::PtrAllocate: {
                 auto* pointer = builder.getPtrTy();
                 auto allocate = module.getOrInsertFunction("lyraPtrAllocate", pointer, builder.getInt64Ty(), pointer);
@@ -1550,6 +1580,7 @@ struct Emitter {
             }
             case Callee::ChannelSend:
                 return NativeExceptions{builder}.created(pointerCall("lyraChannelSend", {receiver, lists.box(args[1])}), source, call.name.span);
+            case Callee::ChannelIterator: return receiver;
             case Callee::ChannelReceive: {
                 auto pack = layouts.channelPacker(builder, layouts.program.taskResults[rawType(id).id]);
                 return NativeExceptions{builder}.created(pointerCall("lyraChannelReceive", {receiver, pack}), source, call.name.span);
@@ -2006,6 +2037,7 @@ struct Emitter {
             builder.CreateBr(test);
             builder.SetInsertPoint(test);
             auto next = callFunction(plan->next, {iterator}, site);
+            if (plan->awaited) next = awaitValue(layouts.native(builder, *plan->awaited), next, *loop.awaitSite);
             builder.CreateCondBr(builder.CreateExtractValue(next, 0), body, done);
             builder.SetInsertPoint(body);
             bindIrrefutable(pattern, builder.CreateExtractValue(next, 1), loop.item.span);

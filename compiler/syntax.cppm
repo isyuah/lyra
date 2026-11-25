@@ -86,7 +86,7 @@ struct Pattern {
     std::vector<Pattern> parts{};
 };
 struct While { ExprId condition, body; std::optional<Pattern> pattern{}; };
-struct For { Pattern item; ExprId input, body; };
+struct For { Pattern item; ExprId input, body; std::optional<Span> awaitSite{}; };
 struct PatternBinding { Pattern pattern; std::optional<Identifier> annotation; ExprId value; };
 struct MatchArm { Pattern pattern; ExprId value; std::optional<ExprId> guard{}; };
 enum class OptionalForm { None, Access, Default };
