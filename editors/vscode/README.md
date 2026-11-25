@@ -31,7 +31,11 @@ code --install-extension lyra-language.vsix
 
 语言服务按入口包和可达依赖缓存语义分析。修改无关包不会重检当前包；修改相关包时会重跑模块链接和类型检查，并复用未变且未展开宏的文件的解析结果。VS Code 会监听这些包的源码、相关清单和锁文件，以及显式授权的宏输入；即使依赖文件未打开，磁盘修改也会刷新诊断。
 
-补全从当前缓冲区读取关键字、声明、导入及作用域内的局部名称。输入 `v` 可补全 `val`、`var`；语法还没写完整时，也能补全已识别的名称。自动弹出遵循 VS Code 的 `editor.quickSuggestions`，也可按 `Ctrl+Space` 手动触发。源码错误显示在编辑器和 Problems 中，不作为悬停或跳转请求错误弹窗。
+补全按当前位置区分顶层声明、函数体、类型、成员和导入。函数体输入 `v` 可补全 `val`、`var`，输入 `pr` 可找到内置 `print`；顶层输入 `#` 可找到 `derive`、`post`，表达式里的 `#` 可找到 `assert`，`@` 可找到 `trace` 和可见装饰器。`router.` 或 `value?.` 提示实际类型上可访问的成员及已导入的扩展。自动弹出遵循 VS Code 的 `editor.quickSuggestions`，也可按 `Ctrl+Space` 手动触发。
+
+输入 `import std.`、`import self.` 或 `import <依赖简称>.` 可逐段选择模块和公开声明，支持 `pub import`、`import macro` 和 `import decorator`。在普通代码里选择尚未导入的候选时，编辑器才添加对应的 `import`；不会自动导入扩展组或下载依赖。
+
+输入 `listen(8080, ho` 会提示 `host:`；参数提示会列出匹配已输入实参的重载。声明前的 `///` 文档显示在补全、悬停和签名提示里。可从宏、装饰器调用或导入跳到实现。诊断在后台合并连续编辑，只发布当前版本，源码错误不会变成悬停或跳转失败弹窗。
 
 省略类型的 `val`、`var` 和函数／方法返回值会显示淡色的原生 Inlay Hints，例如 `val router: Router = Router()` 中的 `: Router`。提示不写入源码，可用 `editor.inlayHints.enabled` 控制显示。
 
@@ -45,6 +49,6 @@ code --install-extension lyra-language.vsix
 python editors/vscode/tests/smoke.py <VS-Code-桌面程序路径> <Lyra-SDK-程序路径>
 ```
 
-第一个路径在 Windows 填 `Code.exe`，Linux 填桌面程序 `code`，不是同发行包里的 `bin/code` 启动脚本。测试使用独立配置和临时项目，检查跨包定义跳转、磁盘依赖更新、未保存的 Unicode 宏报错，以及在 HTTP/SQLite 示例中输入一半时的补全、诊断和行内类型提示。
+第一个路径在 Windows 填 `Code.exe`，Linux 填桌面程序 `code`，不是同发行包里的 `bin/code` 启动脚本。测试使用独立配置和临时项目，检查跨包定义、自动导入、磁盘依赖更新、未保存的 Unicode 宏报错，以及在 HTTP/SQLite 示例中输入一半时的补全、签名提示、诊断和行内类型提示。
 
 打包后可加 `--vsix <扩展包路径>`，改为加载从 VSIX 解包的扩展和依赖；验收该包时不读取源码目录的 `node_modules`。第二个参数可以直接指向解包后 SDK 的 `bin/lyra` 或 `bin/lyra.exe`。

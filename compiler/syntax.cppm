@@ -3,6 +3,7 @@ module;
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <variant>
 #include <vector>
 
@@ -129,6 +130,7 @@ struct Function {
     bool property{};
     std::vector<Identifier> throwsTypes{};
     std::optional<Span> pendingExpansion{};
+    Span header{};
 };
 
 struct FieldDefault { std::size_t function; bool emptyOption; };
@@ -160,13 +162,33 @@ struct MacroArgument { Span span; std::optional<std::string> literal; };
 struct ExpressionExpansion { Identifier name; Span span, argumentsSpan; std::vector<MacroArgument> arguments; };
 struct SyntaxRef { std::size_t index; };
 struct SyntaxToken { Span span; std::string kind; };
-struct SyntaxSuggestion { std::string label; bool keyword{}; };
-struct SyntaxCompletion { Span replacement; std::vector<SyntaxSuggestion> suggestions{}; bool incomplete{}; };
+enum class EditorKind { Keyword, Function, Method, Constructor, Variable, Parameter, Field, Property, Constant, Class, Struct,
+    Enum, EnumCase, Trait, TypeAlias, TypeParameter, Module, Macro, Decorator, Extension };
+struct EditorSymbol { std::string label; EditorKind kind; Span name{}; std::string detail{}, documentation{}, insertion{}; };
+struct EditorParameter { std::string name, label; bool variadic{}; };
+struct EditorSignature { std::string label, documentation; std::vector<EditorParameter> parameters; std::optional<std::size_t> active{}; };
+enum class CompletionPlace { None, TopLevel, MemberDeclaration, FieldDeclaration, TraitDeclaration, ExtensionDeclaration, EnumMethod, FunctionModifier,
+    Statement, Expression, AfterExpression, Type, Constraint, Import, ImportAlias, Member, DeclarationMacro, ExpressionMacro, Decorator };
+struct SyntaxCompletion {
+    Span replacement;
+    CompletionPlace place{};
+    std::vector<EditorSymbol> suggestions{};
+    std::vector<Identifier> importPath{};
+    ImportKind importKind{};
+    std::optional<Span> callOpen{};
+    bool argumentLabel{}, incomplete{}, afterPublic{}, asynchronous{};
+};
 struct Module { std::vector<Function> functions; std::vector<Aggregate> aggregates; std::vector<Import> imports; std::vector<Expansion> expansions; std::vector<Trait> traits{}; std::vector<Enumeration> enums{}; std::vector<Extension> extensions{}; std::vector<std::vector<std::string>> importedExtensions{}; std::vector<ExceptionType> exceptions{}; std::vector<TypeAlias> aliases{}; };
 Module parse(const std::vector<Source>& sources);
 void parseFile(Module& module, const Source& source, std::size_t file, std::vector<ExpressionExpansion>* expressions = nullptr, bool macroImplementation = false);
 void validateMacroExpression(const Source& generated);
 std::vector<SyntaxToken> syntaxTokens(const Source& source, bool comments = false, bool partial = false);
 SyntaxCompletion completeSyntax(const Source& source, std::size_t offset);
+Module indexFileSyntax(const Source& source, std::vector<ExpressionExpansion>* expressions = nullptr);
+std::string editorDocumentation(const Source& source, std::size_t declarationStart);
+std::string editorSpelling(const Source& source, const Identifier& name);
+std::string editorIdentifier(std::string_view name);
+EditorSignature describeFunction(const Source& source, const Function& function, std::string_view label,
+    const std::vector<std::string>& parameterTypes = {}, std::string_view result = {}, std::size_t enclosingTypes = 0);
 
 }

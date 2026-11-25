@@ -116,7 +116,7 @@ lyra fmt [--check] <文件.ly>...
 - [JSON Lines 统计 CLI](examples/jsonlines/README.md) 是可直接运行的双包项目：公开库解码，命令行逐行统计，错误带行号。验收会实际发布库、移走源码和中心，再从锁和缓存重新原生编译。
 - `check` 不生成原生产物。`build` 由 LLVM 直接生成目标文件，再用 SDK 内的 LLD 链接。默认输出 `<包目录>/build/debug/app`（`-O0`，含源码级调试信息），`--release` 输出 `build/release/app`（`-O2`），`--release --debug-info` 保留优化版符号。Windows 的程序名为 `app.exe`，有符号时另生成同名 `.pdb`。目标文件按 LLVM IR、后端版本和发射选项缓存；每次仍进行类型检查与链接。缓存默认位于 `.lyra-cache/objects`，`LYRA_CACHE` 可指定共享缓存根。`-o` 指定完整目标路径；类型错误或链接失败不会覆盖已有产物。
 - 设置 `LYRA_NATIVE_BACKTRACE=1` 会在未捕获异常的 Lyra 源码链后显示原生帧。见[调试原生程序](rfc/native-toolchain.md#调试原生程序)。
-- `lyra lsp --stdio` 提供基于同一 parser/checker 的 VS Code 语言服务，支持未保存缓冲区诊断、补全、悬停、定义、引用、重命名、行内类型提示及格式化。扩展在 `editors/vscode/`，通过 `lyra.serverPath` 或 `PATH` 找到 SDK；服务端只读解析已有依赖，不下载包或执行准备脚本。LSP 行列使用 UTF-16，编译器诊断仍保留 UTF-8 字节范围。
+- `lyra lsp --stdio` 提供基于同一 parser/checker 的 VS Code 语言服务，支持未保存缓冲区诊断、上下文和成员补全、模块与自动导入、签名提示、悬停、定义（含宏）、引用、重命名、行内类型提示及格式化。扩展在 `editors/vscode/`，通过 `lyra.serverPath` 或 `PATH` 找到 SDK；服务端只读解析已有依赖，不下载包或执行准备脚本。LSP 行列使用 UTF-16，编译器诊断仍保留 UTF-8 字节范围。
 - `lyra fmt` 整理显式传入的 `.ly` 文件，`--check` 只检查不写入。首版整理缩进和 token 之外的行尾空白，不重排语句或改动字面量、注释内容和原有换行；无需解析包或展开宏。
 - 诊断写到标准错误；`--diagnostics=json` 输出诊断数组，成功为 `[]`。带源码位置时，`range.start/end` 是左闭右开区间：`offset` 为从 0 开始的原文件 UTF-8 字节偏移，`line/column` 从 1 开始，列按 Unicode 码点计，CRLF 和 LF 均算一次换行。
 

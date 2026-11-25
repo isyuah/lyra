@@ -44,6 +44,7 @@ struct PackageGraph {
 };
 
 PackageGraph resolvePackages(const std::filesystem::path& directory, PackageOptions options = {});
+PackageGraph indexPackages(const std::filesystem::path& directory);
 int packageCommand(const std::vector<std::string_view>& args);
 
 }
@@ -719,6 +720,57 @@ PackageGraph resolvePackages(const fs::path& directory, PackageOptions options) 
         if (!options.readOnly) replaceFile(lockPath, render(json::Value(std::move(lock))));
     }
     for (auto& [id, package] : packages) graph.packages.push_back(std::move(package));
+    return graph;
+}
+
+PackageGraph indexPackages(const fs::path& directory) {
+    try { return resolvePackages(directory, {.readOnly = true}); }
+    catch (const PackageError&) {}
+    auto workspace = directory;
+    try { workspace = layout(directory).root; }
+    catch (const PackageError&) {}
+    auto cache = cacheOverride();
+    if (cache.empty()) cache = workspace / ".lyra" / "cache";
+    Store store{workspace, cache, {.offline = true, .readOnly = true}, {}, {}, {}};
+    auto lock = workspace / "lyra.lock";
+    if (fs::is_regular_file(lock)) {
+        try { store.locks = readLock(objectFrom(readFile(lock), pathText(lock)), pathText(lock)); }
+        catch (const PackageError&) {}
+    }
+    PackageGraph graph{workspace, "$editor", {{"$editor", "", "", directory, {}, false}}, {}, {}, {}};
+    std::map<string, ResolvedPackage> packages;
+    auto add = [&](auto&& visit, const Node& node) -> void {
+        const auto& manifest = node.manifest;
+        auto id = identity(node.source, manifest.name);
+        auto [entry, fresh] = packages.try_emplace(id, ResolvedPackage{id, manifest.name, manifest.version,
+            node.root, {}, manifest.library, manifest.macroInputs});
+        if (!fresh) return;
+        for (const auto& [alias, dependency] : manifest.dependencies) {
+            auto& target = entry->second.dependencies[alias];
+            try {
+                auto request = store.dependency(node, dependency);
+                const Node* child = nullptr;
+                if (!request.path.empty()) child = &store.local(request.path);
+                else {
+                    auto locked = store.locks.find(identity(request.source, request.name));
+                    if (locked != store.locks.end()) child = &store.released(request, {versionOf(locked->second.version), locked->second.hash, false});
+                }
+                if (child && child->manifest.name == request.name && rangeOf(request.range).accepts(versionOf(child->manifest.version))) {
+                    target = identity(child->source, child->manifest.name);
+                    visit(visit, *child);
+                }
+            } catch (const PackageError&) {}
+            catch (const fs::filesystem_error&) {}
+        }
+    };
+    if (!fs::is_regular_file(directory / manifestFile)) return graph;
+    try {
+        const auto& entry = store.local(directory);
+        graph.entry = identity(entry.source, entry.manifest.name);
+        add(add, entry);
+        graph.packages.clear();
+        for (auto& [id, package] : packages) graph.packages.push_back(std::move(package));
+    } catch (const PackageError&) {}
     return graph;
 }
 

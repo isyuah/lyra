@@ -166,6 +166,30 @@ std::string typeName(const CheckedModule& module, Type type, bool canonical) {
     throw std::logic_error("invalid Lyra type");
 }
 
+std::vector<EditorSymbol> editorBuiltins(bool types, bool constraints) {
+    std::vector<EditorSymbol> symbols;
+    if (constraints) return {{"Eq", EditorKind::Trait}, {"Hash", EditorKind::Trait}};
+    if (types) {
+        CheckedModule module;
+        for (auto type : scalarTypes) symbols.push_back({typeName(module, type), EditorKind::TypeAlias});
+        for (auto kind : {Type::Int, Type::UInt, Type::Real}) for (auto width : {8u, 16u, 32u, 64u})
+            if (kind != Type::Real || width >= 32) {
+                auto prefix = kind == Type::Int ? "Int" : kind == Type::UInt ? "UInt" : "Float";
+                symbols.push_back({prefix + std::to_string(width), EditorKind::TypeAlias});
+            }
+        for (auto name : {"Int", "UInt", "Float", "Never", "List", "FrozenList", "Range", "Option", "Result", "Task", "TaskLocal", "TaskOutcome", "Channel"})
+            symbols.push_back({name, EditorKind::TypeAlias});
+    } else {
+        symbols = {{"print", EditorKind::Function, {}, "fn print(value: Number | Bool | Char | String): Unit", "将标量值和换行写入 stdout。"},
+            {"sleepMs", EditorKind::Function, {}, "fn sleepMs(milliseconds: Int): Task<Unit>"},
+            {"gcCollect", EditorKind::Function, {}, "fn gcCollect(): Unit"}, {"awaitOutcome", EditorKind::Function},
+            {"Some", EditorKind::EnumCase}, {"None", EditorKind::EnumCase}, {"Ok", EditorKind::EnumCase}, {"Err", EditorKind::EnumCase}};
+        for (auto name : {"Channel", "TaskLocal", "FrozenList", "Exception", "ChannelClosed", "Error"}) symbols.push_back({name, EditorKind::Constructor});
+        for (auto name : {"Task", "TaskOutcome", "CPtr", "CCallback"}) symbols.push_back({name, EditorKind::Class});
+    }
+    return symbols;
+}
+
 namespace {
 
 struct Callable {
@@ -312,6 +336,7 @@ struct Symbols {
     std::vector<TypeAlias> aliasDeclarations{};
     std::vector<std::string> resolvingAliases{};
     std::function<void(std::size_t)> checkGeneric{};
+    EditorIndex* editor{};
 
     struct TypeTrial {
         Symbols& symbols;
@@ -349,6 +374,22 @@ struct Symbols {
     const Function& declaration(const Callable& callable) const { return callable.generic ? *callable.generic : module.functions[callable.target].syntax; }
 
     const Identifier& resultAnnotation(const Callable& candidate, const Source& use, Span site);
+
+    EditorSignature editorSignature(const Function& syntax, std::string_view spelling, std::span<const Type> known = {},
+        std::string_view inferred = {}) {
+        std::vector<std::string> parameters;
+        auto annotation = [&](const Identifier& type) {
+            if (!known.empty() && !type.text.empty()) {
+                auto resolved = resolveWith(typeForm(type.text), sources[syntax.file], type.span, syntax.typeParameters,
+                    [&](auto slot) -> std::optional<Type> { return slot < known.size() ? std::optional(known[slot]) : std::nullopt; });
+                if (resolved) return typeName(module, *resolved);
+            }
+            return editorSpelling(sources[syntax.file], type);
+        };
+        for (const auto& parameter : syntax.parameters) parameters.push_back(annotation(parameter.type));
+        auto result = inferred.empty() ? annotation(syntax.result) : std::string(inferred);
+        return describeFunction(sources[syntax.file], syntax, spelling, parameters, result, enclosingParameters(syntax));
+    }
 
     std::string declarationSite(const Function& syntax) const {
         auto site = sources[syntax.file].userSite(syntax.name.span);
@@ -1158,9 +1199,11 @@ struct Checker {
     std::size_t indexedReferences{};
 
     Checker trial(CheckedFunction& body) const {
-        return {body, source, module, symbols, scopes, variables, loops, workers,
+        Checker trial{body, source, module, symbols, scopes, variables, loops, workers,
             catchOwners, lambdaHints, receiverSlot, implicitReceivers, true, inferredReturn,
             present, unsafeDepth, collectingTail, reachable};
+        if (editor && editor->probe) trial.editor = editor;
+        return trial;
     }
 
     void requireUnsafe(Span site) const {
@@ -1215,14 +1258,14 @@ struct Checker {
     }
 
     void indexReferences() {
-        if (!editor || indexedReferences == fn.references.size()) return;
+        if (!editor || editor->probe || indexedReferences == fn.references.size()) return;
         auto references = std::span(fn.references).subspan(indexedReferences);
         editor->references.insert(editor->references.end(), references.begin(), references.end());
         indexedReferences = fn.references.size();
     }
 
     void indexType(Span span, std::string_view name, Type type) {
-        if (!editor || source.origin || name == "_" || name.starts_with('$') || source.hygieneAt(span)) return;
+        if (!editor || editor->probe || source.origin || name == "_" || name.starts_with('$') || source.hygieneAt(span)) return;
         editor->inferredTypes.push_back({{fn.syntax.file, span}, typeName(module, type)});
     }
 
@@ -2327,11 +2370,126 @@ struct Checker {
         return shapes;
     }
 
+    bool atEditorProbe(const Identifier& name) const {
+        return editor && editor->probe && editor->probe->path == source.path && editor->probe->marker == name.text;
+    }
+
+    std::optional<std::size_t> editorArgument(const Call& call) const {
+        if (!editor || !editor->probe || editor->probe->path != source.path) return {};
+        for (std::size_t index = 0; index < call.arguments.size(); ++index)
+            if (auto name = std::get_if<Identifier>(&fn.syntax.expressions[call.arguments[index].value].node); name && atEditorProbe(*name)) return index;
+        return {};
+    }
+
+    struct EditorBinding { CallPlan supplied; std::optional<std::size_t> active; };
+
+    EditorBinding editorBinding(const Call& call, std::size_t cursor, std::span<const ParameterShape> parameters, std::vector<ArgumentShape> shapes) {
+        const auto& active = call.arguments[cursor];
+        std::optional<std::string_view> label;
+        if (active.label) label = active.label->text;
+        shapes.insert(shapes.begin() + cursor, {label, active.spread.has_value(), call.name.span});
+        try {
+            auto plan = bindArguments(parameters, shapes, source, call.name.span, call.name.text, true);
+            auto slot = plan.explicitSlots[cursor].index;
+            plan.explicitSlots.erase(plan.explicitSlots.begin() + cursor);
+            return {std::move(plan), slot};
+        } catch (const Diagnostic&) {
+            if (label) throw;
+        }
+        shapes.erase(shapes.begin() + cursor);
+        return {bindArguments(parameters, shapes, source, call.name.span, call.name.text, true), {}};
+    }
+
+    void addEditorSignature(EditorSignature signature, std::span<const ParameterShape> parameters, const EditorBinding& binding) {
+        signature.active = binding.active;
+        for (std::size_t slot = 0; slot < parameters.size(); ++slot) {
+            if (parameters[slot].name.empty() || parameters[slot].variadic ||
+                std::ranges::any_of(binding.supplied.explicitSlots, [&](const auto& filled) { return filled.index == slot; })) continue;
+            auto spelling = editorIdentifier(parameters[slot].name);
+            editor->probe->labels.push_back({spelling + ':', EditorKind::Parameter, {}, signature.parameters[slot].label, {}, spelling + ": "});
+        }
+        editor->probe->signatures.push_back(std::move(signature));
+    }
+
+    void editorCallable(ExprId id, const Call& call, const Function& target, std::span<const Type> ownerTypes,
+        std::size_t cursor, std::span<const Field> fields = {}) {
+        Symbols::TypeTrial transaction{symbols};
+        auto body = fn;
+        auto checker = trial(body);
+        checker.editor = nullptr;
+        auto preceding = call;
+        preceding.arguments.erase(preceding.arguments.begin() + cursor);
+        auto skip = static_cast<std::size_t>(target.hasReceiver);
+        std::vector<ParameterShape> parameters;
+        for (auto slot = skip; slot < target.parameters.size(); ++slot) {
+            auto& parameter = target.parameters[slot];
+            parameters.push_back({parameter.name.text, fields.empty() ? bool(parameter.defaultValue) : bool(fields[slot].defaultValue), parameter.variadic});
+        }
+        try {
+            std::vector<Type> known(ownerTypes.begin(), ownerTypes.end());
+            for (const auto& annotation : call.typeArguments) known.push_back(symbols.resolve(fn.syntax, annotation, variables));
+            if (known.size() > target.typeParameters.size()) return;
+            auto shapes = argumentShapes(preceding, !parameters.empty() && !parameters.back().variadic &&
+                symbols.expandAliases(target.parameters.back().type, symbols.sources[target.file]).name == "$fn");
+            auto binding = editorBinding(call, cursor, parameters, std::move(shapes));
+            auto& slots = body.expressions[id].argumentSlots;
+            slots.clear();
+            for (const auto& item : binding.supplied.explicitSlots) slots.push_back(item.index);
+            std::vector<bool> checked(preceding.arguments.size());
+            for (std::size_t index = 0; index < preceding.arguments.size(); ++index) {
+                auto argument = preceding.arguments[index].value;
+                auto learned = checker.argumentHints(id, preceding, target, checked, known, {});
+                const auto& annotation = target.parameters[slots[index] + skip].type;
+                auto expected = symbols.resolveWith(typeForm(annotation.text), symbols.sources[target.file], annotation.span, target.typeParameters,
+                    [&](auto parameter) { return learned[parameter]; });
+                if (!expected && checker.needsArgumentHint(argument)) continue;
+                if (expected && preceding.arguments[index].spread) expected = symbols.list(*expected);
+                auto actual = checker.inspect(argument, expected);
+                checker.fitArgument(argument, actual, expected, preceding.arguments[index].spread.has_value());
+                checked[index] = true;
+            }
+            auto learned = checker.argumentHints(id, preceding, target, checked, known, {});
+            bool concrete = std::ranges::all_of(learned, [](const auto& type) { return type.has_value(); });
+            if (concrete) {
+                known.clear();
+                for (const auto& type : learned) known.push_back(*type);
+                symbols.requireBounds(target, known, source, call.name.span);
+            }
+            auto signature = symbols.editorSignature(target, editorSpelling(source, call.name), known);
+            addEditorSignature(std::move(signature), parameters, binding);
+        } catch (const Diagnostic&) {}
+    }
+
     template<class GetName, class GetType>
     bool arguments(ExprId id, const Call& call, std::size_t count, GetName getName, GetType getType) {
         std::vector<ParameterShape> parameters;
         for (std::size_t slot = 0; slot < count; ++slot) parameters.push_back({getName(slot), false, false});
         auto last = count ? std::optional<Type>(getType(count - 1)) : std::nullopt;
+        if (auto cursor = editorArgument(call)) {
+            auto filled = call;
+            filled.arguments.erase(filled.arguments.begin() + *cursor);
+            auto signature = EditorSignature{"fn " + call.name.text + '(', {}, {}};
+            for (std::size_t slot = 0; slot < count; ++slot) {
+                auto name = std::string(getName(slot));
+                auto expected = std::optional<Type>(getType(slot));
+                auto type = expected ? typeName(module, *expected) : "value";
+                auto label = name.empty() ? type : name + ": " + type;
+                if (slot) signature.label += ", ";
+                signature.label += label;
+                signature.parameters.push_back({std::move(name), std::move(label)});
+            }
+            signature.label += ')';
+            if (call.name.text == "print") {
+                auto builtin = editorBuiltins(false).front();
+                signature.label = std::move(builtin.detail);
+                signature.documentation = std::move(builtin.documentation);
+                signature.parameters.front().label = "value: Number | Bool | Char | String";
+            }
+            auto shapes = argumentShapes(filled, last && last->kind == Type::Closure);
+            auto binding = editorBinding(call, *cursor, parameters, std::move(shapes));
+            addEditorSignature(std::move(signature), parameters, binding);
+            throw EditorProbeFinished{};
+        }
         auto shapes = argumentShapes(call, last && last->kind == Type::Closure);
         if (count != shapes.size() && (shapes.empty() || !shapes.back().trailing)) throw at(source, call.name.span, "LYT0002", call.name.text + " 需要 " + std::to_string(count) + " 个实参");
         auto plan = bindArguments(parameters, shapes, source, call.name.span, call.name.text);
@@ -2413,6 +2571,166 @@ struct Checker {
         throw at(source, name.span, "LYN0001", symbols.enumDeclarations[owner].name.text + " 没有分支：" + name.text);
     }
 
+    void editorMembers(std::optional<ExprId> receiver, const TypeQualifier* qualifier, Span site) {
+        std::map<std::string, EditorSymbol> members;
+        std::set<std::string> fields;
+        auto add = [&](const std::string& name, EditorKind kind, std::string detail, std::string docs = {}) {
+            auto spelling = editorIdentifier(name);
+            if (!spelling.empty()) members.try_emplace(spelling, EditorSymbol{spelling, kind, {}, std::move(detail), std::move(docs)});
+        };
+        auto method = [&](std::size_t callable, const std::string& name, std::span<const Type> arguments, bool property = false) {
+            if (fields.contains(name)) return;
+            const auto& target = symbols.declaration(symbols.callables[callable]);
+            if (!target.isPublic && symbols.sources[target.file].moduleId != source.moduleId) return;
+            auto signature = symbols.editorSignature(target, editorIdentifier(name), arguments);
+            if (property) {
+                auto colon = signature.label.find("): ");
+                if (colon != std::string::npos) signature.label = editorIdentifier(name) + signature.label.substr(colon + 1);
+            }
+            add(name, property ? EditorKind::Property : EditorKind::Method, std::move(signature.label), std::move(signature.documentation));
+        };
+        auto overloads = [&](const Overloads& table, std::span<const Type> arguments) {
+            for (const auto& [name, entries] : table) for (auto callable : entries) method(callable, name, arguments);
+        };
+        auto shape = [&](const std::string& name, const RequiredMethod& method) {
+            auto signature = name + '(';
+            for (std::size_t slot = 0; slot < method.parameters.size(); ++slot) {
+                if (slot) signature += ", ";
+                if (!method.labels[slot].empty()) signature += method.labels[slot] + ": ";
+                signature += typeName(module, method.parameters[slot]);
+            }
+            signature += "): " + typeName(module, method.result);
+            if (method.asynchronous) signature = "async " + signature;
+            add(name, EditorKind::Method, std::move(signature));
+        };
+        const Identifier* named = qualifier ? &qualifier->name : std::get_if<Identifier>(&fn.syntax.expressions[*receiver].node);
+        if (named && !qualifier && (lookupLocal(*named) || implicitMember(*named))) named = nullptr;
+        auto key = named ? std::string_view(linkedName(*named)) : std::string_view{};
+        if (auto item = symbols.enums.find(std::string(key)); item != symbols.enums.end()) {
+            const auto& declaration = symbols.enumDeclarations[item->second];
+            for (const auto& variant : declaration.cases) {
+                std::string detail = editorSpelling(symbols.sources[declaration.file], declaration.name) + '.' + variant.name.text;
+                if (!variant.fields.empty()) {
+                    detail += '(';
+                    for (const auto& field : variant.fields) {
+                        if (&field != &variant.fields.front()) detail += ", ";
+                        if (field.name) detail += field.name->text + ": ";
+                        detail += editorSpelling(symbols.sources[declaration.file], field.type);
+                    }
+                    detail += ')';
+                }
+                add(variant.name.text, EditorKind::EnumCase, std::move(detail), editorDocumentation(symbols.sources[declaration.file], variant.name.span.begin));
+            }
+        } else if (auto record = symbols.records.find(std::string(key)); record != symbols.records.end()) {
+            std::vector<Type> arguments;
+            if (qualifier) for (const auto& type : qualifier->arguments) arguments.push_back(symbols.resolve(fn.syntax, type, variables));
+            overloads(symbols.staticMethods[record->second], arguments);
+        } else if (key == "Task" || key == "CPtr" || key == "CCallback") {
+            if (key == "Task" && inAsync()) {
+                shape("cancelled", {{}, {}, Type::Bool, false});
+                shape("checkCancellation", {{}, {}, Type::Unit, false});
+            }
+            if (key == "CPtr") {
+                shape("nullPtr", {{}, {}, Type::CPtr, false});
+                if (unsafeDepth) shape("alloc", {{"bytes"}, {Type::Int}, Type::CPtr, false});
+            }
+            if (key == "CCallback" && unsafeDepth) add("register", EditorKind::Method, "register(callback, fallback): CCallback");
+        } else if (receiver) {
+            auto owner = visit(*receiver);
+            auto property = [&](const std::string& name, Type type) { add(name, EditorKind::Property, name + ": " + typeName(module, type)); };
+            if (owner.kind == Type::Record || owner.kind == Type::Enum) {
+                auto& arguments = symbols.instanceArguments(owner);
+                if (owner.kind == Type::Record) {
+                    const auto& record = module.aggregates[owner.id];
+                    for (std::size_t slot = 0; slot < record.fields.size(); ++slot) {
+                        const auto& field = record.syntax.fields[slot];
+                        fields.insert(field.name.text);
+                        if (field.isPublic || symbols.sources[record.syntax.file].moduleId == source.moduleId)
+                            add(field.name.text, EditorKind::Field, field.name.text + ": " + typeName(module, record.fields[slot]),
+                                editorDocumentation(symbols.sources[record.syntax.file], field.name.span.begin));
+                    }
+                    for (const auto& [name, getter] : symbols.properties[record.declaration]) method(getter, name, arguments, true);
+                }
+                overloads(symbols.instanceMethods(owner), arguments);
+            }
+            for (auto name : {"size", "add", "removeAt", "slice", "send", "receive", "next", "asyncIterator", "close", "toBytes", "toString"})
+                if (auto builtin = symbols.builtinMember(owner, name)) {
+                    if (std::string_view(name) == "size") property(name, builtin->shape.result);
+                    else shape(name, builtin->shape);
+                }
+            if (numericType(owner)) for (const auto& target : editorBuiltins(true)) {
+                auto type = numberType(target.label);
+                if (!type) continue;
+                auto name = "to" + target.label + (integerType(*type) ? "Checked" : "");
+                if (auto builtin = symbols.builtinMember(owner, name)) shape(name, builtin->shape);
+            }
+            if (owner.kind == Type::IntRange) for (std::size_t slot = 0; slot < std::size(rangeFields); ++slot) property(rangeFieldNames[slot], rangeFields[slot]);
+            if (owner == Type::String) property("byteSize", Type::Int);
+            if (owner == Type::Char) property("codePoint", number(Type::UInt, 32));
+            if (owner.kind == Type::Task && inAsync()) shape("cancel", {{}, {}, Type::Unit, false});
+            if (owner.kind == Type::TaskLocal) shape("get", {{}, {}, symbols.sum(Type::Option, module.taskLocalValues[owner.id]), false});
+            if (owner.kind == Type::Result) shape("failureInfo", {{}, {}, symbols.sum(Type::Option, Type::Error), false});
+            if (owner.kind == Type::Exception || owner == Type::Error) property("message", Type::String);
+            if (owner.kind == Type::Exception) {
+                property("taskFailures", symbols.list(Type::Exception));
+                property("cleanupFailures", symbols.list(Type::Exception));
+            }
+            if (owner == Type::Error) {
+                property("original", Type::Any);
+                property("cause", symbols.sum(Type::Option, Type::Error));
+                property("suppressed", symbols.list(Type::Error));
+                shape("withSuppressed", {{"error"}, {Type::Error}, Type::Error, false});
+            }
+            if (owner == Type::Any) {
+                shape("typeName", {{}, {}, Type::String, false});
+                shape("fieldCount", {{}, {}, Type::Int, false});
+                shape("fieldNames", {{}, {}, symbols.list(Type::String), false});
+                shape("field", {{"name"}, {Type::String}, symbols.sum(Type::Option, Type::Any), false});
+            }
+            if (owner == Type::CCallback) {
+                shape("takeError", {{}, {}, symbols.sum(Type::Option, Type::Exception), false});
+                if (unsafeDepth) {
+                    shape("context", {{}, {}, Type::CPtr, false});
+                    shape("function", {{}, {}, Type::CPtr, false});
+                    shape("close", {{}, {}, Type::Unit, false});
+                }
+            }
+            if (owner == Type::CPtr) {
+                shape("isNull", {{}, {}, Type::Bool, false});
+                if (unsafeDepth) {
+                    shape("free", {{}, {}, Type::Unit, false});
+                    shape("offset", {{"bytes"}, {Type::Int}, Type::CPtr, false});
+                    for (const auto& builtin : editorBuiltins(true)) {
+                        auto type = builtin.label == "CPtr" ? std::optional(Type{Type::CPtr}) : numberType(builtin.label);
+                        if (!type) continue;
+                        shape("read" + builtin.label, {{"offset"}, {Type::Int}, *type, false});
+                        shape("write" + builtin.label, {{"offset", "value"}, {Type::Int, *type}, Type::Unit, false});
+                    }
+                }
+            }
+            if (!symbols.valueSupport(owner, ValueOperation::Equal).missing) shape("equals", {{"other"}, {owner}, Type::Bool, false});
+            if (!symbols.valueSupport(owner, ValueOperation::Hash).missing) shape("hashCode", {{}, {}, Type::Int, false});
+            auto traitMembers = [&](const Trait& trait) {
+                for (const auto& required : trait.methods) shape(required.name.text, symbols.requiredShape(owner, trait, required, source, site));
+            };
+            if (owner.kind == Type::Dyn) traitMembers(module.traits[module.dynamicTypes[owner.id].trait]);
+            for (const auto& bound : symbols.contracts.constraints(owner)) if (!valueConstraint(bound)) traitMembers(symbols.contracts.declaration(bound));
+            for (auto extension : symbols.visibleExtensions[fn.syntax.file]) {
+                Symbols::TypeTrial transaction{symbols};
+                try {
+                    auto arguments = symbols.extensionTypes(extension, owner);
+                    if (!arguments) continue;
+                    const auto& group = symbols.extensionDeclarations[extension];
+                    symbols.requireBounds(group.bounds, group.file, *arguments, source, site, group.typeParameters);
+                    overloads(symbols.extensionMethods[extension], *arguments);
+                    for (const auto& entry : group.properties) method(symbols.functionCallables[entry.getter], entry.name.text, *arguments, true);
+                } catch (const Diagnostic&) {}
+            }
+        }
+        for (auto& [name, member] : members) editor->probe->members.push_back(std::move(member));
+        throw EditorProbeFinished{};
+    }
+
     Type variant(ExprId id, const TypeQualifier& qualifier, const Call& call, std::optional<Type> expected, bool bare = false) {
         auto declaration = symbols.enums.at(linkedName(qualifier.name));
         const auto& syntax = symbols.enumDeclarations[declaration];
@@ -2426,6 +2744,10 @@ struct Checker {
         for (const auto& field : entry.fields) payload.push_back({field.name.value_or(Identifier{"", field.type.span}), field.type});
         Function signature{syntax.file, entry.name, std::move(payload), nominalAnnotation(syntax), {}, 0, {}, syntax.isPublic, syntax.typeParameters, false, {}, false, syntax.bounds};
         Call construction{call.name, call.arguments, {}, qualifier.arguments};
+        if (auto cursor = editorArgument(construction)) {
+            editorCallable(id, construction, signature, {}, *cursor);
+            throw EditorProbeFinished{};
+        }
         if (expected && expected->kind == Type::Option) expected = module.sumTypes[expected->id].success;
         auto [types, exits] = bindGeneric(id, construction, signature, expected);
         auto& info = fn.expressions[id];
@@ -2435,12 +2757,14 @@ struct Checker {
     }
 
     Type infer(ExprId id, const QualifiedMember& member, std::optional<Type> expected, bool) {
+        if (atEditorProbe(member.name)) editorMembers({}, &member.owner, member.name.span);
         if (!symbols.enums.contains(linkedName(member.owner.name)))
             throw at(source, member.name.span, "LYP0001", "静态方法调用需要参数列表或尾部 lambda");
         return variant(id, member.owner, Call{member.name, {}}, expected, true);
     }
 
     Type infer(ExprId id, const Member& member, std::optional<Type> expected, bool) {
+        if (atEditorProbe(member.name)) editorMembers(member.receiver, nullptr, member.name.span);
         if (const auto* item = enumNamespace(member.receiver)) return variant(id, TypeQualifier{*item}, Call{member.name, {}}, expected, true);
         auto owner = visit(member.receiver);
         if (owner == Type::Never) return owner;
@@ -2598,6 +2922,10 @@ struct Checker {
     Type declaredCall(std::size_t declaration, ExprId id, const Call& call, std::optional<Type> expected, std::span<const Type> ownerTypes = {}, bool onlyArguments = false) {
         const auto& candidate = symbols.callables[declaration];
         const auto& syntax = symbols.declaration(candidate);
+        if (auto cursor = editorArgument(call)) {
+            editorCallable(id, call, syntax, ownerTypes, *cursor);
+            throw EditorProbeFinished{};
+        }
         if (syntax.constant == ConstKind::Value) throw at(source, call.name.span, "LYCT0001", "编译期常量不是函数：" + call.name.text);
         if (!onlyArguments) {
             if (!syntax.initializer) refer(call.name, syntax.file, syntax.name.span);
@@ -2629,6 +2957,11 @@ struct Checker {
     }
 
     std::size_t selectOverloadWith(ExprId id, const Call& call, std::optional<Type> expected, std::span<const std::size_t> candidates, const auto& ownerTypes) {
+        if (auto cursor = editorArgument(call)) {
+            for (auto declaration : candidates)
+                editorCallable(id, call, symbols.declaration(symbols.callables[declaration]), ownerTypes(declaration), *cursor);
+            throw EditorProbeFinished{};
+        }
         if (candidates.size() == 1) return candidates.front();
         auto site = fn.syntax.expressions[id].span;
         std::vector<OverloadMatch> matches;
@@ -2695,6 +3028,8 @@ struct Checker {
     }
 
     Type infer(ExprId id, const Call& call, std::optional<Type> expected, bool) {
+        if ((call.receiver || call.typeOwner) && atEditorProbe(call.name))
+            editorMembers(call.receiver, call.typeOwner ? &*call.typeOwner : nullptr, call.name.span);
         auto& info = fn.expressions[id];
         auto noTypeArgs = [&] { if (!call.typeArguments.empty()) throw at(source, call.typeArguments.front().span, "LYG0001", "此调用不接受类型实参：" + call.name.text); };
         auto invoke = [&](Type type) -> Type {
@@ -3058,6 +3393,10 @@ struct Checker {
             } else {
                 info.callee = Callee::Constructor;
                 auto signature = constructorSignature(decl);
+                if (auto cursor = editorArgument(call)) {
+                    editorCallable(id, call, signature, {}, *cursor, decl.fields);
+                    throw EditorProbeFinished{};
+                }
                 Type type;
                 bool exits;
                 if (!decl.typeParameters.empty()) {
@@ -3487,7 +3826,9 @@ const Identifier& Symbols::resultAnnotation(const Callable& candidate, const Sou
     candidate.inferring = true;
     try {
         auto body = prepare(syntax, candidate.variables);
-        auto type = Checker{body, sources[syntax.file], module, *this, {}, candidate.variables}.inferResult();
+        auto checker = Checker{body, sources[syntax.file], module, *this, {}, candidate.variables};
+        if (editor && editor->probe) checker.editor = editor;
+        auto type = checker.inferResult();
         candidate.inferredResult = Identifier{typeName(module, type, true), syntax.result.span};
     } catch (...) {
         candidate.inferring = false;
@@ -3506,6 +3847,7 @@ CheckedModule check(Module module, const std::vector<Source>& sources, bool requ
     }
     CheckedModule checked{};
     Symbols symbols{checked, sources, {}, {}, {}, {}, {}, {}, {}, {}};
+    symbols.editor = editor;
     auto expose = [&](Type type, const Source& source, Span site) {
         if (auto hidden = hiddenType(checked, type)) throw at(source, site, "LYN0003", "公开签名不能暴露模块私有类型：" + typeName(checked, *hidden));
     };
@@ -3793,6 +4135,24 @@ CheckedModule check(Module module, const std::vector<Source>& sources, bool requ
     for (std::size_t index = 0; index < checked.functions.size(); ++index) if (checked.functions[index].syntax.conversion) registerConversion(symbols.conversions, checked, sources, index);
     symbols.boundsReady = true;
     symbols.validateNominalBounds();
+    if (editor && editor->probe) {
+        const auto& probe = *editor->probe;
+        for (const auto& callable : symbols.callables) {
+            const auto& syntax = symbols.declaration(callable);
+            const auto& source = sources[syntax.file];
+            if (source.path != probe.path || syntax.expressions.empty()) continue;
+            auto span = syntax.expressions[syntax.body].span;
+            if (source.text.find(probe.marker, span.begin) >= span.end) continue;
+            auto declaration = syntax;
+            declaration.result = symbols.resultAnnotation(callable, source, syntax.name.span);
+            auto body = symbols.prepare(std::move(declaration), callable.variables);
+            auto checker = Checker{body, source, checked, symbols, {}, callable.variables};
+            checker.editor = editor;
+            checker.probing = true;
+            checker.run();
+        }
+        return checked;
+    }
     const auto declaredFunctions = checked.functions.size();
     using FunctionSite = std::pair<std::size_t, std::size_t>;
     std::map<FunctionSite, std::vector<FunctionSite>> dependencies;
@@ -3805,6 +4165,23 @@ CheckedModule check(Module module, const std::vector<Source>& sources, bool requ
         if (!syntax.result.text.empty() || syntax.pendingExpansion) continue;
         const auto& annotation = symbols.resultAnnotation(callable, sources[syntax.file], syntax.name.span);
         if (!callable.generic) checked.functions[callable.target].result = symbols.resolve(syntax, annotation, {});
+    }
+    if (editor) for (const auto& callable : symbols.callables) {
+        const auto& syntax = symbols.declaration(callable);
+        const auto& source = sources[syntax.file];
+        auto name = editorSpelling(source, syntax.name);
+        auto separator = syntax.name.text.rfind("::");
+        if (syntax.name.text.find('$', separator == std::string::npos ? 0 : separator + 2) != std::string::npos ||
+            syntax.conversion || syntax.initializer || name == "_") continue;
+        if (syntax.constant == ConstKind::Value) {
+            editor->descriptions.push_back({{syntax.file, syntax.name.span}, "const " + name + ": " + editorSpelling(source, syntax.result),
+                editorDocumentation(source, syntax.name.span.begin)});
+        } else {
+            auto inferred = callable.inferredResult
+                ? typeName(checked, symbols.resolve(syntax, *callable.inferredResult, callable.variables)) : std::string{};
+            auto signature = symbols.editorSignature(syntax, name, {}, inferred);
+            editor->descriptions.push_back({{syntax.file, syntax.name.span}, std::move(signature.label), std::move(signature.documentation)});
+        }
     }
     std::set<std::size_t> checkedGenerics;
     auto checkGeneric = [&](std::size_t declaration) {

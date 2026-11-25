@@ -36,21 +36,8 @@ def message(value):
     return b'Content-Length: ' + str(len(body)).encode() + b'\r\n\r\n' + body
 
 
-def responses(output):
-    result = []
-    offset = 0
-    while offset < len(output):
-        separator = output.index(b'\r\n\r\n', offset)
-        headers = output[offset:separator].decode('ascii').split('\r\n')
-        length = next(int(line.split(':', 1)[1]) for line in headers if line.lower().startswith('content-length:'))
-        offset = separator + 4
-        result.append(json.loads(output[offset:offset + length]))
-        offset += length
-    return result
-
-
 def run_server(documents, messages):
-    environment = {**os.environ, 'LYRA_CACHE': str(documents[0][0].parents[1] / 'cache')}
+    output = []
     transcript = [
         {'jsonrpc': '2.0', 'id': 1, 'method': 'initialize', 'params': {'capabilities': {'general': {'positionEncodings': ['utf-16']}}}},
         {'jsonrpc': '2.0', 'method': 'initialized', 'params': {}},
@@ -58,14 +45,36 @@ def run_server(documents, messages):
     for path, text in documents:
         transcript.append({'jsonrpc': '2.0', 'method': 'textDocument/didOpen', 'params': {'textDocument': {'uri': uri(path), 'languageId': 'lyra', 'version': 1, 'text': text}}})
     transcript.extend(messages)
-    transcript.extend([
-        {'jsonrpc': '2.0', 'id': 90, 'method': 'shutdown', 'params': None},
-        {'jsonrpc': '2.0', 'method': 'exit', 'params': None},
-    ])
-    process = subprocess.run([COMPILER, 'lsp', '--stdio'], input=b''.join(map(message, transcript)), capture_output=True, timeout=60, env=environment)
-    if process.returncode:
-        raise AssertionError(process.stderr.decode('utf-8', errors='replace'))
-    return responses(process.stdout)
+    open_versions = {}
+    with interactive_server(documents[0][0].parents[1]) as (send, receive):
+        for request in transcript:
+            send(request)
+            method = request['method']
+            if 'id' in request:
+                while True:
+                    reply = receive()
+                    output.append(reply)
+                    if reply.get('id') == request['id']:
+                        break
+            elif method in ('textDocument/didOpen', 'textDocument/didChange', 'textDocument/didClose'):
+                document = request['params']['textDocument']
+                key = document['uri']
+                if method == 'textDocument/didChange' and document['version'] <= open_versions[key]:
+                    continue
+                if method == 'textDocument/didClose':
+                    open_versions.pop(key)
+                    pending = {**open_versions, key: None}
+                else:
+                    open_versions[key] = document['version']
+                    pending = dict(open_versions)
+                while pending:
+                    reply = receive()
+                    output.append(reply)
+                    if reply.get('method') == 'textDocument/publishDiagnostics':
+                        by_uri = reply['params']
+                        if by_uri['uri'] in pending and pending[by_uri['uri']] == by_uri.get('version'):
+                            pending.pop(by_uri['uri'])
+    return output
 
 
 @contextmanager
@@ -112,6 +121,207 @@ def interactive_server(root):
 
 
 class LanguageServer(unittest.TestCase):
+    def test_context_completion_distinguishes_declarations_values_types_and_macro_families(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / 'src/main.ly'
+            source.parent.mkdir()
+            (root / 'lyra.json5').write_text('{name:"app",version:"0.1.0"}', encoding='utf-8')
+            text = ('vHere\n#\n@\nfn sample(request: String): Unit {\n'
+                    '    val text: StrHere = "#doc"\n    prHere\n    imHere\n    #\n}\n')
+            source.write_text('', encoding='utf-8')
+            positions = [1, text.index('#') + 1, text.index('@') + 1, text.index('StrHere') + 3,
+                         text.index('prHere') + 2, text.index('imHere') + 2, text.rindex('#') + 1,
+                         text.index('#doc') + 2]
+            output = run_server([(source, text)], [document_request(index, source, 'completion', position=position_at(text, offset))
+                                                    for index, offset in enumerate(positions, 2)])
+            items = {item['id']: {entry['label']: entry['kind'] for entry in item['result']['items']}
+                     for item in output if item.get('id', 0) > 1}
+            self.assertEqual(items[2], {})
+            self.assertEqual(items[3], {'derive': 3, 'post': 3})
+            self.assertEqual(items[4], {'trace': 23})
+            self.assertEqual(items[5], {'String': 7})
+            self.assertEqual(items[6]['print'], 3)
+            self.assertNotIn('import', items[7])
+            self.assertNotIn('implicit', items[7])
+            self.assertEqual(items[8], {'assert': 3})
+            self.assertEqual(items[9], {})
+
+    def test_generated_completion_preserves_only_necessary_escapes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / 'src/main.ly'
+            macro = root / 'src/.macros/emit.ly'
+            macro.parent.mkdir(parents=True)
+            (root / 'lyra.json5').write_text('{name:"app",version:"0.1.0"}', encoding='utf-8')
+            text = '#emit\nfn main(): Unit { routeName(); `val`(); unfinished }\n'
+            source.write_text(text, encoding='utf-8')
+            declarations = 'fn `routeName`(): Unit {}\nfn `val`(): Unit {}\n'
+            macro.write_text(f'fn emit(target: String, raw: String): Syntax {{ syntaxCode({json.dumps(declarations)}) }}', encoding='utf-8')
+            offsets = [text.index('routeName') + len('routeNa'), text.index('`val`') + len('`val')]
+            output = run_server([(source, text)], [document_request(index, source, 'completion', position=position_at(text, offset))
+                                                    for index, offset in enumerate(offsets, 2)])
+            results = {item['id']: [(entry['label'], entry['kind'], entry['textEdit']['newText'])
+                                    for entry in item['result']['items']]
+                       for item in output if item.get('id', 0) > 1}
+            self.assertEqual(results, {2: [('routeName', 3, 'routeName')], 3: [('`val`', 3, '`val`')]})
+
+    def test_module_completion_uses_public_exports_and_adds_import_only_to_the_selected_item(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            app = root / 'client'
+            source = app / 'src/main.ly'
+            sibling = app / 'src/sibling.ly'
+            export = app / 'src/api/exports.ly'
+            declaration = root / 'kit/src/sub/implementation.ly'
+            for path, text in [
+                (app / 'lyra.json5', '{name:"client",version:"0.1.0",dependencies:{kit:{name:"kit",version:"0.1.0",path:"../kit"},'
+                                    'pending:{name:"missing",version:"0.1.0",registry:"https://invalid.invalid"}}}'),
+                (root / 'kit/lyra.json5', '{name:"kit",version:"0.1.0",kind:"lib"}'),
+                (declaration, '/// Builds a heading.\npub fn renderTitle(): String { "hello" }\nfn hiddenTitle(): String { "private" }\n'),
+                (export, 'pub import kit.sub.renderTitle as title\n'),
+                (sibling, 'import std.http.Router as WebRouter\n'),
+                (source, ''),
+            ]:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(text, encoding='utf-8')
+            text = ('// 文件头\r\n\r\nimport \r\nimport std.ht\r\nimport std.http.Ro\r\n'
+                    'pub import kit.su\r\nimport kit.sub.\r\nimport self.api.\r\n'
+                    '/// Main docs.\r\nfn main(): Unit { val _ = "中文🙂"; renderTi; Web; tit }\r\n')
+            markers = ['import ', 'std.ht', 'http.Ro', 'kit.su', 'kit.sub.', 'self.api.', 'renderTi', 'Web', 'tit }']
+            offsets = [text.index(marker) + len(marker.removesuffix(' }')) for marker in markers]
+            output = run_server([(source, text)], [document_request(index, source, 'completion', position=position_at(text, offset))
+                                                    for index, offset in enumerate(offsets, 2)])
+            items = {item['id']: {entry['label']: entry for entry in item['result']['items']}
+                     for item in output if item.get('id', 0) > 1}
+            self.assertTrue({'kit', 'pending', 'self', 'std'} <= items[2].keys())
+            self.assertTrue({'http', 'httpClient', 'httpTls'} <= items[3].keys())
+            self.assertIn('Router', items[4])
+            self.assertEqual(set(items[5]), {'sub'})
+            self.assertEqual(set(items[6]), {'renderTitle'})
+            self.assertEqual(set(items[7]), {'title'})
+            auto = items[8]['renderTitle']
+            self.assertEqual(auto['documentation']['value'], 'Builds a heading.')
+            self.assertEqual(auto['additionalTextEdits'], [{'range': {'start': position_at(text, text.index('import ')),
+                                                                     'end': position_at(text, text.index('import '))},
+                                                            'newText': 'import kit.sub.renderTitle\r\n'}])
+            self.assertNotIn('additionalTextEdits', items[9]['WebRouter'])
+            self.assertEqual(items[10]['title']['additionalTextEdits'][0]['newText'], 'import self.api.title\r\n')
+            self.assertFalse((app / 'lyra.lock').exists())
+            self.assertEqual(source.read_bytes(), b'')
+
+    def test_member_completion_and_overload_signatures_use_current_types(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            app = Path(temporary)
+            source = app / 'src/main.ly'
+            api = app / 'src/api/box.ly'
+            api.parent.mkdir(parents=True)
+            (app / 'lyra.json5').write_text('{name:"app",version:"0.1.0"}', encoding='utf-8')
+            api.write_text('pub class Box<T>(pub val value: T, val secret: Int = 0) {\n'
+                           '    pub static fn one(value: T): Box<T> { Box(value) }\n'
+                           '    pub fn get(): T { value }\n    fn internal(): T { value }\n}\n'
+                           'pub enum State { Closed, Opened(Int) }\n'
+                           'pub extension BoxOps<T> for Box<T> { fn unwrap(): T { this.value } }\n'
+                           'pub extension OtherOps<T> for Box<T> { fn unwanted(): T { this.value } }\n', encoding='utf-8')
+            text = ('import self.api.Box\nimport self.api.BoxOps\nimport self.api.State\nimport std.http.listen\n'
+                    '/// Integer lookup.\nfn lookup(count: Int, limit: Int): Int { count + limit }\n'
+                    'fn lookup(count: Int, label: String): String { label }\n'
+                    'fn lookup(text: String, other: Bool): Bool { other }\n'
+                    'fn valueProbe(): Unit { val first = Box(5); first. }\n'
+                    'fn optionProbe(): Unit { val optional: Box<Int>? = Box(5); optional?. }\n'
+                    'fn staticProbe(): Unit { Box<Int>. }\nfn enumProbe(): Unit { State. }\n'
+                    'fn listProbe(): Unit { [1, 2]. }\nfn overloadProbe(): Unit { lookup(1, li) }\n'
+                    'fn main(): Unit { listen(8080, ho\n}\n')
+            source.write_text('', encoding='utf-8')
+            points = [(word, 'completion') for word in ['first.', 'optional?.', 'Box<Int>.', 'State.', '[1, 2].', 'lookup(1, li', 'listen(8080, ho']]
+            points.extend([('lookup(1, li', 'signatureHelp'), ('listen(8080, ho', 'signatureHelp')])
+            output = run_server([(source, text)], [document_request(index, source, method, position=position_at(text, text.index(word) + len(word)))
+                                                    for index, (word, method) in enumerate(points, 2)])
+            result = {item['id']: item['result'] for item in output if 'id' in item}
+            self.assertIn('signatureHelpProvider', result[1]['capabilities'])
+            for index in (2, 3):
+                members = {item['label']: item for item in result[index]['items']}
+                self.assertEqual(members['value']['kind'], 5)
+                self.assertIn(': Int', members['get']['detail'])
+                self.assertIn('unwrap', members)
+                self.assertFalse({'other', 'secret', 'internal', 'one', 'unwanted'} & members.keys())
+            self.assertEqual({item['label'] for item in result[4]['items']}, {'one'})
+            self.assertEqual({item['label']: item['kind'] for item in result[5]['items']}, {'Closed': 20, 'Opened': 20})
+            self.assertTrue({'add', 'slice', 'size'} <= {item['label'] for item in result[6]['items']})
+            self.assertIn('limit:', {item['label'] for item in result[7]['items']})
+            self.assertIn('host:', {item['label'] for item in result[8]['items']})
+            self.assertEqual(result[9]['activeParameter'], 1)
+            self.assertEqual([item['label'] for item in result[9]['signatures']],
+                             ['fn lookup(count: Int, limit: Int): Int', 'fn lookup(count: Int, label: String): String'])
+            self.assertEqual(result[9]['signatures'][0]['documentation']['value'], 'Integer lookup.')
+            self.assertIn('host: String', result[10]['signatures'][0]['label'])
+
+    def test_latest_edit_wins_during_rapid_changes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / 'src/main.ly'
+            source.parent.mkdir()
+            original = 'fn main(): Unit { print(1) }\n'
+            source.write_text(original, encoding='utf-8')
+            with interactive_server(root) as (send, receive):
+                send({'id': 1, 'method': 'initialize'})
+                self.assertEqual(receive()['id'], 1)
+                send({'method': 'textDocument/didOpen', 'params': {'textDocument': {
+                    'uri': uri(source), 'languageId': 'lyra', 'version': 1, 'text': original,
+                }}})
+                self.assertEqual(receive()['params']['version'], 1)
+                for version in range(2, 20):
+                    send({'method': 'textDocument/didChange', 'params': {
+                        'textDocument': {'uri': uri(source), 'version': version},
+                        'contentChanges': [{'text': original if version == 19 else 'fn main(): Unit { unknown() }\n'}],
+                    }})
+                published = [1]
+                while published[-1] < 19:
+                    latest = receive()
+                    self.assertEqual(latest['method'], 'textDocument/publishDiagnostics')
+                    self.assertGreater(latest['params']['version'], published[-1])
+                    published.append(latest['params']['version'])
+                self.assertEqual(published[-1], 19)
+                self.assertLess(len(published), 19)
+                self.assertEqual(latest['params']['diagnostics'], [])
+
+    def test_macro_completion_and_definition_follow_compiletime_reexports(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / 'client/src/main.ly'
+            macro = root / 'kit/src/hooks/.expressions/value.ly'
+            decorator = root / 'kit/src/hooks/.decorators/audit.ly'
+            text = ('import macro kit.checked as guard\nimport decorator kit.report as traced\n'
+                    'pub import macro kit.ch\npub import decorator kit.re\n'
+                    '@traced\nfn example(): Int { #guard() }\n')
+            implementation = '/// Expands to the checked value.\npub fn value(target: String, argument: String): Syntax { quote { 1 } }\n'
+            for path, body in [
+                (root / 'client/lyra.json5', '{name:"client",version:"0.1.0",dependencies:{kit:{name:"kit",version:"0.1.0",path:"../kit"}}}'),
+                (root / 'kit/lyra.json5', '{name:"kit",version:"0.1.0",kind:"lib"}'),
+                (root / 'kit/src/exports.ly', 'pub import macro self.hooks.value as checked\npub import decorator self.hooks.audit as report\n'),
+                (macro, implementation),
+                (decorator, 'pub fn audit(target: String, argument: String): Syntax { syntaxAround(syntaxCode(""), syntaxCode(""), syntaxCode("")) }'),
+                (source, text),
+            ]:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(body, encoding='utf-8')
+            output = run_server([(source, text)], [
+                document_request(2, source, 'completion', position=position_at(text, text.index('kit.ch\n') + len('kit.ch'))),
+                document_request(3, source, 'completion', position=position_at(text, text.index('kit.re\n') + len('kit.re'))),
+                document_request(4, source, 'definition', position=position_at(text, text.rindex('guard') + 2)),
+                document_request(5, source, 'definition', position=position_at(text, text.rindex('traced') + 2)),
+                document_request(6, source, 'definition', position=position_at(text, text.index('checked') + 2)),
+                document_request(7, source, 'hover', position=position_at(text, text.rindex('guard') + 2)),
+            ])
+            results = {item['id']: item['result'] for item in output if 'id' in item}
+            self.assertEqual([item['label'] for item in results[2]['items']], ['checked'])
+            self.assertEqual([item['label'] for item in results[3]['items']], ['report'])
+            self.assertEqual(results[4][0]['uri'], uri(macro))
+            self.assertEqual(results[4][0]['range']['start'], position_at(implementation, implementation.index('fn value') + 3))
+            self.assertEqual(results[5][0]['uri'], uri(decorator))
+            self.assertEqual(results[6], results[4])
+            self.assertIn('Expands to the checked value.', results[7]['contents']['value'])
+
     def test_incomplete_source_completes_keywords_imports_and_only_visible_names(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -140,7 +350,7 @@ class LanguageServer(unittest.TestCase):
             ])
             results = {item['id']: item['result'] for item in output if item.get('id') in range(2, 6)}
             self.assertEqual({(item['label'], item['kind']) for item in results[2]['items']}, {('val', 14), ('var', 14)})
-            self.assertEqual({item['label'] for item in results[3]['items']}, {'route', 'router'})
+            self.assertEqual({item['label'] for item in results[3]['items']}, {'route', 'router', 'rowOutsideFile'})
             router = next(item for item in results[3]['items'] if item['label'] == 'router')
             self.assertEqual(router['textEdit'], {'newText': 'router', 'range': {
                 'start': position_at(text, local), 'end': position_at(text, local + len('roSuffix')),
@@ -238,7 +448,7 @@ class LanguageServer(unittest.TestCase):
                 }},
             ])
             hover = next(item['result'] for item in output if item.get('id') == 2)
-            self.assertEqual(hover['contents']['value'], '```lyra\nfn read(): Unit\n    throws Closed, Exception\n```')
+            self.assertEqual(hover['contents']['value'], '```lyra\nfn read(): Unit throws Closed, Exception\n```')
 
     def test_formatting_uses_unsaved_source_and_preserves_raw_strings_despite_type_errors(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -286,7 +496,7 @@ class LanguageServer(unittest.TestCase):
             self.assertEqual(len(references), 2)
             usage = next(item for item in references if item['range']['start']['line'] == 2)
             self.assertEqual(usage['range']['start']['character'], utf16)
-            self.assertEqual(results[4]['result']['contents']['value'], '```lyra\nfn greet(name: String): String { "你好 😀 " + name }\n```')
+            self.assertEqual(results[4]['result']['contents']['value'], '```lyra\nfn greet(name: String): String\n```')
             self.assertTrue(any(item['label'] == 'greet' for item in results[5]['result']['items']))
             self.assertIn('newText', results[6]['result'][0])
             rename = results[7]['result']['changes'][uri(source)]

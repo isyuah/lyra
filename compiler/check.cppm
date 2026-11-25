@@ -2,6 +2,7 @@ module;
 #include <compare>
 #include <cstdint>
 #include <deque>
+#include <filesystem>
 #include <functional>
 #include <map>
 #include <optional>
@@ -84,7 +85,22 @@ struct DynamicType { std::size_t trait; std::vector<Type> bindings; bool operato
 struct CheckedModule { std::deque<CheckedFunction> functions; std::optional<std::size_t> entry; std::deque<CheckedAggregate> aggregates; std::vector<std::string> variableNames; std::vector<Type> taskResults; std::vector<SumTypes> sumTypes; std::vector<Type> listElements; std::deque<FunctionShape> signatures{}; std::deque<CheckedEnum> enums{}; std::vector<Trait> traits{}; std::vector<ExceptionType> exceptions{}; std::vector<Type> taskLocalValues{}; std::vector<std::optional<ConstValue>> constants{}; std::vector<TypeProjection> projections{}; std::deque<ConstComposite> constantComposites{}; std::map<std::pair<Type, ValueOperation>, std::size_t> valueOverrides{}; std::vector<DeferredPatternCheck> deferredPatternChecks{}; std::vector<Type> channelElements{}; std::vector<DynamicType> dynamicTypes{}; std::vector<MatchCoverage> matchCoverage{}; std::vector<Diagnostic> warnings{}; std::vector<BlockConstant> blockConstants{}; };
 
 struct InferredTypeHint { SourceAnchor anchor; std::string type; };
-struct EditorIndex { std::vector<NameReference> references; std::vector<InferredTypeHint> inferredTypes; };
+struct EditorDescription { SourceAnchor anchor; std::string detail, documentation; };
+struct EditorProbe {
+    std::filesystem::path path;
+    std::string marker;
+    std::vector<EditorSymbol> members{};
+    std::vector<EditorSignature> signatures{};
+    std::vector<EditorSymbol> labels{};
+};
+struct EditorProbeFinished {};
+struct EditorIndex {
+    std::vector<NameReference> references;
+    std::vector<InferredTypeHint> inferredTypes;
+    std::vector<EditorDescription> descriptions;
+    EditorProbe* probe{};
+};
+std::vector<EditorSymbol> editorBuiltins(bool types, bool constraints = false);
 const std::optional<ConstValue>& constantValue(const CheckedModule& module, ConstantUse target);
 std::string typeName(const CheckedModule& module, Type type, bool canonical = false);
 std::optional<Type> hiddenType(const CheckedModule& module, Type type);

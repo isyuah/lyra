@@ -3,8 +3,10 @@ module;
 #include <algorithm>
 #include <cstdint>
 #include <lyra/utf8.hpp>
+#include <map>
 #include <optional>
 #include <set>
+#include <span>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -16,7 +18,7 @@ module lyra.syntax;
 namespace lyra {
 namespace {
 
-enum class Kind { Name, Keyword, Escaped, Number, String, Bytes, Char, TextHead, TextMiddle, TextTail, Symbol, End };
+enum class Kind { Name, Keyword, Escaped, Number, String, Bytes, Char, TextHead, TextMiddle, TextTail, Symbol, Bad, Hole, End };
 constexpr std::string_view keywords[] = {"fn", "val", "var", "const", "if", "else", "while", "for", "in", "return", "break", "continue", "true", "false", "struct", "class", "enum", "trait", "pub", "import", "as", "is", "async", "await", "spawn", "extern", "match", "null", "implicit", "defer", "throw", "try", "catch", "this", "static"};
 
 struct Token {
@@ -177,6 +179,23 @@ public:
         return {kind, {start, offset}, newline};
     }
 
+    Token editorNext() {
+        auto before = offset;
+        try { return next(); }
+        catch (const Diagnostic& error) {
+            auto start = error.site->start.offset;
+            auto from = text.substr(start);
+            bool toEnd = from.starts_with("/*") || (error.code == "LYL0003" && (from.starts_with('r') || from.starts_with("br")));
+            if (toEnd) offset = text.size();
+            else if (offset == text.size() && from.starts_with("${")) return {Kind::End, {offset, offset}, false};
+            else offset = std::max(offset, error.site->end.offset);
+            if (error.code == "LYL0003" && !interpolations.empty()) interpolations.clear();
+            auto kind = from.starts_with("/*") ? "comment" : error.code == "LYL0003" ? "string" : "invalid";
+            if (comments && std::string_view(kind) != "invalid") comments->push_back({{start, offset}, kind});
+            return {Kind::Bad, {start, offset}, text.substr(before, start >= before ? start - before : 0).find_first_of("\r\n") != text.npos};
+        }
+    }
+
 private:
     const Source& source;
     std::string_view text;
@@ -260,14 +279,19 @@ constexpr Infix infix[] = {
 struct CompletionScope {
     std::string_view text;
     std::size_t offset;
+    SyntaxCompletion& result;
     std::vector<std::size_t> blocks{};
-    std::set<std::string> names{};
+    std::map<std::string, EditorSymbol> names{};
+    bool asynchronous{}, receiver{};
+    unsigned loops{};
 
     bool contains(std::size_t block) const { return std::ranges::find(blocks, block) != blocks.end(); }
 
-    void add(const Identifier& name) {
-        if (name.text != "_" && !name.text.starts_with('$') && name.span.begin < name.span.end)
-            names.emplace(text.substr(name.span.begin, name.span.end - name.span.begin));
+    void add(const Identifier& name, EditorKind kind = EditorKind::Variable) {
+        if (name.text != "_" && !name.text.starts_with('$') && name.span.begin < name.span.end) {
+            auto label = std::string(text.substr(name.span.begin, name.span.end - name.span.begin));
+            names.insert_or_assign(label, EditorSymbol{label, kind, name.span});
+        }
     }
 
     void add(const Pattern& pattern) {
@@ -277,15 +301,46 @@ struct CompletionScope {
     }
 };
 
+struct CompletionReached {};
+
 class Parser {
 public:
-    Parser(const Source& source, std::size_t file, std::vector<ExpressionExpansion>* expressions = nullptr, bool macroImplementation = false, CompletionScope* completion = nullptr)
-        : source(source), file(file), lexer(source), token(lexer.next()), next(lexer.next()), macros(expressions), macroImplementation(macroImplementation), completion(completion) {}
+    Parser(const Source& source, std::size_t file, std::vector<ExpressionExpansion>* expressions = nullptr, bool macroImplementation = false,
+        const std::vector<Token>* editorTokens = nullptr, CompletionScope* completion = nullptr)
+        : source(source), file(file), lexer(source), editorTokens(editorTokens), token(readToken()), next(readToken()),
+          macros(expressions), macroImplementation(macroImplementation), completion(completion) {}
 
     void appendTo(Module& module) {
         while (token.kind != Kind::End) {
+            if (completion) completion->names.clear();
+            auto start = token.span.begin;
+            auto functions = module.functions.size(), expansions = module.expansions.size();
+            try { appendDeclaration(module); }
+            catch (const Diagnostic&) {
+                if (!editorTokens) throw;
+                if (completion) completion->result.incomplete = true;
+                module.functions.resize(functions);
+                module.expansions.resize(expansions);
+                selfType.clear();
+                nodes.clear();
+                pendingExpansion.reset();
+                recover(start, true);
+            }
+        }
+    }
+
+    void expansionExpression() {
+        expression(true);
+        if (token.kind != Kind::End) throw at(source, token.span, "LYM0002", "表达式宏需要恰好一个表达式");
+    }
+
+private:
+    void appendDeclaration(Module& module) {
+            completeAt(CompletionPlace::TopLevel);
             auto firstPrefix = prefixes(module);
             bool pub = visibility();
+            if (token.kind == Kind::Hole && completion) completion->result.afterPublic = pub;
+            completeAt(CompletionPlace::TopLevel);
             if (is("const")) {
                 if (firstPrefix != module.expansions.size()) throw at(source, module.expansions[firstPrefix].name.span, "LYM0001", "不能修饰 const 声明");
                 auto prefix = consume().span;
@@ -309,12 +364,12 @@ public:
                     constant.pendingExpansion = std::exchange(pendingExpansion, {});
                     module.functions.push_back(std::move(constant));
                 }
-                continue;
+                return;
             }
             if (is("trait")) {
                 if (firstPrefix != module.expansions.size()) throw at(source, module.expansions[firstPrefix].name.span, "LYM0001", "不能修饰 trait 约束声明");
                 module.traits.push_back(trait(pub));
-                continue;
+                return;
             }
             if (is("type")) {
                 if (firstPrefix != module.expansions.size()) throw at(source, module.expansions[firstPrefix].name.span, "LYM0001", "不能修饰类型别名");
@@ -328,7 +383,7 @@ public:
                 if (is(";")) consume();
                 else if (token.kind != Kind::End && !token.newlineBefore) throw at(source, token.span, "LYP0001", "类型别名后需要换行或分号");
                 module.aliases.push_back(std::move(alias));
-                continue;
+                return;
             }
             if (is("enum")) {
                 for (auto index = firstPrefix; index < module.expansions.size(); ++index) {
@@ -338,12 +393,12 @@ public:
                     prefix.target = module.enums.size();
                 }
                 module.enums.push_back(enumeration(module, pub));
-                continue;
+                return;
             }
             if (is("extension")) {
                 if (firstPrefix != module.expansions.size()) throw at(source, module.expansions[firstPrefix].name.span, "LYM0001", "此版本不能修饰扩展组声明");
                 extension(module, pub);
-                continue;
+                return;
             }
             if (is("exception")) {
                 if (firstPrefix != module.expansions.size()) throw at(source, module.expansions[firstPrefix].name.span, "LYM0001", "此版本不能修饰异常声明");
@@ -351,7 +406,7 @@ public:
                 module.exceptions.push_back({file, identifier(), pub});
                 if (is(";")) consume();
                 else if (token.kind != Kind::End && !token.newlineBefore) throw at(source, token.span, "LYP0001", "异常声明后需要换行或分号");
-                continue;
+                return;
             }
             for (auto index = firstPrefix; index < module.expansions.size(); ++index) {
                 auto& prefix = module.expansions[index];
@@ -364,27 +419,24 @@ public:
                 auto kind = ImportKind::Runtime;
                 if ((is("macro") || is("decorator")) && text(next) != ".")
                     kind = text(consume()) == "macro" ? ImportKind::Macro : ImportKind::Decorator;
+                importCompletion(kind, {});
                 std::vector<Identifier> path{identifier()};
-                while (is(".")) { consume(); path.push_back(identifier()); }
+                while (is(".")) { consume(); importCompletion(kind, path); path.push_back(identifier()); }
                 auto alias = path.back();
                 if (is("as")) { consume(); alias = identifier(); }
+                else if (!token.newlineBefore) completeAt(CompletionPlace::ImportAlias);
                 module.imports.push_back({file, pub, std::move(path), std::move(alias), kind});
                 if (is(";")) consume();
                 else if (token.kind != Kind::End && !token.newlineBefore) throw at(source, token.span, "LYP0001", "导入后需要换行或分号");
             } else if (is("struct") || is("class")) aggregate(module, pub);
             else appendFunction(module, function({}, pub), firstPrefix);
-        }
     }
 
-    void expansionExpression() {
-        expression(true);
-        if (token.kind != Kind::End) throw at(source, token.span, "LYM0002", "表达式宏需要恰好一个表达式");
-    }
-
-private:
     const Source& source;
     std::size_t file;
     Lexer lexer;
+    const std::vector<Token>* editorTokens;
+    std::size_t editorIndex{};
     Token token, next;
     std::vector<ExpressionExpansion>* macros;
     bool macroImplementation;
@@ -392,9 +444,40 @@ private:
     std::vector<Expr> nodes;
     std::optional<Span> pendingExpansion;
     std::string selfType;
+    std::optional<Span> callOpen;
 
     struct Lookahead {};
-    Parser(const Parser& parser, Lookahead) : source(parser.source), file(parser.file), lexer(parser.lexer), token(parser.token), next(parser.next), macros(nullptr), macroImplementation(parser.macroImplementation), selfType(parser.selfType) {}
+    Parser(const Parser& parser, Lookahead) : source(parser.source), file(parser.file), lexer(parser.lexer), editorTokens(parser.editorTokens),
+        editorIndex(parser.editorIndex), token(parser.token), next(parser.next), macros(nullptr), macroImplementation(parser.macroImplementation), selfType(parser.selfType) {}
+
+    Token readToken() { return editorTokens ? (*editorTokens)[std::min(editorIndex++, editorTokens->size() - 1)] : lexer.next(); }
+
+    void completeAt(CompletionPlace place) {
+        if (token.kind != Kind::Hole || !completion) return;
+        completion->result.place = place;
+        completion->result.callOpen = callOpen;
+        completion->result.asynchronous = completion->asynchronous;
+        throw CompletionReached{};
+    }
+
+    void importCompletion(ImportKind kind, const std::vector<Identifier>& path) {
+        if (token.kind != Kind::Hole || !completion) return;
+        completion->result.importKind = kind;
+        completion->result.importPath = path;
+        completeAt(CompletionPlace::Import);
+    }
+
+    void recover(std::size_t start, bool topLevel) {
+        unsigned braces = 0;
+        while (token.kind != Kind::End) {
+            completeAt(topLevel ? CompletionPlace::TopLevel : CompletionPlace::Statement);
+            if (!braces && ((!topLevel && is("}")) || (token.span.begin > start && token.newlineBefore))) return;
+            if (is("{")) ++braces;
+            else if (is("}") && braces) --braces;
+            else if (!braces && is(";")) { consume(); return; }
+            consume();
+        }
+    }
 
     bool completingBlock() const { return completion && is("{") && completion->contains(token.span.begin); }
 
@@ -402,6 +485,7 @@ private:
         auto first = module.expansions.size();
         while (is("@") || (!method && is("#"))) {
             bool decorator = text(consume()) == "@";
+            completeAt(decorator ? CompletionPlace::Decorator : CompletionPlace::DeclarationMacro);
             auto name = identifier();
             std::optional<Identifier> argument;
             std::vector<Identifier> extra, exports;
@@ -434,11 +518,11 @@ private:
     Token consume() {
         auto previous = token;
         token = next;
-        next = lexer.next();
+        next = readToken();
         return previous;
     }
 
-    std::string_view text(Token item) const { return std::string_view(source.text).substr(item.span.begin, item.span.end - item.span.begin); }
+    std::string_view text(Token item) const { return item.kind == Kind::Hole ? std::string_view{} : std::string_view(source.text).substr(item.span.begin, item.span.end - item.span.begin); }
     bool is(std::string_view word) const { return text(token) == word; }
     Token require(std::string_view word) {
         if (!is(word)) throw at(source, token.span, "LYP0001", "此处需要 " + std::string(word));
@@ -446,6 +530,8 @@ private:
     }
 
     Identifier identifier() {
+        completeAt(CompletionPlace::None);
+        if (token.kind == Kind::Hole && editorTokens) return {"Cursor", consume().span};
         if (token.kind != Kind::Name && token.kind != Kind::Escaped) throw at(source, token.span, "LYP0001", "此处需要标识符");
         auto item = consume();
         auto word = text(item);
@@ -498,6 +584,7 @@ private:
     }
 
     Identifier type() {
+        completeAt(CompletionPlace::Type);
         if (is("(")) {
             auto start = consume().span.begin;
             std::vector<Identifier> parameters;
@@ -526,6 +613,7 @@ private:
         auto name = [&] {
             if (!is("dyn") || next.newlineBefore || (next.kind != Kind::Name && next.kind != Kind::Escaped)) return identifier();
             auto start = consume().span.begin;
+            completeAt(CompletionPlace::Constraint);
             auto trait = identifier();
             if (is("<")) {
                 auto bindings = associatedBindings(trait.span.end);
@@ -599,6 +687,7 @@ private:
         Trait declaration{file, identifier(), {}, pub};
         require("{");
         while (!is("}")) {
+            completeAt(CompletionPlace::TraitDeclaration);
             if (is("type")) {
                 consume();
                 declaration.associated.push_back(identifier());
@@ -646,9 +735,11 @@ private:
         consume();
         for (;;) {
             parameters.push_back(identifier());
+            if (completion) completion->add(parameters.back(), EditorKind::TypeParameter);
             if (is(":")) {
                 consume();
                 for (;;) {
+                    completeAt(CompletionPlace::Constraint);
                     Bound bound{parameters.size() - 1, identifier()};
                     if (is("<")) {
                         std::size_t end;
@@ -694,6 +785,7 @@ private:
             while (!is("}")) {
                 auto firstPrefix = prefixes(module, true);
                 auto publicMember = visibility();
+                completeAt(CompletionPlace::EnumMethod);
                 if (!is("fn") && !is("async")) throw at(source, token.span, "LYP0001", "enum 分支之后只允许实例方法");
                 appendFunction(module, function(result.name, publicMember, result.typeParameters, false, false, result.bounds), firstPrefix);
                 if (is(";")) consume();
@@ -766,7 +858,10 @@ private:
             consume();
             while (!is(")")) {
                 auto marks = attributes();
-                field(module, decl, visibility(), std::move(marks), true);
+                auto publicField = visibility();
+                if (token.kind == Kind::Hole && completion) completion->result.afterPublic = publicField;
+                completeAt(CompletionPlace::FieldDeclaration);
+                field(module, decl, publicField, std::move(marks), true);
                 if (!is(",")) break;
                 consume();
             }
@@ -778,6 +873,8 @@ private:
                 auto firstPrefix = prefixes(module, true);
                 auto marks = attributes();
                 bool publicMember = visibility();
+                if (token.kind == Kind::Hole && completion) completion->result.afterPublic = publicMember;
+                completeAt(CompletionPlace::MemberDeclaration);
                 if (firstPrefix != module.expansions.size() && !is("fn") && !is("async"))
                     throw at(source, module.expansions[firstPrefix].name.span, "LYM0001", "成员装饰器只适用于实例方法");
                 if (is("type")) {
@@ -833,6 +930,7 @@ private:
         require("{");
         if (is("}")) throw at(source, token.span, "LYP0001", "扩展组至少声明一个实例方法");
         while (!is("}")) {
+            completeAt(CompletionPlace::ExtensionDeclaration);
             if (is("val")) {
                 consume();
                 auto name = identifier();
@@ -857,10 +955,14 @@ private:
     }
 
     Function function(std::optional<Identifier> owner, bool pub, const std::vector<Identifier>& enclosing = {}, bool initializer = false, bool staticMember = false, const std::vector<Bound>& enclosingBounds = {}, const Extension* extension = nullptr) {
+        auto start = token.span.begin;
+        auto previousNames = completion ? std::optional(completion->names) : std::nullopt;
+        completeAt(CompletionPlace::FunctionModifier);
         bool isAsync = false, foreign = false;
         if (is("async") || is("extern")) {
             isAsync = is("async"); foreign = !isAsync;
             consume();
+            completeAt(CompletionPlace::FunctionModifier);
             if (is("async") || is("extern")) throw at(source, token.span, "LYF0001", "声明只能使用一个 async 或 extern 修饰符");
         }
         bool conversion = is("implicit");
@@ -922,19 +1024,26 @@ private:
             while (is(",")) { consume(); throwsTypes.push_back(type()); }
         }
         if (foreign) {
-            require(";");
+            auto end = require(";").span.begin;
             auto symbol = name;
-            return {file, std::move(name), std::move(parameters), std::move(result), {}, 0, {}, pub, {}, false, std::move(symbol)};
+            Function declaration{file, std::move(name), std::move(parameters), std::move(result), {}, 0, {}, pub, {}, false, std::move(symbol)};
+            declaration.header = {start, end};
+            if (completion) completion->names = std::move(*previousNames);
+            return declaration;
         }
-        if (completion && !owner && !extension) completion->add(name);
         if (completingBlock()) {
-            for (const auto& parameter : parameters) completion->add(parameter.name);
-            for (const auto& generic : generics) completion->add(generic);
+            for (const auto& parameter : parameters) completion->add(parameter.name, EditorKind::Parameter);
+            for (const auto& generic : generics) completion->add(generic, EditorKind::TypeParameter);
+            completion->asynchronous = isAsync;
+            completion->receiver = hasReceiver || initializer;
         }
+        auto end = token.span.begin;
         auto body = block();
         Function decl{file, std::move(name), std::move(parameters), std::move(result), std::exchange(nodes, {}), body, std::move(owner), pub, std::move(generics), isAsync, {}, conversion, std::move(bounds), initializer, hasReceiver, extension ? std::optional(extension->name) : std::nullopt};
+        decl.header = {start, end};
         decl.throwsTypes = std::move(throwsTypes);
         decl.pendingExpansion = std::exchange(pendingExpansion, {});
+        if (completion) completion->names = std::move(*previousNames);
         return decl;
     }
 
@@ -945,18 +1054,28 @@ private:
     ExprId blockContents(std::size_t start) {
         Block body;
         while (!is("}")) {
-            if (token.kind == Kind::End) throw at(source, token.span, "LYP0001", "块缺少 }");
-            auto value = statement();
-            std::optional<Span> semi;
-            if (is(";")) semi = consume().span;
-            else if (!is("}") && token.kind != Kind::End && !token.newlineBefore) {
-                throw at(source, token.span, "LYP0001", "表达式之间需要换行或分号");
+            if (token.kind == Kind::End) {
+                if (!editorTokens) throw at(source, token.span, "LYP0001", "块缺少 }");
+                break;
             }
-            if (completion && completion->contains(start) && semi.value_or(nodes[value].span).end < completion->offset) {
-                if (const auto* binding = std::get_if<Binding>(&nodes[value].node)) completion->add(binding->name);
-                if (const auto* binding = std::get_if<PatternBinding>(&nodes[value].node)) completion->add(binding->pattern);
+            auto statementStart = token.span.begin, saved = nodes.size();
+            try {
+                auto value = statement();
+                std::optional<Span> semi;
+                if (is(";")) semi = consume().span;
+                else if (!is("}") && token.kind != Kind::End && !token.newlineBefore)
+                    throw at(source, token.span, "LYP0001", "表达式之间需要换行或分号");
+                if (completion && completion->contains(start) && semi.value_or(nodes[value].span).end <= completion->offset) {
+                    if (const auto* binding = std::get_if<Binding>(&nodes[value].node)) completion->add(binding->name, binding->constant ? EditorKind::Constant : EditorKind::Variable);
+                    if (const auto* binding = std::get_if<PatternBinding>(&nodes[value].node)) completion->add(binding->pattern);
+                }
+                body.statements.push_back({value, semi});
+            } catch (const Diagnostic&) {
+                if (!editorTokens) throw;
+                if (completion) completion->result.incomplete = true;
+                nodes.resize(saved);
+                recover(statementStart, false);
             }
-            body.statements.push_back({value, semi});
         }
         body.end = consume().span;
         auto span = Span{start, body.end.end};
@@ -964,6 +1083,7 @@ private:
     }
 
     ExprId statement() {
+        completeAt(CompletionPlace::Statement);
         auto start = token.span.begin;
         if (is("const")) {
             consume();
@@ -1017,6 +1137,7 @@ private:
             }
             auto condition = expression(false, 1, false);
             if (matched && completingBlock()) completion->add(*matched);
+            if (completingBlock()) ++completion->loops;
             auto body = block();
             return add({start, nodes[body].span.end}, While{condition, body, std::move(matched)});
         }
@@ -1037,6 +1158,7 @@ private:
         require("in");
         auto input = expression(false, 1, false);
         if (completingBlock()) completion->add(item);
+        if (completingBlock()) ++completion->loops;
         auto body = block();
         return add({site.begin, nodes[body].span.end}, For{std::move(item), input, body, awaitSite});
     }
@@ -1051,6 +1173,7 @@ private:
         auto left = prefix(inParens, trailingBlock);
         int previous = 0;
         while (inParens || !token.newlineBefore) {
+            completeAt(CompletionPlace::AfterExpression);
             if (is("??") && minRank <= 2) {
                 auto site = consume().span;
                 auto right = expression(inParens, 2, trailingBlock);
@@ -1167,6 +1290,7 @@ private:
             if (!is(".") && !is("?.")) break;
             bool safe = is("?.");
             auto site = consume().span;
+            completeAt(CompletionPlace::Member);
             auto name = identifier();
             auto begin = nodes[value].span.begin;
             auto subject = value;
@@ -1306,7 +1430,11 @@ private:
             while (!is("=>")) consume();
             consume();
         } else literal.parameters.clear();
-        if (completion && completion->contains(open.begin)) for (const auto& parameter : literal.parameters) completion->add(parameter.name);
+        if (completion && completion->contains(open.begin)) {
+            for (const auto& parameter : literal.parameters) completion->add(parameter.name, EditorKind::Parameter);
+            completion->asynchronous = async;
+            completion->loops = 0;
+        }
         literal.body = blockContents(open.begin);
         auto end = nodes[literal.body].span.end;
         auto value = add({site.begin, end}, std::move(literal));
@@ -1317,16 +1445,16 @@ private:
 
     bool lambdaHead() const {
         if (next.kind != Kind::Name && next.kind != Kind::Escaped && text(next) != ")") return false;
-        auto look = lexer;
+        Parser look(*this, Lookahead{});
         auto current = next;
         unsigned depth = 1;
         while (current.kind != Kind::End) {
             if (text(current) == "(") ++depth;
             if (text(current) == ")" && !--depth) {
-                auto after = text(look.next());
+                auto after = text(look.readToken());
                 return after == "=>" || after == ":";
             }
-            current = look.next();
+            current = look.readToken();
         }
         return false;
     }
@@ -1345,7 +1473,11 @@ private:
         require(")");
         if (is(":")) { consume(); literal.result = type(); }
         require("=>");
-        if (completingBlock()) for (const auto& parameter : literal.parameters) completion->add(parameter.name);
+        if (completingBlock()) {
+            for (const auto& parameter : literal.parameters) completion->add(parameter.name, EditorKind::Parameter);
+            completion->asynchronous = async.has_value();
+            completion->loops = 0;
+        }
         literal.body = block();
         auto end = nodes[literal.body].span.end;
         return add({start, end}, std::move(literal));
@@ -1353,9 +1485,16 @@ private:
 
     ExprId call(std::size_t begin, Identifier name, std::optional<ExprId> receiver, std::optional<ExprId> function = {}, std::optional<TypeQualifier> typeOwner = {}) {
         auto types = is("<") ? typeList() : std::vector<Identifier>{};
-        require("(");
+        auto open = require("(").span;
+        struct CallScope {
+            std::optional<Span>& current;
+            std::optional<Span> previous;
+            ~CallScope() { current = previous; }
+        } frame{callOpen, std::exchange(callOpen, open)};
         Call node{std::move(name), {}, receiver, std::move(types), function, std::move(typeOwner)};
         while (!is(")")) {
+            if (completion && token.kind == Kind::Hole) completion->result.argumentLabel = true;
+            completeAt(CompletionPlace::Expression);
             std::optional<Identifier> label;
             if (text(next) == ":") { label = identifier(); consume(); }
             std::optional<Span> spread;
@@ -1370,6 +1509,7 @@ private:
 
     ExprId macroExpression() {
         auto begin = require("#").span.begin;
+        completeAt(CompletionPlace::ExpressionMacro);
         auto name = identifier();
         if (!macros) throw at(source, name.span, "LYM0001", "此处不能调用表达式宏 #" + name.text);
         auto open = require("(").span;
@@ -1458,6 +1598,7 @@ private:
     }
 
     ExprId atom(bool inParens, bool trailingBlock) {
+        completeAt(CompletionPlace::Expression);
         auto start = token.span.begin;
         if (is("#")) return macroExpression();
         if (macroImplementation && is("quote") && text(next) == "{") return quotedSyntax();
@@ -1465,6 +1606,7 @@ private:
             auto site = consume().span;
             if (token.newlineBefore || (!is("{") && !is("("))) throw at(source, site, "LYP0001", "异步表达式需要同行的块或 lambda");
             if (is("(")) return lambda(site);
+            if (completingBlock()) { completion->asynchronous = true; completion->loops = 0; }
             auto body = block();
             return add({start, nodes[body].span.end}, AsyncBlock{AsyncBlock::Cold, body, site});
         }
@@ -1574,6 +1716,7 @@ private:
         }
         if (trailingBlock && is("blocking") && text(next) == "{" && !next.newlineBefore) {
             consume();
+            if (completingBlock()) { completion->asynchronous = false; completion->loops = 0; }
             auto body = block();
             return add({start, nodes[body].span.end}, Blocking{body});
         }
@@ -1585,6 +1728,7 @@ private:
         if (trailingBlock && (is("taskGroup") || is("parallel")) && text(next) == "{" && !next.newlineBefore) {
             auto kind = is("parallel") ? AsyncBlock::Parallel : AsyncBlock::Group;
             auto site = consume().span;
+            if (completingBlock()) { completion->asynchronous = true; completion->loops = 0; }
             auto body = block();
             return add({start, nodes[body].span.end}, AsyncBlock{kind, body, site});
         }
@@ -1595,6 +1739,7 @@ private:
             if (suffix == TypeSuffix::Qualifier) {
                 TypeQualifier owner{std::move(name), typeList()};
                 require(".");
+                completeAt(CompletionPlace::Member);
                 auto method = identifier();
                 if (explicitTypes(method) || (is("(") && (inParens || !token.newlineBefore))) return call(start, std::move(method), {}, {}, std::move(owner));
                 if (trailingBlock && (is("{") || (is("async") && text(next) == "{" && !next.newlineBefore)) && !token.newlineBefore)
@@ -1650,74 +1795,184 @@ std::vector<SyntaxToken> syntaxTokens(const Source& source, bool comments, bool 
 
 SyntaxCompletion completeSyntax(const Source& source, std::size_t offset) {
     SyntaxCompletion result{{offset, offset}};
-    CompletionScope scope{source.text, offset};
+    CompletionScope scope{source.text, offset, result};
     const auto text = scope.text;
-    std::vector<SyntaxToken> comments;
-    std::optional<Token> previous;
-    Lexer lexer(source, &comments);
-    try {
-        for (auto token = lexer.next(); token.kind != Kind::End && token.span.begin <= offset; token = lexer.next()) {
-            auto spelling = text.substr(token.span.begin, token.span.end - token.span.begin);
-            if (token.kind == Kind::Symbol && token.span.end <= offset) {
-                if (spelling == "{") scope.blocks.push_back(token.span.begin);
-                else if (spelling == "}" && !scope.blocks.empty()) scope.blocks.pop_back();
-            }
-            if (token.span.begin <= offset && offset <= token.span.end && (token.kind == Kind::Name || token.kind == Kind::Keyword || token.kind == Kind::Escaped)) {
-                result.replacement = token.span;
-                break;
-            }
-            if (token.span.end > offset) {
-                if (token.kind != Kind::Symbol) return result;
-                break;
-            }
-            previous = token;
+    std::vector<SyntaxToken> trivia;
+    Lexer lexer(source, &trivia);
+    std::vector<Token> tokens;
+    bool inserted = false;
+    for (auto token = lexer.editorNext();; token = lexer.editorNext()) {
+        const auto span = token.span;
+        if (!inserted && offset >= span.begin && offset <= span.end &&
+            (token.kind == Kind::Name || token.kind == Kind::Keyword || token.kind == Kind::Escaped ||
+             (token.kind == Kind::Bad && text[span.begin] == '`'))) {
+            result.replacement = span;
+            tokens.push_back({Kind::Hole, span, token.newlineBefore});
+            inserted = true;
+            continue;
         }
-    } catch (const Diagnostic& error) {
-        result.incomplete = true;
-        if (error.site && error.site->start.offset < offset) {
-            auto from = text.substr(error.site->start.offset);
-            if (from.starts_with("/*") || (error.code == "LYL0003" && !from.starts_with("${") &&
-                (offset <= error.site->end.offset || from.starts_with('r') || from.starts_with("br")))) return result;
+        if (!inserted && offset > span.begin && offset < span.end) return result;
+        if (!inserted && offset <= span.begin) {
+            auto start = tokens.empty() ? 0 : tokens.back().span.end;
+            auto newline = text.substr(start, offset - start).find_first_of("\r\n") != text.npos;
+            tokens.push_back({Kind::Hole, result.replacement, newline});
+            inserted = true;
         }
-        auto wordByte = [](char value) { return isLetter(value) || isDigit(value); };
-        while (result.replacement.begin && wordByte(text[result.replacement.begin - 1])) --result.replacement.begin;
-        while (result.replacement.end < text.size() && wordByte(text[result.replacement.end])) ++result.replacement.end;
-        if (result.replacement.begin && text[result.replacement.begin - 1] == '`') --result.replacement.begin;
+        if (!inserted && token.kind == Kind::Symbol) {
+            auto spelling = text.substr(span.begin, span.end - span.begin);
+            if (spelling == "{") scope.blocks.push_back(span.begin);
+            else if (spelling == "}" && !scope.blocks.empty()) scope.blocks.pop_back();
+        }
+        tokens.push_back(token);
+        if (token.kind == Kind::End) break;
     }
-    for (const auto& comment : comments) if (comment.span.begin <= offset &&
-        (offset < comment.span.end || (offset == comment.span.end && text.substr(comment.span.begin).starts_with("//")))) return result;
-    auto family = ImportKind::Runtime;
-    if (previous) {
-        const auto span = previous->span;
-        if (span.end <= result.replacement.begin && text.substr(span.end, result.replacement.begin - span.end).find_first_of("\r\n") == text.npos) {
-            auto separator = text.substr(span.begin, span.end - span.begin);
-            if (separator == "." || separator == "?.") return result;
-            if (separator == "#") family = ImportKind::Macro;
-            if (separator == "@") family = ImportKind::Decorator;
-        }
-    }
+    for (const auto& item : trivia) if (item.span.begin <= offset &&
+        (offset < item.span.end || (offset == item.span.end && (item.kind == "string" ||
+            text.substr(item.span.begin).starts_with("//") || !text.substr(item.span.begin, item.span.end - item.span.begin).ends_with("*/"))))) return result;
     Module module;
     std::vector<ExpressionExpansion> expansions;
     auto directory = source.path.parent_path().filename();
     bool macroImplementation = directory == ".expressions" || directory == ".macros" || directory == ".decorators";
-    try { Parser(source, 0, &expansions, macroImplementation, family == ImportKind::Runtime ? &scope : nullptr).appendTo(module); }
-    catch (const Diagnostic&) { result.incomplete = true; }
-    for (const auto& imported : module.imports) if (imported.kind == family) scope.add(imported.alias);
-    if (family == ImportKind::Runtime) {
-        auto declarations = [&](const auto& entries) { for (const auto& entry : entries) scope.add(entry.name); };
-        for (const auto& function : module.functions) if (!function.owner && !function.extensionGroup && !function.property) scope.add(function.name);
-        declarations(module.aggregates);
-        declarations(module.enums);
-        declarations(module.traits);
-        declarations(module.aliases);
-        declarations(module.exceptions);
-        declarations(module.extensions);
+    try { Parser(source, 0, &expansions, macroImplementation, &tokens, &scope).appendTo(module); }
+    catch (const CompletionReached&) {}
+    auto offer = [&](std::initializer_list<std::string_view> words) {
+        for (auto word : words) result.suggestions.push_back({std::string(word), EditorKind::Keyword});
+    };
+    using enum CompletionPlace;
+    switch (result.place) {
+        case TopLevel:
+            offer({"fn", "const", "async", "extern", "implicit", "struct", "class", "enum", "trait", "type", "exception", "extension", "import"});
+            if (!result.afterPublic) offer({"pub"});
+            break;
+        case MemberDeclaration:
+            offer({"fn", "async", "static", "type", "val", "var", "init"});
+            if (!result.afterPublic) offer({"pub"});
+            break;
+        case FieldDeclaration:
+            offer({"val", "var"});
+            if (!result.afterPublic) offer({"pub"});
+            break;
+        case TraitDeclaration: offer({"fn", "async", "type"}); break;
+        case ExtensionDeclaration: offer({"fn", "async", "val"}); break;
+        case EnumMethod: offer({"fn", "async", "pub"}); break;
+        case FunctionModifier: offer({"fn"}); break;
+        case Import:
+            if (result.importPath.empty() && result.importKind == ImportKind::Runtime) offer({"macro", "decorator"});
+            break;
+        case ImportAlias: offer({"as"}); break;
+        case Type: offer({"dyn"}); break;
+        case AfterExpression: offer({"as", "is"}); break;
+        case Statement:
+            offer({"val", "var", "const", "defer", "return", "for", "while"});
+            if (scope.loops) offer({"break", "continue"});
+            [[fallthrough]];
+        case Expression:
+            offer({"if", "match", "async", "true", "false", "null", "throw", "try", "blocking", "unsafe"});
+            if (scope.asynchronous) offer({"await", "spawn", "taskGroup", "parallel"});
+            if (scope.receiver) offer({"this"});
+            if (macroImplementation) offer({"quote"});
+            break;
+        default: break;
     }
-    auto prefix = text.substr(result.replacement.begin, offset - result.replacement.begin);
-    if (family == ImportKind::Runtime) for (auto keyword : keywords)
-        if (keyword.starts_with(prefix)) result.suggestions.push_back({std::string(keyword), true});
-    for (const auto& name : scope.names) if (name.starts_with(prefix)) result.suggestions.push_back({name});
+    if (result.place == Statement || result.place == Expression || result.place == Type || result.place == Constraint)
+        for (auto& [name, symbol] : scope.names)
+            if ((symbol.kind == EditorKind::TypeParameter) == (result.place == Type)) result.suggestions.push_back(std::move(symbol));
     return result;
+}
+
+Module indexFileSyntax(const Source& source, std::vector<ExpressionExpansion>* expressions) {
+    if (source.previous || source.origin) return indexFileSyntax(sourceText(source.path, source.text, source.moduleId), expressions);
+    Lexer lexer(source);
+    std::vector<Token> tokens;
+    do { tokens.push_back(lexer.editorNext()); } while (tokens.back().kind != Kind::End);
+    Module module;
+    std::vector<ExpressionExpansion> expansions;
+    auto directory = source.path.parent_path().filename();
+    auto macro = directory == ".macros" || directory == ".expressions" || directory == ".decorators" ||
+        directory == "macros" || directory == "expressions" || directory == "decorators";
+    Parser(source, 0, expressions ? expressions : &expansions, macro, &tokens).appendTo(module);
+    return module;
+}
+
+namespace {
+
+std::string_view trimmed(std::string_view text) {
+    auto start = text.find_first_not_of(" \t\r\n");
+    return start == text.npos ? std::string_view{} : text.substr(start, text.find_last_not_of(" \t\r\n") - start + 1);
+}
+
+std::string_view excerpt(const Source& source, Span span) {
+    return std::string_view(source.text).substr(span.begin, span.end - span.begin);
+}
+
+}
+
+std::string editorSpelling(const Source& source, const Identifier& name) {
+    if (name.span.begin == name.span.end) return name.text;
+    return std::string(excerpt(source, name.span));
+}
+
+std::string editorIdentifier(std::string_view name) {
+    if (name.empty() || !isLetter(name.front()) || !std::ranges::all_of(name, [](auto letter) { return isLetter(letter) || isDigit(letter); })) return {};
+    return std::ranges::find(keywords, name) == std::end(keywords) ? std::string(name) : "`" + std::string(name) + "`";
+}
+
+std::string editorDocumentation(const Source& source, std::size_t start) {
+    auto line = std::upper_bound(source.lineStarts.begin(), source.lineStarts.end(), start) - source.lineStarts.begin() - 1;
+    auto preceding = [&] { return trimmed(excerpt(source, {source.lineStarts[line - 1], source.lineStarts[line]})); };
+    while (line && (preceding().starts_with('@') || preceding().starts_with('#') || preceding().starts_with('['))) --line;
+    std::vector<std::string_view> lines;
+    while (line && preceding().starts_with("///")) { lines.push_back(trimmed(preceding().substr(3))); --line; }
+    std::string documentation;
+    for (auto item = lines.rbegin(); item != lines.rend(); ++item) {
+        if (item != lines.rbegin()) documentation += '\n';
+        documentation += *item;
+    }
+    return documentation;
+}
+
+EditorSignature describeFunction(const Source& source, const Function& function, std::string_view label,
+    const std::vector<std::string>& parameterTypes, std::string_view resultType, std::size_t enclosingTypes) {
+    EditorSignature signature{{}, editorDocumentation(source, function.header.end ? function.header.begin : function.name.span.begin), {}};
+    if (function.isPublic) signature.label += "pub ";
+    if (function.constant == ConstKind::Function) signature.label += "const ";
+    if (function.owner && !function.hasReceiver && !function.initializer) signature.label += "static ";
+    if (function.isAsync) signature.label += "async ";
+    if (function.foreignSymbol) signature.label += "extern ";
+    if (!function.initializer) signature.label += "fn ";
+    signature.label += label;
+    if (function.typeParameters.size() > enclosingTypes) {
+        signature.label += '<';
+        for (const auto& parameter : std::span(function.typeParameters).subspan(enclosingTypes)) {
+            if (!signature.label.ends_with('<')) signature.label += ", ";
+            signature.label += parameter.text;
+        }
+        signature.label += '>';
+    }
+    signature.label += '(';
+    for (std::size_t slot = function.hasReceiver; slot < function.parameters.size(); ++slot) {
+        const auto& parameter = function.parameters[slot];
+        auto name = parameter.name.text.empty() ? std::string{} : editorSpelling(source, parameter.name);
+        auto type = parameterTypes.empty() ? trimmed(excerpt(source, parameter.type.span)) : std::string_view(parameterTypes[slot]);
+        std::string rendered = name.empty() ? std::string(type) : name + ": " + std::string(type);
+        if (parameter.variadic) rendered += "...";
+        if (parameter.defaultValue) rendered += " = …";
+        if (!signature.parameters.empty()) signature.label += ", ";
+        signature.parameters.push_back({std::move(name), rendered, parameter.variadic});
+        signature.label += rendered;
+    }
+    signature.label += ')';
+    if (resultType.empty() && function.result.span.begin < function.result.span.end)
+        resultType = trimmed(excerpt(source, function.result.span));
+    if (!resultType.empty()) signature.label += ": " + std::string(resultType);
+    if (!function.throwsTypes.empty()) {
+        signature.label += " throws ";
+        for (const auto& type : function.throwsTypes) {
+            if (&type != &function.throwsTypes.front()) signature.label += ", ";
+            signature.label += trimmed(excerpt(source, type.span));
+        }
+    }
+    return signature;
 }
 
 }

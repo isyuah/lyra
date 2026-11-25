@@ -26,7 +26,22 @@ export namespace lyra {
 struct Compilation { std::vector<Source> sources; Module syntax; std::vector<std::filesystem::path> macroInputs{}; std::vector<NameReference> references{}; };
 struct ParsedFileSyntax { std::string text; Module syntax; };
 struct ParseCache { std::map<std::string, ParsedFileSyntax> files; };
-Compilation loadProgram(const PackageGraph& graph, const std::string& entry, const std::optional<std::filesystem::path>& testFile = {}, const SourceOverlay* overlays = nullptr, ParseCache* parseCache = nullptr);
+Compilation loadProgram(const PackageGraph& graph, const std::string& entry, const std::optional<std::filesystem::path>& testFile = {}, const SourceOverlay* overlays = nullptr, ParseCache* parseCache = nullptr, bool editorProbe = false);
+struct EditorFileSyntax { std::string text; Module syntax; std::vector<ExpressionExpansion> expressions; };
+struct EditorParseCache { std::map<std::filesystem::path, EditorFileSyntax> files; };
+struct EditorDeclaration { std::size_t file; std::string name; EditorSymbol symbol; bool visible; };
+struct EditorImport { ImportKind kind; std::vector<std::string> path; EditorSymbol symbol; bool automatic{}; std::optional<MacroKind> macro{}; };
+struct EditorMacro { MacroKind kind; EditorSymbol symbol; };
+struct EditorDefinition { Span use; std::filesystem::path path; Span target; EditorSymbol symbol; };
+struct EditorModuleIndex {
+    std::vector<EditorSymbol> visible;
+    std::vector<EditorMacro> macros;
+    std::vector<EditorImport> imports;
+    std::vector<EditorDefinition> definitions;
+    std::set<std::string> occupied;
+};
+std::vector<EditorDeclaration> editorDeclarations(const Module& syntax, std::span<const Source> sources, bool generatedOnly = false);
+EditorModuleIndex indexModule(const PackageGraph& graph, const std::filesystem::path& path, const SourceOverlay& overlays, EditorParseCache& cache);
 }
 
 namespace lyra {
@@ -50,6 +65,30 @@ struct Space {
 
 struct ImportTarget { std::string package, module; fs::path directory; };
 using SymbolDependencies = std::map<std::string, std::set<std::string>>;
+
+std::vector<fs::path> sourcePaths(const fs::path& directory, const SourceOverlay* overlays, bool strict, bool recursive = true) {
+    std::set<fs::path> paths;
+    auto first = fs::is_directory(directory) ? fs::recursive_directory_iterator(directory) : fs::recursive_directory_iterator{};
+    for (auto item = std::move(first); item != fs::recursive_directory_iterator{}; ++item) {
+        if (item->is_symlink() && strict) throw Diagnostic{"LYI0001", "源码不允许符号链接：" + pathText(item->path())};
+        if (item->is_directory() && (!recursive || pathText(item->path().filename()).starts_with('.'))) { item.disable_recursion_pending(); continue; }
+        if (!item->is_symlink() && item->is_regular_file() && item->path().extension() == ".ly") paths.insert(item->path());
+    }
+    if (overlays) for (const auto& [path, text] : *overlays) {
+        auto relative = path.lexically_relative(directory);
+        if (relative.empty() || relative == "." || *relative.begin() == ".." || path.extension() != ".ly") continue;
+        if (!recursive && relative.has_parent_path()) continue;
+        if (std::ranges::any_of(relative, [](const auto& part) { return pathText(part).starts_with('.'); })) continue;
+        paths.insert(path);
+    }
+    return {paths.begin(), paths.end()};
+}
+
+std::string directoryModule(std::string prefix, const fs::path& directory, const fs::path& source) {
+    auto relative = source.parent_path().lexically_relative(directory);
+    if (relative != ".") prefix += '/' + pathText(relative);
+    return prefix;
+}
 
 const std::string& declarationGroup(const Function& function) {
     return function.owner ? function.owner->text : function.extensionGroup ? function.extensionGroup->text : function.name.text;
@@ -710,7 +749,378 @@ struct MacroDependencies {
 
 }
 
-Compilation loadProgram(const PackageGraph& graph, const std::string& entry, const std::optional<fs::path>& testFile, const SourceOverlay* overlays, ParseCache* parseCache) {
+std::vector<EditorDeclaration> editorDeclarations(const Module& syntax, std::span<const Source> sources, bool generatedOnly) {
+    std::vector<EditorDeclaration> result;
+    auto add = [&](const auto& item, EditorKind kind, std::string detail = {}, std::string documentation = {}) {
+        const auto& source = sources[item.file];
+        if (generatedOnly && !source.origin) return;
+        auto separator = item.name.text.rfind("::");
+        auto name = item.name.text.substr(separator == std::string::npos ? 0 : separator + 2);
+        if (name == "_" || name.contains('$') || item.name.span.begin == item.name.span.end) return;
+        auto label = editorSpelling(source, item.name);
+        if (source.origin && label.starts_with('`')) {
+            constexpr std::array<std::string_view, 8> contextual{"None", "Self", "blocking", "parallel", "quote", "select", "taskGroup", "unsafe"};
+            if (std::ranges::find(contextual, name) == contextual.end()) label = editorIdentifier(name);
+        }
+        if (documentation.empty()) documentation = editorDocumentation(source, item.name.span.begin);
+        result.push_back({item.file, std::move(name), {std::move(label), kind, item.name.span, std::move(detail), std::move(documentation)}, item.isPublic});
+    };
+    for (const auto& record : syntax.aggregates) add(record, record.reference ? EditorKind::Class : EditorKind::Struct);
+    for (const auto& item : syntax.enums) add(item, EditorKind::Enum);
+    for (const auto& trait : syntax.traits) add(trait, EditorKind::Trait);
+    for (const auto& alias : syntax.aliases) add(alias, EditorKind::TypeAlias, "type " + editorSpelling(sources[alias.file], alias.name) + " = " + editorSpelling(sources[alias.file], alias.target));
+    for (const auto& exception : syntax.exceptions) add(exception, EditorKind::Class, "exception " + editorSpelling(sources[exception.file], exception.name));
+    for (const auto& group : syntax.extensions) add(group, EditorKind::Extension, "extension " + editorSpelling(sources[group.file], group.name) + " for " + editorSpelling(sources[group.file], group.receiver));
+    for (const auto& function : syntax.functions) {
+        if (function.owner || function.extensionGroup || function.conversion || (generatedOnly && !sources[function.file].origin)) continue;
+        const auto& source = sources[function.file];
+        if (function.constant == ConstKind::Value)
+            add(function, EditorKind::Constant, "const " + editorSpelling(source, function.name) + ": " + editorSpelling(source, function.result));
+        else if (!function.name.text.contains('$')) {
+            auto signature = describeFunction(source, function, editorSpelling(source, function.name));
+            add(function, EditorKind::Function, std::move(signature.label), std::move(signature.documentation));
+        }
+    }
+    return result;
+}
+
+namespace {
+
+const EditorFileSyntax& indexedFile(const Source& source, EditorParseCache& cache) {
+    auto entry = cache.files.find(source.path);
+    if (entry != cache.files.end() && entry->second.text == source.text) return entry->second;
+    EditorFileSyntax file{source.text, {}, {}};
+    file.syntax = indexFileSyntax(source, &file.expressions);
+    return cache.files.insert_or_assign(source.path, std::move(file)).first->second;
+}
+
+struct ModuleCatalog {
+    ModuleCatalog(const PackageGraph& graph, const fs::path& path, const SourceOverlay& overlays, EditorParseCache& cache, const ResolvedPackage& entry)
+        : graph(graph), path(path), overlays(overlays), cache(cache), entry(entry) {}
+
+    const PackageGraph& graph;
+    const fs::path& path;
+    const SourceOverlay& overlays;
+    EditorParseCache& cache;
+    const ResolvedPackage& entry;
+    fs::path standard = sdkRoot() / "share" / "lyra" / "std";
+    EditorModuleIndex index{};
+    std::map<std::string, ResolvedPackage> bundled;
+    std::map<std::string, std::string> prefixes;
+    std::map<std::string, const ResolvedPackage*> packages;
+    std::map<std::string, Space> spaces;
+    std::map<std::string, fs::path> directories;
+    std::vector<Source> sources;
+    std::vector<NameReference> unusedReferences;
+    std::map<std::pair<std::size_t, std::size_t>, EditorSymbol> symbols;
+    std::multimap<std::string, std::vector<std::string>> routes;
+    std::set<std::pair<ImportKind, std::vector<std::string>>> suggestedModules;
+    std::vector<Import> imports;
+    std::optional<std::size_t> current;
+    Linker linker{sources, spaces, prefixes, "", unusedReferences, true};
+    MacroImports macroImports{sources, spaces, packages, prefixes, &overlays};
+    std::map<std::tuple<std::string, MacroKind, std::string>, EditorDefinition> authoredMacros;
+    std::map<std::pair<MacroKind, std::string>, EditorDefinition> builtinMacros;
+
+    void moduleCandidate(ImportKind kind, std::vector<std::string> route) {
+        auto label = editorIdentifier(route.back());
+        if (!label.empty() && suggestedModules.emplace(kind, route).second)
+            index.imports.push_back({kind, std::move(route), {std::move(label), EditorKind::Module}});
+    }
+
+    void addPackage(const ResolvedPackage& package, std::string prefix) {
+        packages.emplace(package.id, &package);
+        prefixes.emplace(package.id, std::move(prefix));
+    }
+
+    std::string addModule(const ResolvedPackage& package, fs::path relative) {
+        auto module = prefixes.at(package.id);
+        if (relative == ".") relative.clear();
+        if (!relative.empty()) module += '/' + pathText(relative);
+        spaces.try_emplace(module, Space{&package});
+        directories.try_emplace(module, std::move(relative));
+        return module;
+    }
+
+    void loadFile(const fs::path& filePath, std::string module) {
+        try { sources.push_back(loadSource(filePath, std::move(module), &overlays)); }
+        catch (const Diagnostic&) { return; }
+        auto file = sources.size() - 1;
+        if (filePath == path) current = file;
+        const auto& source = sources.back();
+        const auto& parsed = indexedFile(source, cache);
+        for (auto use : parsed.syntax.imports) { use.file = file; imports.push_back(std::move(use)); }
+        for (auto& declaration : editorDeclarations(parsed.syntax, std::span(&source, 1))) {
+            auto kind = declaration.symbol.kind;
+            auto spaceKind = kind == EditorKind::Function ? SymbolKind::Callable : kind == EditorKind::Constant ? SymbolKind::Constant
+                : kind == EditorKind::Extension ? SymbolKind::Extension : SymbolKind::Type;
+            Identifier name{declaration.name, declaration.symbol.name};
+            try { linker.declare(file, name, declaration.visible, false, spaceKind); }
+            catch (const Diagnostic&) { continue; }
+            symbols.emplace(std::pair{file, name.span.begin}, std::move(declaration.symbol));
+        }
+    }
+
+    void loadPackages() {
+        for (const auto& package : graph.packages) addPackage(package, "pkg" + std::to_string(prefixes.size()));
+        routes.emplace(entry.id, std::vector<std::string>{"self"});
+        for (const auto& [alias, id] : entry.dependencies) routes.emplace(id, std::vector<std::string>{alias});
+        for (const auto& [id, route] : routes)
+            for (auto kind : {ImportKind::Runtime, ImportKind::Macro, ImportKind::Decorator}) moduleCandidate(kind, route);
+        moduleCandidate(ImportKind::Runtime, {"std"});
+        std::vector<std::string> pending{entry.id};
+        if (fs::is_directory(standard)) for (const auto& item : fs::directory_iterator(standard)) {
+            if (!fs::is_directory(item.path() / "src")) continue;
+            auto name = pathText(item.path().filename());
+            if (editorIdentifier(name).empty()) continue;
+            auto id = "$std/" + name;
+            auto& package = bundled.emplace(id, ResolvedPackage{id, name, "builtin", item.path(), {}, true}).first->second;
+            addPackage(package, id);
+            routes.emplace(id, std::vector<std::string>{"std", name});
+            pending.push_back(id);
+        }
+        std::set<std::string> reachable;
+        for (std::size_t next = 0; next < pending.size(); ++next) {
+            auto id = pending[next];
+            if (!reachable.insert(id).second || !packages.contains(id)) continue;
+            const auto& package = *packages.at(id);
+            for (const auto& [alias, target] : package.dependencies) pending.push_back(target);
+            auto directory = package.root / "src";
+            auto paths = sourcePaths(directory, &overlays, false, !id.starts_with("$std/"));
+            addModule(package, {});
+            if (id == entry.id && std::ranges::find(paths, path) == paths.end()) paths.push_back(path);
+            for (const auto& filePath : paths) {
+                auto relative = filePath.parent_path().lexically_relative(directory);
+                if (!relative.empty() && *relative.begin() == "..") relative.clear();
+                loadFile(filePath, addModule(package, relative));
+            }
+            if (id.starts_with("$std/")) continue;
+            if (fs::is_directory(directory)) for (auto item = fs::recursive_directory_iterator(directory); item != fs::recursive_directory_iterator{}; ++item) {
+                if (!item->is_directory()) continue;
+                auto name = pathText(item->path().filename());
+                if (item->is_symlink() || name.starts_with('.')) {
+                    item.disable_recursion_pending();
+                    if (!item->is_symlink() && (name == ".macros" || name == ".expressions" || name == ".decorators"))
+                        addModule(package, item->path().parent_path().lexically_relative(directory));
+                }
+            }
+            for (const auto& [openPath, text] : overlays) {
+                auto folder = openPath.parent_path();
+                if (folder.filename() != ".macros" && folder.filename() != ".expressions" && folder.filename() != ".decorators") continue;
+                auto relative = folder.parent_path().lexically_relative(directory);
+                if (!relative.empty() && *relative.begin() != "..") addModule(package, relative);
+            }
+        }
+    }
+
+    void runtimeSymbols();
+    void macroSymbols();
+};
+
+Import editorImport(std::size_t file, const std::vector<std::string>& route, ImportKind kind) {
+    std::vector<Identifier> segments;
+    for (const auto& word : route) segments.push_back({word, {0, 0}});
+    auto alias = segments.back();
+    return {file, false, std::move(segments), std::move(alias), kind};
+}
+
+void ModuleCatalog::runtimeSymbols() {
+    const auto& source = sources[*current];
+    for (const auto& use : imports) {
+        const auto& module = sources[use.file].moduleId;
+        if (use.kind == ImportKind::Runtime) {
+            if (module == source.moduleId) index.occupied.insert(use.alias.text);
+            spaces.at(module).imports.try_emplace(use.alias.text, use);
+        } else macroImports.aliases.try_emplace(std::tuple{module, use.kind, use.alias.text}, &use);
+    }
+    auto resolve = [&](const Import& use) -> std::optional<Symbol> {
+        std::set<const Import*> active;
+        try { return linker.resolve(use, active); }
+        catch (const Diagnostic&) { return {}; }
+    };
+    auto describe = [&](const Symbol& symbol, const std::string& alias) {
+        auto anchor = symbol.targets.front().anchor;
+        auto description = symbols.at({anchor.file, anchor.span.begin});
+        description.label = editorIdentifier(alias);
+        return description;
+    };
+    std::set<std::pair<std::size_t, std::size_t>> visibleTargets;
+    auto visible = [&](const std::string& alias, const Symbol& symbol) {
+        index.visible.push_back(describe(symbol, alias));
+        for (const auto& target : symbol.targets) visibleTargets.emplace(target.anchor.file, target.anchor.span.begin);
+    };
+    const auto& own = spaces.at(source.moduleId);
+    for (const auto& [name, symbol] : own.definitions) { index.occupied.insert(name); visible(name, symbol); }
+    for (const auto& [alias, use] : own.imports) if (auto symbol = resolve(use)) {
+        if (!own.definitions.contains(alias)) visible(alias, *symbol);
+        if (use.file == *current) for (const auto& target : symbol->targets) {
+            auto anchor = target.anchor;
+            auto description = symbols.at({anchor.file, anchor.span.begin});
+            index.definitions.push_back({use.path.back().span, sources[anchor.file].path, anchor.span, description});
+            if (use.alias.span != use.path.back().span) index.definitions.push_back({use.alias.span, sources[anchor.file].path, anchor.span, description});
+        }
+    }
+    for (const auto& [module, space] : spaces) {
+        auto [first, last] = routes.equal_range(space.package->id);
+        for (auto base = first; base != last; ++base) {
+            auto route = base->second;
+            bool standardLibrary = route.front() == "std";
+            if (standardLibrary) moduleCandidate(ImportKind::Runtime, route);
+            for (const auto& component : directories.at(module)) {
+                route.push_back(pathText(component));
+                if (!editorIdentifier(route.back()).empty()) {
+                    moduleCandidate(ImportKind::Runtime, route);
+                    if (!standardLibrary) for (auto kind : {ImportKind::Macro, ImportKind::Decorator}) moduleCandidate(kind, route);
+                }
+            }
+            if (std::ranges::any_of(route, [](const auto& word) { return editorIdentifier(word).empty(); })) continue;
+            auto exported = [&](const std::string& name, const Symbol& symbol) {
+                auto qualified = route;
+                qualified.push_back(name);
+                bool automatic = symbol.kind != SymbolKind::Extension && !index.occupied.contains(name) &&
+                    std::ranges::none_of(symbol.targets, [&](const auto& target) { return visibleTargets.contains({target.anchor.file, target.anchor.span.begin}); });
+                index.imports.push_back({ImportKind::Runtime, std::move(qualified), describe(symbol, name), automatic});
+            };
+            for (const auto& [name, symbol] : space.definitions) if (symbol.visible) {
+                auto qualified = route;
+                qualified.push_back(name);
+                if (auto resolved = resolve(editorImport(*current, qualified, ImportKind::Runtime))) exported(name, *resolved);
+            }
+            for (const auto& [alias, use] : space.imports)
+                if (use.isPublic && !space.definitions.contains(alias)) if (auto symbol = resolve(use)) exported(alias, *symbol);
+        }
+    }
+}
+
+void ModuleCatalog::macroSymbols() {
+    const auto& source = sources[*current];
+    auto read = [&](const fs::path& file, MacroKind kind) -> std::optional<std::pair<EditorDefinition, bool>> {
+        auto text = overlays.find(file);
+        if ((text != overlays.end() ? text->second.size() : fs::file_size(file)) > macroInputByteLimit) return {};
+        try {
+            auto implementation = loadSource(file, {}, &overlays);
+            const auto& syntax = indexedFile(implementation, cache).syntax;
+            auto name = pathText(file.stem());
+            auto declaration = std::ranges::find_if(syntax.functions, [&](const auto& fn) {
+                return fn.name.text == name && !fn.owner && !fn.extensionGroup;
+            });
+            if (declaration == syntax.functions.end()) return {};
+            auto spelling = editorIdentifier(name);
+            auto sigil = kind == MacroKind::Decorator ? '@' : '#';
+            auto description = EditorSymbol{spelling, kind == MacroKind::Decorator ? EditorKind::Decorator : EditorKind::Macro,
+                declaration->name.span, sigil + spelling, editorDocumentation(implementation, declaration->name.span.begin)};
+            return std::pair{EditorDefinition{{}, file, declaration->name.span, std::move(description)}, declaration->isPublic};
+        } catch (const Diagnostic&) { return {}; }
+    };
+    auto scan = [&](const fs::path& folder, const auto& accept) {
+        auto paths = sourcePaths(folder, &overlays, false, false);
+        for (const auto& file : paths) if (!editorIdentifier(pathText(file.stem())).empty()) accept(file);
+    };
+    for (auto kind : {MacroKind::Declaration, MacroKind::Expression, MacroKind::Decorator}) {
+        auto directory = std::string(macroDirectory(kind));
+        scan(standard / "meta" / directory, [&](const auto& file) {
+            if (auto definition = read(file, kind)) builtinMacros.emplace(std::pair{kind, pathText(file.stem())}, std::move(definition->first));
+        });
+        for (const auto& [module, relative] : directories) {
+            const auto& package = *spaces.at(module).package;
+            if (package.id.starts_with("$std/")) continue;
+            scan(package.root / "src" / relative / ('.' + directory), [&](const auto& file) {
+                auto pathInPackage = fs::weakly_canonical(file).lexically_relative(package.root);
+                if (pathInPackage.empty() || *pathInPackage.begin() == "..") return;
+                if (auto definition = read(file, kind)) {
+                    macroImports.exports[file] = definition->second;
+                    authoredMacros.emplace(std::tuple{module, kind, pathText(file.stem())}, std::move(definition->first));
+                }
+            });
+        }
+    }
+    auto resolveImport = [&](const Import& use, MacroKind kind) -> std::optional<EditorDefinition> {
+        std::set<const Import*> active;
+        try {
+            if (auto origin = macroImports.resolve(use, kind, active)) if (auto definition = read(origin->path, kind)) return std::move(definition->first);
+        } catch (const Diagnostic&) {}
+        return {};
+    };
+    auto family = MacroImports::family;
+    std::map<std::pair<MacroKind, std::string>, EditorDefinition> visible;
+    auto rootModule = prefixes.at(spaces.at(source.moduleId).package->id);
+    for (const auto& [key, definition] : builtinMacros) visible.emplace(key, definition);
+    for (const auto& module : {rootModule, source.moduleId}) for (const auto& [key, definition] : authoredMacros) {
+        const auto& [owner, kind, name] = key;
+        if (owner == module) visible.insert_or_assign({kind, name}, definition);
+    }
+    for (const auto& [key, use] : macroImports.aliases) {
+        const auto& [module, kind, alias] = key;
+        for (auto macro : {MacroKind::Declaration, MacroKind::Expression, MacroKind::Decorator}) {
+            if (family(macro) != kind) continue;
+            auto resolved = resolveImport(*use, macro);
+            if (module == source.moduleId) {
+                visible.erase({macro, alias});
+                if (resolved) visible.emplace(std::pair{macro, alias}, *resolved);
+            }
+            if (resolved && use->file == *current) {
+                resolved->use = use->path.back().span;
+                index.definitions.push_back(*resolved);
+                if (use->alias.span != resolved->use) { resolved->use = use->alias.span; index.definitions.push_back(*resolved); }
+            }
+        }
+    }
+    for (const auto& [key, definition] : visible) {
+        auto symbol = definition.symbol;
+        symbol.label = editorIdentifier(key.second);
+        index.macros.push_back({key.first, std::move(symbol)});
+    }
+    const auto& parsed = indexedFile(source, cache);
+    auto link = [&](const Identifier& name, MacroKind kind) {
+        if (auto target = visible.find({kind, name.text}); target != visible.end()) {
+            auto definition = target->second;
+            definition.use = name.span;
+            index.definitions.push_back(std::move(definition));
+        }
+    };
+    for (const auto& expansion : parsed.syntax.expansions) link(expansion.name, expansion.decorator ? MacroKind::Decorator : MacroKind::Declaration);
+    for (const auto& expression : parsed.expressions) link(expression.name, MacroKind::Expression);
+    auto exported = [&](const std::string& module, MacroKind kind, const std::string& name, const EditorDefinition& definition) {
+        const auto& space = spaces.at(module);
+        auto [first, last] = routes.equal_range(space.package->id);
+        for (auto base = first; base != last; ++base) {
+            if (base->second.front() == "std") continue;
+            auto route = base->second;
+            for (const auto& component : directories.at(module)) route.push_back(pathText(component));
+            route.push_back(name);
+            if (std::ranges::any_of(route, [](const auto& word) { return editorIdentifier(word).empty(); })) continue;
+            auto description = definition.symbol;
+            description.label = editorIdentifier(name);
+            bool automatic = !visible.contains({kind, name}) && !macroImports.aliases.contains({source.moduleId, family(kind), name}) &&
+                std::ranges::none_of(visible, [&](const auto& item) { return item.first.first == kind && item.second.path == definition.path; });
+            index.imports.push_back({family(kind), std::move(route), std::move(description), automatic, kind});
+        }
+    };
+    for (const auto& [key, definition] : authoredMacros) {
+        const auto& [module, kind, name] = key;
+        if (!macroImports.exports.at(definition.path) || macroImports.aliases.contains({module, family(kind), name})) continue;
+        exported(module, kind, name, definition);
+    }
+    for (const auto& [key, use] : macroImports.aliases) if (use->isPublic) {
+        const auto& [module, kind, alias] = key;
+        for (auto macro : {MacroKind::Declaration, MacroKind::Expression, MacroKind::Decorator}) if (family(macro) == kind)
+            if (auto definition = resolveImport(*use, macro)) exported(module, macro, alias, *definition);
+    }
+}
+
+}
+
+EditorModuleIndex indexModule(const PackageGraph& graph, const fs::path& path, const SourceOverlay& overlays, EditorParseCache& cache) {
+    if (cache.files.size() >= 4096) cache.files.clear();
+    auto entry = std::ranges::find(graph.packages, graph.entry, &ResolvedPackage::id);
+    if (entry == graph.packages.end()) return {};
+    ModuleCatalog catalog{graph, path, overlays, cache, *entry};
+    catalog.loadPackages();
+    if (catalog.current) { catalog.runtimeSymbols(); catalog.macroSymbols(); }
+    return std::move(catalog.index);
+}
+
+Compilation loadProgram(const PackageGraph& graph, const std::string& entry, const std::optional<fs::path>& testFile, const SourceOverlay* overlays, ParseCache* parseCache, bool editorProbe) {
     std::map<std::string, const ResolvedPackage*> packages;
     std::map<std::string, std::string> prefixes;
     for (const auto& package : graph.packages) {
@@ -728,24 +1138,8 @@ Compilation loadProgram(const PackageGraph& graph, const std::string& entry, con
     for (const auto& id : reachable) {
         auto package = packages.at(id);
         auto directory = package->root / "src";
-        std::vector<fs::path> paths;
-        auto first = fs::is_directory(directory) ? fs::recursive_directory_iterator(directory) : fs::recursive_directory_iterator{};
-        for (auto item = std::move(first); item != fs::recursive_directory_iterator{}; ++item) {
-            if (item->is_directory() && pathText(item->path().filename()).starts_with('.')) { item.disable_recursion_pending(); continue; }
-            if (item->is_symlink()) throw Diagnostic{"LYI0001", "源码不允许符号链接：" + pathText(item->path())};
-            if (item->is_regular_file() && item->path().extension() == ".ly") paths.push_back(item->path());
-        }
-        if (overlays) for (const auto& [path, text] : *overlays) {
-            auto relative = path.lexically_relative(directory);
-            if (relative.empty() || relative == "." || *relative.begin() == ".." || path.extension() != ".ly") continue;
-            if (std::ranges::any_of(relative, [](const auto& part) { return pathText(part).starts_with('.'); })) continue;
-            if (std::ranges::find(paths, path) == paths.end()) paths.push_back(path);
-        }
-        std::sort(paths.begin(), paths.end());
-        for (const auto& path : paths) {
-            auto module = prefixes.at(id);
-            auto relative = path.parent_path().lexically_relative(directory);
-            if (relative != ".") module += '/' + pathText(relative);
+        for (const auto& path : sourcePaths(directory, overlays, true)) {
+            auto module = directoryModule(prefixes.at(id), directory, path);
             spaces.try_emplace(module, Space{package});
             program.sources.push_back(loadSource(path, module, overlays));
         }
@@ -763,7 +1157,8 @@ Compilation loadProgram(const PackageGraph& graph, const std::string& entry, con
         const auto& source = program.sources[file];
         std::vector<ExpressionExpansion> calls;
         Module syntax;
-        if (parseCache && source.text.find_first_of("#@") == std::string::npos) syntax = cachedFileSyntax(source, *parseCache);
+        if (editorProbe) syntax = indexFileSyntax(source, &calls);
+        else if (parseCache && source.text.find_first_of("#@") == std::string::npos) syntax = cachedFileSyntax(source, *parseCache);
         else parseFile(syntax, source, file, &calls);
         appendCachedSyntax(authored, syntax, file);
         fileSyntax.push_back(std::move(syntax));
@@ -821,7 +1216,8 @@ Compilation loadProgram(const PackageGraph& graph, const std::string& entry, con
         auto& source = program.sources[file];
         if (expressionMacros[file]) {
             expandExpressions(source, file, macroPackages.at(source.moduleId), program.macroInputs, environment);
-            parseFile(program.syntax, source, file);
+            if (editorProbe) appendCachedSyntax(program.syntax, indexFileSyntax(source), file);
+            else parseFile(program.syntax, source, file);
         } else appendCachedSyntax(program.syntax, fileSyntax[file], file);
     }
     if (!program.syntax.expansions.empty()) {

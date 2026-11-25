@@ -47,6 +47,7 @@ def main():
             'lyra.serverPath': str(lyra),
             'chat.disableAIFeatures': True,
             'files.autoSave': 'off',
+            'editor.wordBasedSuggestions': 'off',
             'update.mode': 'none',
             'extensions.autoCheckUpdates': False,
             'extensions.autoUpdate': False,
@@ -73,7 +74,7 @@ def main():
                 failure = str(error)
         result = report.read_text(encoding='utf-8') if report.is_file() else ''
         channels = '\n'.join(path.read_text(encoding='utf-8', errors='replace') for path in profile.rglob('*Lyra Language Server.log'))
-        if any(f'Request textDocument/{method} failed.' in channels for method in ('definition', 'hover', 'completion', 'inlayHint')):
+        if any(f'Request textDocument/{method} failed.' in channels for method in ('definition', 'hover', 'completion', 'inlayHint', 'signatureHelp')):
             failure = 'An editing request reported an error instead of using diagnostics'
         if failure or not result.startswith('PASS '):
             output = '\n'.join(log.read_text(encoding='utf-8', errors='replace').splitlines()[-50:])

@@ -89,6 +89,28 @@ async function checkSmoke() {
     }
     await waitForDiagnostics(source, listing => listing.length === 0, 'diagnostic did not clear after reverting');
     assert.ok(!document.isDirty);
+
+    const addImport = 'fn autoImportProbe(): Unit { val _ = Clo.now() }';
+    const end = document.positionAt(document.getText().length);
+    assert.ok(await sourceEditor.edit(edit => edit.insert(end, endOfLine + addImport + endOfLine)));
+    try {
+        const position = end.translate(1, addImport.indexOf('Clo') + 'Clo'.length);
+        await waitForDiagnostics(source, listing => listing.some(item => item.code === 'LYN0001'), 'missing unresolved auto-import probe');
+        const completions = await vscode.commands.executeCommand('vscode.executeCompletionItemProvider', source, position);
+        const clock = completions.items.find(item => (item.label.label ?? item.label) === 'Clock');
+        assert.equal(clock.kind, vscode.CompletionItemKind.Class);
+        assert.equal(clock.additionalTextEdits.length, 1);
+        assert.equal(clock.additionalTextEdits[0].newText, `import std.time.Clock${endOfLine}`);
+        assert.ok(!document.getText().includes('import std.time.Clock'));
+        const edit = new vscode.WorkspaceEdit();
+        edit.set(source, [...clock.additionalTextEdits, vscode.TextEdit.replace(clock.range.replacing ?? clock.range, clock.insertText)]);
+        assert.ok(await vscode.workspace.applyEdit(edit));
+        assert.ok(document.getText().includes('Clock.now()'));
+        await waitForDiagnostics(source, listing => !listing.some(item => item.severity === vscode.DiagnosticSeverity.Error),
+            'auto import did not make Clock.now resolve');
+    } finally {
+        await vscode.commands.executeCommand('workbench.action.files.revert');
+    }
 }
 
 async function checkTyping() {
@@ -119,6 +141,11 @@ async function checkTyping() {
         await waitForDiagnostics(source, listing => listing.some(item => item.code === 'LYN0001'), 'missing unfinished-name diagnostic');
         const keywords = (await complete(start.translate(0, 1))).items.map(item => item.label);
         assert.ok(keywords.includes('val') && keywords.includes('var'), `keyword completions: ${JSON.stringify(keywords)}`);
+        const generated = document.getText().indexOf('createUserRoute(router)');
+        assert.notEqual(generated, -1);
+        const routeItems = (await complete(document.positionAt(generated + 'createUserRo'.length))).items;
+        assert.ok(routeItems.some(item => item.label === 'createUserRoute' && item.kind === vscode.CompletionItemKind.Function),
+            `route completions: ${JSON.stringify(routeItems.map(item => [item.label, item.kind]))}`);
         expectTypes(await inlays());
         const known = await vscode.commands.executeCommand('vscode.executeDefinitionProvider', source, use);
         assert.ok(known.some(item => item.range.end.isEqual(router)));
@@ -129,6 +156,14 @@ async function checkTyping() {
         assert.ok(await editor.edit(edit => edit.replace(new vscode.Range(start, start.translate(0, 1)), 'ro')));
         const names = (await complete(start.translate(0, 2))).items.map(item => item.label);
         assert.ok(names.includes('router'), `visible name completions: ${JSON.stringify(names)}`);
+        assert.ok(await editor.edit(edit => edit.replace(new vscode.Range(start, start.translate(0, 2)), 'router.')));
+        const members = (await complete(start.translate(0, 'router.'.length))).items;
+        assert.ok(members.some(item => item.label === 'serve' && item.kind === vscode.CompletionItemKind.Method));
+        const call = 'val _ = listen(8080, ho';
+        assert.ok(await editor.edit(edit => edit.replace(new vscode.Range(start, start.translate(0, 'router.'.length)), call)));
+        const signature = await vscode.commands.executeCommand('vscode.executeSignatureHelpProvider', source, start.translate(0, call.length));
+        assert.ok(signature.signatures.some(item => item.parameters.some(parameter => parameter.label.includes('host:'))));
+        assert.ok((await complete(start.translate(0, call.length))).items.some(item => item.label === 'host:'));
         assert.ok(document.isDirty);
         assert.ok(document.getText().includes('val router = Router()'));
     } finally {
@@ -143,7 +178,7 @@ async function run() {
     try {
         await checkSmoke();
         await checkTyping();
-        await writeFile(report, `PASS VS Code ${vscode.version}: cross-package definitions, Unicode macro diagnostics, HTTP example completions and inlay hints on unsaved edits\n`);
+        await writeFile(report, `PASS VS Code ${vscode.version}: cross-package definitions, auto import, Unicode macro diagnostics, member completion, signatures and inlay hints\n`);
     } catch (error) {
         await writeFile(report, `${error.stack}\n`);
         throw error;

@@ -25,7 +25,7 @@ struct CallPlan {
 };
 
 CallPlan bindArguments(std::span<const ParameterShape> parameters, std::span<const ArgumentShape> arguments,
-                       const Source& source, Span call, std::string_view name) {
+                       const Source& source, Span call, std::string_view name, bool partial = false) {
     CallPlan plan;
     if (!parameters.empty() && parameters.back().variadic) plan.variadic = parameters.size() - 1;
     auto fixed = plan.variadic.value_or(parameters.size());
@@ -66,6 +66,7 @@ CallPlan bindArguments(std::span<const ParameterShape> parameters, std::span<con
     }
     for (std::size_t slot = 0; slot < fixed; ++slot) {
         if (filled[slot]) continue;
+        if (partial) continue;
         if (!parameters[slot].defaulted) throw at(source, call, "LYT0002", std::string(name) + " 缺少形参：" + std::string(parameters[slot].name));
         plan.defaults.push_back(slot);
     }
