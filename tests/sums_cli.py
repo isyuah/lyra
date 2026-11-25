@@ -55,6 +55,20 @@ fn main(): Unit {
 }
 ''', b"outer\ninner\nvalue\n")
 
+    def test_near_enum_variant_warns_only_for_an_unescaped_binding(self):
+        self.main.write_text('''
+enum Color { Red, Blue }
+fn typo(color: Color): Color { match color { Bule => Bule } }
+fn escaped(color: Color): Color { match color { `Bule` => Bule } }
+fn ordinary(color: Color): Color { match color { blue => blue } }
+fn main(): Unit {}
+''', encoding='utf-8')
+        result = subprocess.run([COMPILER, 'check', self.package, '--diagnostics=json'], capture_output=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+        warning, = json.loads(result.stderr)
+        self.assertEqual(warning['code'], 'LYW0003')
+        self.assertIn('Blue', warning['message'])
+
     def test_value_equality_is_structural_for_records_and_sums(self):
         self.native('''
 struct User(val id: Int, val name: String)

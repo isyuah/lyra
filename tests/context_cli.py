@@ -12,6 +12,27 @@ COMPILER = Path(sys.argv.pop(1)).resolve()
 
 
 class TaskContext(unittest.TestCase):
+    def test_task_local_signature_is_shared_by_calls_constraints_and_dyn(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'src').mkdir()
+            (root / 'src/main.ly').write_text('''
+trait Reader { fn get(): Option<Int> }
+fn read<T: Reader>(key: T): Int { key.get() ?? -1 }
+async fn inspect(key: TaskLocal<Int>): Unit {
+    val dynamic = key as dyn Reader
+    print(key.get() ?? -1)
+    print(read(key))
+    print(dynamic.get() ?? -1)
+}
+async fn main(): Unit {
+    val key = TaskLocal<Int>()
+    await withLocal(key, 42, inspect(key))
+}
+''', encoding='utf-8')
+            result = subprocess.run([COMPILER, 'run', root], capture_output=True, timeout=30)
+            self.assertEqual((result.returncode, result.stdout, result.stderr), (0, b'42\n42\n42\n', b''))
+
     def test_activation_scopes_worker_and_waiter_deadline(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

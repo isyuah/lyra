@@ -680,34 +680,100 @@ struct Symbols {
         }
     }
 
-    struct BuiltinMember { Callee callee; RequiredMethod shape; };
+    enum class MemberContext { Ordinary, Unsafe, AsyncBody };
+    struct BuiltinMember { Callee callee; RequiredMethod shape; MemberContext context; };
 
-    std::optional<BuiltinMember> builtinMember(Type type, std::string_view name) {
-        auto noArgs = [](Callee callee, Type result) { return BuiltinMember{callee, {{}, {}, result, false}}; };
-        if (name == "size" && (type.kind == Type::List || type.kind == Type::FrozenList || type == Type::String || type == Type::Bytes)) return noArgs(Callee::Size, Type::Int);
-        if (name == "add" && type.kind == Type::List) return BuiltinMember{Callee::ListAdd, {{"value"}, {module.listElements[type.id]}, Type::Unit, false}};
-        if (name == "removeAt" && type.kind == Type::List) return BuiltinMember{Callee::ListRemoveAt, {{"index"}, {Type::Int}, module.listElements[type.id], false}};
-        if (name == "slice" && type.kind == Type::List) return BuiltinMember{Callee::ListSlice, {{"range"}, {Type::IntRange}, type, false}};
+    void builtinMembers(Type type, std::string_view filter, auto&& accept) {
+        auto emit = [&](std::string_view name, Callee callee, Type result, std::vector<std::string> labels = {}, std::vector<Type> parameters = {},
+                        MemberContext context = MemberContext::Ordinary) {
+            if (filter.empty() || filter == name) accept(name, BuiltinMember{callee, {std::move(labels), std::move(parameters), result, false}, context});
+        };
+        auto matches = [&](std::string_view name) { return filter.empty() || name == filter; };
+        if (type.kind == Type::List || type.kind == Type::FrozenList || type == Type::String || type == Type::Bytes)
+            emit("size", Callee::Size, Type::Int);
+        if (type.kind == Type::List) {
+            auto element = module.listElements[type.id];
+            emit("add", Callee::ListAdd, Type::Unit, {"value"}, {element});
+            emit("removeAt", Callee::ListRemoveAt, element, {"index"}, {Type::Int});
+            emit("slice", Callee::ListSlice, type, {"range"}, {Type::IntRange});
+        }
         if (type.kind == Type::Channel) {
             auto element = module.channelElements[type.id];
-            if (name == "send") return BuiltinMember{Callee::ChannelSend, {{"value"}, {element}, task(Type::Unit), false}};
-            if (name == "receive" || name == "next") return noArgs(Callee::ChannelReceive, task(sum(Type::Option, element)));
-            if (name == "asyncIterator") return noArgs(Callee::ChannelIterator, type);
-            if (name == "close") return noArgs(Callee::ChannelClose, Type::Unit);
+            if (matches("send")) emit("send", Callee::ChannelSend, task(Type::Unit), {"value"}, {element});
+            if (matches("receive") || matches("next")) {
+                auto result = task(sum(Type::Option, element));
+                emit("receive", Callee::ChannelReceive, result);
+                emit("next", Callee::ChannelReceive, result);
+            }
+            emit("asyncIterator", Callee::ChannelIterator, type);
+            emit("close", Callee::ChannelClose, Type::Unit);
         }
-        if (name == "toBytes" && type == Type::String) return noArgs(Callee::ToBytes, Type::Bytes);
-        if (name == "toString") {
-            if (builtInDisplay(type)) return noArgs(Callee::ToString, Type::String);
-            if (type == Type::Bytes) return noArgs(Callee::DecodeUtf8, sum(Type::Option, Type::String));
+        if (type == Type::String) emit("toBytes", Callee::ToBytes, Type::Bytes);
+        if (matches("toString")) {
+            if (builtInDisplay(type)) emit("toString", Callee::ToString, Type::String);
+            if (type == Type::Bytes) emit("toString", Callee::DecodeUtf8, sum(Type::Option, Type::String));
         }
-        if (numericType(type) && name.starts_with("to")) {
-            name.remove_prefix(2);
-            bool checked = name.ends_with("Checked");
-            if (checked) name.remove_suffix(7);
-            if (auto target = numberType(name); target && (checked ? integerType(*target) : target->kind == Type::Real))
-                return checked ? noArgs(Callee::ToIntegerChecked, sum(Type::Option, *target)) : noArgs(Callee::ToReal, *target);
+        if (type.kind == Type::Task) emit("cancel", Callee::TaskCancel, Type::Unit, {}, {}, MemberContext::AsyncBody);
+        if (type.kind == Type::TaskLocal && matches("get")) emit("get", Callee::LocalGet, sum(Type::Option, module.taskLocalValues[type.id]));
+        if (type.kind == Type::Result && matches("failureInfo")) emit("failureInfo", Callee::FailureInfo, sum(Type::Option, Type::Error));
+        if (type == Type::Error) emit("withSuppressed", Callee::ErrorSuppress, Type::Error, {"error"}, {Type::Error});
+        if (type == Type::Any) {
+            emit("typeName", Callee::ReflectTypeName, Type::String);
+            emit("fieldCount", Callee::ReflectFieldCount, Type::Int);
+            if (matches("fieldNames")) emit("fieldNames", Callee::ReflectFieldName, list(Type::String));
+            if (matches("field")) emit("field", Callee::ReflectField, sum(Type::Option, Type::Any), {"name"}, {Type::String});
         }
-        return {};
+        if (type == Type::CCallback) {
+            if (matches("takeError")) emit("takeError", Callee::CallbackTakeError, sum(Type::Option, Type::Exception));
+            emit("context", Callee::CallbackContext, Type::CPtr, {}, {}, MemberContext::Unsafe);
+            emit("function", Callee::CallbackFunction, Type::CPtr, {}, {}, MemberContext::Unsafe);
+            emit("close", Callee::CallbackClose, Type::Unit, {}, {}, MemberContext::Unsafe);
+        }
+        if (type == Type::CPtr) {
+            emit("isNull", Callee::PtrIsNull, Type::Bool);
+            emit("free", Callee::PtrFree, Type::Unit, {}, {}, MemberContext::Unsafe);
+            emit("offset", Callee::PtrOffset, Type::CPtr, {"bytes"}, {Type::Int}, MemberContext::Unsafe);
+        }
+        auto conversion = [&](std::string_view name) {
+            if (!name.starts_with("to")) return;
+            auto targetName = name.substr(2);
+            bool checked = targetName.ends_with("Checked");
+            if (checked) targetName.remove_suffix(7);
+            if (auto target = numberType(targetName); target && (checked ? integerType(*target) : target->kind == Type::Real)) {
+                if (checked) emit(name, Callee::ToIntegerChecked, sum(Type::Option, *target));
+                else emit(name, Callee::ToReal, *target);
+            }
+        };
+        auto pointerAccess = [&](std::string_view name) {
+            bool write = name.starts_with("write");
+            if (!write && !name.starts_with("read")) return;
+            auto suffix = name.substr(write ? 5 : 4);
+            auto value = suffix == "CPtr" ? std::optional(Type{Type::CPtr}) : numberType(suffix);
+            if (!value) return;
+            if (write) emit(name, Callee::PtrWrite, Type::Unit, {"offset", "value"}, {Type::Int, *value}, MemberContext::Unsafe);
+            else emit(name, Callee::PtrRead, *value, {"offset"}, {Type::Int}, MemberContext::Unsafe);
+        };
+        if (!filter.empty()) {
+            if (numericType(type)) conversion(filter);
+            if (type == Type::CPtr) pointerAccess(filter);
+        } else if (numericType(type) || type == Type::CPtr) {
+            for (const auto& target : editorBuiltins(true)) {
+                auto numeric = numberType(target.label);
+                if (numericType(type) && numeric) conversion("to" + target.label + (integerType(*numeric) ? "Checked" : ""));
+                if (type == Type::CPtr && (numeric || target.label == "CPtr")) {
+                    pointerAccess("read" + target.label);
+                    pointerAccess("write" + target.label);
+                }
+            }
+        }
+    }
+
+    std::optional<BuiltinMember> builtinMember(Type type, std::string_view name, bool contextual = false) {
+        std::optional<BuiltinMember> result;
+        builtinMembers(type, name, [&](auto, BuiltinMember member) {
+            if (contextual || member.context == MemberContext::Ordinary) result = std::move(member);
+        });
+        return result;
     }
 
     std::size_t builtinImplementation(Type owner, const std::string& name, const BuiltinMember& builtin, std::size_t file, Span site) {
@@ -1745,7 +1811,7 @@ struct Checker {
                     }
                     auto selected = symbols.shapedMethod(actual, method.name.text, source, [&](const auto& methodShape) { return methodShape == expected; }).value().first;
                     const auto& entry = symbols.callables[selected];
-                    auto function = entry.generic ? symbols.instantiate(selected, module.aggregates[actual.id].arguments, source, operation.site) : entry.target;
+                    auto function = entry.generic ? symbols.instantiate(selected, symbols.instanceArguments(actual), source, operation.site) : entry.target;
                     implementations.push_back(function);
                 }
             }
@@ -2062,6 +2128,27 @@ struct Checker {
                 requireValueOperation(type, ValueOperation::Equal, pattern.span);
                 refer(name, declaration.file, declaration.name.span);
                 return {PatternConstant{{ConstantUse::Global, target}, type}};
+            }
+        }
+        if (!named.escaped && !named.module && subject.kind == Type::Enum && !probing && !inferredReturn &&
+            name.text.size() >= 3 && name.text.front() >= 'A' && name.text.front() <= 'Z') {
+            auto closeTo = [&](std::string_view candidate) {
+                std::string_view written = name.text;
+                auto prefix = std::mismatch(written.begin(), written.end(), candidate.begin(), candidate.end()).first - written.begin();
+                written.remove_prefix(prefix);
+                candidate.remove_prefix(prefix);
+                if (written.size() == candidate.size()) {
+                    return (!written.empty() && written.substr(1) == candidate.substr(1)) ||
+                        (written.size() >= 2 && written[0] == candidate[1] && written[1] == candidate[0] && written.substr(2) == candidate.substr(2));
+                }
+                if (written.size() < candidate.size()) std::swap(written, candidate);
+                return written.substr(1) == candidate;
+            };
+            const auto& variants = module.enums[subject.id].syntax.cases;
+            if (auto nearby = std::ranges::find_if(variants, [&](const auto& variant) { return closeTo(variant.name.text); }); nearby != variants.end()) {
+                auto warning = at(source, name.span, "LYW0003", name.text + " 会绑定任意值；你是否想匹配分支 " + nearby->name.text + "？");
+                warning.hint = "如果有意绑定，可写成 `" + name.text + "`。";
+                module.warnings.push_back(std::move(warning));
             }
         }
         auto slot = fn.locals.size();
@@ -2791,23 +2878,15 @@ struct Checker {
                 }
                 overloads(symbols.instanceMethods(owner), arguments);
             }
-            for (auto name : {"size", "add", "removeAt", "slice", "send", "receive", "next", "asyncIterator", "close", "toBytes", "toString"})
-                if (auto builtin = symbols.builtinMember(owner, name)) {
-                    if (std::string_view(name) == "size") property(name, builtin->shape.result);
-                    else shape(name, builtin->shape);
-                }
-            if (numericType(owner)) for (const auto& target : editorBuiltins(true)) {
-                auto type = numberType(target.label);
-                if (!type) continue;
-                auto name = "to" + target.label + (integerType(*type) ? "Checked" : "");
-                if (auto builtin = symbols.builtinMember(owner, name)) shape(name, builtin->shape);
-            }
+            symbols.builtinMembers(owner, {}, [&](std::string_view name, const Symbols::BuiltinMember& builtin) {
+                if (builtin.context == Symbols::MemberContext::Unsafe && !unsafeDepth) return;
+                if (builtin.context == Symbols::MemberContext::AsyncBody && !inAsync()) return;
+                if (builtin.callee == Callee::Size) property(std::string(name), builtin.shape.result);
+                else shape(std::string(name), builtin.shape);
+            });
             if (owner.kind == Type::IntRange) for (std::size_t slot = 0; slot < std::size(rangeFields); ++slot) property(rangeFieldNames[slot], rangeFields[slot]);
             if (owner == Type::String) property("byteSize", Type::Int);
             if (owner == Type::Char) property("codePoint", number(Type::UInt, 32));
-            if (owner.kind == Type::Task && inAsync()) shape("cancel", {{}, {}, Type::Unit, false});
-            if (owner.kind == Type::TaskLocal) shape("get", {{}, {}, symbols.sum(Type::Option, module.taskLocalValues[owner.id]), false});
-            if (owner.kind == Type::Result) shape("failureInfo", {{}, {}, symbols.sum(Type::Option, Type::Error), false});
             if (owner.kind == Type::Exception || owner == Type::Error) property("message", Type::String);
             if (owner.kind == Type::Exception) {
                 property("taskFailures", symbols.list(Type::Exception));
@@ -2817,34 +2896,6 @@ struct Checker {
                 property("original", Type::Any);
                 property("cause", symbols.sum(Type::Option, Type::Error));
                 property("suppressed", symbols.list(Type::Error));
-                shape("withSuppressed", {{"error"}, {Type::Error}, Type::Error, false});
-            }
-            if (owner == Type::Any) {
-                shape("typeName", {{}, {}, Type::String, false});
-                shape("fieldCount", {{}, {}, Type::Int, false});
-                shape("fieldNames", {{}, {}, symbols.list(Type::String), false});
-                shape("field", {{"name"}, {Type::String}, symbols.sum(Type::Option, Type::Any), false});
-            }
-            if (owner == Type::CCallback) {
-                shape("takeError", {{}, {}, symbols.sum(Type::Option, Type::Exception), false});
-                if (unsafeDepth) {
-                    shape("context", {{}, {}, Type::CPtr, false});
-                    shape("function", {{}, {}, Type::CPtr, false});
-                    shape("close", {{}, {}, Type::Unit, false});
-                }
-            }
-            if (owner == Type::CPtr) {
-                shape("isNull", {{}, {}, Type::Bool, false});
-                if (unsafeDepth) {
-                    shape("free", {{}, {}, Type::Unit, false});
-                    shape("offset", {{"bytes"}, {Type::Int}, Type::CPtr, false});
-                    for (const auto& builtin : editorBuiltins(true)) {
-                        auto type = builtin.label == "CPtr" ? std::optional(Type{Type::CPtr}) : numberType(builtin.label);
-                        if (!type) continue;
-                        shape("read" + builtin.label, {{"offset"}, {Type::Int}, *type, false});
-                        shape("write" + builtin.label, {{"offset", "value"}, {Type::Int, *type}, Type::Unit, false});
-                    }
-                }
             }
             if (!symbols.valueSupport(owner, ValueOperation::Equal).missing) shape("equals", {{"other"}, {owner}, Type::Bool, false});
             if (!symbols.valueSupport(owner, ValueOperation::Hash).missing) shape("hashCode", {{}, {}, Type::Int, false});
@@ -3262,68 +3313,14 @@ struct Checker {
             if (const auto* item = enumNamespace(*call.receiver)) return variant(id, TypeQualifier{*item}, call, expected);
             auto owner = visit(*call.receiver);
             if (owner == Type::Never) return owner;
-            if (owner == Type::CPtr) {
-                const auto& name = call.name.text;
-                if (name == "isNull" || name == "free" || name == "offset") {
-                    noTypeArgs();
-                    if (name != "isNull") requireUnsafe(call.name.span);
-                    info.callee = name == "isNull" ? Callee::PtrIsNull : name == "free" ? Callee::PtrFree : Callee::PtrOffset;
-                    bool exits = arguments(id, call, name == "offset" ? 1 : 0, [](auto) { return "bytes"; }, [](auto) { return Type{Type::Int}; });
-                    return exits ? Type{Type::Never} : name == "isNull" ? Type{Type::Bool} : name == "free" ? Type{Type::Unit} : Type{Type::CPtr};
-                }
-                bool write = name.starts_with("write");
-                if (write || name.starts_with("read")) {
-                    auto suffix = std::string_view(name).substr(write ? 5 : 4);
-                    auto type = suffix == "CPtr" ? std::optional(Type{Type::CPtr}) : numberType(suffix);
-                    if (type) {
-                        noTypeArgs();
-                        requireUnsafe(call.name.span);
-                        info.callee = write ? Callee::PtrWrite : Callee::PtrRead;
-                        bool exits = arguments(id, call, write ? 2 : 1, [](auto slot) { return slot ? "value" : "offset"; }, [&](auto slot) { return slot ? *type : Type{Type::Int}; });
-                        return exits ? Type{Type::Never} : write ? Type{Type::Unit} : *type;
-                    }
-                }
-            }
-            if (owner == Type::CCallback && (call.name.text == "context" || call.name.text == "function" || call.name.text == "close" || call.name.text == "takeError")) {
-                noTypeArgs();
-                auto operation = call.name.text;
-                if (operation != "takeError") requireUnsafe(call.name.span);
-                info.callee = operation == "context" ? Callee::CallbackContext : operation == "function" ? Callee::CallbackFunction
-                    : operation == "close" ? Callee::CallbackClose : Callee::CallbackTakeError;
-                arguments(id, call, 0, [](auto) { return ""; }, [](auto) { return Type{Type::Unit}; });
-                return operation == "takeError" ? symbols.sum(Type::Option, Type::Exception) : operation == "close" ? Type{Type::Unit} : Type{Type::CPtr};
-            }
-            if (owner == Type::Any && (call.name.text == "typeName" || call.name.text == "fieldCount" ||
-                call.name.text == "fieldNames" || call.name.text == "field")) {
-                noTypeArgs();
-                info.callee = call.name.text == "typeName" ? Callee::ReflectTypeName :
-                    call.name.text == "fieldCount" ? Callee::ReflectFieldCount :
-                    call.name.text == "fieldNames" ? Callee::ReflectFieldName : Callee::ReflectField;
-                if (call.name.text == "field") {
-                    if (arguments(id, call, 1, [](auto) { return "name"; }, [](auto) { return Type{Type::String}; })) return Type::Never;
-                    return symbols.sum(Type::Option, Type::Any);
-                }
-                if (!call.arguments.empty()) throw at(source, call.name.span, "LYT0002", "Any." + call.name.text + " 不接收实参");
-                if (call.name.text == "typeName") return Type::String;
-                if (call.name.text == "fieldCount") return Type::Int;
-                return symbols.list(Type::String);
-            }
             bool privateMember = false, staticMember = false;
-            if (owner.kind == Type::Result && call.name.text == "failureInfo") {
+            if (auto builtin = symbols.builtinMember(owner, call.name.text, true)) {
                 noTypeArgs();
-                if (!call.arguments.empty()) throw at(source, call.name.span, "LYT0002", "failureInfo 不接收实参");
-                info.callee = Callee::FailureInfo;
-                info.errorDisplay = displayError(module.sumTypes[owner.id].failure, call.name.span, false);
-                return symbols.sum(Type::Option, Type::Error);
-            }
-            if (owner == Type::Error && call.name.text == "withSuppressed") {
-                noTypeArgs();
-                info.callee = Callee::ErrorSuppress;
-                return arguments(id, call, 1, [](auto) { return "error"; }, [](auto) { return Type{Type::Error}; }) ? Type::Never : Type::Error;
-            }
-            if (auto builtin = symbols.builtinMember(owner, call.name.text)) {
-                noTypeArgs();
+                if (builtin->context == Symbols::MemberContext::Unsafe) requireUnsafe(call.name.span);
+                if (builtin->context == Symbols::MemberContext::AsyncBody && !inAsync())
+                    throw at(source, call.name.span, "LYT0008", "Task.cancel() 只能在异步执行体中调用，不能在同步 lambda、blocking 或 defer 中调用");
                 info.callee = builtin->callee;
+                if (info.callee == Callee::FailureInfo) info.errorDisplay = displayError(module.sumTypes[owner.id].failure, call.name.span, false);
                 const auto& shape = builtin->shape;
                 return arguments(id, call, shape.parameters.size(), [&](auto slot) -> std::string_view { return shape.labels[slot]; },
                     [&](auto slot) { return shape.parameters[slot]; }) ? Type{Type::Never} : shape.result;
@@ -3396,19 +3393,6 @@ struct Checker {
             }
             if (call.name.text == "equals" || call.name.text == "hashCode") {
                 if (!privateMember && !staticMember) return valueMember(call.name.text == "equals" ? ValueOperation::Equal : ValueOperation::Hash);
-            }
-            if (owner.kind == Type::Task && call.name.text == "cancel") {
-                if (!inAsync()) throw at(source, call.name.span, "LYT0008", "Task.cancel() 只能在异步执行体中调用，不能在同步 lambda、blocking 或 defer 中调用");
-                noTypeArgs();
-                if (!call.arguments.empty()) throw at(source, call.name.span, "LYT0002", "Task.cancel() 不接收实参");
-                info.callee = Callee::TaskCancel;
-                return Type::Unit;
-            }
-            if (owner.kind == Type::TaskLocal && call.name.text == "get") {
-                noTypeArgs();
-                if (!call.arguments.empty()) throw at(source, call.name.span, "LYT0002", "TaskLocal.get 不接收实参");
-                info.callee = Callee::LocalGet;
-                return symbols.sum(Type::Option, module.taskLocalValues[owner.id]);
             }
             if (auto result = extensionCall(id, call, owner, expected)) return *result;
             if (privateMember) throw at(source, call.name.span, "LYN0003", "此成员是模块私有的：" + call.name.text);
