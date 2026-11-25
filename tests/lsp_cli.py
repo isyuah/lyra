@@ -102,6 +102,20 @@ def interactive_server(root):
 
 
 class LanguageServer(unittest.TestCase):
+    def test_hover_includes_a_multiline_throws_clause(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / 'src/main.ly'
+            source.parent.mkdir()
+            text = 'exception Closed\nfn read(): Unit\n    throws Closed, Exception {}\nfn main(): Unit { read() }\n'
+            source.write_text(text, encoding='utf-8')
+            output = run_server([(source, text)], [
+                {'jsonrpc': '2.0', 'id': 2, 'method': 'textDocument/hover', 'params': {
+                    'textDocument': {'uri': uri(source)}, 'position': {'line': 3, 'character': 19},
+                }},
+            ])
+            hover = next(item['result'] for item in output if item.get('id') == 2)
+            self.assertEqual(hover['contents']['value'], '```lyra\nfn read(): Unit\n    throws Closed, Exception\n```')
+
     def test_formatting_uses_unsaved_source_and_preserves_raw_strings_despite_type_errors(self):
         with tempfile.TemporaryDirectory() as temporary:
             source = Path(temporary) / 'src' / 'main.ly'

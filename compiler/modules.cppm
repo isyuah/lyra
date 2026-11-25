@@ -212,6 +212,7 @@ struct Linker {
             if (fn.extensionGroup) rename(*fn.extensionGroup);
             for (auto& bound : fn.bounds) rename(bound.trait);
             if (!fn.result.text.empty()) renameType(fn.result);
+            for (auto& type : fn.throwsTypes) renameType(type);
             for (auto& param : fn.parameters) renameType(param.type);
             auto reference = [&](Identifier& name, std::optional<SymbolKind> kind = {}) {
                 if (auto found = scope.find(name.text); found != scope.end()) {

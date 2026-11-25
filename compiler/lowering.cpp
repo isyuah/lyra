@@ -1267,7 +1267,14 @@ struct Emitter {
             return collectionSize(owner, object, member.name.text == "byteSize");
         if (owner == Type::IntRange) return builder.CreateExtractValue(object, static_cast<unsigned>(fn.expressions[id].target));
         if (owner == Type::Char) return object;
-        if (owner.kind == Type::Exception) return NativeExceptions{builder}.message(object);
+        if (owner.kind == Type::Exception) {
+            switch (static_cast<ExceptionMember>(fn.expressions[id].target)) {
+                case ExceptionMember::Message: return NativeExceptions{builder}.message(object);
+                case ExceptionMember::TaskFailures: return pointerCall("lyraExceptionTaskFailures", {object});
+                case ExceptionMember::CleanupFailures: return pointerCall("lyraExceptionCleanupFailures", {object});
+            }
+            llvm_unreachable("invalid Exception member");
+        }
         if (owner.kind == Type::Error) {
             switch (static_cast<ErrorMember>(fn.expressions[id].target)) {
                 case ErrorMember::Message: return pointerCall("lyraErrorMessage", {object});

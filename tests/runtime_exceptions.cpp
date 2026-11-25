@@ -41,7 +41,7 @@ int main() {
     auto primary = raised("business", 8);
     auto first = raised("cleanup-new", 21), second = raised("cleanup-old", 32);
     auto trace = lyraExceptionFrame(primary, "await", "awaiting.ly", 15, 2);
-    auto after = lyraExceptionSuppress(lyraExceptionSuppress(trace, first), second);
+    auto after = lyraExceptionAddCleanupFailure(lyraExceptionAddCleanupFailure(trace, first), second);
     lyraGcCollect();
     check(lyraExceptionSuppressedCount(primary) == 0 && lyraExceptionSuppressedCount(after) == 2, "another observer's failure was mutated");
     check(lyraExceptionRaise(after, "rethrown.ly", 66, 1) == after, "rethrow replaced the original throw site");
@@ -54,5 +54,5 @@ int main() {
     const std::string binary("left\0right", 10);
     check(report(lyraExceptionCreate(lyraStringFromBytes(binary.data(), binary.size()))).find(binary) != std::string::npos,
         "embedded NUL truncated a Lyra message");
-    check(lyraExceptionSuppress(nullptr, first) == first, "a failing cleanup after normal exit did not become primary");
+    check(lyraExceptionSame(lyraExceptionAddCleanupFailure(nullptr, first), first), "a failing cleanup after normal exit did not become primary");
 }

@@ -1,5 +1,6 @@
 #include "exceptions.h"
 #include "backtrace.h"
+#include "lists.h"
 #include "managed.h"
 #include "strings.h"
 
@@ -12,7 +13,7 @@ namespace {
 
 struct Location { const char* file; std::uint64_t line, column; };
 struct Frame { const char* role; Location location; const Frame* previous; };
-struct Suppressed { const LyraException* error; const Suppressed* previous; std::size_t count; };
+struct Failures { const LyraException* error; const Failures* previous; std::size_t count; };
 
 template<class Item, class... Args> Item* managed(Args&&... args) {
     return ::new (lyraGcAlloc(sizeof(Item))) Item{std::forward<Args>(args)...};
@@ -24,14 +25,52 @@ void location(FILE* stream, Location point) {
 
 }
 
-struct LyraException { const void* message; const void* type; const char* name; Location origin; const Frame* trace; const Suppressed* suppressed; const LyraException* identity; const lyraRuntime::Backtrace* native; };
+struct LyraException {
+    const void* message;
+    const void* type;
+    const char* name;
+    Location origin{};
+    const Frame* trace{};
+    const Failures *suppressed{}, *tasks{}, *cleanups{};
+    const LyraException* identity{};
+    const lyraRuntime::Backtrace* native{};
+};
+
+namespace {
+
+std::size_t failureCount(const Failures* list) { return list ? list->count : 0; }
+
+const Failures* append(const Failures* list, const LyraException* error) {
+    return managed<Failures>(error, list, failureCount(list) + 1);
+}
+
+const LyraException* record(const LyraException* primary, const LyraException* failure, const Failures* LyraException::* category) {
+    auto* result = managed<LyraException>(*(primary ? primary : failure));
+    if (primary) result->suppressed = append(primary->suppressed, failure);
+    else result->tasks = result->cleanups = nullptr;
+    result->*category = append(result->*category, failure);
+    return result;
+}
+
+LyraList* snapshot(const Failures* entries) {
+    auto* result = lyraListCreate();
+    if (!entries) return result;
+    auto count = entries->count;
+    auto** ordered = static_cast<const LyraException**>(lyraGcAlloc(count * sizeof(const LyraException*)));
+    for (auto entry = entries; entry; entry = entry->previous) ordered[entry->count - 1] = entry->error;
+    for (std::size_t index = 0; index < count; ++index)
+        lyraListAdd(result, ::new (lyraGcAlloc(sizeof(*ordered))) const LyraException*(ordered[index]));
+    return result;
+}
+
+}
 
 const LyraException* lyraExceptionCreate(const void* message) {
     return lyraExceptionCreateTyped(message, nullptr, "Exception");
 }
 
 const LyraException* lyraExceptionCreateTyped(const void* message, const void* type, const char* name) {
-    auto error = managed<LyraException>(message, type, name, Location{}, nullptr, nullptr, nullptr, nullptr);
+    auto error = managed<LyraException>(message, type, name);
     error->identity = error;
     return error;
 }
@@ -54,14 +93,18 @@ const LyraException* lyraExceptionFrame(const LyraException* error, const char* 
     return traced;
 }
 
-std::size_t lyraExceptionSuppressedCount(const LyraException* error) { return error->suppressed ? error->suppressed->count : 0; }
+std::size_t lyraExceptionSuppressedCount(const LyraException* error) { return failureCount(error->suppressed); }
 
-const LyraException* lyraExceptionSuppress(const LyraException* primary, const LyraException* additional) {
-    if (!primary) return additional;
-    auto merged = managed<LyraException>(*primary);
-    merged->suppressed = managed<Suppressed>(additional, primary->suppressed, lyraExceptionSuppressedCount(primary) + 1);
-    return merged;
+const LyraException* lyraExceptionAddTaskFailure(const LyraException* primary, const LyraException* failure) {
+    return record(primary, failure, &LyraException::tasks);
 }
+
+const LyraException* lyraExceptionAddCleanupFailure(const LyraException* primary, const LyraException* failure) {
+    return record(primary, failure, &LyraException::cleanups);
+}
+
+LyraList* lyraExceptionTaskFailures(const LyraException* error) { return snapshot(error->tasks); }
+LyraList* lyraExceptionCleanupFailures(const LyraException* error) { return snapshot(error->cleanups); }
 
 void lyraExceptionWrite(const LyraException* error, FILE* stream) {
     struct Pending { const LyraException* error; const Pending* next; };

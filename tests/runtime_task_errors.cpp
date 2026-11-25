@@ -77,7 +77,7 @@ void ownership(LyraDomain *origin, LyraDomain *other, bool spawnFirst, bool late
     lyraDomainRun(other);
     check(group.caught && lyraTaskState(external) == LYRA_TASK_COMPLETED, "cross-domain failure could not be caught");
     if (late) {
-        check(lyraTaskState(parent) == LYRA_TASK_FAILED && lyraTaskException(parent) == group.error, "late await erased group failure");
+        check(lyraTaskState(parent) == LYRA_TASK_FAILED && lyraExceptionSame(lyraTaskException(parent), group.error), "late await erased group failure");
     } else {
         check(lyraTaskState(parent) == LYRA_TASK_COMPLETED && group.siblingCompleted, "observed failure was also reported to the group");
     }

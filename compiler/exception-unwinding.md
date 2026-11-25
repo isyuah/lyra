@@ -4,7 +4,7 @@
 
 ## 同步的最小闭环
 
-内置 `Exception(message: String)` 暴露只读 `message`，`exception MissingEntry` 声明可按类型捕获的具名异常。`throw expression` 抛出一个普通异常。catch 按源码顺序先匹配类型，再求值可选的 `if` 过滤条件；条件为假继续检查下一项。`catch { ... }` 兜底，具名绑定只在自己的过滤条件和处理块中可见。处理块内单独的 `throw` 原样重抛。`try` 是表达式：正常路径与 catch 中正常完成的分支需要有相同的目标类型；`throw` 类型为 `Never`。`throws` 文档标记尚未实现。
+内置 `Exception(message: String)` 暴露只读 `message`、`taskFailures` 和 `cleanupFailures`，`exception MissingEntry` 声明可按类型捕获的具名异常。`throw expression` 抛出一个普通异常。catch 按源码顺序先匹配类型，再求值可选的 `if` 过滤条件；条件为假继续检查下一项。`catch { ... }` 兜底，具名绑定只在自己的过滤条件和处理块中可见。处理块内单独的 `throw` 原样重抛。`try` 是表达式：正常路径与 catch 中正常完成的分支需要有相同的目标类型；`throw` 类型为 `Never`。`throws` 是签名上的文档标注，不改变调用约定。
 
 ```lyra
 exception Closed

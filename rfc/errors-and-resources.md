@@ -26,6 +26,8 @@ fn startServer(): Result<Server, Error> {
 
 用 `exception MissingEntry` 声明 `Exception` 的具名子类型，通过 `MissingEntry("missing")` 创建；`pub` 允许导入此类型。这只引入异常类别，不引入普通 Class 继承。`catch reason: MissingEntry if condition { ... }` 先按类型匹配，再用绑定求布尔条件；条件为假继续匹配下一分支。无过滤的根类型捕获或 `catch { ... }` 须放在最后。未匹配的异常原样向外传递。见[异常传递、清理与可运行示例](../compiler/exception-unwinding.md)。
 
+函数可在返回类型后写 `throws MissingEntry, Exception`，IDE 的函数悬停显示此标注。`throws` 是上下文词，标注项必须是不同的异常类型；公开签名不能引用私有异常。标注不限制函数体实际抛出的异常，也不参与函数类型、重载及调用点检查。`extern` 不接受此标注。
+
 段错误、进程被操作系统终止及运行时损坏不是普通 `catch` 的恢复路径。**暂定的首版 OOM 策略**：只有显式可失败的分配 API 可以用 `Result` 报告本次分配失败；普通对象分配、字符串拼接、集合自动增长等隐式分配耗尽内存时终止。无可恢复 `panic`，需要强制终止时用标准库 `abort`。
 
 语言异常不得未经明确 C ABI 适配越过 C 边界。对外导出函数须在边界转换为错误码、结果结构/回调或明确的致命故障。
@@ -58,6 +60,8 @@ fn load(id: Int): Result<User, ServiceError> { Ok(readUser(id)?) }
 
 若正在展开的异常或取消遇到清理异常，原异常/取消原因仍是主因，清理异常作为附加原因保留；之后的清理仍执行。若块原本正常返回（包括返回 `Err`），清理异常接管这次返回。格式化诊断必须使主因和附加清理失败都能观察。
 
+`Exception.cleanupFailures: List<Exception>` 给出当前异常记录中的清理失败，按清理执行顺序保留原异常。清理失败本身成为主异常时也包含在列表中。每次读取返回独立的列表快照；修改列表不影响异常、其他等待者或再次抛出。`taskFailures` 和子任务清理的汇总顺序见[异步执行](async-execution.md#task-group-和错误传播)。
+
 ### 文件和连接是普通引用对象
 
 GC 管理 `File`、`Connection` 等包装对象的内存，不替调用者决定何时关闭操作系统或数据库句柄。用显式 `close`、`defer` 或库提供的作用域 API 确定释放时机。赋值、传参或返回只复制引用，不复制原生句柄，没有 `Owned<T>` 参数、移动或借用检查。可选的漏关诊断是工具能力，不是合法使用资源的前提。
@@ -84,5 +88,4 @@ alias.readAll()   // 已关闭错误；不会拿旧句柄去读
 
 ## 仍开放
 
-- `throws` 文档标记及其展示方式。
-- 可失败分配 API 的最小范围，以及多个清理失败的完整诊断数据结构。
+- 可失败分配 API 的最小范围。

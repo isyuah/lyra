@@ -1,4 +1,5 @@
 #include "context.h"
+#include "lists.h"
 #include "managed.h"
 #include "net.h"
 #include "strings.h"
@@ -19,6 +20,14 @@ void check(bool condition, const char *message) {
         fprintf(stderr, "task test: %s\n", message);
         exit(EXIT_FAILURE);
     }
+}
+
+void checkFailures(LyraTask* task, const LyraException* first, const LyraException* second) {
+    check(lyraTaskState(task) == LYRA_TASK_FAILED, "task group did not fail");
+    auto* failures = lyraExceptionTaskFailures(lyraTaskException(task));
+    check(lyraListSize(failures) == 2, "task group lost a child failure");
+    auto at = [&](int index) { return *static_cast<const LyraException* const*>(lyraListGet(failures, index, __FILE__, __LINE__, 1)); };
+    check(at(0) == first && at(1) == second, "task group failures were not in registration order");
 }
 
 struct Counter {
@@ -546,9 +555,7 @@ void checkParallel(LyraDomain *origin) {
     auto *failed = lyraTaskCreate(parallelFailureGroup, &failure);
     lyraTaskStart(origin, failed);
     lyraDomainRun(origin);
-    check(lyraTaskState(failed) == LYRA_TASK_FAILED && lyraTaskFailureCount(failed) == 2, "parallel group lost a child failure");
-    check(lyraTaskFailureAt(failed, 0) == failure.causes[0] && lyraTaskFailureAt(failed, 1) == failure.causes[1],
-          "parallel failures were reported in completion order");
+    checkFailures(failed, failure.causes[0], failure.causes[1]);
 }
 
 void checkSingleWorker() {
@@ -674,9 +681,8 @@ int main(int argc, char **argv) {
     lyraTaskKeepCleanups(parent, &group.cleanups);
     lyraTaskStart(origin, parent);
     lyraDomainRun(origin);
-    check(lyraTaskState(parent) == LYRA_TASK_FAILED && lyraTaskFailureCount(parent) == 2 && group.cleaned == 1, "unobserved failure or group cleanup was lost");
-    check(lyraTaskFailureAt(parent, 0) == group.causes[0] && lyraTaskFailureAt(parent, 1) == group.causes[1],
-          "failures were reported by completion instead of registration");
+    check(group.cleaned == 1, "group cleanup was lost");
+    checkFailures(parent, group.causes[0], group.causes[1]);
     checkParallel(origin);
     lyraDomainDestroy(other);
     lyraDomainDestroy(origin);

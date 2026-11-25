@@ -250,14 +250,68 @@ fn main(): Unit { relay() }
             ('fn main(): Unit { try {} catch problem: Exception {} catch {} }', 'LYE0002', 'catch {}'),
             ('fn main(): Unit { try {} catch problem: Exception {}; print(problem.message) }', 'LYN0001', 'problem.message'),
             ('fn main(): Unit { try {} catch { defer { throw } } }', 'LYE0001', 'throw'),
+            ('fn main(): Unit throws Int {}', 'LYE0003', 'Int'),
+            ('type Other = Exception\nfn main(): Unit throws Exception, Other {}', 'LYE0003', 'Other {}'),
+            ('exception Hidden\npub fn api(): Unit throws Hidden {}\nfn main(): Unit {}', 'LYN0003', 'Hidden {}'),
         )
         for source, code, token in cases:
             with self.subTest(source=source):
-                self.source.write_text(source, encoding='utf-8')
+                self.source.write_bytes(source.encode('utf-8'))
                 result = subprocess.run([COMPILER, 'check', self.package, '--diagnostics=json'], capture_output=True, text=True, timeout=10)
                 self.assertNotEqual(result.returncode, 0)
                 item, = json.loads(result.stderr)
                 self.assertEqual((item['code'], item['range']['start']['offset']), (code, source.index(token)), item)
+
+
+    def test_structured_failures_keep_the_original_exceptions_and_order(self):
+        self.executable('''exception Lost
+exception CloseFailed
+async fn work(original: Lost, release: CloseFailed): Unit {
+    defer { throw release }
+    throw original
+}
+async fn main(): Unit {
+    val original = Lost("task")
+    val release = CloseFailed("child cleanup")
+    val outer = CloseFailed("group cleanup")
+    try {
+        taskGroup {
+            defer { throw outer }
+            spawn work(original, release);
+        }
+    } catch problem: Lost {
+        gcCollect()
+        print(problem == original)
+        print(problem.taskFailures.size)
+        print(problem.taskFailures[0] == original)
+        print(problem.taskFailures[0].cleanupFailures[0] == release)
+        print(problem.cleanupFailures[0] == outer)
+        val copy = problem.taskFailures
+        copy[0] = Exception("changed")
+        print(problem.taskFailures[0].message)
+    }
+    print(original.cleanupFailures.size)
+    try {
+        defer { throw CloseFailed("older") }
+        defer { throw CloseFailed("newer") }
+    } catch problem: CloseFailed {
+        print(problem == problem.cleanupFailures[0])
+        for failure in problem.cleanupFailures { print(failure.message) }
+    }
+}''', ['true', '1', 'true', 'true', 'true', 'task', '0', 'true', 'newer', 'older'])
+
+    def test_throws_is_cross_module_documentation_not_an_effect(self):
+        (self.package / 'src/errors').mkdir()
+        (self.package / 'src/errors/types.ly').write_text('pub exception Missing\n')
+        self.executable('''import self.errors.Missing as MissingEntry
+pub fn preserve<T>(value: T): T throws MissingEntry, Exception { value }
+fn throws(): Int { 7 }
+fn unexpected(): Unit throws MissingEntry { throw Exception("not declared") }
+fn main(): Unit {
+    val callable: (Int) -> Int = preserve
+    print(callable(throws()))
+    try { unexpected() } catch problem: Exception { print(problem.message) }
+}''', ['7', 'not declared'])
 
 
 if __name__ == '__main__':

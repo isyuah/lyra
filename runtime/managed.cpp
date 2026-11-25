@@ -72,7 +72,7 @@ const LyraException *lyraCleanupUntil(LyraCleanup **stack, const LyraCleanup *ma
     while (*stack != mark) {
         auto *top = *stack;
         *stack = top->next;
-        if (auto *failure = top->call(top->environment)) primary = lyraExceptionSuppress(primary, failure);
+        if (auto *failure = top->call(top->environment)) primary = lyraExceptionAddCleanupFailure(primary, failure);
     }
     return primary;
 }

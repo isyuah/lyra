@@ -44,6 +44,7 @@ struct IteratorPlan { std::size_t open, next; };
 struct CheckedCatch { Type type; std::optional<std::size_t> local; };
 struct ErrorDisplay { std::optional<std::size_t> method; std::string fallback; };
 enum class ErrorMember { Message, Original, Cause, Suppressed };
+enum class ExceptionMember { Message, TaskFailures, CleanupFailures };
 struct CheckedExpr { Type type; std::size_t target{}; std::vector<std::size_t> argumentSlots{}; Callee callee{}; std::optional<Type> sourceType{}; std::vector<std::size_t> captures{}; std::vector<std::size_t> omittedDefaults{}; std::optional<std::size_t> conversion{}, errorConversion{}, functionRef{}, constantRef{}; std::optional<Type> callableType{}; std::optional<IteratorPlan> iterator{}; std::vector<CheckedPattern> patterns{}; std::optional<double> realLiteral{}; bool narrowed{}; std::optional<std::string> boundTrait{}; std::optional<Type> testedType{}; bool boxedSpread{}; std::vector<std::size_t> interfaceMethods{}; bool interfaceAsync{}; std::vector<CheckedCatch> catches{}; ErrorDisplay errorDisplay{}, errorPromotion{}; };
 struct CheckedFunction {
     Function syntax;
@@ -54,6 +55,7 @@ struct CheckedFunction {
     std::vector<std::optional<ExprId>> cleanupOwners{};
     std::vector<NameReference> references{};
     std::vector<SourceAnchor> calls{};
+    std::vector<Type> throwsTypes{};
 };
 struct CheckedAggregate { Aggregate syntax; std::vector<Type> fields; std::size_t declaration; std::vector<Type> arguments; bool abstract; std::vector<std::optional<std::size_t>> defaultFunctions{}; };
 struct CheckedEnum { Enumeration syntax; std::vector<std::vector<Type>> payloads; std::size_t declaration; std::vector<Type> arguments; bool abstract; };

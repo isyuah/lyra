@@ -120,6 +120,7 @@ Function specializeGeneric(Function result, const std::vector<std::string>& type
         type.text = mapTypeNames(typeForm(type.text), [&](const std::string& name) { auto index = genericParameter(result, name); return index ? types[*index] : name; });
     };
     substitute(result.result);
+    for (auto& type : result.throwsTypes) substitute(type);
     for (auto& parameter : result.parameters) substitute(parameter.type);
     for (auto& expression : result.expressions) {
         if (auto binding = std::get_if<Binding>(&expression.node); binding && binding->annotation) substitute(*binding->annotation);

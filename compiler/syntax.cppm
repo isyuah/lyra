@@ -116,6 +116,7 @@ struct Function {
     std::optional<Identifier> extensionGroup{};
     ConstKind constant{};
     bool extensionProperty{};
+    std::vector<Identifier> throwsTypes{};
 };
 
 struct FieldDefault { std::size_t function; bool emptyOption; };

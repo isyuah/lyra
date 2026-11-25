@@ -36,7 +36,12 @@ namespace {
 namespace json = llvm::json;
 
 struct Document { fs::path path; std::string uri, text; std::int64_t version{}; };
-struct Workspace { std::vector<Source> sources; std::vector<NameReference> references; std::set<std::string> names; };
+struct Workspace {
+    std::vector<Source> sources;
+    std::vector<NameReference> references;
+    std::set<std::string> names;
+    std::map<std::pair<std::size_t, std::size_t>, std::size_t> throwsEnds;
+};
 
 const Source* sourceFor(const Workspace& workspace, const fs::path& path);
 
@@ -167,9 +172,14 @@ fs::path packageRoot(fs::path file) {
 
 Workspace loadWorkspace(const fs::path& root, const SourceOverlay& overlays, const std::optional<PackageGraph>& graph, ParseCache& parseCache) {
     Workspace workspace;
+    auto rememberThrows = [&](const Module& syntax, const std::vector<Source>& sources) {
+        for (const auto& function : syntax.functions) if (!function.throwsTypes.empty() && !sources[function.file].origin)
+            workspace.throwsEnds.emplace(std::pair{function.file, function.name.span.begin}, function.throwsTypes.back().span.end);
+    };
     if (graph) {
         if (graph->entry.empty()) throw Diagnostic{"LYK0001", "workspace 根没有可分析的 Lyra 包"};
         auto program = loadProgram(*graph, graph->entry, {}, &overlays, &parseCache);
+        rememberThrows(program.syntax, program.sources);
         auto checked = check(program.syntax, program.sources, false);
         workspace.sources = std::move(program.sources);
         workspace.references = std::move(program.references);
@@ -178,6 +188,7 @@ Workspace loadWorkspace(const fs::path& root, const SourceOverlay& overlays, con
         auto sources = loadSources(root);
         for (auto& source : sources) if (auto found = overlays.find(source.path); found != overlays.end()) source = sourceText(source.path, found->second, {});
         auto syntax = parse(sources);
+        rememberThrows(syntax, sources);
         auto checked = check(std::move(syntax), sources, false);
         workspace.sources = std::move(sources);
         workspace.references = std::move(checked.references);
@@ -792,6 +803,9 @@ private:
             auto start = definition.lineStarts[site.start.line - 1];
             auto end = definition.text.find_first_of("\r\n", start);
             if (end == std::string::npos) end = definition.text.size();
+            auto file = static_cast<std::size_t>(&definition - workspace.sources.data());
+            if (auto annotation = workspace.throwsEnds.find({file, resolved->second.begin}); annotation != workspace.throwsEnds.end())
+                end = annotation->second;
             auto signature = std::string_view(definition.text).substr(start, end - start);
             return json::Object{{"contents", json::Object{{"kind", "markdown"}, {"value", "```lyra\n" + std::string(signature) + "\n```"}}}};
         }

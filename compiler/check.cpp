@@ -214,6 +214,7 @@ Function defaultFunction(const Function& original, std::size_t slot) {
     syntax.name.span = parameter.name.span;
     syntax.body = *parameter.defaultValue;
     syntax.result = parameter.type;
+    syntax.throwsTypes.clear();
     syntax.owner.reset();
     syntax.isAsync = false;
     syntax.initializer = false;
@@ -917,7 +918,15 @@ struct Symbols {
             locals.push_back({param.variadic ? list(type) : type, false});
         }
         std::vector<CheckedExpr> expressions(syntax.expressions.size());
-        return {std::move(syntax), result, std::move(locals), std::move(expressions)};
+        CheckedFunction function{std::move(syntax), result, std::move(locals), std::move(expressions)};
+        for (const auto& annotation : function.syntax.throwsTypes) {
+            const auto& source = sources[function.syntax.file];
+            auto type = resolve(function.syntax, annotation, arguments);
+            if (type.kind != Type::Exception) throw at(source, annotation.span, "LYE0003", "throws 需要 Exception 或其具名子类型");
+            if (std::ranges::contains(function.throwsTypes, type)) throw at(source, annotation.span, "LYE0003", "throws 重复标注了同一个异常类型");
+            function.throwsTypes.push_back(type);
+        }
+        return function;
     }
 
     void addConcrete(CheckedFunction function) {
@@ -1994,7 +2003,12 @@ struct Checker {
         if (owner == Type::String && (member.name.text == "size" || member.name.text == "byteSize")) return Type::Int;
         if (owner == Type::Bytes && member.name.text == "size") return Type::Int;
         if (owner == Type::Char && member.name.text == "codePoint") return number(Type::UInt, 32);
-        if (owner.kind == Type::Exception && member.name.text == "message") return Type::String;
+        if (owner.kind == Type::Exception) {
+            auto slot = [&](ExceptionMember field, Type type) { fn.expressions[id].target = static_cast<std::size_t>(field); return type; };
+            if (member.name.text == "message") return slot(ExceptionMember::Message, Type::String);
+            if (member.name.text == "taskFailures") return slot(ExceptionMember::TaskFailures, symbols.list(Type::Exception));
+            if (member.name.text == "cleanupFailures") return slot(ExceptionMember::CleanupFailures, symbols.list(Type::Exception));
+        }
         if (owner == Type::Error) {
             auto slot = [&](ErrorMember field, Type type) { fn.expressions[id].target = static_cast<std::size_t>(field); return type; };
             if (member.name.text == "message") return slot(ErrorMember::Message, Type::String);
@@ -2972,6 +2986,8 @@ CheckedModule check(Module module, const std::vector<Source>& sources, bool requ
         const auto& source = sources[syntax.file];
         exposeBounds(syntax);
         expose(function.result, source, syntax.result.span);
+        for (std::size_t index = 0; index < function.throwsTypes.size(); ++index)
+            expose(function.throwsTypes[index], source, syntax.throwsTypes[index].span);
         for (auto slot = static_cast<std::size_t>(syntax.hasReceiver); slot < syntax.parameters.size(); ++slot)
             expose(function.locals[slot].type, source, syntax.parameters[slot].type.span);
     };

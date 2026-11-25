@@ -50,8 +50,6 @@ void lyraTaskFinishCancelled(LyraTask *task);
 LyraTaskState lyraTaskState(const LyraTask *task);
 void *lyraTaskOutcome(const LyraTask *task);
 const LyraException *lyraTaskException(const LyraTask *task);
-size_t lyraTaskFailureCount(const LyraTask *task);
-const LyraException *lyraTaskFailureAt(const LyraTask *task, size_t index);
 
 #ifdef __cplusplus
 }

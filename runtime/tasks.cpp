@@ -489,20 +489,17 @@ void finish(TaskLock& lock, LyraTask *task, LyraTaskState state, void *outcome) 
 
 void publish(TaskLock& lock, LyraTask *task) {
     require(!task->firstChild, "task still has children to clean up");
-    if (task->error) addFailure(task->failures, 0, task->error);
-    const LyraException *primary = nullptr;
-    for (auto *cause = task->failures; cause; cause = cause->next) primary = lyraExceptionSuppress(primary, cause->cause);
-    for (auto *cause = task->cancelledCleanups; cause; cause = cause->next) primary = lyraExceptionSuppress(primary, cause->cause);
+    auto *primary = task->error;
+    for (auto *cause = task->failures; cause; cause = cause->next) primary = lyraExceptionAddTaskFailure(primary, cause->cause);
+    for (auto *cause = task->cancelledCleanups; cause; cause = cause->next) primary = lyraExceptionAddCleanupFailure(primary, cause->cause);
     if (auto **stack = task->cleanups) {
         task->cleanups = nullptr;
         auto *previous = currentTask;
         currentTask = task;
         lock.unlock();
-        auto *cleaned = lyraCleanupUntil(stack, nullptr, primary);
+        primary = lyraCleanupUntil(stack, nullptr, primary);
         lock.lock();
         currentTask = previous;
-        if (!primary && cleaned) addFailure(task->failures, 0, cleaned);
-        primary = cleaned;
     }
     auto terminal = task->pendingState;
     if (terminal == LYRA_TASK_COMPLETED && task->cancelRequested) terminal = LYRA_TASK_CANCELLED;
@@ -512,6 +509,7 @@ void publish(TaskLock& lock, LyraTask *task) {
     }
     if (terminal != LYRA_TASK_COMPLETED) task->outcome = nullptr;
     task->state = terminal;
+    task->failures = task->cancelledCleanups = nullptr;
     task->frame = nullptr;
     task->step = nullptr;
     stopDeadline(task);
@@ -535,7 +533,7 @@ void publish(TaskLock& lock, LyraTask *task) {
         if (task->state == LYRA_TASK_FAILED && task->reportToGroup) {
             addFailure(parent->failures, task->ordinal + 1, task->error);
             for (auto *sibling = parent->firstChild; sibling; sibling = sibling->nextChild) requestCancel(sibling);
-        } else if (task->error && (parent->cancelRequested || parent->failures || (parent->joining && parent->pendingState == LYRA_TASK_FAILED))) {
+        } else if (task->state == LYRA_TASK_CANCELLED && task->error && (parent->cancelRequested || parent->failures || (parent->joining && parent->pendingState == LYRA_TASK_FAILED))) {
             addFailure(parent->cancelledCleanups, task->ordinal + 1, task->error);
         }
         if (!parent->firstChild && (parent->joining || parent->resumeAfterChildren)) {
@@ -913,21 +911,4 @@ const LyraException *lyraTaskException(const LyraTask *task) {
     TaskLock lock;
     require(isTerminal(task), "task has not finished cleanup");
     return task->error;
-}
-
-size_t lyraTaskFailureCount(const LyraTask *task) {
-    TaskLock lock;
-    require(isTerminal(task), "task has not finished cleanup");
-    size_t count = 0;
-    for (auto *entry = task->failures; entry; entry = entry->next) ++count;
-    return count;
-}
-
-const LyraException *lyraTaskFailureAt(const LyraTask *task, size_t index) {
-    TaskLock lock;
-    require(isTerminal(task), "task has not finished cleanup");
-    auto *entry = task->failures;
-    while (entry && index--) entry = entry->next;
-    require(entry, "failure index is out of range");
-    return entry->cause;
 }

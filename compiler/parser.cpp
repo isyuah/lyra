@@ -780,13 +780,22 @@ private:
         else if (is(":")) { consume(); result = type(); }
         else if (pub || foreign || conversion || (!owner && !extension && name.text == "main"))
             throw at(source, token.span, "LYP0001", "此声明需要用 : 标注返回类型");
+        std::vector<Identifier> throwsTypes;
+        if (is("throws")) {
+            auto site = consume().span;
+            if (foreign) throw at(source, site, "LYE0003", "extern 函数不能声明 throws");
+            throwsTypes.push_back(type());
+            while (is(",")) { consume(); throwsTypes.push_back(type()); }
+        }
         if (foreign) {
             require(";");
             auto symbol = name;
             return {file, std::move(name), std::move(parameters), std::move(result), {}, 0, {}, pub, {}, false, std::move(symbol)};
         }
         auto body = block();
-        return {file, std::move(name), std::move(parameters), std::move(result), std::exchange(nodes, {}), body, std::move(owner), pub, std::move(generics), isAsync, {}, conversion, std::move(bounds), initializer, hasReceiver, extension ? std::optional(extension->name) : std::nullopt};
+        Function decl{file, std::move(name), std::move(parameters), std::move(result), std::exchange(nodes, {}), body, std::move(owner), pub, std::move(generics), isAsync, {}, conversion, std::move(bounds), initializer, hasReceiver, extension ? std::optional(extension->name) : std::nullopt};
+        decl.throwsTypes = std::move(throwsTypes);
+        return decl;
     }
 
     ExprId block() {
