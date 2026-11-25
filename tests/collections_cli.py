@@ -145,6 +145,8 @@ fn main(): Unit {
     def test_hash_capability_rejects_non_hashable_struct_fields(self):
         cases = [
             ('struct Key(val value: Any)\nfn main(): Unit { val items = hashSet<Key>() }', 'value'),
+            ('import std.io.File\nstruct Key(val file: File)\nfn main(): Unit { val items = hashSet<Key>() }', 'file'),
+            ('struct Key(val callback: CCallback)\nfn main(): Unit { val items = hashSet<Key>() }', 'callback'),
             ('class Handle {}\nstruct Key(val value: Handle)\nfn main(): Unit { val items = hashSet<Key>() }', 'value'),
             ('struct Key(val callback: () -> Int)\nfn main(): Unit { val items = hashSet<Key>() }', 'callback'),
             ('trait Render { fn render(): String }\nstruct Key(val value: dyn Render)\nfn main(): Unit { val items = hashSet<Key>() }', 'value'),

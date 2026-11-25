@@ -72,7 +72,7 @@
 | 宏与数据交换 | `[标记]`、`@装饰器`、`#宏` 分写。声明宏和表达式宏使用传入的语法与显式只读输入展开；外部准备工具另行授权。JSON/TOML 由 `#derive(Json, Toml)` 显式生成实现；默认只映射公开字段、拒绝未知键。 |
 | 整数 | 普通有符号整数算术在 Debug 和 Release 下都检查溢出；需回绕时使用明确的回绕操作。 |
 | 包与部署 | 目录组成模块；源码包及 workspace 锁文件作为默认分发模型。Windows 用原生 PowerShell 工作流，Linux 用本机或 WSL；允许显式使用动态库。 |
-| 互操作与库 | 首个 C ABI 集成样例为阻塞式 SQLite API，不包含来自 C 线程的反向回调。异步、HTTP、JSON/TOML 等作为工具链维护的语言与标准库能力，不因此成为全部必须的语法关键字。 |
+| 互操作与库 | 首个 C ABI 集成样例为阻塞式 SQLite API；另支持显式原生指针操作、来自 C 线程的同步闭包回调和 `import-c`。异步、HTTP、JSON/TOML 等作为工具链维护的语言与标准库能力，不因此成为全部必须的语法关键字。 |
 
 可观察行为见[语言核心](rfc/language-core.md)。[RFC-0002](rfc/0002-syntax.md) 已确认：变长形参写 `values: Int...`，函数体得到本次调用独立的可变 `List<Int>`；调用处的 `...ids` 首版只展开列表，按顺序传入元素，不共用来源列表。固定列表形参写 `values: List<Int>`，直接传 `ids` 时两边访问同一个列表。`identity<Int>(7)` 按显式泛型调用解析，省略类型实参时可从实参和明确的目标类型推断；`await findUser(id)?` 先等待、再传播。跨行、完整运算符分组和求值顺序见同篇 §3–4。HTTP 参数绑定是库设计，不是另一种函数调用。
 
@@ -1045,7 +1045,7 @@ Runtime 调度器在迁移 Task 时不得改变其上下文语义。
 
 通过 C 回调重新进入语言 Runtime 时，必须满足线程接入、GC 和异常边界要求。
 
-首个 FFI 验收目标为 SQLite 的同步 API，不包括 C 线程反向回调 Lyra 闭包。阻塞调用必须隔离；取消等待不等于 C 调用已经停止。封装必须让原生句柄在调用期间保持有效，再确定性释放 statement 和连接，不依赖 GC。具体验收见[原生工具链与 FFI RFC](rfc/native-toolchain.md)。
+首个 FFI 验收目标为 SQLite 的同步 API。阻塞调用必须隔离；取消等待不等于 C 调用已经停止。封装必须让原生句柄在调用期间保持有效，再确定性释放 statement 和连接，不依赖 GC。`CCallback` 登记的同步闭包由 GC 根保活，外部线程接入后执行，失败以 fallback 和可读取的 `Exception` 返回，不跨 C 展开。指针操作、回调注销和显式头文件导入见[原生工具链与 FFI RFC](rfc/native-toolchain.md)。
 
 ### 8.10 Module + Package + Build
 

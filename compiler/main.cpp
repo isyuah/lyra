@@ -15,6 +15,7 @@
 #endif
 
 import lyra.build;
+import lyra.c_import;
 import lyra.check;
 import lyra.format;
 import lyra.lsp;
@@ -29,6 +30,7 @@ namespace {
 constexpr auto usage = "lyra --help | --version\n"
                        "lyra lsp --stdio\n"
                        "lyra fmt [--check] <文件.ly>...\n"
+                       "lyra import-c <头文件> [-I <包含目录>] [-D <宏[=值]>] [-o <新文件.ly>]\n"
                        "lyra new <目录> [--name <包名>] [--lib]\n"
                        "lyra check|build|run|test <包目录> [--locked] [--offline] [--diagnostics=json]\n"
                        "lyra build <包目录> [-o <产物>] [--release] [--debug-info] [--link <C库>] | run <包目录> [--release] [--debug-info] [--link <C库>] [-- <程序实参>...]\n"
@@ -160,6 +162,10 @@ int run(std::vector<std::string_view> args) {
         if (args.size() == 1 && args[0] == "--help") { std::cout << usage << '\n'; return 0; }
         if (args.empty()) throw Diagnostic{"LYC0001", usage};
         if (args.size() == 2 && args[0] == "lsp" && args[1] == "--stdio" && !forwards && !json) return languageServer();
+        if (args[0] == "import-c") {
+            if (forwards) throw Diagnostic{"LYC0001", usage};
+            return importC(args, json);
+        }
         int code;
         if (args[0] == "fmt") {
             if (forwards) throw Diagnostic{"LYC0001", usage};

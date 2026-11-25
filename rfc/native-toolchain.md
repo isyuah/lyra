@@ -71,7 +71,7 @@ for pid in "${pids[@]}"; do cat "/proc/$pid/smaps_rollup"; done |
    cmake --install build/windows-release --prefix build/sdk-windows
    ```
 
-   调试版改用 `windows-dev`。安装树包含标准库和静态库，不附 Clang；运行编译器仍需要 Visual C++ Redistributable，该环境通常由 VS Build Tools 提供。构建和运行源码的命令示例见[仓库说明](../README.md)。外部 C 静态库若也希望随应用单文件交付，使用 x64 MSVC ABI 和静态 CRT（`/MT`）。
+   调试版改用 `windows-dev`。安装树包含标准库和静态库，并为 `import-c` 提供 `libclang` 与内建头文件；运行编译器仍需要 Visual C++ Redistributable，该环境通常由 VS Build Tools 提供。构建和运行源码的命令示例见[仓库说明](../README.md)。外部 C 静态库若也希望随应用单文件交付，使用 x64 MSVC ABI 和静态 CRT（`/MT`）。
 
 ### 打包与复验 SDK
 
@@ -104,7 +104,7 @@ Windows 的解包验收可加 `--deployment-bundle build/dist/windows-apps`，�
 
    ```sh
    sudo apt update
-   sudo apt install build-essential clang-18 clang-tools-18 llvm-18-dev cmake ninja-build python3 libgc-dev libuv1-dev libsqlite3-dev libjansson-dev curl
+   sudo apt install build-essential clang-18 clang-tools-18 llvm-18-dev libclang-18-dev cmake ninja-build python3 libgc-dev libuv1-dev libsqlite3-dev libjansson-dev curl
    ```
 
 3. 在同一 Ubuntu 终端做一次冒烟检查。`LLVMConfig.cmake` 应可读；IR 编译链接出的程序应返回 `42`：
@@ -134,7 +134,7 @@ LLVM 是代码生成后端，不是语言运行时或 GC。Lyra Runtime 实现�
 
 ## 首个 C ABI 用例：SQLite
 
-第一版通过显式 `extern` 声明绑定 C 标量、指针和不透明句柄。字符串按每个 C 接口的契约明确传长度或使用终止符；SQLite 文本在下一次 step 或 finalize 使原缓冲失效前复制为 Lyra 字符串。首个绑定是按需导入的官方 SQLite 包：打开连接、准备/执行语句、绑定值、迭代结果、确定性关闭 statement 和 connection。C 保存 Lyra 闭包、外部线程反向回调和任意 C 头文件自动导入不纳入首版。
+显式 `extern` 声明绑定 C 标量、指针和不透明句柄。字符串按每个 C 接口的契约明确传长度或使用终止符；SQLite 文本在下一次 step 或 finalize 使原缓冲失效前复制为 Lyra 字符串。首个绑定是按需导入的官方 SQLite 包：打开连接、准备/执行语句、绑定值、迭代结果、确定性关闭 statement 和 connection。
 
 数值类型按位宽与符号对应 C 的 `intN_t` / `uintN_t`，`Float32` 对应 `float`，`Float64` 对应 `double`。Linux 上使用浮点 `%` 的程序可能另依赖系统 `libm.so.6`；整数和不用该运算的程序无需引入它。
 
@@ -169,6 +169,40 @@ int64_t writeText(const LyraString *text) {
 
 公开 `Connection` 是[普通资源引用](errors-and-resources.md)，可以传参、返回或存入对象；离开注册了 `defer close` 的块时仍照常关闭，带出引用不会延长原生资源的打开期。使用中或正在关闭的连接遇到另一次 `close()` 要报 `Busy`；关闭成功后再关则幂等。原始 C 指针、固定与释放留在不安全 FFI 边界；安全封装须遵守 SQLite 线程模式及 statement 的生命周期。
 
+## 原生指针与闭包回调
+
+`unsafe { ... }` 是词法块，正常结束取块尾值。下面的读写以字节为偏移、使用目标平台的字节序；支持全部定宽整数、`Float32/64` 及 `CPtr`，例如 `readUInt16`、`writeFloat64` 和 `readCPtr`。
+
+```lyra
+fn nativeValue(): Int32 {
+    unsafe {
+        val buffer = CPtr.alloc(8)
+        defer buffer.free()
+        buffer.offset(4).writeInt32(0, 42)
+        buffer.readInt32(4)
+    }
+}
+```
+
+`CPtr.alloc(bytes)` 使用 C `malloc`，内存未初始化，负长度或分配失败抛 `Exception`。`free()` 只能释放同一 C 分配器给出的基址，不能释放借用指针或偏移后的地址。边界、对齐、生命周期和线程同步由调用者负责；原生缓冲区不会被 GC 扫描。`CPtr.nullPtr()`、`ptr.isNull()` 和指针相等比较可在 `unsafe` 外使用。违例的指针操作在调用名处报 `LYF0002`。
+
+`CCallback.register(closure, fallback: value)` 登记同步闭包，并用 GC 根保活捕获环境，直到显式注销。C 端用 `function()` 取得函数地址、用 `context()` 取得第一个实参；其余参数和返回值按上述 C ABI 传递。比如 Lyra `(Int32) -> Int` 对应 `int64_t (*)(void *context, int32_t value)`。首版回调支持数值、`Bool`、`CPtr`，返回 `Unit` 时对应 `void` 且不接收 fallback。
+
+- 回调在发起调用的原生线程同步执行。若线程尚未接入 GC，trampoline 在调用前注册线程、返回前注销。不会为它启动 Task 或切换执行域。
+- 普通异常先在 Lyra 内完成清理，再由 trampoline 截获。非 `Unit` 回调向 C 返回登记时的 fallback；`Unit` 正常返回。`takeError(): Option<Exception>` 取走自上次读取以来第一条未收取的异常，保留原异常及其位置；并发失败以最先写入者为准。
+- 先让 C 端移除登记并等所有已进入的回调返回，再在 `unsafe` 中调用 `close()`；不得从仍在执行的同一回调中注销。关闭幂等、释放 GC 根，关闭后 `function()` 和 `context()` 返回空指针；未收取的异常仍可读取。C 不得继续使用关闭前取得的任一地址。`CCallback` 与其他资源句柄一样不提供默认 Hash。
+
+## 从 C 头文件生成绑定
+
+```sh
+lyra import-c include/api.h -I include -D API_VERSION=2 -o src/bindings.ly
+lyra build . --link /path/to/libapi.a
+```
+
+命令使用 SDK 内的 Clang 按应用目标解析 C17 头文件。`-I` 和 `-D` 可重复；内建头文件提供 `stdint.h`、`stddef.h` 等，第三方头文件和完整系统头文件由调用方通过包含目录提供。导入只为所选头文件中的外部函数生成 `pub extern fn`，不会为间接包含的头文件生成绑定。整数位宽按目标确定，例如 Windows 的 `long` 是 32 位、Linux 是 64 位；C 指针（包括函数指针）映射为 `CPtr`，`_Bool` 映射为 `Bool`。不生成 C 实现，不链接 C 库，也不在普通构建中自动运行。
+
+按值聚合类型、C 全局变量、C++、可变参数、非默认调用约定与 inline 函数不在首版映射范围内。无法映射的声明报带头文件位置的 `LYF0004` 警告，仍输出其余绑定；C 解析错误报 `LYF0003` 并停止生成。可通过 `--diagnostics=json` 获取诊断。省略 `-o` 输出到 stdout，`-o` 只创建新文件；可从生成的普通 Lyra 源码继续手写 `extern` 或包装 API。
+
 ## 标准库与诊断
 
 - `async`、`await` 等影响 Task 控制流的能力由语言和 Runtime 配合支持；核心 Runtime 和基础库随工具链，HTTP、JSON/TOML 作为官方维护、按需导入的库包，可独立发修复版。首个编译器切片的正反例、入口与后续验证顺序见[编译器验收设计](compiler-acceptance.md)。
@@ -183,11 +217,12 @@ int64_t writeText(const LyraString *text) {
 - 任务暂停期间仅由异步状态帧持有的对象仍能通过 GC 压力测试。
 - 异步异常报告能沿源调用链回溯到 `await` 和原始任务创建位置。
 - 有/无动态 SQLite 依赖的交付行为显式区分；未来支持 scratch 时通过独立目标配置声明。
+- [FFI 命令行验收](../tests/ffi_cli.py)链接独立 C 库，在 Debug/Release 应用中核对定宽读写、外部线程回调期间的 GC 保活、异常隔离和注销；用搬迁后的 SDK 在清空 `PATH` 的环境下导入头文件，再链接运行生成的绑定。
 
 ## 仍开放
 
 - 额外架构、libc/链接器组合及全静态支持矩阵。
-- 后续收集器的选择、精确根追踪与优化级别的交互，以及是否开放外部线程注册。
+- 后续收集器的选择、精确根追踪与优化级别的交互，以及是否在回调以外开放通用外部线程注册。
 - Runtime 默认管理 GC 和 Worker，并提供基本限制和统计；具体配置、指标和默认值由原型测量。
 - `extern` 声明的完整 ABI 类型表、错误码到 Result 的具体映射、内部句柄表示和中断接口。
 - 官方库包与工具链的版本兼容范围。

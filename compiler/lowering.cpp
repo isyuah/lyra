@@ -48,10 +48,12 @@ struct Layouts {
     bool workers{};
 
     Layouts(const CheckedModule& program, Builder& builder) : program(program) {
-        for (const auto& fn : program.functions) workers |= std::ranges::any_of(fn.syntax.expressions, [](const Expr& expr) {
-            const auto* block = std::get_if<AsyncBlock>(&expr.node);
-            return std::holds_alternative<Blocking>(expr.node) || (block && block->kind == AsyncBlock::Parallel);
-        });
+        for (const auto& fn : program.functions) {
+            workers |= std::ranges::any_of(fn.syntax.expressions, [](const Expr& expr) {
+                const auto* block = std::get_if<AsyncBlock>(&expr.node);
+                return std::holds_alternative<Blocking>(expr.node) || (block && block->kind == AsyncBlock::Parallel);
+            }) || std::ranges::any_of(fn.expressions, [](const CheckedExpr& expr) { return expr.callee == Callee::CallbackRegister; });
+        }
         for (const auto& record : program.aggregates) objects.push_back(record.abstract ? nullptr : llvm::StructType::create(builder.getContext(), "lyra.type." + record.syntax.name.text));
         for (std::size_t id = 0; id < objects.size(); ++id) {
             if (program.aggregates[id].abstract) continue;
@@ -84,6 +86,7 @@ struct Layouts {
             case Type::Bytes: return "Bytes";
             case Type::Never: return "Never";
             case Type::CPtr: return "CPtr";
+            case Type::CCallback: return "CCallback";
             case Type::Any: return "Any";
             case Type::Error: return "Error";
             case Type::Exception:
@@ -237,7 +240,7 @@ struct Layouts {
         case Type::Bool: return builder.getInt1Ty();
         case Type::Char: return builder.getInt32Ty();
         case Type::Unit: case Type::Never: return builder.getInt8Ty();
-        case Type::String: case Type::Bytes: case Type::Task: case Type::CPtr: case Type::List: case Type::Exception: case Type::Closure: case Type::Error: case Type::TaskLocal: case Type::Channel: return builder.getPtrTy();
+        case Type::String: case Type::Bytes: case Type::Task: case Type::CPtr: case Type::List: case Type::Exception: case Type::Closure: case Type::Error: case Type::TaskLocal: case Type::Channel: case Type::CCallback: return builder.getPtrTy();
         case Type::Variable: case Type::Projection: llvm_unreachable("abstract type reached LLVM lowering");
         case Type::Any: case Type::Dyn: return llvm::StructType::get(builder.getContext(), {builder.getPtrTy(), builder.getPtrTy()});
         case Type::IntRange: return llvm::StructType::get(builder.getContext(), {builder.getInt64Ty(), builder.getInt64Ty(), builder.getInt1Ty()});
@@ -557,7 +560,7 @@ struct DebugInfo {
             case Type::Unit: cached = basic(8, llvm::dwarf::DW_ATE_unsigned); break;
             case Type::CPtr: cached = pointer(nullptr); break;
             case Type::String: case Type::Bytes: case Type::Task: case Type::List: case Type::Exception:
-            case Type::Closure: case Type::Error: case Type::TaskLocal: case Type::Channel:
+            case Type::Closure: case Type::Error: case Type::TaskLocal: case Type::Channel: case Type::CCallback:
                 cached = pointer(builder.createForwardDecl(llvm::dwarf::DW_TAG_structure_type, name, unit->getFile(), unit->getFile(), 0));
                 break;
             default: cached = builder.createUnspecifiedType(name); break;
@@ -1416,6 +1419,8 @@ struct Emitter {
         return rawType(id) == Type::Unit ? unit() : tail;
     }
 
+    Value emitNode(ExprId, const UnsafeBlock& block) { return emit(block.body); }
+
     Value emitNode(ExprId id, const Call& call) {
         const auto& info = fn.expressions[id];
         if (info.callee == Callee::Indirect) {
@@ -1449,7 +1454,9 @@ struct Emitter {
         }
         if (info.callee == Callee::TaskCancelled) return asyncTaskCancelled(builder);
         if (info.callee == Callee::TaskCheckCancellation) { asyncCheckCancellation(builder); return unit(); }
-        auto skip = static_cast<std::size_t>(call.receiver && info.callee != Callee::Variant);
+        bool namespaceCall = info.callee == Callee::Variant || info.callee == Callee::PtrNull ||
+            info.callee == Callee::PtrAllocate || info.callee == Callee::CallbackRegister;
+        auto skip = static_cast<std::size_t>(call.receiver && !namespaceCall);
         Value receiver = nullptr;
         if (skip) {
             receiver = emit(*call.receiver);
@@ -1482,6 +1489,40 @@ struct Emitter {
         switch (info.callee) {
             case Callee::Indirect: llvm_unreachable("indirect call already emitted");
             case Callee::TaskCancelled: case Callee::TaskCheckCancellation: llvm_unreachable("static task call already emitted");
+            case Callee::PtrAllocate: {
+                auto* pointer = builder.getPtrTy();
+                auto allocate = module.getOrInsertFunction("lyraPtrAllocate", pointer, builder.getInt64Ty(), pointer);
+                builder.CreateStore(nullPointer(), errorSlot);
+                auto* address = builder.CreateCall(allocate, {args[0], errorSlot});
+                guard(builder.CreateLoad(pointer, errorSlot), handlers.size(), call.name.span, "call");
+                return address;
+            }
+            case Callee::PtrNull: return nullPointer();
+            case Callee::PtrIsNull: return builder.CreateIsNull(receiver);
+            case Callee::PtrFree:
+                builder.CreateCall(module.getOrInsertFunction("free", builder.getVoidTy(), builder.getPtrTy()), {receiver});
+                return unit();
+            case Callee::PtrOffset: case Callee::PtrRead: case Callee::PtrWrite: {
+                auto* address = builder.CreateGEP(builder.getInt8Ty(), receiver, args[1]);
+                if (info.callee == Callee::PtrOffset) return address;
+                if (info.callee == Callee::PtrRead) return builder.CreateLoad(layouts.native(builder, rawType(id)), address);
+                builder.CreateStore(args[2], address);
+                return unit();
+            }
+            case Callee::CallbackRegister: {
+                const auto& shape = layouts.program.signatures[info.callableType->id];
+                auto* fallback = args.size() == 2 ? lists.box(args[1]) : nullPointer();
+                return emitCallback(builder, *info.callableType, shape, signature(shape), args[0], fallback);
+            }
+            case Callee::CallbackContext: return pointerCall("lyraCallbackContext", {receiver});
+            case Callee::CallbackFunction: return pointerCall("lyraCallbackFunction", {receiver});
+            case Callee::CallbackClose:
+                builder.CreateCall(module.getOrInsertFunction("lyraCallbackClose", builder.getVoidTy(), builder.getPtrTy()), {receiver});
+                return unit();
+            case Callee::CallbackTakeError: {
+                auto* error = pointerCall("lyraCallbackTakeError", {receiver});
+                return builder.CreateInsertValue(makeSum(rawType(id), SumTag::Some, error), builder.CreateIsNotNull(error), 0);
+            }
             case Callee::ChannelCreate: {
                 auto* pointer = builder.getPtrTy();
                 auto create = module.getOrInsertFunction("lyraChannelCreate", pointer, builder.getInt64Ty(), pointer, pointer);

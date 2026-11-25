@@ -1355,6 +1355,11 @@ private:
             auto body = block();
             return add({start, nodes[body].span.end}, Blocking{body});
         }
+        if (trailingBlock && is("unsafe") && text(next) == "{" && !next.newlineBefore) {
+            consume();
+            auto body = block();
+            return add({start, nodes[body].span.end}, UnsafeBlock{body});
+        }
         if (trailingBlock && (is("taskGroup") || is("parallel")) && text(next) == "{" && !next.newlineBefore) {
             auto kind = is("parallel") ? AsyncBlock::Parallel : AsyncBlock::Group;
             auto site = consume().span;

@@ -8,19 +8,26 @@ module;
 
 export module lyra.foreign;
 import lyra.check;
+import lyra.closures;
+import lyra.exceptions;
 import lyra.numbers;
 
 export namespace lyra {
+bool callbackAbiType(Type type);
 void validateForeign(const CheckedFunction& function, const Source& source);
 void validateForeignDeclarations(const CheckedModule& program, const std::vector<Source>& sources);
 void emitForeign(const CheckedFunction& function, const Source& source, llvm::Function& wrapper);
+llvm::Value* emitCallback(llvm::IRBuilder<>& builder, Type type, const FunctionShape& shape,
+                         llvm::FunctionType* closureSignature, llvm::Value* closure, llvm::Value* fallback);
 }
 
 namespace lyra {
+bool callbackAbiType(Type type) { return numericType(type) || type == Type::Bool || type == Type::CPtr; }
+
 namespace {
 
 bool abiType(Type type) {
-    return numericType(type) || type == Type::Bool || type == Type::String || type == Type::Bytes || type == Type::CPtr;
+    return callbackAbiType(type) || type == Type::String || type == Type::Bytes;
 }
 
 llvm::Type* cType(Type type, llvm::IRBuilder<>& builder) {
@@ -96,6 +103,65 @@ void emitForeign(const CheckedFunction& fn, const Source& source, llvm::Function
     if (fn.result == Type::Unit) builder.CreateRet(builder.getInt8(0));
     else if (fn.result == Type::Bool) builder.CreateRet(builder.CreateIsNotNull(result));
     else builder.CreateRet(result);
+}
+
+llvm::Value* emitCallback(llvm::IRBuilder<>& builder, Type type, const FunctionShape& shape,
+                         llvm::FunctionType* closureSignature, llvm::Value* closure, llvm::Value* fallback) {
+    auto& module = *builder.GetInsertBlock()->getModule();
+    auto& context = module.getContext();
+    auto* pointer = builder.getPtrTy();
+    auto name = "lyra.callback." + std::to_string(type.id);
+    auto* trampoline = module.getFunction(name);
+    if (!trampoline) {
+        std::vector<llvm::Type*> params{pointer};
+        for (auto param : shape.parameters) params.push_back(cType(param, builder));
+        auto* signature = llvm::FunctionType::get(cType(shape.result, builder), params, false);
+        trampoline = llvm::Function::Create(signature, llvm::Function::InternalLinkage, name, module);
+        auto* entry = llvm::BasicBlock::Create(context, "entry", trampoline);
+        auto* failed = llvm::BasicBlock::Create(context, "failed", trampoline);
+        auto* finished = llvm::BasicBlock::Create(context, "finished", trampoline);
+        llvm::IRBuilder<> emit(entry);
+        auto* callback = trampoline->getArg(0);
+        auto registerThread = module.getOrInsertFunction("lyraGcEnterWorker", emit.getInt32Ty());
+        auto unregisterThread = module.getOrInsertFunction("lyraGcLeaveWorker", emit.getVoidTy(), emit.getInt32Ty());
+        auto getClosure = module.getOrInsertFunction("lyraCallbackClosure", pointer, pointer);
+        auto recordError = module.getOrInsertFunction("lyraCallbackRecordError", emit.getVoidTy(), pointer, pointer);
+        auto* registration = emit.CreateCall(registerThread);
+        auto* callable = emit.CreateCall(getClosure, {callback});
+        std::vector<llvm::Value*> inputs;
+        for (unsigned slot = 0; slot < shape.parameters.size(); ++slot) {
+            auto param = shape.parameters[slot];
+            if (auto attr = extension(param); attr != llvm::Attribute::None) trampoline->addParamAttr(slot + 1, attr);
+            auto* argument = trampoline->getArg(slot + 1);
+            inputs.push_back(param == Type::Bool ? emit.CreateIsNotNull(argument) : argument);
+        }
+        if (auto attr = extension(shape.result); attr != llvm::Attribute::None) trampoline->addRetAttr(attr);
+        auto* slot = NativeExceptions{emit}.slot();
+        auto* value = NativeClosures{emit}.invoke(closureSignature, callable, inputs, nullptr, slot);
+        auto* error = emit.CreateLoad(pointer, slot);
+        emit.CreateCondBr(emit.CreateIsNotNull(error), failed, finished);
+        emit.SetInsertPoint(failed);
+        emit.CreateCall(recordError, {callback, error});
+        llvm::Value* substitute = nullptr;
+        if (shape.result != Type::Unit) {
+            auto getFallback = module.getOrInsertFunction("lyraCallbackFallback", pointer, pointer);
+            substitute = emit.CreateLoad(value->getType(), emit.CreateCall(getFallback, {callback}));
+        }
+        emit.CreateBr(finished);
+        emit.SetInsertPoint(finished);
+        llvm::Value* result = nullptr;
+        if (substitute) {
+            auto* selected = emit.CreatePHI(value->getType(), 2);
+            selected->addIncoming(value, entry);
+            selected->addIncoming(substitute, failed);
+            result = shape.result == Type::Bool ? emit.CreateZExt(selected, emit.getInt8Ty()) : selected;
+        }
+        emit.CreateCall(unregisterThread, {registration});
+        if (result) emit.CreateRet(result);
+        else emit.CreateRetVoid();
+    }
+    auto registerCallback = module.getOrInsertFunction("lyraCallbackRegister", pointer, pointer, pointer, pointer);
+    return builder.CreateCall(registerCallback, {closure, trampoline, fallback});
 }
 
 }

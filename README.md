@@ -45,7 +45,7 @@ $lyra = Resolve-Path 'build/windows-release/bin/lyra.exe'
 
 最后一条命令输出 `42`。安装 SDK 用 `cmake --install build/windows-release --prefix build/sdk-windows`，搬迁时整体复制 SDK 目录。用 SDK **编译**程序仍需本机 Clang、LLD 和 VS/Windows SDK 的链接环境；**运行**该示例只需复制 `app.exe`。
 
-**Linux x86-64：** 在 Linux 的仓库根目录执行；在 Windows 上给 Linux 服务器构建应用时使用 WSL 2。编译器使用 C++23 命名模块，需要 Clang/LLVM 18.1、配套的 `clang-scan-deps-18`、CMake 3.28+、Ninja 1.11+ 和 Python 3（测试）。
+**Linux x86-64：** 在 Linux 的仓库根目录执行；在 Windows 上给 Linux 服务器构建应用时使用 WSL 2。编译器使用 C++23 命名模块，需要 Clang/LLVM 18.1、配套的 `clang-scan-deps-18`、`libclang-18-dev`、CMake 3.28+、Ninja 1.11+ 和 Python 3（测试）。
 
 ```sh
 cmake --preset dev
@@ -104,6 +104,7 @@ lyra fmt [--check] <文件.ly>...
 - `taskGroup` 等待孩子收尾；`parallel` 和 [`parallelFor`](std/collections/README.md#有界并行遍历) 可在多个 OS 线程上同时执行。用 `LYRA_PARALLEL_WORKERS` 调整 CPU Worker 数，复合共享更新可用 [std.sync](std/sync/README.md) 的锁和原子操作。
 - 普通异常写 `throw Exception("reason")`，用 `try { ... } catch e: Exception { ... }` 或 `catch { ... }` 捕获。`defer` 在退出当前块时倒序清理；取消独立于异常。使用 [std.task](std/task/README.md) 给一棵任务树设置 trace 或 deadline，不需要逐层传 `context`。
 - `extern fn` 通过 C ABI 调用原生函数。可用 `--link` 指定 Linux 的 `.o`、`.a`、`.so`，或 Windows MSVC ABI 的 `.obj`、静态库或导入库 `.lib`。从工具链 `include/` 引入 `<lyra/string.h>` 可按字节读取 `String`。随工具链安装的 [std.io](std/io/README.md) 可读参数、标准流和文件；[std.sqlite](std/sqlite/README.md) 提供预编译语句。Linux 使用 SQLite 的应用需要 `libsqlite3.so.0`，Windows 由 SDK 静态链接 SQLite。
+- `lyra import-c api.h -I include -o src/bindings.ly` 用 SDK 自带的 Clang 解析 C 头文件并生成 `extern` 声明。`unsafe` 块支持定宽指针读写和同步闭包回调；[FFI RFC](rfc/native-toolchain.md#原生指针与闭包回调)列出生命周期和 ABI 契约。
 - [std.json](std/json/README.md) 支持显式 `#derive(Json)`，派生器本身是 [Lyra 宏](std/meta/README.md)。用 [std.http](std/http/README.md) 可以运行[真实 HTTP/SQLite 查询服务](examples/http-sqlite/README.md)，无需 VM 或外部 Web 服务器。
 - [std.toml](std/toml/README.md) 同样用显式 `#derive(Toml)` 生成 TOML 编解码器，严格拒绝未知字段，可用显式入口放宽；别名、默认值、嵌套表和数组表均有端到端验收。日期时间目前解析为 TOML 专用值，业务类型需要手写映射。
 - `const` 可调用纯同步函数并预计算复合值，`pub const` 可跨包导入。编译期求值范围与预算见[元编程 RFC](rfc/metaprogramming-data.md#编译期常量)。[std.reflect](std/reflect/README.md) 可显式读取 `Any` 的类型名及公开 Struct/Class 字段；它与静态 JSON/TOML 派生相互独立。

@@ -13,7 +13,7 @@ export import lyra.syntax;
 
 export namespace lyra {
 struct Type {
-    enum Kind { Unit, Int, UInt, Real, Bool, String, Char, Bytes, Never, Record, Enum, Variable, Task, CPtr, Option, Result, List, Exception, Closure, Any, Dyn, Error, TaskLocal, Projection, IntRange, Channel };
+    enum Kind { Unit, Int, UInt, Real, Bool, String, Char, Bytes, Never, Record, Enum, Variable, Task, CPtr, Option, Result, List, Exception, Closure, Any, Dyn, Error, TaskLocal, Projection, IntRange, Channel, CCallback };
     Kind kind;
     std::size_t id{};
     constexpr Type(Kind kind = Unit, std::size_t id = 0) : kind(kind), id(id) {}
@@ -24,7 +24,7 @@ inline constexpr const char* rangeFieldNames[] = {"start", "end", "inclusive"};
 inline constexpr Type channelClosed{Type::Exception, 1};
 inline constexpr std::size_t firstDeclaredException = channelClosed.id + 1;
 struct Local { Type type; bool writable; std::optional<ExprId> worker{}; bool captured{}; std::optional<Span> declaration{}; std::string name{}; };
-enum class Callee { Function, Constructor, Variant, Print, Collect, Sum, ListAdd, ListSlice, TaskCancel, TaskCancelled, TaskCheckCancellation, Exception, Indirect, ToReal, ToIntegerChecked, ToString, ToBytes, DecodeUtf8, Dynamic, BusinessError, ErrorSuppress, FailureInfo, LocalKey, LocalGet, WithLocal, ExtensionProperty, ReflectTypeName, ReflectFieldCount, ReflectFieldName, ReflectField, Size, ValueEqual, ValueHash, ChannelCreate, ChannelSend, ChannelReceive, ChannelClose, Sleep };
+enum class Callee { Function, Constructor, Variant, Print, Collect, Sum, ListAdd, ListSlice, TaskCancel, TaskCancelled, TaskCheckCancellation, Exception, Indirect, ToReal, ToIntegerChecked, ToString, ToBytes, DecodeUtf8, Dynamic, BusinessError, ErrorSuppress, FailureInfo, LocalKey, LocalGet, WithLocal, ExtensionProperty, ReflectTypeName, ReflectFieldCount, ReflectFieldName, ReflectField, Size, ValueEqual, ValueHash, ChannelCreate, ChannelSend, ChannelReceive, ChannelClose, Sleep, PtrAllocate, PtrNull, PtrIsNull, PtrFree, PtrOffset, PtrRead, PtrWrite, CallbackRegister, CallbackContext, CallbackFunction, CallbackClose, CallbackTakeError };
 enum class ValueOperation { Equal, Hash };
 struct PatternSlot { std::size_t local; };
 struct PatternListRest { std::size_t local; };

@@ -109,6 +109,8 @@ struct SyntaxArena {
                 if constexpr (std::is_same_v<Node, Blocking>) return "blocking";
                 else if constexpr (std::is_same_v<Node, Deferred>) return "defer";
                 else return node.kind == AsyncBlock::Group ? "taskGroup" : node.kind == AsyncBlock::Parallel ? "parallel" : "async";
+            } else if constexpr (std::is_same_v<Node, UnsafeBlock>) {
+                child(node.body); return "unsafe";
             } else if constexpr (std::is_same_v<Node, TypeOperation>) {
                 child(node.value); named("type", node.type); return "typeOperation";
             } else if constexpr (std::is_same_v<Node, TextTemplate>) {

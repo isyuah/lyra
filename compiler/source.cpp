@@ -83,22 +83,23 @@ static llvm::json::Object jsonPosition(Position position) {
     return llvm::json::Object{{"offset", position.offset}, {"line", position.line}, {"column", position.column}};
 }
 
-void report(const Diagnostic& error, bool json) {
-    auto& stream = llvm::errs();
-    if (json) {
-        llvm::json::Object item{{"code", error.code}, {"message", llvm::json::fixUTF8(error.message)}};
-        if (error.site) {
-            item["file"] = llvm::json::fixUTF8(error.site->file);
-            item["range"] = llvm::json::Object{{"start", jsonPosition(error.site->start)}, {"end", jsonPosition(error.site->end)}};
-        }
-        if (!error.expected.empty()) item["expected"] = error.expected;
-        if (!error.actual.empty()) item["actual"] = error.actual;
-        if (!error.hint.empty()) item["hint"] = error.hint;
-        if (error.generated) item["generated"] = llvm::json::Object{{"file", error.generated->file}, {"start", jsonPosition(error.generated->start)}, {"end", jsonPosition(error.generated->end)}, {"source", error.generated->lineText}};
-        stream << llvm::formatv("{0}\n", llvm::json::Value(llvm::json::Array{std::move(item)}));
-        return;
+static llvm::json::Object jsonDiagnostic(const Diagnostic& error) {
+    llvm::json::Object item{{"code", error.code}, {"message", llvm::json::fixUTF8(error.message)}};
+    if (error.site) {
+        item["file"] = llvm::json::fixUTF8(error.site->file);
+        item["range"] = llvm::json::Object{{"start", jsonPosition(error.site->start)}, {"end", jsonPosition(error.site->end)}};
     }
+    if (!error.expected.empty()) item["expected"] = error.expected;
+    if (!error.actual.empty()) item["actual"] = error.actual;
+    if (!error.hint.empty()) item["hint"] = error.hint;
+    if (error.generated) item["generated"] = llvm::json::Object{{"file", error.generated->file}, {"start", jsonPosition(error.generated->start)}, {"end", jsonPosition(error.generated->end)}, {"source", error.generated->lineText}};
+    return item;
+}
+
+static void reportText(const Diagnostic& error, bool warning) {
+    auto& stream = llvm::errs();
     if (error.site) stream << error.site->file << ':' << error.site->start.line << ':' << error.site->start.column << ": ";
+    if (warning) stream << "warning: ";
     stream << error.code << ": " << error.message << '\n';
     if (error.site) {
         stream << error.site->lineText << '\n';
@@ -113,6 +114,25 @@ void report(const Diagnostic& error, bool json) {
     }
     if (!error.hint.empty()) stream << "提示：" << error.hint << '\n';
     if (error.generated) stream << "展开代码 " << error.generated->file << ':' << error.generated->start.line << ": " << error.generated->lineText << '\n';
+}
+
+void report(const Diagnostic& error, bool json) {
+    if (json) llvm::errs() << llvm::formatv("{0}\n", llvm::json::Value(llvm::json::Array{jsonDiagnostic(error)}));
+    else reportText(error, false);
+}
+
+void reportWarnings(const std::vector<Diagnostic>& warnings, bool json) {
+    if (!json) {
+        for (const auto& warning : warnings) reportText(warning, true);
+        return;
+    }
+    llvm::json::Array diagnostics;
+    for (const auto& warning : warnings) {
+        auto item = jsonDiagnostic(warning);
+        item["severity"] = "warning";
+        diagnostics.push_back(std::move(item));
+    }
+    llvm::errs() << llvm::formatv("{0}\n", llvm::json::Value(std::move(diagnostics)));
 }
 
 std::vector<Source> loadSources(const fs::path& package) {

@@ -59,6 +59,7 @@ struct CatchArm { Span site; std::optional<CatchBinding> binding; std::optional<
 struct Attempt { ExprId body; std::vector<CatchArm> arms; };
 struct TaskOp { bool spawn; Span site; ExprId operand; };
 struct Blocking { ExprId body; };
+struct UnsafeBlock { ExprId body; };
 struct AsyncBlock { enum Kind { Cold, Group, Parallel }; Kind kind; ExprId body; Span site; };
 struct Deferred { ExprId body; };
 struct LambdaParameter { Identifier name; std::optional<Identifier> type; };
@@ -89,7 +90,7 @@ enum class Jump { Break, Continue };
 
 struct Expr {
     Span span;
-    std::variant<IntegerLiteral, RealLiteral, bool, StringLiteral, BytesLiteral, CharLiteral, DisplayValue, TextTemplate, Identifier, This, Call, Member, QualifiedMember, Unary, Binary, RangeValue, TypeOperation, Block, Binding, PatternBinding, Conditional, While, For, Return, Raise, Attempt, Jump, TaskOp, Blocking, AsyncBlock, Deferred, EmptyOption, Propagate, Match, Select, ListLiteral, Index, Lambda> node;
+    std::variant<IntegerLiteral, RealLiteral, bool, StringLiteral, BytesLiteral, CharLiteral, DisplayValue, TextTemplate, Identifier, This, Call, Member, QualifiedMember, Unary, Binary, RangeValue, TypeOperation, Block, Binding, PatternBinding, Conditional, While, For, Return, Raise, Attempt, Jump, TaskOp, Blocking, UnsafeBlock, AsyncBlock, Deferred, EmptyOption, Propagate, Match, Select, ListLiteral, Index, Lambda> node;
 };
 
 struct Parameter { Identifier name, type; bool variadic{}; std::optional<ExprId> defaultValue{}; std::vector<Attribute> attributes{}; };

@@ -82,7 +82,7 @@ val message = await select {
 
 同步阻塞 C 调用通过 `blocking { ... }` 进入有界阻塞池；池满时挂起调用任务，不阻塞串行执行域的 Worker，也不临时无限增加线程。如果 C API 没有取消支持，取消调用方等待不等于停止底层 C 函数，Task Group 仍需等安全收尾。
 
-首个实测互操作场景为同步 SQLite 连接、查询和 statement 操作。C 侧句柄以明确的作用域 API 确定性关闭，不依赖 GC；首期不包括 C 新线程反向回调 Lyra 闭包。
+首个实测互操作场景为同步 SQLite 连接、查询和 statement 操作。C 侧句柄以明确的作用域 API 确定性关闭，不依赖 GC。[C 回调](native-toolchain.md#原生指针与闭包回调)在发起调用的线程同步执行，不另建 Task；关闭登记前要先从 C 端移除它并等进行中的回调返回。
 
 ## 并行池与并行遍历
 

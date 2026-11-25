@@ -73,7 +73,7 @@ using Overloads = std::unordered_map<std::string, std::vector<std::size_t>>;
 
 const std::string& linkedName(const Identifier& name) { return name.linked.empty() ? name.text : name.linked; }
 
-constexpr Type scalarTypes[] = {Type::Bool, Type::String, Type::Char, Type::Bytes, Type::Unit, Type::CPtr, Type::Exception, channelClosed, Type::Any, Type::Error};
+constexpr Type scalarTypes[] = {Type::Bool, Type::String, Type::Char, Type::Bytes, Type::Unit, Type::CPtr, Type::CCallback, Type::Exception, channelClosed, Type::Any, Type::Error};
 
 bool builtInDisplay(Type type) { return numericType(type) || type == Type::Bool || type == Type::String || type == Type::Char; }
 
@@ -97,6 +97,7 @@ std::string typeName(const CheckedModule& module, Type type, bool canonical) {
             return canonical || separator == full.npos ? full : full.substr(separator + 2);
         }
         case Type::CPtr: return "CPtr";
+        case Type::CCallback: return "CCallback";
         case Type::Any: return "Any";
         case Type::Error: return "Error";
         case Type::Dyn: {
@@ -1061,6 +1062,11 @@ struct Checker {
     std::optional<Type>* inferredReturn{};
     using Present = std::set<std::size_t>;
     Present present{};
+    unsigned unsafeDepth{};
+
+    void requireUnsafe(Span site) const {
+        if (!unsafeDepth) throw at(source, site, "LYF0002", "此原生操作必须写在 unsafe { ... } 内");
+    }
 
     bool materializing() const { return variables.empty() && !probing && !inferredReturn; }
 
@@ -2257,7 +2263,7 @@ struct Checker {
             Symbols::TypeTrial transaction{symbols};
             auto trial = fn;
             auto returnHint = inferredReturn ? *inferredReturn : std::optional<Type>{};
-            Checker checker{trial, source, module, symbols, scopes, variables, loops, workers, catchOwners, lambdaHints, receiverSlot, implicitReceivers, true, inferredReturn ? &returnHint : nullptr, present};
+            Checker checker{trial, source, module, symbols, scopes, variables, loops, workers, catchOwners, lambdaHints, receiverSlot, implicitReceivers, true, inferredReturn ? &returnHint : nullptr, present, unsafeDepth};
             try {
                 const auto& trialCall = std::get<Call>(trial.syntax.expressions[id].node);
                 checker.declaredCall(index, id, trialCall, expected, ownerTypes(index), true);
@@ -2331,13 +2337,46 @@ struct Checker {
         if (!call.receiver && !call.typeOwner) if (auto local = localSlot(call.name)) return invoke(readLocal(id, call.name, *local));
         if (call.receiver && !call.typeOwner) {
             const auto* qualifier = std::get_if<Identifier>(&fn.syntax.expressions[*call.receiver].node);
-            if (qualifier && linkedName(*qualifier) == "Task" && !lookupLocal(*qualifier) && !implicitMember(*qualifier) &&
+            auto builtin = qualifier && !lookupLocal(*qualifier) && !implicitMember(*qualifier) ? std::string_view(linkedName(*qualifier)) : std::string_view{};
+            if (builtin == "Task" &&
                 (call.name.text == "cancelled" || call.name.text == "checkCancellation")) {
                 noTypeArgs();
                 if (!call.arguments.empty()) throw at(source, call.name.span, "LYT0002", "Task." + call.name.text + " 不接收实参");
                 if (!inAsync()) throw at(source, call.name.span, "LYT0008", "Task." + call.name.text + " 只能在异步执行体中调用");
                 info.callee = call.name.text == "cancelled" ? Callee::TaskCancelled : Callee::TaskCheckCancellation;
                 return call.name.text == "cancelled" ? Type{Type::Bool} : Type{Type::Unit};
+            }
+            if (builtin == "CPtr" && (call.name.text == "alloc" || call.name.text == "nullPtr")) {
+                noTypeArgs();
+                bool allocate = call.name.text == "alloc";
+                if (allocate) requireUnsafe(call.name.span);
+                info.callee = allocate ? Callee::PtrAllocate : Callee::PtrNull;
+                return arguments(id, call, allocate ? 1 : 0, [](auto) { return "bytes"; }, [](auto) { return Type{Type::Int}; }) ? Type{Type::Never} : Type{Type::CPtr};
+            }
+            if (builtin == "CCallback" && call.name.text == "register") {
+                noTypeArgs();
+                requireUnsafe(call.name.span);
+                if (call.arguments.empty() || call.arguments.size() > 2 || call.arguments.front().label ||
+                    std::ranges::any_of(call.arguments, [](const auto& arg) { return arg.spread || arg.trailing; }) ||
+                    (call.arguments.size() == 2 && call.arguments[1].label && call.arguments[1].label->text != "fallback"))
+                    throw at(source, call.name.span, "LYF0002", "写作 CCallback.register(callback, fallback: value)；Unit 回调不传 fallback");
+                info.callee = Callee::CallbackRegister;
+                auto callback = visit(call.arguments.front().value);
+                info.argumentSlots.push_back(0);
+                if (callback == Type::Never) return callback;
+                const auto site = fn.syntax.expressions[call.arguments.front().value].span;
+                if (callback.kind != Type::Closure) throw at(source, site, "LYF0002", "C 回调需要同步函数值");
+                const auto& shape = module.signatures[callback.id];
+                if (!std::ranges::all_of(shape.parameters, callbackAbiType) || (shape.result != Type::Unit && !callbackAbiType(shape.result)))
+                    throw at(source, site, "LYF0002", "C 回调仅支持同步函数、数值、Bool、CPtr 和 Unit 返回值");
+                if (call.arguments.size() != (shape.result == Type::Unit ? 1u : 2u))
+                    throw at(source, call.name.span, "LYF0002", "非 Unit 回调必须提供异常时返回给 C 的 fallback；Unit 回调不接收 fallback");
+                info.callableType = callback;
+                if (call.arguments.size() == 2) {
+                    info.argumentSlots.push_back(1);
+                    if (visit(call.arguments[1].value, shape.result) == Type::Never) return Type::Never;
+                }
+                return Type::CCallback;
             }
         }
         std::size_t declaration;
@@ -2371,6 +2410,37 @@ struct Checker {
             if (const auto* item = enumNamespace(*call.receiver)) return variant(id, TypeQualifier{*item}, call, expected);
             auto owner = visit(*call.receiver);
             if (owner == Type::Never) return owner;
+            if (owner == Type::CPtr) {
+                const auto& name = call.name.text;
+                if (name == "isNull" || name == "free" || name == "offset") {
+                    noTypeArgs();
+                    if (name != "isNull") requireUnsafe(call.name.span);
+                    info.callee = name == "isNull" ? Callee::PtrIsNull : name == "free" ? Callee::PtrFree : Callee::PtrOffset;
+                    bool exits = arguments(id, call, name == "offset" ? 1 : 0, [](auto) { return "bytes"; }, [](auto) { return Type{Type::Int}; });
+                    return exits ? Type{Type::Never} : name == "isNull" ? Type{Type::Bool} : name == "free" ? Type{Type::Unit} : Type{Type::CPtr};
+                }
+                bool write = name.starts_with("write");
+                if (write || name.starts_with("read")) {
+                    auto suffix = std::string_view(name).substr(write ? 5 : 4);
+                    auto type = suffix == "CPtr" ? std::optional(Type{Type::CPtr}) : numberType(suffix);
+                    if (type) {
+                        noTypeArgs();
+                        requireUnsafe(call.name.span);
+                        info.callee = write ? Callee::PtrWrite : Callee::PtrRead;
+                        bool exits = arguments(id, call, write ? 2 : 1, [](auto slot) { return slot ? "value" : "offset"; }, [&](auto slot) { return slot ? *type : Type{Type::Int}; });
+                        return exits ? Type{Type::Never} : write ? Type{Type::Unit} : *type;
+                    }
+                }
+            }
+            if (owner == Type::CCallback && (call.name.text == "context" || call.name.text == "function" || call.name.text == "close" || call.name.text == "takeError")) {
+                noTypeArgs();
+                auto operation = call.name.text;
+                if (operation != "takeError") requireUnsafe(call.name.span);
+                info.callee = operation == "context" ? Callee::CallbackContext : operation == "function" ? Callee::CallbackFunction
+                    : operation == "close" ? Callee::CallbackClose : Callee::CallbackTakeError;
+                arguments(id, call, 0, [](auto) { return ""; }, [](auto) { return Type{Type::Unit}; });
+                return operation == "takeError" ? symbols.sum(Type::Option, Type::Exception) : operation == "close" ? Type{Type::Unit} : Type{Type::CPtr};
+            }
             if (owner == Type::Any && (call.name.text == "typeName" || call.name.text == "fieldCount" ||
                 call.name.text == "fieldNames" || call.name.text == "field")) {
                 noTypeArgs();
@@ -2817,6 +2887,13 @@ struct Checker {
             throw error;
         }
         return discard ? Type::Unit : type;
+    }
+
+    Type infer(ExprId, const UnsafeBlock& block, std::optional<Type> expected, bool discard) {
+        ++unsafeDepth;
+        auto result = visit(block.body, expected, discard);
+        --unsafeDepth;
+        return result;
     }
 
     Type infer(ExprId id, const Conditional& branch, std::optional<Type> expected, bool discard) {

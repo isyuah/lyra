@@ -365,7 +365,7 @@ struct DeclarationTypes {
                 return make(dynamic ? "dyn" : standard ? "standard" : "named", symbol->name.substr(separator + 2), std::move(module));
             }
             if (!symbol && !dynamic) {
-                if (form.arguments.empty() && (numberType(name) || name == "Bool" || name == "String" || name == "Char" || name == "Bytes" || name == "Unit" || name == "Never" || name == "CPtr" || name == "Exception" || name == "ChannelClosed" || name == "Any" || name == "Error"))
+                if (form.arguments.empty() && (numberType(name) || name == "Bool" || name == "String" || name == "Char" || name == "Bytes" || name == "Unit" || name == "Never" || name == "CPtr" || name == "CCallback" || name == "Exception" || name == "ChannelClosed" || name == "Any" || name == "Error"))
                     return make("builtin", name);
                 if (form.arguments.size() == 1 && (name == "List" || name == "Option" || name == "Range" || name == "Task" || name == "TaskLocal" || name == "Channel"))
                     return make("builtin", name);
