@@ -708,12 +708,12 @@ struct Symbols {
             emit("asyncIterator", Callee::ChannelIterator, type);
             emit("close", Callee::ChannelClose, Type::Unit);
         }
+        if (type.kind == Type::Task) emit("cancel", Callee::TaskCancel, Type::Unit, {}, {}, MemberContext::AsyncBody);
         if (type == Type::String) emit("toBytes", Callee::ToBytes, Type::Bytes);
         if (matches("toString")) {
             if (builtInDisplay(type)) emit("toString", Callee::ToString, Type::String);
             if (type == Type::Bytes) emit("toString", Callee::DecodeUtf8, sum(Type::Option, Type::String));
         }
-        if (type.kind == Type::Task) emit("cancel", Callee::TaskCancel, Type::Unit, {}, {}, MemberContext::AsyncBody);
         if (type.kind == Type::TaskLocal && matches("get")) emit("get", Callee::LocalGet, sum(Type::Option, module.taskLocalValues[type.id]));
         if (type.kind == Type::Result && matches("failureInfo")) emit("failureInfo", Callee::FailureInfo, sum(Type::Option, Type::Error));
         if (type == Type::Error) emit("withSuppressed", Callee::ErrorSuppress, Type::Error, {"error"}, {Type::Error});

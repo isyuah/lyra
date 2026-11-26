@@ -70,7 +70,6 @@ async fn getUpstream(url: String, options: httpClient.HttpClientOptions, logger:
         },
     }
 }
-
 async fn barrier(request: http.Request): http.Response {
     print("barrier")
     http.Response.text(200, request.target())
