@@ -1,7 +1,5 @@
 #include "net.h"
-#include "tasks.h"
 
-#include <algorithm>
 #include <cerrno>
 
 #ifndef _WIN32
@@ -21,6 +19,8 @@ int error() {
         case WSAETIMEDOUT: return ETIMEDOUT;
         case WSAEADDRINUSE: return EADDRINUSE;
         case WSAEACCES: return EACCES;
+        case WSAEMFILE: return EMFILE;
+        case WSAENOBUFS: return ENOBUFS;
         default: return status;
     }
 #else
@@ -77,91 +77,6 @@ void close(Socket socket) {
 #else
     ::close(socket);
 #endif
-}
-
-void shutdownConnection(Socket socket, uintptr_t monitor) {
-#ifdef _WIN32
-    ::shutdown(socket, SD_BOTH);
-    if (monitor) WSASetEvent(reinterpret_cast<WSAEVENT>(monitor));
-#else
-    (void)monitor;
-    ::shutdown(socket, SHUT_RDWR);
-#endif
-}
-
-int poll(PollSlot& slot, int timeout) {
-#ifdef _WIN32
-    return WSAPoll(&slot, 1, timeout);
-#else
-    return ::poll(&slot, 1, timeout);
-#endif
-}
-
-int receive(Socket socket, char* data, int size, int flags) {
-    return static_cast<int>(::recv(socket, data, size, flags));
-}
-
-int send(Socket socket, const char* data, int size) {
-#ifdef _WIN32
-    return ::send(socket, data, size, 0);
-#else
-    return static_cast<int>(::send(socket, data, size, MSG_NOSIGNAL));
-#endif
-}
-
-uintptr_t disconnectMonitor(Socket socket) {
-#ifdef _WIN32
-    auto event = WSACreateEvent();
-    if (event == WSA_INVALID_EVENT) return 0;
-    if (WSAEventSelect(socket, event, FD_CLOSE) == 0) return reinterpret_cast<uintptr_t>(event);
-    auto status = WSAGetLastError();
-    WSACloseEvent(event);
-    WSASetLastError(status);
-    return 0;
-#else
-    return static_cast<uintptr_t>(socket) + 1;
-#endif
-}
-
-void closeMonitor(uintptr_t monitor) {
-#ifdef _WIN32
-    if (monitor) WSACloseEvent(reinterpret_cast<HANDLE>(monitor));
-#else
-    (void)monitor;
-#endif
-}
-
-bool disconnected(Socket socket) {
-    char next;
-    for (;;) {
-        auto count = receive(socket, &next, 1, MSG_PEEK);
-        if (count >= 0) return count == 0;
-        auto status = error();
-        if (status != EINTR) return !retry(status);
-    }
-}
-
-bool waitDisconnect(uintptr_t monitor, int timeout) {
-    auto now = [] { return static_cast<int64_t>(uv_hrtime() / UINT64_C(1000000)); };
-    auto deadline = now() + timeout;
-#ifndef _WIN32
-    PollSlot slot{static_cast<Socket>(monitor - 1), POLLRDHUP, 0};
-#endif
-    for (;;) {
-        if (lyraBlockingCancelled()) return false;
-        auto remaining = deadline - now();
-        if (remaining < 0) return false;
-        auto interval = static_cast<int>(std::min<int64_t>(remaining, 25));
-#ifdef _WIN32
-        auto result = WaitForSingleObject(reinterpret_cast<HANDLE>(monitor), interval);
-        if (result != WAIT_TIMEOUT) return result == WAIT_OBJECT_0;
-#else
-        auto result = poll(slot, interval);
-        if (result < 0 && error() == EINTR) continue;
-        if (result != 0) return result > 0 && (slot.revents & (POLLRDHUP | POLLHUP | POLLERR | POLLNVAL));
-#endif
-        if (remaining <= interval) return false;
-    }
 }
 
 }

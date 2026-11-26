@@ -1,7 +1,6 @@
 #include "context.h"
 #include "lists.h"
 #include "managed.h"
-#include "net.h"
 #include "strings.h"
 #include "tasks.h"
 
@@ -12,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <thread>
+#include <uv.h>
 
 namespace {
 
@@ -202,70 +202,6 @@ void cancelDuringCall(LyraTask *self, void *storage) {
     gate->changed.notify_one();
     lock.unlock();
     lyraTaskComplete(self, nullptr);
-}
-
-struct DisconnectCase {
-    lyraRuntime::net::Socket sockets[2];
-    uintptr_t monitor{};
-    bool *locallyClosed{};
-    NativeGate gate;
-    LyraTask *handler{}, *blocked{};
-    LyraCleanup *cleanups{};
-    bool observed{}, closed{};
-};
-
-int disconnectSocketClosed(const void *target) {
-    return *static_cast<const bool *>(target);
-}
-
-void *queuedClosure(void *storage, const LyraException **) {
-    auto *test = static_cast<DisconnectCase *>(storage);
-    check(!lyraTaskWatchDisconnect(test->monitor, test->locallyClosed, disconnectSocketClosed), "worker shared the caller's current task");
-    lyraRuntime::net::close(test->sockets[1]);
-    nativeCall(&test->gate);
-    lyraGcCollect();
-    return lyraGcAlloc(sizeof(Counter));
-}
-
-void observeDisconnect(LyraTask *self, void *storage) {
-    auto *test = static_cast<DisconnectCase *>(storage);
-    if (!lyraTaskCancelRequested(test->handler)) {
-        lyraTaskSuspend(self);
-        lyraTaskWake(self);
-        return;
-    }
-    std::unique_lock lock(test->gate.mutex);
-    check(!test->closed && lyraTaskCancelRequested(test->blocked), "disconnect did not cancel the worker's owner tree");
-    check(lyraTaskState(test->handler) == LYRA_TASK_SUSPENDED && lyraTaskState(test->blocked) == LYRA_TASK_SUSPENDED,
-          "pending C operation or its parent resumed before the worker returned");
-    test->observed = true;
-    test->gate.mayReturn = true;
-    test->gate.changed.notify_one();
-    lock.unlock();
-    lyraTaskComplete(self, nullptr);
-}
-
-void watchedHandler(LyraTask *self, void *storage) {
-    auto *test = static_cast<DisconnectCase *>(storage);
-    if (!test->blocked) {
-        lyraCleanupPush(&test->cleanups, [](void *environment) -> const LyraException * {
-            auto *closing = static_cast<DisconnectCase *>(environment);
-            check(closing->gate.returned && closing->observed && !closing->closed, "defer closed a resource before opaque native work ended");
-            *closing->locallyClosed = true;
-            lyraRuntime::net::close(closing->sockets[0]);
-            lyraRuntime::net::closeMonitor(closing->monitor);
-            closing->closed = true;
-            return nullptr;
-        }, test);
-        check(lyraTaskWatchDisconnect(test->monitor, test->locallyClosed, disconnectSocketClosed), "owner could not watch a socket");
-        test->blocked = lyraTaskBlocking(queuedClosure, test);
-        const LyraException *error;
-        check(lyraTaskAwaitValue(self, test->blocked, &error) == LYRA_AWAIT_PENDING, "cold blocking closure was already done");
-        return;
-    }
-    check(lyraTaskCancelRequested(self) && test->observed && test->gate.returned, "cleanup ran early or missed disconnect");
-    check(lyraTaskState(test->blocked) == LYRA_TASK_CANCELLED, "blocking work did not complete cancellation");
-    lyraTaskFinishCancelled(self);
 }
 
 struct GroupCase {
@@ -747,19 +683,6 @@ int main(int argc, char **argv) {
     lyraTaskStart(origin, lyraTaskCreate(cancelDuringCall, &cancellation));
     lyraDomainRun(origin);
     check(gate.closed && lyraTaskState(call) == LYRA_TASK_CANCELLED, "native cleanup did not complete cancellation");
-    DisconnectCase disconnected{};
-    disconnected.locallyClosed = static_cast<bool *>(lyraGcAlloc(sizeof(bool)));
-    *disconnected.locallyClosed = false;
-    check(uv_socketpair(SOCK_STREAM, 0, disconnected.sockets, UV_NONBLOCK_PIPE, UV_NONBLOCK_PIPE) == 0, "cannot create test sockets");
-    disconnected.monitor = lyraRuntime::net::disconnectMonitor(disconnected.sockets[0]);
-    check(disconnected.monitor != 0, "cannot create disconnect monitor");
-    disconnected.handler = lyraTaskCreate(watchedHandler, &disconnected);
-    lyraTaskKeepCleanups(disconnected.handler, &disconnected.cleanups);
-    lyraTaskStart(origin, disconnected.handler);
-    lyraTaskStart(origin, lyraTaskCreate(observeDisconnect, &disconnected));
-    lyraDomainRun(origin);
-    check(disconnected.closed && lyraTaskState(disconnected.handler) == LYRA_TASK_CANCELLED, "request never finished cleanup");
-
     GroupCase group{};
     group.causes[0] = lyraExceptionCreate(lyraStringFromBytes("first", 5));
     group.causes[1] = lyraExceptionCreate(lyraStringFromBytes("second", 6));

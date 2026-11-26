@@ -43,7 +43,6 @@ LyraTask *lyraTaskSleep(int64_t milliseconds);
 LyraTask *lyraTaskSelect(size_t arms);
 void lyraTaskSelectArm(LyraTask *select, size_t index, const LyraTask *operation);
 void lyraTaskSharedCopy(void *destination, const void *source, size_t bytes);
-int lyraTaskWatchDisconnect(uintptr_t monitor, void *target, int (*locallyClosed)(const void *));
 void lyraTaskStart(LyraDomain *domain, LyraTask *task);
 LyraAwaitStatus lyraTaskAwaitValue(LyraTask *waiter, LyraTask *target, const LyraException **error);
 LyraAwaitStatus lyraTaskAwaitOutcome(LyraTask *waiter, LyraTask *target, const LyraException **error);

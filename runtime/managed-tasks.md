@@ -78,7 +78,11 @@ async fn main(): Result<Unit, String> {
 
 `lyraTaskBlock(self, work, nativeData)` 将同步 C 回调交给 libuv 进程级有界线程池，当前任务挂起，同域仍能执行其他步骤。存有 GC 引用的工作载荷须用 `lyraGcAlloc` 分配；运行时在操作期间保活载荷并注册 Worker，允许原生封装分配对象、复制结果（如 [SQLite 文本](sqlite.md)）。普通 `malloc` 载荷内部仍不扫描。工作线程不调用 Task API；不要同时无同步地修改同一个 C/C++ 字段。被接纳的工作运行中收到取消时，仍等 C 返回才在所属域恢复清理；提交前已经取消则不发起工作。可以用 `UV_THREADPOOL_SIZE=1` 重跑测试，验证不需要额外 Worker 解围。
 
-`lyraTaskWatchDisconnect(monitor)` 从当前任务注册连接断开通知，不读写或关闭请求套接字。Linux 用重复的 fd 加 libuv poll；Windows 给连接登记 Winsock `FD_CLOSE`，用独立的事件句柄和 libuv 通知所属域。断连时取消当前任务及其激活的孩子；C 工作返回后父任务才执行取消清理。未捕获的原生任务失败会取消仍在运行的兄弟，多个失败按登记顺序遍历。[原生任务用例](../tests/runtime_tasks.cpp)验证实际 socket 对断开、取消安全与逆序发生的两个失败。
+### 事件驱动的原生工作
+
+SDK 内部的 [`native_async.h`](native_async.h) 为外部事件源创建冷 Task。首次执行时，在提交回调前登记挂起状态、活跃 root 与执行器 lease。提交及撤销回调只投递命令，不同步回调调度器。外部事件在操作释放资源后确认完成；结果按 Lyra 的 ABI 装箱，`Task<Unit>` 的成功值也是一个可读的字节盒。Reactor 只登记完成，Task 在自己的域恢复，不在外部事件线程执行清理或用户代码。
+
+`lyraNativeTryComplete` 在调度锁内与取消竞争；成功交接的原生资源可以同时在拥有者中登记一个原生清理 Task。清理在子任务结束后启动，不继承取消或截止时间，运行结束才发布拥有者终态。它只供 SDK 资源作用域使用，不改变 Lyra `defer` 的规则。HTTP 的断线通知由自己的 Reactor 实现；不在普通 Task 上额外监听 socket。[原生交接用例](../tests/runtime_native_async.cpp)覆盖取消前后的保活与清理顺序。
 
 **任务上下文：**[std.task](../std/task/README.md) 用普通泛型函数提供隐式 trace 和 deadline。冷 Task 创建时没有快照，首次启动时从所有者继承；重复等待不重设。阻塞请求在提交时保留不可变快照，Worker 仅在调用期间可读，不能登记超时或 socket watch。每个更严格的作用域在所属事件循环安装单调时钟定时器；继承同一期限的子任务由上层传播取消，无需另建定时器。只有已经激活的所有者承担收尾责任。[源码用例](../tests/context_cli.py)用单 Worker 和受测试进程控制的标准输入固定等待顺序；[原生用例](../tests/runtime_context.cpp)验证任务局部的 GC 保活、提前结束时撤掉定时器及已挂起任务到期后被唤醒。
 
@@ -99,7 +103,7 @@ async fn main(): Result<Unit, String> {
 ```sh
 out=$(mktemp -d)
 clang++-18 -std=c++23 -O2 -I runtime -I include runtime/managed.cpp runtime/exceptions.cpp runtime/backtrace.cpp runtime/strings.cpp tests/runtime_managed.cpp $(pkg-config --cflags --libs bdw-gc) -ldl -o "$out/managed"
-clang++-18 -std=c++23 -O2 -I runtime -I include runtime/managed.cpp runtime/tasks.cpp runtime/strings.cpp runtime/context.cpp runtime/exceptions.cpp runtime/backtrace.cpp runtime/net.cpp tests/runtime_tasks.cpp $(pkg-config --cflags --libs bdw-gc libuv) -ldl -o "$out/tasks"
+clang++-18 -std=c++23 -O2 -I runtime -I include runtime/managed.cpp runtime/tasks.cpp runtime/strings.cpp runtime/context.cpp runtime/exceptions.cpp runtime/backtrace.cpp tests/runtime_tasks.cpp $(pkg-config --cflags --libs bdw-gc libuv) -ldl -o "$out/tasks"
 "$out/managed" && "$out/tasks" && UV_THREADPOOL_SIZE=1 "$out/tasks"
 readelf -d "$out/tasks" | grep NEEDED
 ```

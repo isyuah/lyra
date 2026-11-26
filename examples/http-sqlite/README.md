@@ -26,9 +26,9 @@ lyra build examples/http-sqlite --locked --offline -o "$work/users-app"
 
 手写 `GET /users/{id}` 处理器和宏生成的 `POST` 适配器共用 `Router` 注册表。`#post` 读取 `[path]`、`[query("tag")]` 和 `[body("newUserCodec")]` 参数标记，在同模块生成 `createUserRoute(router)` 挂载函数。body 解码使用从库导入的 `JsonCodec<NewUser>` 工厂；宏不扫描运行时类型。`@trace` 仍装饰业务函数，所以有效请求调用时会记录，参数校验失败和 JSON 解码失败不会调用它。
 
-`Router.serve(listener, capacity)` 用固定数量的槽登记接收游标，达到容量时不会接受额外请求；每个请求收到完整消息后才分派给并发 handler。请求断开只取消所属 handler，原生响应和 SQLite 工作安全收尾后再关闭句柄。服务每个监听槽都在独立执行域推进，可在线程池只有一个阻塞 worker 时同时处理连接与查询。
+`Router.serve(listener)` 使用 `listen` / `listenTls` 的 `HttpServerOptions` 限制并发。连接由独立的 libuv Reactor 推进，先读完请求再占用 handler 槽。断线只取消所属 handler；SQLite 工作安全收尾后，请求作用域才结束。即使阻塞池只有一个 Worker，网络读写和 TLS 握手也能继续推进。
 
-生产环境可传 `http.Shutdown()` 给 `serve`，信号到来后先停止接入，再等待在途请求完成；超过 `graceMs` 才取消尚未完成的 handler，并等待它们释放请求与 SQLite 资源。示例通过 `retryBusy` 对短暂的数据库锁冲突作有限退避，其他 `Busy` 或附带清理错误不会被重试。
+生产环境可把 `http.Shutdown()` 传给 `serve`。`request()` 先停止接入，再等待已进入的请求；超过监听配置的 `graceMs` 才取消剩余 handler，并等它们释放资源。示例通过 `retryBusy` 对短暂的数据库锁冲突作有限退避，带清理错误的失败不重试。
 
 ## SQL 快照与取消
 

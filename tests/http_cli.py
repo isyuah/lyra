@@ -23,6 +23,7 @@ CANCELLATION = Path(__file__).resolve().parent / "fixtures/http-cancel"
 HTTP_HELPERS = '''
 import std.http.{HttpError}
 import std.http.{HttpErrorKind}
+import std.http.{HttpServerOptions}
 import std.http.{listen}
 import std.http.{Response}
 
@@ -39,7 +40,10 @@ fn failed<T>(result: Result<T, HttpError>, expected: HttpErrorKind): Bool {
 @contextlib.contextmanager
 def server(app, *arguments):
     with running([app, *arguments], env={**os.environ, "UV_THREADPOOL_SIZE": "1"}) as (process, output):
-        yield int(output.line()), process, output
+        line = output.line()
+        if not line:
+            raise RuntimeError(f"server exited ({process.wait(timeout=5)}): {process.stderr.read().decode(errors='replace')}")
+        yield int(line), process, output
 
 
 def reset_on_close(connection):
@@ -69,6 +73,18 @@ class HTTP(unittest.TestCase):
             built = subprocess.run([COMPILER, "build", package, *package_flags, "-o", output, *flags], capture_output=True, timeout=45)
             self.assertEqual(built.returncode, 0, built.stderr.decode())
             yield profile, output
+
+    def test_native_async_extern_is_private_to_the_sdk(self):
+        package = self.root / "native-extern"
+        (package / "src").mkdir(parents=True)
+        (package / "lyra.json5").write_text("{name:'test/http-native-extern',version:'1.0.0'}")
+        source = package / "src/main.ly"
+        for declaration in ("extern fn hostTask(): Task<Int>;", "extern fn lyraHttpListenerCloseAsync(handle: CPtr): Task<Unit>;"):
+            with self.subTest(declaration=declaration):
+                source.write_text(declaration + "\nfn main(): Unit {}\n", encoding="utf-8")
+                result = subprocess.run([COMPILER, "check", package, "--diagnostics=json"], capture_output=True, timeout=20)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("LYF0001", [diagnostic["code"] for diagnostic in json.loads(result.stderr)])
 
     def test_sqlite_service(self):
         package = self.root / "service"
@@ -201,17 +217,17 @@ import std.http.{Request}
 import std.http.{Router}
 async fn hold(request: Request): Response {
     print("entered")
-    await blocking { request.waitDisconnect(15000); }
+    val _ = await request.waitDisconnect(15000)
     Response.text(200, "released")
 }
 async fn ready(request: Request): Response { Response.text(200, "ready") }
 async fn main(): Unit {
-    val listener = requireHttp(listen(0))
+    val listener = requireHttp(listen(0, options: HttpServerOptions(capacity: 1)))
     val router = Router()
     router.get("/hold", (request: Request) => { hold(request) })
     router.get("/ready", (request: Request) => { ready(request) })
     print(listener.port())
-    await router.serve(listener, 1)
+    await router.serve(listener)
 }
 ''')
         for profile, app in self.profiles(package):
@@ -233,6 +249,94 @@ async fn main(): Unit {
                 response.begin()
                 self.assertEqual((response.status, response.read()), (200, b"ready"))
 
+    def test_slow_connections_and_a_busy_worker_do_not_block_ready_requests(self):
+        package = self.root / "backpressure"
+        (package / "src").mkdir(parents=True)
+        (package / "lyra.json5").write_text("{name:'test/http-backpressure',version:'1.0.0'}")
+        (package / "src/main.ly").write_text(HTTP_HELPERS + '''
+import std.http.{Request, Router}
+import std.io.{readLine}
+
+async fn main(): Unit {
+    val listener = requireHttp(listen(0, options: HttpServerOptions(capacity: 2, idleReadTimeoutMs: Some(2000))))
+    val router = Router()
+    router.get("/hold", async (request: Request) => {
+        await blocking {
+            print("worker occupied")
+            #assert(match readLine() { Ok(Some(line)) => line == "release", _ => false })
+        }
+        Response.text(200, "released")
+    })
+    router.get("/ready", async (request: Request) => { Response.text(200, "ready") })
+    print(listener.port())
+    await router.serve(listener)
+}
+''', encoding="utf-8")
+
+        def connect(port, request):
+            connection = socket.create_connection(("127.0.0.1", port), timeout=5)
+            if request:
+                connection.sendall(request)
+            return connection
+
+        def response(connection):
+            with contextlib.closing(http.client.HTTPResponse(connection)) as reply:
+                reply.begin()
+                return reply.status, reply.getheader("Retry-After"), reply.read()
+
+        partial = b"GET /ready HTTP/1.1\r\nHost:"
+        for profile, app in self.profiles(package):
+            with self.subTest(profile=profile, phase="ready"), server(app) as (port, process, output), contextlib.ExitStack() as clients:
+                slow = clients.enter_context(connect(port, partial))
+                held = clients.enter_context(connect(port, b"GET /hold HTTP/1.1\r\nHost: localhost\r\n\r\n"))
+                self.assertEqual(output.line(), b"worker occupied\n")
+                with connect(port, b"GET /ready HTTP/1.1\r\nHost: localhost\r\n\r\n") as healthy:
+                    healthy.shutdown(socket.SHUT_WR)
+                    self.assertEqual(response(healthy), (200, None, b"ready"))
+                process.stdin.write(b"release\n")
+                process.stdin.flush()
+                self.assertEqual(response(held), (200, None, b"released"))
+                self.assertEqual(response(slow), (408, None, b""))
+            with self.subTest(profile=profile, phase="overload"), server(app) as (port, _, _), contextlib.ExitStack() as clients:
+                for _ in range(4):
+                    clients.enter_context(connect(port, partial))
+                with connect(port, None) as overloaded:
+                    self.assertEqual(response(overloaded), (503, "1", b""))
+
+    def test_cold_operations_and_expiration_of_unclaimed_requests(self):
+        package = self.root / "claim"
+        (package / "src").mkdir(parents=True)
+        (package / "lyra.json5").write_text("{name:'test/http-claim',version:'1.0.0'}")
+        (package / "src/main.ly").write_text(HTTP_HELPERS + '''
+import std.io.{readLine}
+
+async fn main(): Unit {
+    val listener = requireHttp(listen(0, options: HttpServerOptions(capacity: 1, claimTimeoutMs: 150)))
+    val _ = listener.accept()
+    print(listener.port())
+    val stale = requireHttp(await listener.accept(5000))
+    print(stale.target())
+    await blocking { val _ = readLine() }
+    #assert(failed(stale.claim(), HttpErrorKind.Closed), "an expired offer was claimed")
+    val active = requireHttp(await listener.accept(5000))
+    requireHttp(active.claim())
+    val _ = active.respond(Response.text(500, "cold response ran"))
+    await sleepMs(250)
+    requireHttp(await active.respond(Response.text(200, "claimed")))
+    await listener.closeAndWait()
+}
+''', encoding="utf-8")
+        for profile, app in self.profiles(package):
+            with self.subTest(profile=profile), server(app) as (port, process, output):
+                with socket.create_connection(("127.0.0.1", port), timeout=5) as stale:
+                    stale.sendall(b"GET /unclaimed HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                    self.assertEqual(output.line(), b"/unclaimed\n")
+                    self.assertEqual(stale.recv(1), b"")
+                process.stdin.write(b"continue\n")
+                process.stdin.flush()
+                self.assertEqual(exchange(port, "GET", "/claimed"), (200, "text/plain", b"claimed"))
+                self.assertEqual(process.wait(timeout=5), 0, process.stderr.read())
+
     def test_handler_bounds_failure_does_not_stop_the_server(self):
         package = self.root / "handler-error"
         (package / "src").mkdir(parents=True)
@@ -241,7 +345,7 @@ async fn main(): Unit {
 import std.http.{Request}
 import std.http.{Router}
 async fn main(): Unit {
-    val listener = requireHttp(listen(0))
+    val listener = requireHttp(listen(0, options: HttpServerOptions(capacity: 1)))
     val router = Router()
     router.get("/fail", async (request: Request) => {
         defer print("handler cleanup")
@@ -249,7 +353,7 @@ async fn main(): Unit {
     })
     router.get("/ready", async (request: Request) => { Response.text(200, "ready") })
     print(listener.port())
-    await router.serve(listener, 1)
+    await router.serve(listener)
 }
 ''', encoding="utf-8")
         for profile, app in self.profiles(package):
@@ -269,7 +373,7 @@ import std.http.{Shutdown}
 import std.io.{readLine}
 
 async fn main(): Unit {
-    val listener = requireHttp(listen(0))
+    val listener = requireHttp(listen(0, options: HttpServerOptions(capacity: 1, graceMs: 1000)))
     val router = Router()
     router.get("/delayed", async (request: Request) => {
         print("handler-started")
@@ -278,7 +382,7 @@ async fn main(): Unit {
         Response.text(200, "done")
     })
     val shutdown = Shutdown()
-    val service = spawn router.serve(listener, 1, Some(shutdown), 1000)
+    val service = spawn router.serve(listener, Some(shutdown))
     print(listener.port())
     await parallel { #assert(match readLine() { Ok(Some(line)) => line == "stop", _ => false }) }
     shutdown.request()
@@ -338,7 +442,7 @@ async fn writeDatabase(path: String): Result<Unit, DbError> {
 
 async fn main(): Unit {
     val arguments = match args() { Ok(value) => value, Err(error) => throw Exception(error.message()) }
-    val listener = requireHttp(listen(0))
+    val listener = requireHttp(listen(0, options: HttpServerOptions(capacity: 1, graceMs: 2000)))
     val router = Router()
     router.get("/write", async (request: Request) => {
         print("write-started")
@@ -349,7 +453,7 @@ async fn main(): Unit {
         }
     })
     val shutdown = Shutdown()
-    val service = spawn router.serve(listener, 1, Some(shutdown), 2000)
+    val service = spawn router.serve(listener, Some(shutdown))
     print(listener.port())
     await parallel { #assert(match readLine() { Ok(Some(line)) => line == "stop", _ => false }) }
     shutdown.request()
@@ -377,6 +481,79 @@ async fn main(): Unit {
                 with contextlib.closing(sqlite3.connect(database_path)) as database:
                     self.assertEqual(database.execute("SELECT value FROM writes").fetchall(), [(1,)])
 
+    def test_shutdown_cancels_at_grace_deadline_but_joins_native_write(self):
+        package = self.root / "shutdown-deadline"
+        (package / "src").mkdir(parents=True)
+        (package / "lyra.json5").write_text("{name:'test/http-shutdown-deadline',version:'1.0.0'}")
+        (package / "src/main.ly").write_text(HTTP_HELPERS + '''
+import std.http.{Request, Router, Shutdown}
+import std.io.{readLine}
+import std.os.{args}
+import std.sqlite.{DbError, withConnection}
+
+async fn write(path: String): Result<Unit, DbError> {
+    await blocking {
+        withConnection<Unit>(path) { db =>
+            db.transaction<Unit>() { tx =>
+                tx.exec("INSERT INTO writes VALUES (1)")?
+                print("transaction open")
+                #assert(match readLine() { Ok(Some(line)) => line == "commit", _ => false })
+                Ok({})
+            }
+        }
+    }
+}
+
+async fn observe(task: Task<Result<Unit, DbError>>): Unit {
+    defer print("observer stopped")
+    print("observer started")
+    val _ = await task
+}
+
+async fn main(): Unit {
+    val arguments = match args() { Ok(value) => value, Err(error) => throw Exception(error.message()) }
+    val listener = requireHttp(listen(0, options: HttpServerOptions(capacity: 2, graceMs: 0)))
+    val shutdown = Shutdown()
+    val router = Router()
+    router.get("/hold", async (request: Request) => {
+        defer print("handler released")
+        taskGroup {
+            val writing = spawn write(arguments[0])
+            spawn observe(writing);
+            val _ = await writing
+            print("handler resumed")
+        };
+        Response.text(200, "unexpected response")
+    })
+    router.get("/stop", async (request: Request) => {
+        shutdown.request()
+        Response.text(200, "stopping")
+    })
+    print(listener.port())
+    await router.serve(listener, Some(shutdown))
+    print("stopped")
+}
+''', encoding="utf-8")
+        for profile, app in self.profiles(package):
+            database = self.root / f"{profile}.sqlite"
+            with contextlib.closing(sqlite3.connect(database, timeout=0)) as connection:
+                connection.execute("CREATE TABLE writes(value INTEGER)")
+                with self.subTest(profile=profile), server(app, database) as (port, process, output):
+                    with socket.create_connection(("127.0.0.1", port), timeout=5) as held:
+                        held.sendall(b"GET /hold HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                        self.assertEqual({output.line(), output.line()}, {b"transaction open\n", b"observer started\n"})
+                        with socket.create_connection(("127.0.0.1", port), timeout=5) as stop:
+                            stop.sendall(b"GET /stop HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                            self.assertEqual(output.line(), b"observer stopped\n")
+                            self.assertIsNone(process.poll())
+                            with self.assertRaisesRegex(sqlite3.OperationalError, "database is locked"):
+                                connection.execute("BEGIN IMMEDIATE")
+                            process.stdin.write(b"commit\n")
+                            process.stdin.flush()
+                            self.assertEqual(process.wait(timeout=5), 0, process.stderr.read())
+                            self.assertEqual(output.remaining(), b"handler released\nstopped\n")
+                    self.assertEqual(connection.execute("SELECT value FROM writes").fetchall(), [(1,)])
+
     def test_bind_methods_head_and_allow(self):
         package = self.root / "methods"
         (package / "src").mkdir(parents=True)
@@ -403,7 +580,7 @@ async fn main(): Unit {
         Response.text(200, "options").withHeader("Access-Control-Allow-Origin", "*")
     })
     print(listener.port())
-    await router.serve(listener, 2)
+    await router.serve(listener)
 }
 ''', encoding="utf-8")
         for profile, app in self.profiles(package):
@@ -436,27 +613,19 @@ async fn main(): Unit {
         (package / "src").mkdir(parents=True)
         (package / "lyra.json5").write_text("{name:'test/http-lifetimes',version:'1.0.0'}")
         (package / "src/main.ly").write_text(HTTP_HELPERS + '''
-import std.http.{Busy}
-import std.http.{Listener}
 import std.http.{Request}
-
-fn tryClose(listener: Listener): Bool {
-    try { listener.close(); true } catch busy: Busy { false }
-}
 
 async fn raceListener(): Unit {
     val listener = requireHttp(listen(0))
-    val accepting = parallel { listener.accept(20) }
-    val closing = parallel { tryClose(listener) }
-    val closedImmediately = await closing
+    val accepting = spawn listener.accept(20)
+    val closing = parallel { listener.close() }
+    await closing
     val accepted = await accepting
-    #assert(failed(accepted, HttpErrorKind.Timeout) || failed(accepted, HttpErrorKind.Closed) ||
-        failed(accepted, HttpErrorKind.Busy), "accept sees timeout or concurrent close, not an invalid descriptor")
-    if !closedImmediately {
-        #assert(failed(accepted, HttpErrorKind.Timeout), "busy close leaves accept and socket intact")
-    }
+    #assert(failed(accepted, HttpErrorKind.Timeout) || failed(accepted, HttpErrorKind.Closed), "accept sees timeout or concurrent close")
     listener.close()
-    #assert(failed(listener.accept(0), HttpErrorKind.Closed), "close releases the listener once")
+    await listener.closeAndWait()
+    val closed = await listener.accept(0)
+    #assert(failed(closed, HttpErrorKind.Closed), "close releases the listener once")
 }
 
 fn sent(result: Result<Unit, HttpError>): Bool {
@@ -472,15 +641,15 @@ fn sent(result: Result<Unit, HttpError>): Bool {
 async fn main(): Unit {
     for attempt in 0..<8 { await raceListener() }
     val listener = requireHttp(listen(0))
-    defer listener.close()
     print(listener.port())
     requireHttp(await listener.withAccepted<Unit>(5000, async (request: Request) => {
-        val first = parallel { request.respond(Response.text(200, "first")) }
-        val second = parallel { request.respond(Response.text(200, "second")) }
+        val first = spawn request.respond(Response.text(200, "first"))
+        val second = spawn request.respond(Response.text(200, "second"))
         val firstSent = sent(await first)
         val secondSent = sent(await second)
         #assert(firstSent != secondSent, "exactly one response uses the socket")
     }))
+    await listener.closeAndWait()
 }
 ''', encoding="utf-8")
         for profile, app in self.profiles(package):
@@ -498,22 +667,25 @@ async fn main(): Unit {
 import std.http.{Request}
 import std.io.{readLine}
 
-async fn observe(work: Task<Unit>): Unit { await work }
+async fn waitForPeer(request: Request): Bool {
+    print("waiting")
+    await request.waitDisconnect(20000)
+}
 
 async fn main(): Unit {
     val listener = requireHttp(listen(0))
     defer listener.close()
     print(listener.port())
     requireHttp(await listener.withAccepted<Unit>(5000, async (request: Request) => {
-        val waiting = spawn blocking {
-            print("waiting")
-            #assert(!request.waitDisconnect(20000), "client closed instead of cancelling")
-        }
+        val waiting = spawn waitForPeer(request)
         await parallel { #assert(match readLine() { Ok(Some(line)) => line == "cancel", _ => false }, "cancel gate") }
         waiting.cancel()
-        taskGroup { spawn observe(waiting); }
-        #assert(!request.disconnected() && request.watchDisconnect(), "connection remains usable")
-        requireHttp(await blocking { request.respond(Response.text(200, "still connected")) })
+        val cancelled = awaitOutcome(waiting)
+        #assert(match cancelled { Cancelled(_) => true, _ => false })
+        val localClose = spawn request.waitDisconnect()
+        requireHttp(await request.respond(Response.text(200, "still connected")))
+        val lost = await localClose
+        #assert(!lost && !request.disconnected(), "local response close looked like a peer disconnect")
         await parallel { #assert(match readLine() { Ok(Some(line)) => line == "closed", _ => false }, "close gate") }
         #assert(!Task.cancelled(), "local response close cancelled its own handler")
         print("finished")
@@ -570,16 +742,28 @@ async fn main(): Unit {
         (package / "src").mkdir(parents=True)
         (package / "lyra.json5").write_text("{name:'test/http',version:'1.0.0'}")
         (package / "src/main.ly").write_text(HTTP_HELPERS + r'''
+import std.http.{Listener}
 import std.io.{readLine}
-fn main(): Unit {
-    val server = requireHttp(listen(0))
+
+async fn expectRejection(server: Listener, kind: HttpErrorKind): Unit {
+    val pending = spawn server.accept(5000)
+    val probe = await server.accept(0)
+    #assert(failed(probe, HttpErrorKind.Busy), "manual receiver was not registered")
+    print("send invalid request")
+    val rejected = await pending
+    #assert(failed(rejected, kind), "wrong rejection kind")
+}
+
+async fn main(): Unit {
+    val server = requireHttp(listen(0, options: HttpServerOptions(capacity: 1)))
     print(server.port())
-    val first = requireHttp(server.accept(5000))
+    val first = requireHttp(await server.accept(5000))
     print(first.method())
-    readLine()
-    #assert(first.waitDisconnect(5000) && first.disconnected(), "client still connected")
-    first.close()
-    val second = requireHttp(server.accept(5000))
+    await blocking { val _ = readLine() }
+    val lost = await first.waitDisconnect(5000)
+    #assert(lost && first.disconnected(), "client still connected")
+    await first.closeAndWait()
+    val second = requireHttp(await server.accept(5000))
     val headers = second.headers("X-Test")
     #assert(headers.size == 3 && headers[0] == "one" && headers[1] == "two" && headers[2] == "", "header order, case and empty value")
     #assert(failed(second.header("x-test"), HttpErrorKind.DuplicateHeader), "a repeated header is not single-valued")
@@ -589,20 +773,24 @@ fn main(): Unit {
     #assert(second.cookie("Session") == None && second.cookie("unknown") == None, "cookie names are case-sensitive")
     #assert(failed(second.text(), HttpErrorKind.InvalidUtf8), "byte body does not silently become text")
     val response = Response.bytes(200, "application/octet-stream", second.body()).withHeader("X-Echo", "present")
-    #assert(failed(second.respond(response.withHeader("content-length", "999")), HttpErrorKind.Invalid), "managed framing")
-    #assert(failed(second.respond(response.withHeader("X-Bad", "value\r\nX-Fake: value")), HttpErrorKind.Invalid), "invalid header")
-    requireHttp(second.respond(response))
-    #assert(failed(second.respond(response), HttpErrorKind.Closed), "write after close")
-    #assert(failed(server.accept(5000), HttpErrorKind.Malformed), "malformed input")
-    #assert(failed(server.accept(5000), HttpErrorKind.InvalidUtf8), "invalid text header")
-    #assert(failed(server.accept(5000), HttpErrorKind.TooLarge), "target size limit")
-    #assert(failed(server.accept(5000), HttpErrorKind.TooLarge), "header size limit")
+    val badLength = await second.respond(response.withHeader("content-length", "999"))
+    val badHeader = await second.respond(response.withHeader("X-Bad", "value\r\nX-Fake: value"))
+    #assert(failed(badLength, HttpErrorKind.Invalid), "managed framing")
+    #assert(failed(badHeader, HttpErrorKind.Invalid), "invalid header")
+    requireHttp(await second.respond(response))
+    val after = await second.respond(response)
+    #assert(failed(after, HttpErrorKind.Closed), "write after close")
+    await expectRejection(server, HttpErrorKind.Malformed)
+    await expectRejection(server, HttpErrorKind.InvalidUtf8)
+    await expectRejection(server, HttpErrorKind.TooLarge)
+    await expectRejection(server, HttpErrorKind.TooLarge)
     for attempt in 0..<3 {
-        #assert(failed(server.accept(5000), HttpErrorKind.Malformed), "require exactly one valid Host")
+        await expectRejection(server, HttpErrorKind.Malformed)
     }
-    #assert(failed(server.accept(5000), HttpErrorKind.UnsupportedExpectation), "reject Expect before reading the body")
-    server.close()
-    #assert(failed(server.accept(5000), HttpErrorKind.Closed), "accept after close")
+    await expectRejection(server, HttpErrorKind.UnsupportedExpectation)
+    await server.closeAndWait()
+    val closed = await server.accept(5000)
+    #assert(failed(closed, HttpErrorKind.Closed), "accept after close")
 }
 ''')
         for profile, app in self.profiles(package):
@@ -631,12 +819,13 @@ fn main(): Unit {
                     (b"GET / HTTP/1.1\r\nHost: user@localhost\r\n\r\n", 400),
                     (b"POST / HTTP/1.1\r\nHost: x\r\nExpect: 100-continue\r\nContent-Length: 4\r\n\r\n", 417),
                 ):
+                    self.assertEqual(output.line(), b"send invalid request\n")
                     with socket.create_connection(("127.0.0.1", port), 5) as sock:
                         sock.settimeout(2)
                         sock.sendall(raw)
-                        response = http.client.HTTPResponse(sock)
-                        response.begin()
-                        self.assertEqual(response.status, expected)
+                        with contextlib.closing(http.client.HTTPResponse(sock)) as response:
+                            response.begin()
+                            self.assertEqual((response.status, response.read()), (expected, b""))
                 self.assertEqual(process.wait(timeout=5), 0, process.stderr.read())
 
     def test_disconnect_cancels_owner_before_sqlite_worker_releases_its_cursor(self):

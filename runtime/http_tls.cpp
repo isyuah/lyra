@@ -1,8 +1,7 @@
 #include "http_transport.h"
 #include "strings.h"
-#include "tasks.h"
 
-#include <cerrno>
+#include <algorithm>
 #include <memory>
 #include <new>
 #include <openssl/err.h>
@@ -13,110 +12,94 @@
 namespace {
 
 namespace http = lyraRuntime::http;
-namespace net = lyraRuntime::net;
+using http::TlsProgress;
+using http::TlsStep;
 
-struct Connection { net::Socket socket; SSL* ssl; int status{}; };
+struct Connection { SSL* ssl; BIO* wire; };
 
-int receive(BIO* bio, char* bytes, int size) {
-    BIO_clear_retry_flags(bio);
-    auto& connection = *static_cast<Connection*>(BIO_get_data(bio));
-    auto count = net::receive(connection.socket, bytes, size);
-    connection.status = count < 0 ? net::error() : 0;
-    if (count < 0 && net::retry(connection.status)) BIO_set_retry_read(bio);
+void* open(void* context) {
+    constexpr std::size_t bioLimit = 32 * 1024;
+    auto connection = std::unique_ptr<Connection>(new (std::nothrow) Connection{});
+    if (!connection) return nullptr;
+    connection->ssl = SSL_new(static_cast<SSL_CTX*>(context));
+    if (!connection->ssl) return nullptr;
+    BIO* engine;
+    if (BIO_new_bio_pair(&engine, bioLimit, &connection->wire, bioLimit) != 1) {
+        SSL_free(connection->ssl);
+        return nullptr;
+    }
+    SSL_set_bio(connection->ssl, engine, engine);
+    SSL_set_accept_state(connection->ssl);
+    SSL_set_mode(connection->ssl, SSL_MODE_ENABLE_PARTIAL_WRITE | SSL_MODE_RELEASE_BUFFERS);
+    return connection.release();
+}
+
+std::size_t feed(void* state, const char* bytes, std::size_t size) {
+    auto* wire = static_cast<Connection*>(state)->wire;
+    auto available = std::min(size, BIO_ctrl_get_write_guarantee(wire));
+    std::size_t consumed = 0;
+    if (available) BIO_write_ex(wire, bytes, available, &consumed);
+    return consumed;
+}
+
+std::size_t flush(void* state, char* bytes, std::size_t size) {
+    auto* wire = static_cast<Connection*>(state)->wire;
+    std::size_t count = 0;
+    if (BIO_ctrl_pending(wire)) BIO_read_ex(wire, bytes, size, &count);
     return count;
 }
 
-int send(BIO* bio, const char* bytes, int size) {
-    BIO_clear_retry_flags(bio);
-    auto& connection = *static_cast<Connection*>(BIO_get_data(bio));
-    auto count = net::send(connection.socket, bytes, size);
-    connection.status = count < 0 ? net::error() : 0;
-    if (count < 0 && net::retry(connection.status)) BIO_set_retry_write(bio);
-    return count;
-}
+void endInput(void* state) { BIO_shutdown_wr(static_cast<Connection*>(state)->wire); }
 
-const BIO_METHOD* socketBio() {
-    static const auto* method = [] {
-        auto* value = BIO_meth_new(BIO_get_new_index() | BIO_TYPE_SOURCE_SINK, "Lyra TCP");
-        if (!value) return value;
-        if (!BIO_meth_set_read(value, receive) || !BIO_meth_set_write(value, send) ||
-            !BIO_meth_set_ctrl(value, [](BIO*, int command, long, void*) -> long { return command == BIO_CTRL_FLUSH; })) {
-            BIO_meth_free(value);
-            return static_cast<BIO_METHOD*>(nullptr);
-        }
-        return value;
-    }();
-    return method;
-}
-
-int open(void* context, net::Socket socket, void** result) {
-    auto connection = std::unique_ptr<Connection>(new (std::nothrow) Connection{socket, nullptr});
-    if (!connection) return ENOMEM;
-    auto* ssl = SSL_new(static_cast<SSL_CTX*>(context));
-    if (!ssl) return http::handshakeFailed;
-    auto* bio = BIO_new(socketBio());
-    if (!bio) { SSL_free(ssl); return ENOMEM; }
-    connection->ssl = ssl;
-    BIO_set_init(bio, 1);
-    BIO_set_data(bio, connection.get());
-    SSL_set_bio(ssl, bio, bio);
-    SSL_set_accept_state(ssl);
-    *result = connection.release();
-    return 0;
-}
-
-int drive(Connection& connection, const auto& operation, int* count, std::int64_t deadline, bool handshaking = false) {
-    for (;;) {
-        if (lyraBlockingCancelled()) return ECANCELED;
-        if (http::now() >= deadline) return ETIMEDOUT;
-        ERR_clear_error();
-        connection.status = 0;
-        auto result = operation(connection.ssl);
-        if (result > 0) { *count = result; return 0; }
-        auto error = SSL_get_error(connection.ssl, result);
-        if (!handshaking && error == SSL_ERROR_ZERO_RETURN) { *count = 0; return 0; }
-        if (error == SSL_ERROR_WANT_READ || error == SSL_ERROR_WANT_WRITE) {
-            auto ready = http::waitFor(connection.socket, error == SSL_ERROR_WANT_READ ? POLLIN : POLLOUT, deadline);
-            if (!ready) continue;
-            return ready;
-        }
-        if (handshaking) return http::handshakeFailed;
-        return error == SSL_ERROR_SYSCALL && connection.status ? connection.status : ECONNRESET;
+TlsStep progress(SSL* ssl, int result, std::size_t count = 0) {
+    if (result > 0) return {TlsProgress::Done, count};
+    switch (SSL_get_error(ssl, result)) {
+        case SSL_ERROR_WANT_READ: return {TlsProgress::WantInput};
+        case SSL_ERROR_WANT_WRITE: return {TlsProgress::WantOutput};
+        case SSL_ERROR_ZERO_RETURN: return {TlsProgress::End};
+        default: return {TlsProgress::Failed};
     }
 }
 
-int handshake(void* state, std::int64_t deadline) {
-    int unused;
-    return drive(*static_cast<Connection*>(state), SSL_accept, &unused, deadline, true);
+TlsStep handshake(void* state) {
+    auto* ssl = static_cast<Connection*>(state)->ssl;
+    ERR_clear_error();
+    return progress(ssl, SSL_accept(ssl));
 }
 
-int read(void* state, char* bytes, int size, int* count, std::int64_t deadline) {
-    return drive(*static_cast<Connection*>(state), [&](auto* ssl) { return SSL_read(ssl, bytes, size); }, count, deadline);
+TlsStep read(void* state, char* bytes, std::size_t size) {
+    auto* ssl = static_cast<Connection*>(state)->ssl;
+    std::size_t count = 0;
+    ERR_clear_error();
+    auto result = SSL_read_ex(ssl, bytes, size, &count);
+    return progress(ssl, result, count);
 }
 
-int write(void* state, const char* bytes, int size, int* count, std::int64_t deadline) {
-    return drive(*static_cast<Connection*>(state), [&](auto* ssl) { return SSL_write(ssl, bytes, size); }, count, deadline);
+TlsStep write(void* state, const char* bytes, std::size_t size) {
+    auto* ssl = static_cast<Connection*>(state)->ssl;
+    std::size_t count = 0;
+    ERR_clear_error();
+    auto result = SSL_write_ex(ssl, bytes, size, &count);
+    return progress(ssl, result, count);
 }
 
-void shutdown(void* state, std::int64_t deadline) {
-    auto& connection = *static_cast<Connection*>(state);
-    while (!lyraBlockingCancelled() && http::now() < deadline) {
-        ERR_clear_error();
-        auto result = SSL_shutdown(connection.ssl);
-        if (result >= 0 || SSL_get_error(connection.ssl, result) != SSL_ERROR_WANT_WRITE ||
-            http::waitFor(connection.socket, POLLOUT, deadline)) return;
-    }
+TlsStep shutdown(void* state) {
+    auto* ssl = static_cast<Connection*>(state)->ssl;
+    ERR_clear_error();
+    auto result = SSL_shutdown(ssl);
+    return result >= 0 ? TlsStep{TlsProgress::Done} : progress(ssl, result);
 }
 
 void releaseConnection(void* state) {
     auto* connection = static_cast<Connection*>(state);
     SSL_free(connection->ssl);
+    BIO_free(connection->wire);
     delete connection;
 }
 
 void releaseListener(void* state) { SSL_CTX_free(static_cast<SSL_CTX*>(state)); }
 
-constexpr http::Transport transport{open, handshake, read, write, shutdown, releaseConnection, releaseListener};
+constexpr http::Transport transport{open, feed, flush, endInput, handshake, read, write, shutdown, releaseConnection, releaseListener};
 
 bool trim(std::string_view& pem) {
     auto begin = pem.find_first_not_of(" \t\r\n");
@@ -162,18 +145,17 @@ void* configurationError(std::string_view detail) {
 
 }
 
-extern "C" void* lyraHttpTlsListen(const void* host, std::int64_t port, const void* chain, const void* key, std::int64_t handshakeTimeout) {
+extern "C" void* lyraHttpTlsListen(const void* host, std::int64_t port, const void* chain, const void* key, const http::ServerOptions* options) {
     constexpr std::size_t pemLimit = 4 * 1024 * 1024;
     auto chainSize = lyraStringLength(chain), keySize = lyraStringLength(key);
     if (chainSize == 0 || chainSize > pemLimit || keySize == 0 || keySize > pemLimit)
         return configurationError("certificate chain and private key must each be 1 byte to 4 MiB");
-    if (handshakeTimeout < 1 || handshakeTimeout > 600000) return configurationError("handshake timeout must be in 1..600000 ms");
-    if (OPENSSL_init_ssl(OPENSSL_INIT_NO_LOAD_CONFIG, nullptr) != 1 || !socketBio()) return configurationError("cannot initialize TLS");
+    if (OPENSSL_init_ssl(OPENSSL_INIT_NO_LOAD_CONFIG, nullptr) != 1) return configurationError("cannot initialize TLS");
     auto context = std::unique_ptr<SSL_CTX, decltype(&SSL_CTX_free)>(SSL_CTX_new(TLS_server_method()), SSL_CTX_free);
     if (!context || SSL_CTX_set_min_proto_version(context.get(), TLS1_2_VERSION) != 1 ||
         SSL_CTX_set_max_proto_version(context.get(), TLS1_3_VERSION) != 1) return configurationError("cannot configure TLS 1.2/1.3");
     SSL_CTX_set_options(context.get(), SSL_OP_NO_COMPRESSION | SSL_OP_NO_RENEGOTIATION);
     if (!loadChain(context.get(), {lyraStringBytes(chain), chainSize})) return configurationError("invalid PEM certificate chain");
     if (!loadKey(context.get(), {lyraStringBytes(key), keySize})) return configurationError("invalid or mismatched PEM private key");
-    return lyraHttpListenWithTransport(host, port, &transport, context.release(), handshakeTimeout);
+    return lyraHttpListenWithTransport(host, port, options, &transport, context.release());
 }

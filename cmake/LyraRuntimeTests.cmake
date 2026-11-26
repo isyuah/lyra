@@ -1,4 +1,4 @@
-set(lyraRuntimeTestComponents managed tasks sqlite lists exceptions context task_errors sync native_async)
+set(lyraRuntimeTestComponents managed tasks sqlite lists exceptions context task_errors sync native_async http_reactor)
 
 function(lyra_build_runtime_tests)
     foreach(component IN LISTS lyraRuntimeTestComponents)

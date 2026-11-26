@@ -15,24 +15,24 @@ async fn main(): Unit {
     router.get("/hello/{name}", async (request: Request) => {
         Response.text(200, "你好 " + (request.path("name") ?? ""))
     })
-    await router.serve(server, capacity: 4)
+    await router.serve(server)
 }
 ```
 
-`listen(port, host: "127.0.0.1")` 返回 `Result<Listener, HttpError>`。`host` 使用数值 IPv4 或 IPv6 地址；如需对外监听，显式用 `0.0.0.0` 或 `::`，分别开放对应协议。传 `0` 让系统分配端口，`port()` 读取实际值。`Router.serve(listener, capacity, shutdown, graceMs)` 接管监听器，用固定接收槽并发处理路由，容量必须在 1..64。`shutdown` 默认为 `None`，`graceMs` 默认为 5000。
+`listen(port, host: "127.0.0.1", options: HttpServerOptions())` 返回 `Result<Listener, HttpError>`。`host` 使用数值 IPv4 或 IPv6 地址；如需对外监听，显式用 `0.0.0.0` 或 `::`。端口 `0` 让系统分配，`port()` 读取实际值。`Router.serve(listener, shutdown: …)` 接管监听器，使用 `options.capacity`（默认 4，范围 1..64）限制同时处理的请求。容量 `N` 的 listener 最多持有 `2N` 条普通连接和一个限时拒绝槽，过载尽力返回 `503` 与 `Retry-After: 1`。
 
-不用 Router 时，同步代码用 `listener.accept(timeoutMs): Result<Request, HttpError>`，成功后自行关闭请求。异步代码用 `await listener.withAccepted<T>(timeoutMs, handler)`，其中 `handler` 的类型为 `(Request) -> Task<T>`：
+不用 Router 时，推荐 `await listener.withAccepted<T>(timeoutMs, handler)`，其中 `handler` 的类型为 `(Request) -> Task<T>`：
 
 ```lyra
 val handled = await server.withAccepted<Unit>(5000, async (request: Request) => {
-    match await blocking { request.respond(Response.text(200, "ready")) } {
+    match await request.respond(Response.text(200, "ready")) {
         Ok(_) => {},
         Err(error) => throw Exception(error.message()),
     }
 })
 ```
 
-两者的超时都覆盖等待连接和读取完整请求。`withAccepted` 接受 `1..2147483647` 毫秒，返回 `Result<T, HttpError>`；回调成功、抛异常或取消后均关闭请求。接收过程中取消也会清理尚未交付的连接。不要从 `blocking { listener.accept(...) }` 直接返回请求，取消可能丢弃尚未由调用者接管的句柄。
+`withAccepted` 在回调成功、抛异常或取消后，等待原生连接释放再结束。`await listener.accept(timeoutMs)` 是低层版本：返回裸请求后，若不立即响应，调用 `request.claim()` 认领，并自行关闭。请求默认在发放 5000ms 后仍未被认领就关闭。两种接收的 `timeoutMs` 控制等待已解析请求，`-1` 无期限，`0` 只取当前就绪项；已登记的手动接收也可能得到客户端解析或握手错误。请求接入后的独立计时见 [`HttpServerOptions`](../../rfc/http-reactor.md#接入超时与背压)。
 
 ## 请求、路由、响应
 
@@ -46,11 +46,11 @@ val handled = await server.withAccepted<Unit>(5000, async (request: Request) => 
 
 ## 关闭与断线
 
-同一监听器可并行接受多个连接。传入 `Shutdown()` 后，可从信号处理任务调用 `request()`：服务停止接收新连接、关闭监听器，并等待已接收请求最多 `graceMs` 毫秒；到期后取消仍在运行的 handler，等待其清理和原生工作收尾，再返回。随后服务拥有并关闭监听器。没有传 shutdown 时，可取消服务任务并等待它收尾。手动关闭前，应停止并等待该监听器的 `accept` 操作结束；占用中的 `close()` 抛出 `std.http.Busy`，不会关闭仍在使用的句柄。请求同样会在响应写入与其他原生操作冲突时返回 `HttpErrorKind.Busy`，关闭与写入冲突时抛出 `Busy`。在关闭完成后再次 `close()` 无副作用。
+`Shutdown.request()` 停止接入并丢弃未认领请求，等待已进入的 handler 最多 `options.graceMs` 毫秒（默认 5000）；到期取消剩余任务，再等原生工作和清理结束。直接取消服务则跳过宽限期。`Listener` 和 `Request` 的 `close()` 只请求关闭，可重复调用；`await closeAndWait()` 等待资源回收。并发响应只有一个胜者，另一个得到 `Busy` 或 `Closed`。
 
 ```lyra
 val shutdown = Shutdown()
-val serving = spawn router.serve(listener, capacity: 4, shutdown: Some(shutdown), graceMs: 5000)
+val serving = spawn router.serve(listener, shutdown: Some(shutdown))
 await waitForTerminationSignal()
 shutdown.request()
 await serving
@@ -58,8 +58,8 @@ await serving
 
 `Shutdown.request()` 可重复调用；该对象用于在异步任务间传递停机信号，不代表操作系统信号处理器。
 
-在异步 handler 中，`request.watchDisconnect()` 把当前请求登记到**当前 Task**：注册成功返回 `true`，随后对端断开会取消这个 Task 及它的子任务。本地 `close()` 或响应完成不会取消 Task。在同步 `main` 或阻塞池线程内无法登记。`disconnected()` 查询当前连接状态；`waitDisconnect(timeoutMs)` 同步等待，在 `blocking` 中会响应任务取消，不必等到超时。当前实现把对端关闭写方向也视为断线，客户端应在读取响应后再关闭连接。
+`await request.waitDisconnect(timeoutMs)` 在对端断线时返回 `true`，超时或本地关闭返回 `false`；`disconnected()` 读取已经观测到的断线状态。完整请求后的 TCP 半关闭仍可响应。Router 自动取消对端已断线的 handler 及其子任务；手写接收循环可以用一个子任务等待断线并取消 handler。
 
-数据库访问和响应写入等同步工作可以放在 `await blocking { ... }` 中。把断线监听挂到每个请求自己的子任务，不要挂到整个服务的根任务；在请求组收尾后再关闭请求。完整的 [SQLite 服务](../../examples/http-sqlite/README.md) 演示了这条路径。
+连接读写、TLS 握手和断线由独立 Reactor 推进，直接 `await`，无需 `parallel` 或 `blocking`。SQLite 等同步工作仍用 `blocking`；完整的 [SQLite 服务](../../examples/http-sqlite/README.md) 演示了这条路径。
 
 解析器为静态链接的官方 llhttp 9.3.0。开发机首次配置会下载带 SHA-256 校验的**生成版 C 源码**到 `$XDG_CACHE_HOME/lyra/toolchain`（未设置则 `$HOME/.cache/lyra/toolchain`）。以后两个预设及多个工作区共享缓存。离线配置用 `cmake --preset dev -DLYRA_LLHTTP_OFFLINE=ON`；全新离线环境设置 `-DLYRA_LLHTTP_SOURCE_DIR=/path/to/llhttp-release-v9.3.0`。约束使用上游 `release/v9.3.0` 的归档，而不是需要 Node.js 生成 C 的普通源码标签。应用部署不需要 Node.js、动态 llhttp 或编译器。

@@ -1,31 +1,33 @@
 import std.io.{writeError}
 import std.json.{JsonCodec}
 import std.task.{withTimeout}
-import std.time.{Clock}
 
-extern fn lyraHttpListen(host: String, port: Int): CPtr;
+extern fn lyraHttpListen(host: String, port: Int, options: CPtr): CPtr;
+extern fn lyraHttpOptions(capacity: Int, requestTimeoutMs: Int, idleReadTimeoutMs: Int, writeTimeoutMs: Int, handshakeTimeoutMs: Int, graceMs: Int, claimTimeoutMs: Int): CPtr;
 extern fn lyraHttpStatus(server: CPtr): Int;
 extern fn lyraHttpStatusDetail(server: CPtr): String;
 extern fn lyraHttpErrorKind(status: Int): Int;
 extern fn lyraHttpPort(server: CPtr): Int;
+extern fn lyraHttpCapacity(server: CPtr): Int;
+extern fn lyraHttpGraceMs(server: CPtr): Int;
 extern fn lyraHttpBeginDrain(server: CPtr): Unit;
-extern fn lyraHttpStop(server: CPtr): Int;
-extern fn lyraHttpAccept(server: CPtr, timeoutMs: Int): CPtr;
+extern fn lyraHttpStop(server: CPtr): Unit;
+extern fn lyraHttpListenerCloseAsync(server: CPtr): Task<Unit>;
+extern fn lyraHttpListenerScopeAsync(server: CPtr): Task<Unit>;
+extern fn lyraHttpKeepListener(server: CPtr): Unit;
+extern fn lyraHttpAcceptAsync(server: CPtr, timeoutMs: Int, scoped: Bool, reportRejections: Bool): Task<CPtr>;
 extern fn lyraHttpRequestStatus(request: CPtr): Int;
 extern fn lyraHttpMethod(request: CPtr): String;
 extern fn lyraHttpTarget(request: CPtr): String;
 extern fn lyraHttpBody(request: CPtr): Bytes;
-extern fn lyraHttpDisconnected(request: CPtr): Int;
-extern fn lyraHttpWaitDisconnect(request: CPtr, timeoutMs: Int): Int;
-extern fn lyraHttpWatchDisconnect(request: CPtr): Bool;
-extern fn lyraHttpDrop(request: CPtr): Int;
+extern fn lyraHttpDisconnected(request: CPtr): Bool;
+extern fn lyraHttpWaitDisconnectAsync(request: CPtr, timeoutMs: Int): Task<Int>;
+extern fn lyraHttpClaim(request: CPtr): Int;
+extern fn lyraHttpDrop(request: CPtr): Unit;
+extern fn lyraHttpRequestCloseAsync(request: CPtr): Task<Unit>;
 extern fn lyraHttpResponseHeaders(count: Int): CPtr;
 extern fn lyraHttpResponseHeaderSet(headers: CPtr, index: Int, name: String, value: String): Int;
-extern fn lyraHttpRespond(request: CPtr, code: Int, mediaType: String, body: Bytes, headers: CPtr): Int;
-extern fn lyraHttpAcceptCursor(server: CPtr, timeoutMs: Int): CPtr;
-extern fn lyraHttpAcceptAdvance(cursor: CPtr): Int;
-extern fn lyraHttpAcceptTake(cursor: CPtr): CPtr;
-extern fn lyraHttpAcceptDrop(cursor: CPtr): Unit;
+extern fn lyraHttpRespondAsync(request: CPtr, code: Int, mediaType: String, body: Bytes, headers: CPtr): Task<Int>;
 extern fn lyraHttpRouteMethodValid(method: String): Bool;
 extern fn lyraHttpRoutePattern(route: String): CPtr;
 extern fn lyraHttpRouteValid(route: CPtr): Bool;
@@ -49,8 +51,6 @@ pub enum HttpErrorKind {
     System(Int), Invalid, Closed, Busy, Timeout, Malformed, TooLarge, InvalidUtf8, InvalidJson, DuplicateHeader,
     TlsConfig, HandshakeFailed, HandshakeTimeout, UnsupportedExpectation,
 }
-
-pub exception Busy
 
 pub struct HttpError(pub val kind: HttpErrorKind, pub val operation: String, pub val detail: String = "") {
     pub fn message(): String {
@@ -92,13 +92,27 @@ fn httpError(operation: String, status: Int, detail: String = ""): HttpError {
     HttpError(kind, operation, detail)
 }
 
-fn closeHandle(status: Int, operation: String): Unit {
-    if status != 0 { throw Busy(httpError(operation, status).message()) }
+pub struct HttpServerOptions(
+    pub val capacity: Int = 4,
+    pub val requestTimeoutMs: Int = 30000,
+    pub val idleReadTimeoutMs: Int? = None,
+    pub val writeTimeoutMs: Int = 5000,
+    pub val handshakeTimeoutMs: Int = 5000,
+    pub val graceMs: Int = 5000,
+    pub val claimTimeoutMs: Int = 5000,
+)
+
+fn serverOptions(options: HttpServerOptions): CPtr {
+    val idle = match options.idleReadTimeoutMs {
+        None => -1,
+        Some(milliseconds) => if milliseconds < 1 { 0 } else { milliseconds },
+    }
+    lyraHttpOptions(options.capacity, options.requestTimeoutMs, idle, options.writeTimeoutMs, options.handshakeTimeoutMs, options.graceMs, options.claimTimeoutMs)
 }
 
-fn observedDisconnect(status: Int): Bool {
-    if status < 0 { throw Busy(httpError("request.disconnect", -status).message()) }
-    status == 1
+fn acceptResult(request: CPtr): Result<Request, HttpError> {
+    val status = lyraHttpRequestStatus(request)
+    if status == 0 { Ok(Request(request)) } else { Err(httpError("accept", status)) }
 }
 
 pub class Listener {
@@ -106,18 +120,15 @@ pub class Listener {
     init(handle: CPtr) { this.handle = handle }
 
     pub fn port(): Int { lyraHttpPort(handle) }
-    pub fn accept(timeoutMs: Int): Result<Request, HttpError> {
-        val request = lyraHttpAccept(handle, timeoutMs)
-        val status = lyraHttpRequestStatus(request)
-        if status == 0 { Ok(Request(request)) } else { Err(httpError("accept", status)) }
+    pub async fn accept(timeoutMs: Int = -1): Result<Request, HttpError> {
+        acceptResult(await lyraHttpAcceptAsync(handle, timeoutMs, false, true))
     }
     pub async fn withAccepted<T>(timeoutMs: Int, handleRequest: (Request) -> Task<T>): Result<T, HttpError> {
-        if timeoutMs < 1 || timeoutMs > 2147483647 { return Err(HttpError(HttpErrorKind.Invalid, "accept")) }
-        val cursor = lyraHttpAcceptCursor(handle, timeoutMs)
-        defer lyraHttpAcceptDrop(cursor)
-        await acceptScoped<T>(cursor, handleRequest)
+        val request = acceptResult(await lyraHttpAcceptAsync(handle, timeoutMs, true, true))?
+        Ok(await handleRequest(request))
     }
-    pub fn close(): Unit { closeHandle(lyraHttpStop(handle), "listener.close") }
+    pub fn close(): Unit { lyraHttpStop(handle) }
+    pub async fn closeAndWait(): Unit { await lyraHttpListenerCloseAsync(handle) }
 }
 
 pub struct Header(pub val name: String, pub val value: String)
@@ -197,10 +208,17 @@ pub class Request {
             Err(detail) => Err(HttpError(HttpErrorKind.InvalidJson, "request.json", detail)),
         }
     }
-    pub fn disconnected(): Bool { observedDisconnect(lyraHttpDisconnected(handle)) }
-    pub fn waitDisconnect(timeoutMs: Int): Bool { observedDisconnect(lyraHttpWaitDisconnect(handle, timeoutMs)) }
-    pub fn watchDisconnect(): Bool { lyraHttpWatchDisconnect(handle) }
-    pub fn respond(response: Response): Result<Unit, HttpError> {
+    pub fn disconnected(): Bool { lyraHttpDisconnected(handle) }
+    pub async fn waitDisconnect(timeoutMs: Int = -1): Bool {
+        val status = await lyraHttpWaitDisconnectAsync(handle, timeoutMs)
+        if status < 0 { throw Exception(httpError("request.disconnect", -status).message()) }
+        status == 1
+    }
+    pub fn claim(): Result<Unit, HttpError> {
+        val status = lyraHttpClaim(handle)
+        if status == 0 { Ok({}) } else { Err(httpError("request.claim", status)) }
+    }
+    pub async fn respond(response: Response): Result<Unit, HttpError> {
         val headers = lyraHttpResponseHeaders(response.headers.size)
         if headers.isNull() { return Err(HttpError(HttpErrorKind.TooLarge, "respond")) }
         for index in 0..<response.headers.size {
@@ -208,10 +226,11 @@ pub class Request {
             val status = lyraHttpResponseHeaderSet(headers, index, field.name, field.value)
             if status != 0 { return Err(httpError("respond", status)) }
         }
-        val status = lyraHttpRespond(handle, response.code, response.contentType, response.body, headers)
+        val status = await lyraHttpRespondAsync(handle, response.code, response.contentType, response.body, headers)
         if status == 0 { Ok({}) } else { Err(httpError("respond", status)) }
     }
-    pub fn close(): Unit { closeHandle(lyraHttpDrop(handle), "request.close") }
+    pub fn close(): Unit { lyraHttpDrop(handle) }
+    pub async fn closeAndWait(): Unit { await lyraHttpRequestCloseAsync(handle) }
 }
 
 fn listenerResult(handle: CPtr, operation: String): Result<Listener, HttpError> {
@@ -219,8 +238,8 @@ fn listenerResult(handle: CPtr, operation: String): Result<Listener, HttpError> 
     if status == 0 { Ok(Listener(handle)) } else { Err(httpError(operation, status, lyraHttpStatusDetail(handle))) }
 }
 
-pub fn listen(port: Int, host: String = "127.0.0.1"): Result<Listener, HttpError> {
-    listenerResult(lyraHttpListen(host, port), "listen")
+pub fn listen(port: Int, host: String = "127.0.0.1", options: HttpServerOptions = HttpServerOptions()): Result<Listener, HttpError> {
+    listenerResult(lyraHttpListen(host, port, serverOptions(options)), "listen")
 }
 
 struct Route(val method: String, val pattern: CPtr, val handler: (Request) -> Task<Response>)
@@ -249,32 +268,20 @@ pub class Router {
         routes.add(Route(method, compiled, handler))
     }
 
-    pub async fn serve(listener: Listener, capacity: Int = 4, shutdown: Shutdown? = None, graceMs: Int = 5000): Unit {
-        if capacity < 1 || capacity > 64 { throw Exception("HTTP capacity must be in 1..64") }
-        if graceMs < 0 { throw Exception("HTTP graceMs must be nonnegative") }
-        defer listener.close()
+    pub async fn serve(listener: Listener, shutdown: Shutdown? = None): Unit {
+        lyraHttpKeepListener(listener.handle)
         val snapshot: List<Route> = []
         for route in routes { snapshot.add(route) }
         taskGroup {
+            spawn lyraHttpListenerScopeAsync(listener.handle);
             val slots: List<Task<Unit>> = []
-            for slot in 0..<capacity { slots.add(spawn serveSlot(listener, snapshot)) }
+            for slot in 0..<lyraHttpCapacity(listener.handle) { slots.add(spawn serveSlot(listener, snapshot)) }
             if let Some(stop) = shutdown {
-                await stop.wait()
-                val started = Clock.monotonicMs()
-                lyraHttpBeginDrain(listener.handle)
-                var status = lyraHttpStop(listener.handle)
-                while lyraHttpErrorKind(status) == 10 {
-                    await sleepMs(1)
-                    status = lyraHttpStop(listener.handle)
-                }
-                closeHandle(status, "listener.close")
-                val elapsed = Clock.monotonicMs() - started
-                val remaining = if elapsed >= graceMs { 0 } else { graceMs - elapsed }
-                if let Cancelled(_) = awaitOutcome(withTimeout(remaining, joinSlots(slots))) {
-                    for slot in slots { slot.cancel() }
-                }
-            }
-        }
+                val stopping = spawn drainOnShutdown(listener, stop, slots)
+                await joinSlots(slots)
+                stopping.cancel()
+            } else { await joinSlots(slots) }
+        };
     }
 }
 
@@ -311,49 +318,53 @@ async fn dispatch(request: Request, routes: List<Route>): Response {
 }
 
 async fn respond(request: Request, routes: List<Route>): Unit {
-    val response = if request.watchDisconnect() {
-        try { await dispatch(request, routes) } catch {
-            val _ = writeError("HTTP handler raised an exception\n")
-            Response.text(500, "internal server error")
-        }
-    } else { Response.text(500, "disconnect watch unavailable") }
+    val response = try { await dispatch(request, routes) } catch {
+        val _ = writeError("HTTP handler raised an exception\n")
+        Response.text(500, "internal server error")
+    }
     if request.disconnected() { return }
-    val sent = await blocking { request.respond(response) }
+    val sent = await request.respond(response)
     if let Err(error) = sent {
         val _ = writeError("HTTP response failed: ${error.message()}\n")
         if error.kind == HttpErrorKind.Invalid || error.kind == HttpErrorKind.TooLarge {
-            val _ = await blocking { request.respond(Response.text(500, "internal server error")) }
+            val _ = await request.respond(Response.text(500, "internal server error"))
         }
     }
 }
 
-async fn acceptScoped<T>(cursor: CPtr, handleRequest: (Request) -> Task<T>): Result<T, HttpError> {
-    var status = 0
-    while status == 0 {
-        status = await parallel { lyraHttpAcceptAdvance(cursor) }
+async fn cancelOnDisconnect(request: Request, handler: Task<Unit>): Unit {
+    if await request.waitDisconnect() { handler.cancel() }
+}
+
+async fn serveRequest(listener: Listener, routes: List<Route>): Bool {
+    val request = match acceptResult(await lyraHttpAcceptAsync(listener.handle, -1, true, false)) {
+        Ok(value) => value,
+        Err(error) => {
+            if error.kind == HttpErrorKind.Closed { return false }
+            throw Exception(error.message())
+        }
     }
-    if status < 0 { return Err(httpError("accept", -status)) }
-    val handle = lyraHttpAcceptTake(cursor)
-    if handle.isNull() { return Err(HttpError(HttpErrorKind.Closed, "accept")) }
-    val request = Request(handle)
-    defer request.close()
-    Ok(await handleRequest(request))
+    taskGroup {
+        val handler = spawn respond(request, routes)
+        val watcher = spawn cancelOnDisconnect(request, handler)
+        if let Failed(error) = awaitOutcome(handler) { throw error }
+        watcher.cancel()
+    };
+    true
 }
 
 async fn serveSlot(listener: Listener, routes: List<Route>): Unit {
-    val cursor = lyraHttpAcceptCursor(listener.handle, -1)
-    defer lyraHttpAcceptDrop(cursor)
-    while true {
-        val accepted = await acceptScoped<Unit>(cursor, async (request: Request) => {
-            taskGroup { spawn respond(request, routes); };
-        })
-        if let Err(error) = accepted {
-            if error.kind == HttpErrorKind.Closed { return }
-            throw Exception(error.message())
-        }
+    while await serveRequest(listener, routes) {}
+}
+
+async fn drainOnShutdown(listener: Listener, stop: Shutdown, slots: List<Task<Unit>>): Unit {
+    await stop.wait()
+    lyraHttpBeginDrain(listener.handle)
+    if let Cancelled(_) = awaitOutcome(withTimeout(lyraHttpGraceMs(listener.handle), joinSlots(slots))) {
+        for slot in slots { slot.cancel() }
     }
 }
 
 async fn joinSlots(slots: List<Task<Unit>>): Unit {
-    for slot in slots { await slot }
+    for slot in slots { val _ = awaitOutcome(slot) }
 }
