@@ -4436,6 +4436,7 @@ static CheckedModule checkProgram(Module module, const std::vector<Source>& sour
         candidates.push_back(symbols.callables.size());
     };
     for (std::size_t functionIndex = 0; functionIndex < module.functions.size(); ++functionIndex) {
+        checkAnalysisCancellation();
         auto& function = module.functions[functionIndex];
         const auto& source = sources[function.file];
         auto enumOwner = function.owner ? symbols.enums.find(function.owner->text) : symbols.enums.end();
@@ -4548,6 +4549,7 @@ static CheckedModule checkProgram(Module module, const std::vector<Source>& sour
         for (const auto& call : fn.calls) calls.emplace_back(call.file, call.span.begin);
     };
     auto analyzeBody = [&](auto&& analyze) -> bool {
+        checkAnalysisCancellation();
         if (!diagnostics) { analyze(); return true; }
         if (diagnostics->full()) return false;
         Symbols::BodyTrial transaction{symbols};

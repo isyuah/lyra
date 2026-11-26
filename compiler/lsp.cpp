@@ -3,6 +3,7 @@ module;
 #include <array>
 #include <atomic>
 #include <cctype>
+#include <charconv>
 #include <chrono>
 #include <compare>
 #include <condition_variable>
@@ -21,6 +22,7 @@ module;
 #include <ranges>
 #include <set>
 #include <span>
+#include <stop_token>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -49,7 +51,13 @@ namespace fs = std::filesystem;
 namespace {
 namespace json = llvm::json;
 
-struct Document { fs::path path; std::string uri, text; std::int64_t version{}; };
+struct Document {
+    fs::path path;
+    std::string uri;
+    std::shared_ptr<const std::string> contents;
+    std::int64_t version{};
+    const std::string& text() const { return *contents; }
+};
 using Documents = std::map<std::string, Document>;
 struct Workspace {
     std::vector<Source> sources;
@@ -90,6 +98,7 @@ fs::path decodeUri(std::string_view uri) {
             index += 2;
         } else text += uri[index];
     }
+    if (text.find('\0') != text.npos || !json::isUTF8(text)) throw Diagnostic{"LYLSP0001", "file URI 不是有效的 UTF-8 路径"};
 #ifdef _WIN32
     if (text.size() >= 3 && text.front() == '/' && std::isalpha(static_cast<unsigned char>(text[1])) && text[2] == ':') text.erase(text.begin());
 #endif
@@ -280,6 +289,7 @@ bool recordInput(AnalysisInputs& inputs, const fs::path& path, InputContents con
     char buffer[8192];
     std::size_t remaining = contents == InputContents::Macro ? macroInputByteLimit + 1 : std::string::npos;
     while (remaining && (file.read(buffer, std::min(remaining, sizeof buffer)) || file.gcount() > 0)) {
+        checkAnalysisCancellation();
         value.append(buffer, file.gcount());
         remaining -= file.gcount();
     }
@@ -311,6 +321,7 @@ void recordTree(AnalysisInputs& inputs, const fs::path& directory, bool packaged
     recordInput(inputs, directory, InputContents::Metadata);
     if (!fs::is_directory(directory)) return;
     for (auto item = fs::recursive_directory_iterator(directory); item != fs::recursive_directory_iterator{}; ++item) {
+        checkAnalysisCancellation();
         if (packaged && item->is_directory() && pathText(item->path().filename()).starts_with('.')) {
             item.disable_recursion_pending();
             continue;
@@ -346,20 +357,25 @@ void recordMacroSources(AnalysisInputs& inputs, const fs::path& package, std::ve
 }
 
 struct Snapshot {
-    AnalysisInputs inputs;
+    std::shared_ptr<const AnalysisInputs> inputs;
     SourceOverlay overlays;
     Workspace workspace;
 };
 
-struct WorkspaceInputs {
+struct DiskInputs {
     AnalysisInputs inputs;
     std::optional<PackageGraph> graph;
+    std::vector<fs::path> extraOverlayPaths;
+};
+
+struct WorkspaceInputs {
+    std::shared_ptr<const DiskInputs> base;
     SourceOverlay overlays;
 };
 
 std::optional<std::vector<std::pair<std::size_t, Source>>> triviaOnlyUpdates(
     const Snapshot& previous, const AnalysisInputs& inputs, const SourceOverlay& overlays) {
-    if (previous.inputs != inputs || previous.overlays == overlays || !previous.workspace.diagnostics.errors.empty())
+    if (*previous.inputs != inputs || previous.overlays == overlays || !previous.workspace.diagnostics.errors.empty())
         return {};
     for (const auto& source : previous.workspace.sources)
         if (source.text.find_first_of("#@") != std::string::npos) return {};
@@ -757,7 +773,7 @@ json::Array documentSymbols(const Source& source, const std::vector<OutlineSymbo
 
 bool macroKind(EditorKind kind) { return kind == EditorKind::Macro || kind == EditorKind::Decorator; }
 
-json::Array workspaceSymbols(std::string query, const std::set<fs::path>& folders, const Documents& documents, EditorParseCache& cache) {
+std::set<fs::path> workspaceFiles(const std::set<fs::path>& folders, const Documents& documents, std::set<fs::path>& roots) {
     auto standard = fromUtf8(pathKey(sdkRoot() / "share" / "lyra" / "std"));
     fs::path localCache;
     if (auto path = cacheOverride(); !path.empty()) localCache = fromUtf8(pathKey(path));
@@ -768,18 +784,20 @@ json::Array workspaceSymbols(std::string query, const std::set<fs::path>& folder
         auto name = pathText(path.filename());
         return name.starts_with('.') || name == "build" || name == "dist" || name == "node_modules";
     };
-    std::set<fs::path> searched, roots, files;
+    std::set<fs::path> searched, files;
     auto addPackage = [&](const fs::path& path) {
         if (!searched.insert(path).second) return;
         for (const auto& root : indexLocalPackageRoots(path)) if (!excluded(root)) roots.insert(root);
     };
     for (const auto& folder : folders) {
+        checkAnalysisCancellation();
         if (excluded(folder)) continue;
         if (fs::is_regular_file(folder / "lyra.json5")) { addPackage(folder); continue; }
         auto options = fs::directory_options::skip_permission_denied;
         if (fs::is_directory(folder / "src")) roots.insert(folder);
         if (!fs::is_directory(folder)) continue;
         for (auto entry = fs::recursive_directory_iterator(folder, options); entry != fs::recursive_directory_iterator{}; ++entry) {
+            checkAnalysisCancellation();
             if (!entry->is_directory()) continue;
             const auto& path = entry->path();
             if (entry->is_symlink() || ignoredDirectory(path) || excluded(path)) { entry.disable_recursion_pending(); continue; }
@@ -793,10 +811,12 @@ json::Array workspaceSymbols(std::string query, const std::set<fs::path>& folder
         else if (path.filename() == "lyra.json5") addPackage(path.parent_path());
     }
     for (const auto& root : roots) {
+        checkAnalysisCancellation();
         auto src = root / "src";
         if (!fs::is_directory(src) || fs::is_symlink(src)) continue;
         auto options = fs::directory_options::skip_permission_denied;
         for (auto entry = fs::recursive_directory_iterator(src, options); entry != fs::recursive_directory_iterator{}; ++entry) {
+            checkAnalysisCancellation();
             const auto& path = entry->path();
             if (entry->is_directory()) {
                 bool macros = macroSourceDirectory(path.filename());
@@ -804,33 +824,105 @@ json::Array workspaceSymbols(std::string query, const std::set<fs::path>& folder
             } else if (path.extension() == ".ly" && !entry->is_symlink() && entry->is_regular_file()) files.insert(path);
         }
     }
-    auto lower = [](std::string text) {
-        std::ranges::transform(text, text.begin(), [](unsigned char letter) { return static_cast<char>(std::tolower(letter)); });
-        return text;
-    };
-    query = lower(std::move(query));
-    json::Array result;
-    for (const auto& path : files) {
+    return files;
+}
+
+std::string lowerAscii(std::string text) {
+    std::ranges::transform(text, text.begin(), [](unsigned char letter) { return static_cast<char>(std::tolower(letter)); });
+    return text;
+}
+
+class WorkspaceSymbols {
+    struct Symbol { std::string search; json::Object item; };
+    struct File { std::shared_ptr<const std::string> contents; std::vector<Symbol> symbols; };
+    std::map<fs::path, File> indexed;
+    std::set<fs::path> roots, openFiles;
+    std::optional<std::size_t> generation;
+    EditorParseCache parsed;
+
+    File read(const fs::path& path, const Document* document) {
+        File result{document ? document->contents : nullptr, {}};
         try {
-            auto opened = documents.find(pathKey(path));
-            auto source = opened != documents.end() ? sourceText(path, opened->second.text, {}) : loadSource(path, {});
+            auto source = document ? sourceText(path, document->text(), {}) : loadSource(path, {});
             auto append = [&](const OutlineSymbol& symbol, const std::string& parent) {
-                auto name = parent.empty() ? symbol.name : parent + '.' + symbol.name;
-                if (result.size() >= 200 || (!lower(symbol.name).contains(query) && !lower(std::move(name)).contains(query))) return;
+                auto search = lowerAscii(parent.empty() ? symbol.name : parent + '.' + symbol.name);
                 json::Object item{{"name", symbol.name}, {"kind", symbolKind(symbol.kind)}, {"location", jsonLocation(source, symbol.selection)}};
                 if (!parent.empty()) item["containerName"] = parent;
-                result.push_back(std::move(item));
+                result.symbols.push_back({std::move(search), std::move(item)});
             };
-            for (const auto& symbol : editorOutline(source, editorFileSyntax(source, cache))) {
+            for (const auto& symbol : editorOutline(source, editorFileSyntax(source, parsed))) {
                 append(symbol, {});
                 for (const auto& member : symbol.children) append(member, symbol.name);
             }
-            if (result.size() >= 200) break;
         } catch (const Diagnostic&) {}
         catch (const fs::filesystem_error&) {}
+        return result;
     }
-    return result;
-}
+
+    bool includes(const fs::path& path) const {
+        if (path.extension() != ".ly") return false;
+        return std::ranges::any_of(roots, [&](const auto& root) {
+            auto relative = path.lexically_relative(root / "src");
+            if (relative.empty() || *relative.begin() == "..") return false;
+            for (const auto& part : relative.parent_path()) {
+                auto name = pathText(part);
+                if ((name.starts_with('.') && !macroSourceDirectory(part)) || name == "build" || name == "dist" || name == "node_modules") return false;
+            }
+            return true;
+        });
+    }
+
+public:
+    bool refresh(std::size_t epoch, const std::set<fs::path>& folders, const Documents& documents, const std::set<fs::path>& changes, bool reconcile) {
+        std::set<fs::path> opened;
+        for (const auto& [key, document] : documents) opened.insert(fromUtf8(key));
+        bool discover = generation != epoch || opened != openFiles || reconcile || std::ranges::any_of(changes, [&](const auto& path) {
+            return path.filename() == "lyra.json5" && (roots.contains(path.parent_path()) ||
+                std::ranges::any_of(folders, [&](const auto& folder) { return inside(folder, path); }));
+        });
+        if (discover) {
+            std::map<fs::path, File> next;
+            std::set<fs::path> nextRoots;
+            for (const auto& path : workspaceFiles(folders, documents, nextRoots)) {
+                checkAnalysisCancellation();
+                auto opened = documents.find(pathText(path));
+                next.emplace(path, read(path, opened != documents.end() ? &opened->second : nullptr));
+            }
+            indexed.swap(next);
+            roots.swap(nextRoots);
+            openFiles.swap(opened);
+            generation = epoch;
+        } else {
+            for (const auto& path : changes) {
+                checkAnalysisCancellation();
+                if (opened.contains(path) || (!indexed.contains(path) && !includes(path))) continue;
+                std::error_code error;
+                auto status = fs::symlink_status(path, error);
+                if (!error && fs::is_regular_file(status)) indexed.insert_or_assign(path, read(path, nullptr));
+                else { indexed.erase(path); parsed.files.erase(path); }
+            }
+            for (const auto& [key, document] : documents) {
+                checkAnalysisCancellation();
+                if (auto found = indexed.find(fromUtf8(key)); found != indexed.end() && found->second.contents != document.contents)
+                    found->second = read(found->first, &document);
+            }
+        }
+        return discover;
+    }
+
+    json::Array search(std::string query) const {
+        query = lowerAscii(std::move(query));
+        json::Array result;
+        for (const auto& [path, file] : indexed) {
+            checkAnalysisCancellation();
+            for (const auto& symbol : file.symbols) if (symbol.search.contains(query)) {
+                result.push_back(json::Object(symbol.item));
+                if (result.size() == 200) return result;
+            }
+        }
+        return result;
+    }
+};
 
 json::Object markdown(std::string text) { return json::Object{{"kind", "markdown"}, {"value", std::move(text)}}; }
 
@@ -1269,7 +1361,12 @@ public:
                 auto value = header.substr(colon + 1);
                 if (!value.empty() && value.front() == ' ') value.erase(value.begin());
                 std::ranges::transform(key, key.begin(), [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
-                if (key == "content-length") { length = static_cast<std::size_t>(std::stoull(value)); foundLength = true; }
+                if (key == "content-length") {
+                    auto end = value.data() + value.size();
+                    auto [parsed, error] = std::from_chars(value.data(), end, length);
+                    if (foundLength || error != std::errc{} || parsed != end) return 1;
+                    foundLength = true;
+                }
                 if (!std::getline(std::cin, header)) return 1;
                 if (!header.empty() && header.back() == '\r') header.pop_back();
                 if (header.empty()) break;
@@ -1278,7 +1375,11 @@ public:
             std::string body(length, '\0');
             if (!std::cin.read(body.data(), static_cast<std::streamsize>(length))) return 1;
             auto message = json::parse(body);
-            if (!message) return 1;
+            if (!message) {
+                llvm::consumeError(message.takeError());
+                send(errorResponse(nullptr, -32700, "parse error"));
+                continue;
+            }
             auto object = message->getAsObject();
             if (!object) continue;
             auto id = object->get("id");
@@ -1294,10 +1395,10 @@ public:
                 if (exited) return shutdown ? 0 : 1;
             } catch (const Diagnostic& error) {
                 if (id) send(errorResponse(*id, -32602, error.message));
-                else publishFailure(error);
+                else trace("Lyra input: " + error.message);
             } catch (const PackageError& error) {
                 if (id) send(errorResponse(*id, -32603, error.message));
-                else publishFailure({error.code, error.message});
+                else trace("Lyra input: " + error.message);
             } catch (const std::exception& error) {
                 if (id) send(errorResponse(*id, -32603, error.what()));
             }
@@ -1311,26 +1412,44 @@ private:
     std::map<AnalysisView, Snapshot> snapshots;
     ParseCache parseCache;
     EditorParseCache editorParseCache;
-    EditorParseCache workspaceSymbolCache;
-    std::map<fs::path, PackageGraph> catalogPackages;
-    std::map<fs::path, EditorModuleIndex> catalogs;
+    struct ProbeSnapshot {
+        std::shared_ptr<const DiskInputs> base;
+        SourceOverlay overlays;
+        std::shared_ptr<EditorProbeEnvironment> declarations;
+    };
+    std::map<AnalysisView, ProbeSnapshot> probes;
+    WorkspaceSymbols workspaceSymbols;
+    struct CatalogPackage { PackageGraph graph; std::set<fs::path> trees; };
+    struct Catalog { fs::path root; std::map<fs::path, std::string> keys; EditorModuleIndex index; };
+    struct OverlayCatalogKey { std::weak_ptr<const std::string> contents; std::string key; };
+    std::map<fs::path, CatalogPackage> catalogPackages;
+    std::map<fs::path, Catalog> catalogs;
+    std::map<fs::path, OverlayCatalogKey> overlayCatalogKeys;
     std::map<std::string, std::vector<EditorSymbol>> generated;
+    std::optional<std::size_t> generatedRevision;
+    std::map<AnalysisView, std::shared_ptr<const DiskInputs>> diskInputs;
     std::set<std::string> publishedClosed;
     std::map<WatchPattern, std::string> activeWatchers;
     std::size_t nextWatcher{};
     std::size_t nextRequest{};
+    std::size_t diskRevision{}, symbolRevision{};
     bool relativeWatchers{};
     bool shutdown{};
     bool exited{};
     std::atomic<bool> traceVerbose{};
     using Clock = std::chrono::steady_clock;
-    struct DiagnosticsJob { std::size_t revision; fs::path changed; Documents documents; Clock::time_point ready; };
+    struct DiagnosticsJob { std::size_t revision, disk, symbols; fs::path changed; Documents documents; std::set<fs::path> folders; Clock::time_point ready; bool reconcile{}; };
+    struct RequestStop { std::stop_source source; bool cancelled{}; };
     std::mutex workMutex;
     std::condition_variable workReady;
     std::deque<std::function<void()>> requests;
+    std::map<std::string, std::shared_ptr<RequestStop>> outstanding;
     std::optional<DiagnosticsJob> pendingDiagnostics;
+    std::optional<DiagnosticsJob> reconcileInputs;
+    std::set<fs::path> pendingFiles, changedInputs, changedSymbols;
+    std::stop_source diagnosticsStop;
     std::size_t revision{};
-    std::size_t generatedRevision{};
+    std::size_t workerDisk{};
     bool stopping{};
     std::thread worker;
 
@@ -1339,6 +1458,10 @@ private:
         {
             std::lock_guard lock(workMutex);
             stopping = true;
+            pendingDiagnostics.reset();
+            reconcileInputs.reset();
+            diagnosticsStop.request_stop();
+            for (auto& [key, request] : outstanding) request->source.request_stop();
         }
         workReady.notify_one();
         worker.join();
@@ -1347,31 +1470,49 @@ private:
     void work() {
         std::unique_lock lock(workMutex);
         while (true) {
+            changedInputs.insert(pendingFiles.begin(), pendingFiles.end());
+            changedSymbols.merge(pendingFiles);
+            pendingFiles.clear();
             if (!requests.empty()) {
                 auto request = std::move(requests.front());
                 requests.pop_front();
                 lock.unlock();
                 request();
                 lock.lock();
-            } else if (pendingDiagnostics && (stopping || Clock::now() >= pendingDiagnostics->ready)) {
-                auto job = std::move(*pendingDiagnostics);
-                pendingDiagnostics.reset();
-                lock.unlock();
-                publishDiagnostics(job);
-                lock.lock();
             } else if (stopping) return;
-            else if (pendingDiagnostics) {
-                auto ready = pendingDiagnostics->ready;
-                workReady.wait_until(lock, ready);
-            } else workReady.wait(lock);
+            else if (auto pending = pendingDiagnostics ? &pendingDiagnostics : &reconcileInputs; *pending && Clock::now() >= (*pending)->ready) {
+                auto job = **pending;
+                if (pending == &pendingDiagnostics) pendingDiagnostics.reset();
+                else (*pending)->ready = Clock::now() + std::chrono::seconds(5);
+                diagnosticsStop = std::stop_source{};
+                analysisStop = diagnosticsStop.get_token();
+                lock.unlock();
+                try {
+                    updateDisk(job.disk, job.reconcile);
+                    try { refreshSymbols(job.symbols, job.folders, job.documents, job.reconcile); }
+                    catch (const std::exception& error) { trace("Lyra index: " + std::string(error.what())); }
+                    publishDiagnostics(job);
+                } catch (const AnalysisCancelled&) {}
+                catch (const Diagnostic& error) { trace("Lyra diagnostics: " + error.message); }
+                catch (const PackageError& error) { trace("Lyra diagnostics: " + error.message); }
+                catch (const std::exception& error) { trace("Lyra diagnostics: " + std::string(error.what())); }
+                analysisStop = {};
+                lock.lock();
+            } else if (*pending) workReady.wait_until(lock, (*pending)->ready);
+            else workReady.wait(lock);
         }
     }
 
     void scheduleDiagnostics(const fs::path& changed) {
-        catalogs.clear();
         {
             std::lock_guard lock(workMutex);
-            pendingDiagnostics = DiagnosticsJob{revision, changed, documents, Clock::now() + std::chrono::milliseconds(45)};
+            pendingDiagnostics = DiagnosticsJob{revision, diskRevision, symbolRevision, changed, documents, workspaceFolders,
+                Clock::now() + std::chrono::milliseconds(45)};
+            if (!relativeWatchers && (!documents.empty() || !workspaceFolders.empty())) {
+                reconcileInputs = *pendingDiagnostics;
+                reconcileInputs->ready = Clock::now() + std::chrono::seconds(5);
+                reconcileInputs->reconcile = true;
+            } else reconcileInputs.reset();
         }
         workReady.notify_one();
     }
@@ -1380,47 +1521,134 @@ private:
         std::lock_guard lock(workMutex);
         ++revision;
         pendingDiagnostics.reset();
+        reconcileInputs.reset();
+        diagnosticsStop.request_stop();
+        for (auto& [key, request] : outstanding) request->source.request_stop();
+    }
+
+    static std::optional<std::string> requestKey(const json::Value& id) {
+        if (auto number = id.getAsInteger()) return "n:" + std::to_string(*number);
+        if (auto text = id.getAsString()) return "s:" + text->str();
+        return {};
+    }
+
+    void cancel(const json::Object& params) {
+        auto id = params.get("id");
+        if (!id) return;
+        auto key = requestKey(*id);
+        if (!key) return;
+        std::lock_guard lock(workMutex);
+        if (auto found = outstanding.find(*key); found != outstanding.end()) {
+            found->second->cancelled = true;
+            found->second->source.request_stop();
+        }
     }
 
     void enqueue(const json::Value& id, json::Value empty, std::function<json::Value()> task) {
+        auto key = requestKey(id);
+        if (!key) { send(errorResponse(id, -32600, "invalid request id")); return; }
         {
             std::lock_guard lock(workMutex);
-            requests.push_back([this, id, empty = std::move(empty), task = std::move(task), requested = revision] {
-                {
-                    std::lock_guard lock(workMutex);
-                    if (requested != revision) { respond(id, empty); return; }
-                }
+            if (outstanding.contains(*key) || stopping) return;
+            if (requests.size() >= 256) { send(errorResponse(id, -32802, "server busy")); return; }
+            auto request = std::make_shared<RequestStop>();
+            outstanding.emplace(*key, request);
+            requests.push_back([this, id, key = std::move(*key), empty = std::move(empty), task = std::move(task),
+                                request = std::move(request), requested = revision, disk = diskRevision] {
+                std::optional<json::Value> result;
+                analysisStop = request->source.get_token();
                 try {
-                    auto result = task();
-                    std::lock_guard lock(workMutex);
-                    respond(id, requested == revision ? std::move(result) : json::Value(empty));
-                } catch (const Diagnostic&) { respond(id, empty); }
-                catch (const PackageError&) { respond(id, empty); }
-                catch (const fs::filesystem_error&) { respond(id, empty); }
-                catch (const std::exception& error) { send(errorResponse(id, -32603, error.what())); }
+                    checkAnalysisCancellation();
+                    updateDisk(disk);
+                    result = task();
+                }
+                catch (const AnalysisCancelled&) {}
+                catch (const Diagnostic&) {}
+                catch (const PackageError&) {}
+                catch (const fs::filesystem_error&) {}
+                catch (const std::exception& error) { trace("Lyra request: " + std::string(error.what())); }
+                analysisStop = {};
+                std::lock_guard lock(workMutex);
+                outstanding.erase(key);
+                if (request->cancelled) send(errorResponse(id, -32800, "request cancelled"));
+                else respond(id, requested == revision && result ? std::move(*result) : std::move(empty));
             });
         }
         workReady.notify_one();
     }
 
-    const EditorModuleIndex& catalog(const fs::path& path) {
-        auto found = catalogs.find(path);
-        if (found != catalogs.end()) return found->second;
-        auto root = packageRoot(path);
-        auto graph = catalogPackages.find(root);
-        if (graph == catalogPackages.end()) graph = catalogPackages.emplace(root, indexPackages(root)).first;
-        SourceOverlay overlays;
-        for (const auto& [key, document] : documents) if (document.path.extension() == ".ly") overlays.emplace(fromUtf8(key), document.text);
-        return catalogs.emplace(path, indexModule(graph->second, path, overlays, editorParseCache)).first->second;
+    void updateDisk(std::size_t disk, bool reconcile = false) {
+        if (workerDisk == disk && !reconcile) return;
+        workerDisk = disk;
+        auto standard = sdkRoot() / "share" / "lyra" / "std";
+        auto anyChanged = [&](auto matches) { return reconcile || std::ranges::any_of(changedInputs, matches); };
+        auto below = [](const auto& trees, const auto& path) {
+            return std::ranges::any_of(trees, [&](const auto& tree) { return path == tree || inside(tree, path); });
+        };
+        std::set<fs::path> invalidCatalogs;
+        std::erase_if(catalogPackages, [&](const auto& entry) {
+            if (!anyChanged([&](const auto& path) {
+                return inside(standard, path) || below(entry.second.trees, path) ||
+                    ((path.filename() == "lyra.lock" || path.filename() == "lyra.json5") &&
+                        (path.parent_path() == entry.first || inside(path.parent_path(), entry.first) ||
+                         std::ranges::any_of(entry.second.graph.packages, [&](const auto& package) { return path.parent_path() == package.root; })));
+            })) return false;
+            invalidCatalogs.insert(entry.first);
+            return true;
+        });
+        std::erase_if(catalogs, [&](const auto& entry) { return invalidCatalogs.contains(entry.second.root); });
+        std::erase_if(diskInputs, [&](const auto& entry) {
+            const auto& inputs = entry.second->inputs;
+            return anyChanged([&](const auto& path) {
+                return inputs.files.contains(path) || ((path.filename() == "lyra.json5" || path.filename() == "lyra.lock") && inside(path.parent_path(), entry.first.root)) ||
+                    std::ranges::any_of(inputs.sourceTrees, [&](const auto& tree) { return inside(tree.first, path) || inside(tree.second, path); });
+            });
+        });
+        changedInputs.clear();
     }
 
-    WorkspaceInputs collectInputs(const AnalysisView& view, const Documents& documents) {
+    void refreshSymbols(std::size_t epoch, const std::set<fs::path>& folders, const Documents& documents, bool reconcile = false) {
+        if (workspaceSymbols.refresh(epoch, folders, documents, changedSymbols, reconcile)) trace("Lyra index: scanned workspace symbols");
+        else if (!changedSymbols.empty()) trace("Lyra index: updated watched workspace symbols");
+        changedSymbols.clear();
+    }
+
+    const EditorModuleIndex& catalog(const fs::path& path, const Documents& documents) {
+        auto root = packageRoot(path);
+        auto package = catalogPackages.find(root);
+        if (package == catalogPackages.end()) {
+            auto graph = indexPackages(root);
+            std::set<fs::path> trees{sdkRoot() / "share" / "lyra" / "std", root / "src"};
+            for (const auto& dependency : graph.packages) trees.insert(dependency.root / "src");
+            package = catalogPackages.emplace(root, CatalogPackage{std::move(graph), std::move(trees)}).first;
+        }
+        std::erase_if(overlayCatalogKeys, [](const auto& entry) { return entry.second.contents.expired(); });
+        std::map<fs::path, std::string> keys;
+        for (const auto& [key, document] : documents) {
+            auto file = fromUtf8(key);
+            if (file.extension() != ".ly" || (file != path && !std::ranges::any_of(package->second.trees, [&](const auto& tree) { return inside(tree, file); }))) continue;
+            checkAnalysisCancellation();
+            auto found = overlayCatalogKeys.find(file);
+            if (found == overlayCatalogKeys.end() || found->second.contents.lock() != document.contents) {
+                auto source = sourceText(file, document.text(), {});
+                found = overlayCatalogKeys.insert_or_assign(file, OverlayCatalogKey{document.contents, editorCatalogKey(source, editorParseCache)}).first;
+            }
+            keys.emplace(file, found->second.key);
+        }
+        if (auto found = catalogs.find(path); found != catalogs.end() && found->second.keys == keys) return found->second.index;
+        SourceOverlay overlays;
+        for (const auto& [file, key] : keys) overlays.emplace(file, documents.at(pathText(file)).text());
+        auto indexed = indexModule(package->second.graph, path, overlays, editorParseCache);
+        trace("Lyra index: rebuilt declaration catalog for " + pathText(path));
+        return catalogs.insert_or_assign(path, Catalog{std::move(root), std::move(keys), std::move(indexed)}).first->second.index;
+    }
+
+    DiskInputs readInputs(const AnalysisView& view) {
         const auto& root = view.root;
-        WorkspaceInputs result;
+        DiskInputs result;
         auto& inputs = result.inputs;
         auto& graph = result.graph;
-        auto& overlays = result.overlays;
-        std::vector<fs::path> extraOverlayPaths;
+        auto& extraOverlayPaths = result.extraOverlayPaths;
         trackFile(inputs, root / "lyra.json5");
         trackFile(inputs, root / "lyra.lock");
         recordTree(inputs, root / "src", true);
@@ -1446,6 +1674,7 @@ private:
             std::vector<std::string> pending{graph->entry};
             std::set<std::string> reachable;
             for (std::size_t index = 0; index < pending.size(); ++index) {
+                checkAnalysisCancellation();
                 if (!reachable.insert(pending[index]).second) continue;
                 const auto& package = *packages.at(pending[index]);
                 if (package.root != root) {
@@ -1461,29 +1690,39 @@ private:
             }
             recordTree(inputs, sdkRoot() / "share" / "lyra" / "std");
         }
+        return result;
+    }
+
+    WorkspaceInputs collectInputs(const AnalysisView& view, const Documents& documents) {
+        auto found = diskInputs.find(view);
+        if (found == diskInputs.end()) found = diskInputs.emplace(view, std::make_shared<const DiskInputs>(readInputs(view))).first;
+        WorkspaceInputs result{found->second, {}};
+        auto& overlays = result.overlays;
         for (const auto& [key, document] : documents) {
             auto path = fromUtf8(key);
             if (path.extension() != ".ly") continue;
-            for (const auto& [directory, resolved] : inputs.sourceTrees) if (inside(resolved, path))
-                overlays.emplace(directory / path.lexically_relative(resolved), document.text);
+            for (const auto& [directory, resolved] : result.base->inputs.sourceTrees) if (inside(resolved, path))
+                overlays.emplace(directory / path.lexically_relative(resolved), document.text());
         }
-        for (const auto& path : extraOverlayPaths) if (auto document = documents.find(pathKey(path)); document != documents.end())
-            overlays.emplace(path, document->second.text);
+        for (const auto& path : result.base->extraOverlayPaths) if (auto document = documents.find(pathKey(path)); document != documents.end())
+            overlays.emplace(path, document->second.text());
         return result;
     }
 
     const Workspace& analyze(const AnalysisView& view, const Documents& documents) {
-        auto [inputs, graph, overlays] = collectInputs(view, documents);
+        auto [base, overlays] = collectInputs(view, documents);
+        auto inputs = std::shared_ptr<const AnalysisInputs>(base, &base->inputs);
         auto label = pathText(view.test.value_or(view.root));
 
         auto found = snapshots.find(view);
-        if (found != snapshots.end() && found->second.inputs == inputs) {
+        if (found != snapshots.end() && (found->second.inputs == inputs || *found->second.inputs == *inputs)) {
             auto& previous = found->second;
+            previous.inputs = inputs;
             if (previous.overlays == overlays) {
                 trace("Lyra analysis: reused package analysis for " + label);
                 return previous.workspace;
             }
-            if (auto updates = triviaOnlyUpdates(previous, inputs, overlays)) {
+            if (auto updates = triviaOnlyUpdates(previous, *inputs, overlays)) {
                 for (auto& [index, source] : *updates) previous.workspace.sources[index] = std::move(source);
                 previous.overlays = std::move(overlays);
                 trace("Lyra analysis: reused checked workspace after trivia-only document edits for " + label);
@@ -1491,7 +1730,8 @@ private:
             }
         }
         trace("Lyra analysis: rebuilt workspace and reran semantic checks for " + label);
-        auto workspace = loadWorkspace(view.root, overlays, graph, parseCache, nullptr, view.test);
+        auto workspace = loadWorkspace(view.root, overlays, base->graph, parseCache, nullptr, view.test);
+        checkAnalysisCancellation();
         return snapshots.insert_or_assign(view, Snapshot{std::move(inputs), std::move(overlays), std::move(workspace)}).first->second.workspace;
     }
 
@@ -1506,9 +1746,10 @@ private:
         auto spelling = declaration->moduleAlias ? editorModuleAlias(newName) : editorIdentifier(newName);
         if (spelling.empty()) return nullptr;
 
-        auto [inputs, graph, overlays] = collectInputs(primary, documents);
+        auto [base, overlays] = collectInputs(primary, documents);
+        auto graph = base->graph;
         const auto& snapshot = snapshots.at(primary);
-        if (inputs != snapshot.inputs || overlays != snapshot.overlays) return nullptr;
+        if (base->inputs != *snapshot.inputs || overlays != snapshot.overlays) return nullptr;
         if (primary.test && pathKey(*primary.test) == target->file) declaration->exported = false;
         auto owner = packageRoot(fromUtf8(target->file));
         if ((!declaration->exported || !graph) && owner != root) return nullptr;
@@ -1545,8 +1786,8 @@ private:
         views.push_back({root, std::move(graph), std::move(overlays), {{primary.test, &workspace}}});
         for (const auto& member : additionalRoots) {
             auto current = collectInputs({member, {}}, documents);
-            additional.push_back(loadWorkspace(member, current.overlays, current.graph, parseCache));
-            views.push_back({member, std::move(current.graph), std::move(current.overlays), {{std::nullopt, &additional.back()}}});
+            additional.push_back(loadWorkspace(member, current.overlays, current.base->graph, parseCache));
+            views.push_back({member, current.base->graph, std::move(current.overlays), {{std::nullopt, &additional.back()}}});
         }
         if (declaration->exported && views.front().graph) for (auto& view : views) {
             if (view.root == root && primary.test) {
@@ -1557,8 +1798,9 @@ private:
             std::set<fs::path> tests(paths.begin(), paths.end());
             for (const auto& [key, document] : documents) if (auto path = fromUtf8(key); isTestEntry(view.root, path)) tests.insert(std::move(path));
             for (const auto& path : tests) {
+                checkAnalysisCancellation();
                 if (view.root == root && primary.test == path) continue;
-                if (auto document = documents.find(pathKey(path)); document != documents.end()) view.overlays.insert_or_assign(path, document->second.text);
+                if (auto document = documents.find(pathKey(path)); document != documents.end()) view.overlays.insert_or_assign(path, document->second.text());
                 additional.push_back(loadWorkspace(view.root, view.overlays, view.graph, parseCache, nullptr, path));
                 view.checks.emplace_back(path, &additional.back());
             }
@@ -1611,7 +1853,7 @@ private:
             auto document = documents.find(file);
             auto path = fromUtf8(file);
             if (document == documents.end() && loadSource(path, {}).text != edits.source.text) return nullptr;
-            if (document != documents.end() && document->second.text != edits.source.text) return nullptr;
+            if (document != documents.end() && document->second.text() != edits.source.text) return nullptr;
             json::Array replacements;
             for (const auto& [span, change] : edits.edits)
                 replacements.push_back(json::Object{{"range", jsonRange(edits.source, span)}, {"newText", change.text}});
@@ -1635,25 +1877,29 @@ private:
     }
 
     void trace(std::string message) const {
-        if (traceVerbose) send(json::Object{{"jsonrpc", "2.0"}, {"method", "$/logTrace"}, {"params", json::Object{{"message", std::move(message)}}}});
+        if (traceVerbose) send(json::Object{{"jsonrpc", "2.0"}, {"method", "$/logTrace"}, {"params", json::Object{{"message", json::fixUTF8(message)}}}});
     }
 
     void requestClient(std::string method, json::Object params) {
         send(json::Object{{"jsonrpc", "2.0"}, {"id", "lyra-" + std::to_string(nextRequest++)}, {"method", std::move(method)}, {"params", std::move(params)}});
     }
 
-    void synchronizeWatchers(const std::map<AnalysisView, const Document*>& roots) {
+    void synchronizeWatchers(const std::map<AnalysisView, const Document*>& roots, const std::set<fs::path>& jobFolders) {
         if (!relativeWatchers) return;
         std::set<WatchPattern> desired;
         for (const auto& [view, owner] : roots) {
             if (auto found = snapshots.find(view); found != snapshots.end()) {
-                const auto& watchers = found->second.inputs.watchers;
+                const auto& watchers = found->second.inputs->watchers;
                 desired.insert(watchers.begin(), watchers.end());
             } else {
                 desired.insert({view.root, "src/**/*.ly"});
                 for (const auto* name : {"lyra.json5", "lyra.lock"}) desired.insert({view.root, name});
                 if (view.test) desired.insert(watchFile(*view.test));
             }
+        }
+        for (const auto& folder : jobFolders) {
+            desired.insert({folder, "**/*.ly"});
+            desired.insert({folder, "**/lyra.json5"});
         }
         const std::string method = "workspace/didChangeWatchedFiles";
         json::Array registrations, removals;
@@ -1694,7 +1940,8 @@ private:
             {"semanticTokensProvider", json::Object{{"legend", semanticLegend()}, {"full", true}}},
             {"renameProvider", true}, {"documentFormattingProvider", true}, {"inlayHintProvider", true}}}};
         }
-        if (method == "initialized" || method == "$/cancelRequest") return {};
+        if (method == "initialized") { scheduleDiagnostics({}); return {}; }
+        if (method == "$/cancelRequest") { cancel(params); return {}; }
         if (method == "$/setTrace") {
             auto value = params.getString("value");
             traceVerbose = value && *value == "verbose";
@@ -1707,28 +1954,37 @@ private:
                 if (const auto* removed = event->getArray("removed")) updateWorkspaceFolders(*removed, false);
                 if (const auto* added = event->getArray("added")) updateWorkspaceFolders(*added, true);
             }
+            invalidateAnalysis();
+            ++symbolRevision;
+            scheduleDiagnostics({});
             return {};
         }
         if (id && method == "workspace/symbol") {
             auto query = params.getString("query").value_or("").str();
-            enqueue(*id, json::Array{}, [this, query = std::move(query), folders = workspaceFolders, documents = documents] {
-                return workspaceSymbols(query, folders, documents, workspaceSymbolCache);
+            enqueue(*id, json::Array{}, [this, query = std::move(query), folders = workspaceFolders, documents = documents, symbols = symbolRevision] {
+                refreshSymbols(symbols, folders, documents);
+                return workspaceSymbols.search(query);
             });
             return {};
         }
         if (method == "workspace/didChangeWatchedFiles") {
             auto changes = params.getArray("changes");
             if (!changes) return {};
+            std::set<fs::path> paths;
             for (const auto& change : *changes) {
                 auto entry = change.getAsObject();
                 auto uri = entry ? entry->getString("uri") : std::nullopt;
-                if (!uri || !uri->starts_with("file://")) continue;
-                auto path = decodeUri(*uri);
-                invalidateAnalysis();
-                catalogPackages.clear();
-                scheduleDiagnostics(path);
-                break;
+                if (uri && uri->starts_with("file://")) paths.insert(decodeUri(*uri));
             }
+            if (paths.empty()) return {};
+            auto first = *paths.begin();
+            invalidateAnalysis();
+            ++diskRevision;
+            {
+                std::lock_guard lock(workMutex);
+                pendingFiles.merge(paths);
+            }
+            scheduleDiagnostics(first);
             return {};
         }
         if (method == "textDocument/didOpen") {
@@ -1738,7 +1994,7 @@ private:
             if (!uri || !text) return {};
             auto path = decodeUri(*uri);
             invalidateAnalysis();
-            documents[pathKey(path)] = {path, uri->str(), text->str(), document->getInteger("version").value_or(0)};
+            documents[pathKey(path)] = {path, uri->str(), std::make_shared<const std::string>(text->str()), document->getInteger("version").value_or(0)};
             scheduleDiagnostics(path);
             return {};
         }
@@ -1753,25 +2009,30 @@ private:
             if (found == documents.end()) return {};
             auto version = document->getInteger("version");
             if (!version || *version <= found->second.version) return {};
-            invalidateAnalysis();
+            auto updated = found->second.text();
             for (const auto& change : *changes) {
                 auto item = change.getAsObject();
-                if (!item) continue;
+                if (!item) return {};
                 auto text = item->getString("text");
-                if (!text) continue;
+                if (!text) return {};
                 auto range = item->getObject("range");
-                if (!range) found->second.text = text->str();
+                if (!range) updated = text->str();
                 else {
                     auto start = range->getObject("start"), end = range->getObject("end");
-                    if (!start || !end) continue;
-                    auto startLine = start->getInteger("line").value_or(0), startCharacter = start->getInteger("character").value_or(0);
-                    auto endLine = end->getInteger("line").value_or(0), endCharacter = end->getInteger("character").value_or(0);
-                    auto current = sourceText(path, found->second.text, {});
+                    if (!start || !end) return {};
+                    auto startLine = start->getInteger("line").value_or(-1), startCharacter = start->getInteger("character").value_or(-1);
+                    auto endLine = end->getInteger("line").value_or(-1), endCharacter = end->getInteger("character").value_or(-1);
+                    if (startLine < 0 || endLine < startLine || startCharacter < 0 || endCharacter < 0 ||
+                        (endLine == startLine && endCharacter < startCharacter)) return {};
+                    auto current = sourceText(path, std::move(updated), {});
                     auto begin = byteOffset(current, static_cast<std::size_t>(startLine), static_cast<std::size_t>(startCharacter));
                     auto finish = byteOffset(current, static_cast<std::size_t>(endLine), static_cast<std::size_t>(endCharacter));
-                    found->second.text.replace(begin, finish - begin, text->str());
+                    current.text.replace(begin, finish - begin, text->str());
+                    updated = std::move(current.text);
                 }
             }
+            invalidateAnalysis();
+            found->second.contents = std::make_shared<const std::string>(std::move(updated));
             found->second.version = *version;
             scheduleDiagnostics(path);
             return {};
@@ -1788,7 +2049,12 @@ private:
             send(json::Object{{"jsonrpc", "2.0"}, {"method", "textDocument/publishDiagnostics"}, {"params", json::Object{{"uri", uri->str()}, {"diagnostics", json::Array{}}}}});
             return {};
         }
-        if (id && method.starts_with("textDocument/")) return documentRequest(method, params, *id);
+        if (id && method.starts_with("textDocument/")) {
+            enqueue(*id, unavailable(method), [this, method = std::string(method), params, documents = documents, requested = revision] {
+                return documentRequest(method, params, documents, requested);
+            });
+            return {};
+        }
         if (id) return json::Value(nullptr);
         return {};
     }
@@ -1825,15 +2091,39 @@ private:
         if (!replacement) return result;
         try {
             auto view = analysisView(source.path);
-            auto [inputs, graph, overlays] = collectInputs(view, documents);
+            auto [base, overlays] = collectInputs(view, documents);
+            if (base->graph && source.text.find_first_of("#@") == std::string::npos) {
+                auto sameOtherFiles = [&](const auto& old) {
+                    for (const auto& [file, text] : old) if (file != source.path) {
+                        auto found = overlays.find(file);
+                        if (found == overlays.end() || found->second != text) return false;
+                    }
+                    return std::ranges::none_of(overlays, [&](const auto& entry) { return entry.first != source.path && !old.contains(entry.first); });
+                };
+                auto query = [&](auto& environment) {
+                    return queryEditorProbe(environment, sourceText(source.path, *replacement, {}), result, editorParseCache);
+                };
+                try {
+                    auto hot = probes.find(view);
+                    if (hot != probes.end() && hot->second.base == base && sameOtherFiles(hot->second.overlays) && query(*hot->second.declarations)) {
+                        trace("Lyra analysis: reused linked declarations for cursor probe");
+                        return result;
+                    }
+                    if (hot == probes.end() || hot->second.base != base || hot->second.overlays != overlays) {
+                        auto declarations = prepareEditorProbe(*base->graph, view.test, overlays, editorParseCache);
+                        probes.insert_or_assign(view, ProbeSnapshot{base, overlays, declarations});
+                        if (query(*declarations)) return result;
+                    }
+                } catch (const Diagnostic&) {}
+            }
             overlays.insert_or_assign(source.path, std::move(*replacement));
-            loadWorkspace(view.root, overlays, graph, parseCache, &result, view.test);
+            loadWorkspace(view.root, overlays, base->graph, parseCache, &result, view.test);
         } catch (const PackageError&) {}
         catch (const fs::filesystem_error&) {}
         return result;
     }
 
-    std::optional<json::Value> documentRequest(std::string_view method, const json::Object& params, const json::Value& id) {
+    json::Value documentRequest(std::string_view method, const json::Object& params, const Documents& documents, std::size_t requested) {
         auto path = requestPath(params);
         auto key = pathKey(path);
         auto opened = documents.find(key);
@@ -1841,7 +2131,7 @@ private:
         const auto& document = opened->second;
         if (path.filename() == "lyra.json5") {
             if (method != "textDocument/completion") return unavailable(method);
-            auto source = sourceText(document.path, document.text, {});
+            auto source = sourceText(document.path, document.text(), {});
             auto offset = requestOffset(source, params.getObject("position"));
             json::Array items;
             for (auto& entry : completeManifest(source, offset)) items.push_back(json::Object{
@@ -1850,20 +2140,17 @@ private:
             return json::Object{{"isIncomplete", false}, {"items", std::move(items)}};
         }
         if (method == "textDocument/documentSymbol" || method == "textDocument/foldingRange") {
-            auto source = sourceText(document.path, document.text, {});
+            auto source = sourceText(document.path, document.text(), {});
             const auto& syntax = editorFileSyntax(source, editorParseCache);
             if (method == "textDocument/documentSymbol") return documentSymbols(source, editorOutline(source, syntax));
             return foldingRanges(source, syntax);
         }
         if (method == "textDocument/completion" || method == "textDocument/signatureHelp") {
-            auto source = sourceText(fromUtf8(key), document.text, {});
+            auto source = sourceText(fromUtf8(key), document.text(), {});
             auto offset = requestOffset(source, params.getObject("position"));
             auto syntax = completeSyntax(source, offset);
             if (method == "textDocument/signatureHelp") {
-                enqueue(id, unavailable(method), [this, source = std::move(source), offset, syntax = std::move(syntax), documents = documents] {
-                    return signatureHelp(probe(source, offset, syntax, true, documents));
-                });
-                return {};
+                return signatureHelp(probe(source, offset, syntax, true, documents));
             }
             using enum CompletionPlace;
             if (const auto* context = params.getObject("context"); syntax.place != ImportMember && context && context->getString("triggerCharacter") == "{")
@@ -1871,40 +2158,28 @@ private:
             const EditorModuleIndex* index = nullptr;
             if (syntax.place == Statement || syntax.place == Expression || syntax.place == Type || syntax.place == Constraint || syntax.place == Import ||
                 syntax.place == ImportMember || syntax.qualifier || syntax.place == DeclarationMacro || syntax.place == ExpressionMacro || syntax.place == Decorator) {
-                try { index = &catalog(source.path); }
+                try { index = &catalog(source.path, documents); }
                 catch (const PackageError&) {}
                 catch (const fs::filesystem_error&) {}
             }
-            std::vector<EditorSymbol> expanded;
-            {
-                std::lock_guard lock(workMutex);
-                if (revision == generatedRevision) if (auto found = generated.find(key); found != generated.end()) expanded = found->second;
-            }
+            std::span<const EditorSymbol> expanded;
+            if (generatedRevision == requested) if (auto found = generated.find(key); found != generated.end()) expanded = found->second;
             bool moduleMember = index && syntax.qualifier && index->namespaces.contains(syntax.qualifier->text);
             if ((syntax.place == Member && (!moduleMember || syntax.implicitReceiver)) || syntax.argumentLabel) {
-                std::optional<EditorModuleIndex> copied = index ? std::optional(*index) : std::nullopt;
-                enqueue(id, unavailable(method), [this, source = std::move(source), offset, syntax = std::move(syntax),
-                    index = std::move(copied), expanded = std::move(expanded), documents = documents] {
-                    auto query = probe(source, offset, syntax, false, documents);
-                    return completionItems(source, offset, syntax, index ? &*index : nullptr, &query, expanded);
-                });
-                return {};
+                auto query = probe(source, offset, syntax, false, documents);
+                return completionItems(source, offset, syntax, index, &query, expanded);
             }
             return completionItems(source, offset, syntax, index, nullptr, expanded);
         }
         if (method == "textDocument/codeAction") {
-            std::optional<EditorModuleIndex> index;
-            try { index = catalog(document.path); }
+            const EditorModuleIndex* index = nullptr;
+            try { index = &catalog(fromUtf8(key), documents); }
             catch (const PackageError&) {}
             catch (const fs::filesystem_error&) {}
-            enqueue(id, unavailable(method), [this, params, key, index = std::move(index), documents = documents] {
-                const auto& document = documents.at(key);
-                const auto& workspace = analyze(analysisView(fromUtf8(key)), documents);
-                auto source = sourceFor(workspace, document.path);
-                if (!source || source->text != document.text) return json::Array{};
-                return diagnosticActions(*source, document, workspace.diagnostics.errors, index ? &*index : nullptr, params);
-            });
-            return {};
+            const auto& workspace = analyze(analysisView(fromUtf8(key)), documents);
+            auto source = sourceFor(workspace, document.path);
+            if (!source || source->text != document.text()) return json::Array{};
+            return diagnosticActions(*source, document, workspace.diagnostics.errors, index, params);
         }
         if (method == "textDocument/formatting") {
             FormatOptions options;
@@ -1913,21 +2188,21 @@ private:
                 if (tabSize >= 1 && tabSize <= 32) options.tabSize = static_cast<unsigned>(tabSize);
                 options.insertSpaces = requested->getBoolean("insertSpaces").value_or(options.insertSpaces);
             }
-            auto source = sourceText(document.path, document.text, {});
+            auto source = sourceText(document.path, document.text(), {});
             auto output = formatSource(source, options);
             if (output == source.text) return json::Array{};
             return json::Array{json::Object{{"range", jsonRange(source, {0, source.text.size()})}, {"newText", std::move(output)}}};
         }
         if (method == "textDocument/hover" || method == "textDocument/definition") {
-            auto source = sourceText(document.path, document.text, {});
+            auto source = sourceText(document.path, document.text(), {});
             auto offset = requestOffset(source, params.getObject("position"));
             try {
-                const auto& definitions = catalog(fromUtf8(key)).definitions;
+                const auto& definitions = catalog(fromUtf8(key), documents).definitions;
                 json::Array locations;
                 for (const auto& definition : definitions) if (definition.use.begin <= offset && offset < definition.use.end) {
                     if (method == "textDocument/hover") return hoverText(definition.symbol.detail, definition.symbol.documentation);
                     auto opened = documents.find(pathKey(definition.path));
-                    auto target = opened != documents.end() ? sourceText(definition.path, opened->second.text, {}) : loadSource(definition.path, {});
+                    auto target = opened != documents.end() ? sourceText(definition.path, opened->second.text(), {}) : loadSource(definition.path, {});
                     locations.push_back(jsonLocation(target, definition.target));
                 }
                 if (!locations.empty()) return locations;
@@ -1937,23 +2212,17 @@ private:
         }
         if (method == "textDocument/semanticTokens/full" || method == "textDocument/documentHighlight") {
             std::vector<EditorDefinition> macros;
-            if (document.text.find_first_of("#@") != std::string::npos || document.text.contains("import macro") || document.text.contains("import decorator")) {
-                try { for (const auto& item : catalog(path).definitions) if (macroKind(item.symbol.kind)) macros.push_back(item); }
+            if (document.text().find_first_of("#@") != std::string::npos || document.text().contains("import macro") || document.text().contains("import decorator")) {
+                try { for (const auto& item : catalog(fromUtf8(key), documents).definitions) if (macroKind(item.symbol.kind)) macros.push_back(item); }
                 catch (const Diagnostic&) {}
                 catch (const PackageError&) {}
                 catch (const fs::filesystem_error&) {}
             }
-            enqueue(id, unavailable(method), [this, method = std::string(method), params, key, macros = std::move(macros), documents = documents] {
-                return checkedRequest(method, params, documents.at(key), documents, macros);
-            });
-            return {};
+            return checkedRequest(method, params, document, documents, macros);
         }
         if (method != "textDocument/inlayHint" && method != "textDocument/definition" && method != "textDocument/references" &&
             method != "textDocument/rename" && method != "textDocument/hover" && method != "textDocument/typeDefinition") return unavailable(method);
-        enqueue(id, unavailable(method), [this, method = std::string(method), params, key, documents = documents] {
-            return checkedRequest(method, params, documents.at(key), documents);
-        });
-        return {};
+        return checkedRequest(method, params, document, documents);
     }
 
     json::Value checkedRequest(std::string_view method, const json::Object& params, const Document& document, const Documents& documents,
@@ -1962,7 +2231,7 @@ private:
         auto view = analysisView(fromUtf8(pathKey(path)));
         const auto& workspace = analyze(view, documents);
         auto source = sourceFor(workspace, path);
-        if (!source || source->text != document.text) return unavailable(method);
+        if (!source || source->text != document.text()) return unavailable(method);
         if (method == "textDocument/semanticTokens/full") return semanticTokens(workspace, *source, macros);
         if (method == "textDocument/inlayHint") {
             auto range = params.getObject("range");
@@ -2023,24 +2292,15 @@ private:
         return json::Value(nullptr);
     }
 
-    void publishFailure(const Diagnostic& error) {
-        if (documents.empty()) return;
-        auto& document = documents.begin()->second;
-        auto source = sourceText(document.path, document.text, {});
-        json::Array diagnostics;
-        json::Object item{{"severity", 1}, {"code", error.code}, {"message", error.message}, {"range", jsonRange(source, {0, 0})}};
-        diagnostics.push_back(std::move(item));
-        send(json::Object{{"jsonrpc", "2.0"}, {"method", "textDocument/publishDiagnostics"}, {"params", json::Object{{"uri", document.uri}, {"diagnostics", std::move(diagnostics)}}}});
-    }
-
     void publishDiagnostics(const DiagnosticsJob& job) {
         std::map<std::string, json::Array> byUri;
-        auto changedKey = pathKey(job.changed);
+        auto changedKey = job.changed.empty() ? std::string{} : pathKey(job.changed);
         const auto& documents = job.documents;
         std::map<AnalysisView, const Document*> roots;
         for (const auto& [key, document] : documents) {
             auto path = fromUtf8(key);
             if (path.extension() != ".ly") continue;
+            checkAnalysisCancellation();
             auto view = analysisView(path);
             auto relative = path.lexically_relative(view.root);
             if (std::ranges::any_of(relative, [](const auto& part) { return pathText(part).starts_with('.'); })) continue;
@@ -2048,6 +2308,7 @@ private:
             else roots.try_emplace(std::move(view), &document);
         }
         std::erase_if(snapshots, [&](const auto& entry) { return !roots.contains(entry.first); });
+        std::erase_if(probes, [&](const auto& entry) { return !roots.contains(entry.first); });
         std::map<std::string, std::optional<Source>> reportSources;
         auto sourceAt = [&](const std::string& file) -> const Source* {
             auto path = fromUtf8(file);
@@ -2057,7 +2318,7 @@ private:
             if (inserted) {
                 auto open = documents.find(key);
                 try {
-                    if (open != documents.end()) entry->second = sourceText(path, open->second.text, {});
+                    if (open != documents.end()) entry->second = sourceText(path, open->second.text(), {});
                     else if (path.extension() == ".ly" && fs::is_regular_file(path)) entry->second = loadSource(path, {});
                 } catch (const Diagnostic&) {}
                 catch (const fs::filesystem_error&) {}
@@ -2066,19 +2327,27 @@ private:
         };
         auto append = [&](const Diagnostic& error, const Document& owner, int severity = 1) {
             auto uri = owner.uri;
-            const Source* source = sourceAt(pathText(owner.path));
-            Span span{0, 0};
+            json::Value start(json::Object{{"line", 0}, {"character", 0}});
+            json::Object range{{"start", start}, {"end", start}};
             if (error.site) {
-                auto document = documents.find(pathKey(fromUtf8(error.site->file)));
+                auto path = fromUtf8(error.site->file);
+                auto document = documents.find(pathKey(path));
                 if (auto located = sourceAt(error.site->file); located && error.site->end.offset <= located->text.size()) {
-                    source = located;
-                    uri = document != documents.end() ? document->second.uri : encodeUri(source->path);
-                    span = {error.site->start.offset, error.site->end.offset};
+                    uri = document != documents.end() ? document->second.uri : encodeUri(located->path);
+                    range = jsonRange(*located, {error.site->start.offset, error.site->end.offset});
+                } else if (error.code == "LYL0001" && path.is_absolute()) {
+                    uri = document != documents.end() ? document->second.uri : encodeUri(path);
+                    auto prefix = json::fixUTF8(std::string_view(error.site->lineText).substr(0, error.site->start.offset - error.site->lineStartOffset));
+                    std::size_t units = 0;
+                    for (std::size_t offset = 0; offset < prefix.size();)
+                        units += decodePoint(prefix, offset) > 0xffff ? 2 : 1;
+                    range = json::Object{{"start", json::Object{{"line", error.site->start.line - 1}, {"character", units}}},
+                                         {"end", json::Object{{"line", error.site->start.line - 1}, {"character", units + 1}}}};
                 }
             }
             auto message = error.message;
             if (!error.hint.empty()) message += "\n" + error.hint;
-            json::Object serialized{{"severity", severity}, {"source", "lyra"}, {"code", error.code}, {"message", std::move(message)}, {"range", jsonRange(*source, span)}};
+            json::Object serialized{{"severity", severity}, {"source", "lyra"}, {"code", error.code}, {"message", json::fixUTF8(message)}, {"range", std::move(range)}};
             json::Array related;
             for (const auto& note : error.notes) if (auto target = sourceAt(note.site.file)) {
                 if (note.site.end.offset <= target->text.size()) related.push_back(json::Object{
@@ -2089,12 +2358,15 @@ private:
             auto& diagnostics = byUri[uri];
             if (std::ranges::find(diagnostics, item) == diagnostics.end()) diagnostics.push_back(std::move(item));
         };
-        std::map<std::string, std::vector<EditorSymbol>> expanded;
+        decltype(generated) expanded;
         for (const auto& [key, document] : documents) if (document.path.filename() == "lyra.json5") {
-            auto source = sourceText(document.path, document.text, {});
-            if (auto error = validateManifest(source)) append(*error, document);
+            try {
+                auto source = sourceText(document.path, document.text(), {});
+                if (auto error = validateManifest(source)) append(*error, document);
+            } catch (const Diagnostic& error) { append(error, document); }
         }
         for (const auto& [view, owner] : roots) {
+            checkAnalysisCancellation();
             try {
                 const auto& workspace = analyze(view, documents);
                 for (const auto& warning : workspace.diagnostics.warnings) append(warning, *owner, 2);
@@ -2106,12 +2378,13 @@ private:
             catch (const Diagnostic& error) { append(error, *owner); }
             catch (const PackageError& error) { append({error.code, error.message}, *owner); }
             catch (const fs::filesystem_error& error) { append({"LYI0001", error.what()}, *owner); }
+            catch (const std::exception& error) { trace("Lyra diagnostics: " + std::string(error.what())); }
         }
         std::lock_guard lock(workMutex);
         if (job.revision != revision) return;
         generated = std::move(expanded);
         generatedRevision = job.revision;
-        synchronizeWatchers(roots);
+        synchronizeWatchers(roots, job.folders);
         for (const auto& [key, document] : documents) {
             auto found = byUri.find(document.uri);
             auto diagnostics = found == byUri.end() ? json::Array{} : std::move(found->second);

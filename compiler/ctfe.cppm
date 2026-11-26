@@ -312,6 +312,7 @@ struct Evaluation {
     Type syntaxType{};
 
     void step(const CheckedFunction& fn, Span site) {
+        checkAnalysisCancellation();
         if (!remaining--) error(sources, fn, site, "LYCT0004", "编译期计算超出执行步数预算");
     }
 

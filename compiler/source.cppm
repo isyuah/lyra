@@ -6,6 +6,7 @@ module;
 #include <memory>
 #include <optional>
 #include <span>
+#include <stop_token>
 #include <string>
 #include <utility>
 #include <vector>
@@ -79,6 +80,13 @@ struct AnalysisDiagnostics {
     void add(Diagnostic error);
     void sort();
 };
+
+struct AnalysisCancelled {};
+inline thread_local std::stop_token analysisStop;
+
+inline void checkAnalysisCancellation() {
+    if (analysisStop.stop_requested()) throw AnalysisCancelled{};
+}
 
 Diagnostic at(const Source& source, Span span, std::string code, std::string message);
 Diagnostic missingName(const Source& source, Span span, std::string code, std::string message, MissingNameKind kind, const std::string& name);

@@ -206,12 +206,16 @@ std::vector<Source> loadSources(const fs::path& package) {
 }
 
 Source loadSource(const fs::path& path, std::string moduleId, const SourceOverlay* overlay) {
+    checkAnalysisCancellation();
     if (overlay) if (auto found = overlay->find(path); found != overlay->end()) return sourceText(path, found->second, std::move(moduleId));
     std::ifstream input(path, std::ios::binary);
     if (!input) throw Diagnostic{"LYI0001", "无法打开源码：" + pathText(path)};
     std::string text;
     char buffer[8192];
-    while (input.read(buffer, sizeof buffer) || input.gcount() > 0) text.append(buffer, input.gcount());
+    while (input.read(buffer, sizeof buffer) || input.gcount() > 0) {
+        checkAnalysisCancellation();
+        text.append(buffer, input.gcount());
+    }
     if (!input.eof() || input.bad()) throw Diagnostic{"LYI0001", "读取源码失败：" + pathText(path)};
     return sourceText(path, std::move(text), std::move(moduleId));
 }

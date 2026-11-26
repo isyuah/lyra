@@ -3,6 +3,7 @@ module;
 #include <array>
 #include <filesystem>
 #include <map>
+#include <memory>
 #include <optional>
 #include <set>
 #include <span>
@@ -30,10 +31,11 @@ bool isTestEntry(const std::filesystem::path& root, const std::filesystem::path&
 std::vector<std::filesystem::path> testEntries(const std::filesystem::path& root);
 struct ParsedFileSyntax { std::string text; RecoveredSyntax parsed; };
 struct ParseCache { std::map<std::string, ParsedFileSyntax> files; };
+struct EditorProbeEnvironment;
 Compilation loadProgram(const PackageGraph& graph, const std::string& entry, const std::optional<std::filesystem::path>& testFile = {}, const SourceOverlay* overlays = nullptr,
-    ParseCache* parseCache = nullptr, bool editorProbe = false, AnalysisDiagnostics* diagnostics = nullptr);
+    ParseCache* parseCache = nullptr, bool editorProbe = false, AnalysisDiagnostics* diagnostics = nullptr, EditorProbeEnvironment* probe = nullptr);
 Compilation loadLooseProgram(std::vector<Source> sources, AnalysisDiagnostics& diagnostics, ParseCache* parseCache = nullptr);
-struct EditorFileSyntax { std::string text; Module syntax; std::vector<ExpressionExpansion> expressions; };
+struct EditorFileSyntax { std::string text; Module syntax; std::vector<ExpressionExpansion> expressions; std::optional<std::string> catalogKey{}; };
 struct EditorParseCache { std::map<std::filesystem::path, EditorFileSyntax> files; };
 struct EditorDeclaration { std::size_t file; std::string name; EditorSymbol symbol; bool visible; };
 struct EditorImport { ImportKind kind; std::vector<std::string> path; EditorSymbol symbol; bool automatic{}; std::optional<MacroKind> macro{}; std::string module{}; };
@@ -50,6 +52,10 @@ struct EditorModuleIndex {
 };
 std::vector<EditorDeclaration> editorDeclarations(const Module& syntax, std::span<const Source> sources, bool generatedOnly = false);
 const Module& editorFileSyntax(const Source& source, EditorParseCache& cache);
+std::string editorCatalogKey(const Source& source, EditorParseCache& cache);
+std::shared_ptr<EditorProbeEnvironment> prepareEditorProbe(const PackageGraph& graph, const std::optional<std::filesystem::path>& testFile,
+    const SourceOverlay& overlays, EditorParseCache& cache);
+bool queryEditorProbe(EditorProbeEnvironment& environment, Source source, EditorProbe& probe, EditorParseCache& cache);
 EditorModuleIndex indexModule(const PackageGraph& graph, const std::filesystem::path& path, const SourceOverlay& overlays, EditorParseCache& cache);
 }
 
@@ -80,6 +86,7 @@ std::vector<fs::path> sourcePaths(const fs::path& directory, const SourceOverlay
     std::set<fs::path> paths;
     auto first = fs::is_directory(directory) ? fs::recursive_directory_iterator(directory) : fs::recursive_directory_iterator{};
     for (auto item = std::move(first); item != fs::recursive_directory_iterator{}; ++item) {
+        checkAnalysisCancellation();
         if (item->is_symlink() && strict) throw Diagnostic{"LYI0001", "源码不允许符号链接：" + pathText(item->path())};
         if (item->is_directory() && (!recursive || pathText(item->path().filename()).starts_with('.'))) { item.disable_recursion_pending(); continue; }
         if (!item->is_symlink() && item->is_regular_file() && item->path().extension() == ".ly") paths.insert(item->path());
@@ -413,9 +420,21 @@ struct Linker {
             }
         }
         for (auto& fn : syntax.functions) {
+            checkAnalysisCancellation();
+            rewriteFunction(fn, syntax, dependencies, moduleExtensions, diagnostics);
+        }
+    }
+
+    void rewriteFunction(Function& fn, const Module& syntax, SymbolDependencies* dependencies = nullptr,
+        const std::map<std::string, std::vector<std::string>>& moduleExtensions = {}, AnalysisDiagnostics* diagnostics = nullptr) {
+            std::set<std::string>* needs{};
             auto rename = [&](Identifier& name) {
                 const auto& definitions = spaces.at(sources[fn.file].moduleId).definitions;
                 if (auto found = definitions.find(name.text); found != definitions.end()) name.text = found->second.name;
+            };
+            auto renameTypeIn = [&](std::size_t file, Identifier& type, std::span<const Identifier> parameters = {}) {
+                if (indexing && type.span.end > type.span.begin) indexTypeNames(file, type.span, parameters);
+                type.text = mapTypeNames(linkType(file, typeForm(type.text), type.span, parameters, needs), [](const auto& name) { return name; });
             };
             auto renameType = [&](Identifier& name) {
                 if (!fn.traitOwner) { renameTypeIn(fn.file, name, fn.typeParameters); return; }
@@ -431,7 +450,7 @@ struct Linker {
             };
             if (fn.owner) rename(*fn.owner);
             if (fn.extensionGroup) rename(*fn.extensionGroup);
-            group(declarationGroup(fn));
+            if (dependencies) needs = &(*dependencies)[declarationGroup(fn)];
             if (needs) {
                 for (const auto& name : syntax.importedExtensions[fn.file]) needs->insert(name);
                 if (auto found = moduleExtensions.find(sources[fn.file].moduleId); found != moduleExtensions.end())
@@ -528,7 +547,6 @@ struct Linker {
                     fn.incompleteBody = true;
                 }
             }
-        }
     }
 };
 
@@ -956,7 +974,7 @@ std::vector<EditorDeclaration> editorDeclarations(const Module& syntax, std::spa
 
 namespace {
 
-const EditorFileSyntax& indexedFile(const Source& source, EditorParseCache& cache) {
+EditorFileSyntax& indexedFile(const Source& source, EditorParseCache& cache) {
     auto entry = cache.files.find(source.path);
     if (entry != cache.files.end() && entry->second.text == source.text) return entry->second;
     EditorFileSyntax file{source.text, {}, {}};
@@ -1310,6 +1328,100 @@ const Module& editorFileSyntax(const Source& source, EditorParseCache& cache) {
     return indexedFile(source, cache).syntax;
 }
 
+struct EditorProbeEnvironment {
+    Compilation program;
+    std::map<std::string, ResolvedPackage> packages;
+    std::map<std::string, Space> spaces;
+    std::map<std::string, std::string> prefixes;
+    std::map<std::size_t, std::map<std::string, Import>> fileImports;
+    std::string entry;
+    EditorParseCache& cache;
+
+    explicit EditorProbeEnvironment(EditorParseCache& cache) : cache(cache) {}
+
+};
+
+std::shared_ptr<EditorProbeEnvironment> prepareEditorProbe(const PackageGraph& graph, const std::optional<fs::path>& testFile,
+    const SourceOverlay& overlays, EditorParseCache& cache) {
+    auto environment = std::make_shared<EditorProbeEnvironment>(cache);
+    environment->program = loadProgram(graph, graph.entry, testFile, &overlays, nullptr, true, nullptr, environment.get());
+    return environment;
+}
+
+bool queryEditorProbe(EditorProbeEnvironment& environment, Source source, EditorProbe& probe, EditorParseCache& cache) {
+    auto& program = environment.program;
+    auto original = std::ranges::find(program.sources, source.path, &Source::path);
+    if (original == program.sources.end() || original->previous || original->origin) return false;
+    auto marker = source.text.find(probe.marker);
+    const auto& parsed = editorFileSyntax(source, cache);
+    auto bodySpan = [](const Function& function) { return function.expressions[function.body].span; };
+    auto patched = std::ranges::find_if(parsed.functions, [&](const auto& function) {
+        if (function.expressions.empty()) return false;
+        auto span = bodySpan(function);
+        return span.begin <= marker && marker < span.end;
+    });
+    if (patched == parsed.functions.end()) return false;
+    const auto originalFile = static_cast<std::size_t>(original - program.sources.begin());
+    auto cached = std::ranges::find_if(program.syntax.functions, [&](const auto& function) {
+        return function.file == originalFile && function.header == patched->header && function.name.span == patched->name.span && !function.expressions.empty();
+    });
+    if (cached == program.syntax.functions.end()) return false;
+    const auto before = bodySpan(*cached), after = bodySpan(*patched);
+    std::string_view oldText = original->text, newText = source.text;
+    if (before.begin != after.begin || oldText.substr(0, before.begin) != newText.substr(0, after.begin) ||
+        oldText.substr(before.end) != newText.substr(after.end)) return false;
+
+    auto syntax = program.syntax;
+    auto& query = syntax.functions[static_cast<std::size_t>(cached - program.syntax.functions.begin())];
+    query = *patched;
+    query.name.text = cached->name.text;
+    query.file = program.sources.size();
+    source.moduleId = original->moduleId;
+    source.importParent = originalFile;
+    auto extensions = syntax.importedExtensions[originalFile];
+    syntax.importedExtensions.push_back(std::move(extensions));
+    program.sources.push_back(std::move(source));
+    struct PopSource { std::vector<Source>& sources; ~PopSource() { sources.pop_back(); } } pop{program.sources};
+    EditorIndex editor;
+    editor.probe = &probe;
+    Linker linker{.sources = program.sources, .spaces = environment.spaces, .prefixes = environment.prefixes, .entry = environment.entry,
+        .references = editor.references, .indexing = false, .fileImports = environment.fileImports};
+    try {
+        linker.rewriteFunction(query, syntax);
+        check(std::move(syntax), program.sources, false, nullptr, &editor);
+    } catch (const EditorProbeFinished&) {}
+    catch (const Diagnostic&) {}
+    return true;
+}
+
+std::string editorCatalogKey(const Source& source, EditorParseCache& cache) {
+    if (cache.files.size() >= 4096) cache.files.clear();
+    auto& file = indexedFile(source, cache);
+    if (file.catalogKey) return *file.catalogKey;
+    llvm::SHA256 hash;
+    auto text = [&](std::string_view value) { hash.update(std::to_string(value.size()) + ':'); hash.update(value); };
+    auto span = [&](Span value) { text(std::to_string(value.begin)); text(std::to_string(value.end)); };
+    auto name = [&](const Identifier& value) { text(value.text); span(value.span); };
+    for (const auto& use : file.syntax.imports) {
+        text("import"); text(std::to_string(static_cast<int>(use.kind))); text(use.isPublic ? "public" : "private");
+        text(std::to_string(use.path.size()));
+        for (const auto& part : use.path) name(part);
+        text(use.member ? "member" : "namespace");
+        if (use.member) name(*use.member);
+        name(use.alias);
+    }
+    for (const auto& declaration : editorDeclarations(file.syntax, std::span(&source, 1))) {
+        const auto& symbol = declaration.symbol;
+        text("declaration"); text(declaration.name); text(declaration.visible ? "public" : "private");
+        text(symbol.label); text(std::to_string(static_cast<int>(symbol.kind))); span(symbol.name);
+        text(symbol.detail); text(symbol.documentation);
+    }
+    for (const auto& prefix : file.syntax.expansions) { text(prefix.decorator ? "decorator" : "macro"); name(prefix.name); }
+    for (const auto& call : file.expressions) { text("expression"); name(call.name); }
+    const auto digest = hash.final();
+    return file.catalogKey.emplace(reinterpret_cast<const char*>(digest.data()), digest.size());
+}
+
 bool isTestEntry(const fs::path& root, const fs::path& path) {
     return path.parent_path() == root / "tests" && path.extension() == ".ly";
 }
@@ -1335,7 +1447,7 @@ Compilation loadLooseProgram(std::vector<Source> sources, AnalysisDiagnostics& d
 }
 
 Compilation loadProgram(const PackageGraph& graph, const std::string& entry, const std::optional<fs::path>& testFile, const SourceOverlay* overlays,
-    ParseCache* parseCache, bool editorProbe, AnalysisDiagnostics* diagnostics) {
+    ParseCache* parseCache, bool editorProbe, AnalysisDiagnostics* diagnostics, EditorProbeEnvironment* probe) {
     std::map<std::string, const ResolvedPackage*> packages;
     std::map<std::string, std::string> prefixes;
     for (const auto& package : graph.packages) {
@@ -1351,13 +1463,18 @@ Compilation loadProgram(const PackageGraph& graph, const std::string& entry, con
     Compilation program;
     std::map<std::string, Space> spaces;
     for (const auto& id : reachable) {
+        checkAnalysisCancellation();
         auto package = packages.at(id);
         auto directory = package->root / "src";
         spaces.try_emplace(prefixes.at(id), Space{package});
         for (const auto& path : sourcePaths(directory, overlays, true)) {
             auto module = directoryModule(prefixes.at(id), directory, path);
             spaces.try_emplace(module, Space{package});
-            program.sources.push_back(loadSource(path, module, overlays));
+            try { program.sources.push_back(loadSource(path, module, overlays)); }
+            catch (const Diagnostic& error) {
+                if (!diagnostics) throw;
+                diagnostics->add(error);
+            }
         }
     }
     auto root = prefixes.at(entry);
@@ -1377,10 +1494,15 @@ Compilation loadProgram(const PackageGraph& graph, const std::string& entry, con
         return std::move(parsed.syntax);
     };
     auto parseAuthored = [&](std::size_t file) {
+        checkAnalysisCancellation();
         const auto& source = program.sources[file];
         std::vector<ExpressionExpansion> calls;
         Module syntax;
-        if (editorProbe) syntax = indexFileSyntax(source, &calls);
+        if (probe) {
+            const auto& parsed = indexedFile(source, probe->cache);
+            syntax = parsed.syntax;
+            calls = parsed.expressions;
+        } else if (editorProbe) syntax = indexFileSyntax(source, &calls);
         else if (diagnostics) syntax = parseRecovering(source, &calls);
         else parseFile(syntax, source, file, &calls);
         appendCachedSyntax(authored, syntax, file);
@@ -1418,10 +1540,24 @@ Compilation loadProgram(const PackageGraph& graph, const std::string& entry, con
     };
     loadBundled(authored, true);
     if (diagnostics && program.incompleteDeclaration) return program;
+    auto linkProgram = [&] {
+        Linker linker{program.sources, spaces, prefixes, root, program.references, overlays != nullptr && !editorProbe};
+        linker.rewrite(program.syntax, nullptr, diagnostics);
+        if (probe) {
+            probe->spaces = std::move(spaces);
+            for (auto& [name, space] : probe->spaces) {
+                auto owner = probe->packages.try_emplace(space.package->id, *space.package).first;
+                space.package = &owner->second;
+            }
+            probe->prefixes = prefixes;
+            probe->fileImports = std::move(linker.fileImports);
+            probe->entry = std::move(linker.entry);
+        }
+    };
     auto hasExpressions = std::ranges::any_of(expressionMacros, [](bool present) { return present; });
     if (!hasExpressions && authored.expansions.empty() && std::ranges::none_of(authored.imports, [](const auto& use) { return use.kind != ImportKind::Runtime; })) {
         program.syntax = std::move(authored);
-        Linker{program.sources, spaces, prefixes, root, program.references, overlays != nullptr}.rewrite(program.syntax, nullptr, diagnostics);
+        linkProgram();
         return program;
     }
     const auto authoredSources = program.sources;
@@ -1492,7 +1628,7 @@ Compilation loadProgram(const PackageGraph& graph, const std::string& entry, con
         loadBundled(program.syntax, false);
     }
     if (program.incompleteDeclaration) return program;
-    Linker{program.sources, spaces, prefixes, root, program.references, overlays != nullptr}.rewrite(program.syntax, nullptr, diagnostics);
+    linkProgram();
     return program;
 }
 

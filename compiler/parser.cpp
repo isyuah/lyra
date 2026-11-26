@@ -93,6 +93,7 @@ public:
     explicit Lexer(const Source& source, std::vector<SyntaxToken>* comments = nullptr) : source(source), text(source.text), comments(comments) {}
 
     Token next() {
+        checkAnalysisCancellation();
         bool newline = false;
         while (offset < text.size()) {
             auto current = text[offset];

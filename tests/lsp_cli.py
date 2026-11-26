@@ -617,6 +617,110 @@ class LanguageServer(unittest.TestCase):
                 self.assertLess(len(published), 19)
                 self.assertEqual(latest['params']['diagnostics'], [])
 
+    def test_cancelled_requests_do_not_block_following_requests(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / 'src/main.ly'
+            source.parent.mkdir()
+            (root / 'lyra.json5').write_text('{name:"app",version:"0.1.0"}', encoding='utf-8')
+            text = 'fn main(): Unit { print(f4000()) }\n' + ''.join(f'fn f{number}(): Int {{ {number} }}\n' for number in range(4001))
+            source.write_text(text, encoding='utf-8')
+            with interactive_server(root) as (send, receive):
+                send({'id': 1, 'method': 'initialize'})
+                self.assertEqual(receive()['id'], 1)
+                send({'method': '$/setTrace', 'params': {'value': 'verbose'}})
+                send({'method': 'textDocument/didOpen', 'params': {'textDocument': {'uri': uri(source), 'version': 1, 'text': text}}})
+                position = position_at(text, text.index('f4000()') + 1)
+                send(document_request(2, source, 'hover', position=position))
+                while True:
+                    observed = receive()
+                    if observed.get('method') == '$/logTrace' and 'reran semantic checks' in observed['params']['message']:
+                        break
+                    self.assertNotEqual(observed.get('id'), 2)
+                send(document_request(3, source, 'hover', position=position))
+                send({'method': '$/cancelRequest', 'params': {'id': 3}})
+                send({'method': '$/cancelRequest', 'params': {'id': 2}})
+                pending = {2, 3}
+                while pending:
+                    reply = receive()
+                    if reply.get('id') in pending:
+                        pending.remove(reply['id'])
+                        self.assertEqual(reply['error']['code'], -32800, reply)
+                send(document_request(4, source, 'completion', position=position))
+                while (reply := receive()).get('id') != 4:
+                    pass
+                self.assertIn('f4000', {item['label'] for item in reply['result']['items']})
+
+    def test_watched_symbol_batches_and_invalid_closed_source(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / 'src/main.ly'
+            broken = root / 'src/a.ly'
+            removed = root / 'src/b.ly'
+            added = root / 'src/c.ly'
+            source.parent.mkdir()
+            (root / 'lyra.json5').write_text('{name:"app",version:"0.1.0"}', encoding='utf-8')
+            text = 'fn main(): Unit { print(1) }\n'
+            source.write_text(text, encoding='utf-8')
+            broken.write_bytes(b'fn broken(): Unit { "\xff" }\n')
+            removed.write_text('fn removed(): Unit {}\n', encoding='utf-8')
+            with interactive_server(root) as (send, receive):
+                send({'id': 1, 'method': 'initialize', 'params': {
+                    'rootUri': uri(root), 'capabilities': {'workspace': {'didChangeWatchedFiles': {
+                        'dynamicRegistration': True, 'relativePatternSupport': True}}}}})
+                self.assertEqual(receive()['id'], 1)
+                send({'method': '$/setTrace', 'params': {'value': 'verbose'}})
+                send({'method': 'textDocument/didOpen', 'params': {'textDocument': {'uri': uri(source), 'version': 1, 'text': text}}})
+                scans = []
+
+                def until(predicate):
+                    while True:
+                        item = receive()
+                        if item.get('method') == '$/logTrace' and 'scanned workspace symbols' in item['params']['message']:
+                            scans.append(item)
+                        if predicate(item):
+                            return item
+
+                invalid = until(lambda item: item.get('method') == 'textDocument/publishDiagnostics' and item['params']['uri'] == uri(broken))
+                self.assertEqual([diag['code'] for diag in invalid['params']['diagnostics']], ['LYL0001'])
+                send({'id': 2, 'method': 'workspace/symbol', 'params': {'query': 'removed'}})
+                self.assertEqual([item['name'] for item in until(lambda item: item.get('id') == 2)['result']], ['removed'])
+                removed.unlink()
+                added.write_text('fn added(): Unit {}\n', encoding='utf-8')
+                broken.write_text('fn repaired(): Unit {}\n', encoding='utf-8')
+                send({'method': 'workspace/didChangeWatchedFiles', 'params': {'changes': [
+                    {'uri': uri(removed), 'type': 3}, {'uri': uri(added), 'type': 1}, {'uri': uri(broken), 'type': 2}]}})
+                send({'id': 3, 'method': 'workspace/symbol', 'params': {'query': ''}})
+                self.assertEqual({item['name'] for item in until(lambda item: item.get('id') == 3)['result']}, {'main', 'added', 'repaired'})
+                cleared = until(lambda item: item.get('method') == 'textDocument/publishDiagnostics' and item['params']['uri'] == uri(broken))
+                self.assertEqual(cleared['params']['diagnostics'], [])
+                self.assertEqual(len(scans), 1)
+
+    def test_member_probe_reuses_declarations_when_only_the_body_changes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / 'src/main.ly'
+            source.parent.mkdir()
+            (root / 'lyra.json5').write_text('{name:"app",version:"0.1.0"}', encoding='utf-8')
+            original = 'struct Box(val key: Int, val name: String)\nfn main(): Unit { val item = Box(7, "box"); item. }\n'
+            edited = original.replace('Box(7, "box")', 'Box(83, "🙂")').replace('item. ', 'item.n ')
+            source.write_text(original, encoding='utf-8')
+            output = run_server([(source, original)], [
+                {'jsonrpc': '2.0', 'method': '$/setTrace', 'params': {'value': 'verbose'}},
+                document_request(4, source, 'completion', position=position_at(original, original.index('Box(7') + 1)),
+                document_request(2, source, 'completion', position=position_at(original, original.index('item.') + len('item.'))),
+                {'jsonrpc': '2.0', 'method': 'textDocument/didChange', 'params': {
+                    'textDocument': {'uri': uri(source), 'version': 2}, 'contentChanges': [{'text': edited}]}},
+                document_request(5, source, 'completion', position=position_at(edited, edited.index('Box(83') + 1)),
+                document_request(3, source, 'completion', position=position_at(edited, edited.index('item.n') + len('item.n'))),
+            ])
+            results = {item['id']: item['result'] for item in output if 'id' in item}
+            self.assertEqual({item['label'] for item in results[2]['items']}, {'key', 'name', 'equals', 'hashCode'})
+            self.assertEqual({item['label'] for item in results[3]['items']}, {'name'})
+            traces = [item['params']['message'] for item in output if item.get('method') == '$/logTrace']
+            self.assertEqual(sum('rebuilt declaration catalog' in item for item in traces), 1, traces)
+            self.assertTrue(any('reused linked declarations for cursor probe' in item for item in traces), traces)
+
     def test_macro_completion_and_definition_follow_compiletime_reexports(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
