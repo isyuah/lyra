@@ -1,6 +1,7 @@
 module;
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -14,6 +15,11 @@ export import lyra.sums;
 export namespace lyra {
 
 using ExprId = std::size_t;
+inline constexpr const char* macroSourceDirectories[] = {".macros", ".typedMacros", ".expressions", ".decorators"};
+inline bool macroSourceDirectory(const std::filesystem::path& directory) {
+    for (const auto* name : macroSourceDirectories) if (directory == name) return true;
+    return false;
+}
 
 struct Identifier {
     std::string text;

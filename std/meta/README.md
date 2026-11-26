@@ -1,6 +1,6 @@
 # 编译期 Lyra
 
-Lyra 宏以 Lyra 编写，入口返回 `Syntax`；编译器解析并检查生成物，运行程序时不加载宏实现。声明宏、表达式宏和装饰器分别放在源码模块的 `.macros/`、`.expressions/` 和 `.decorators/`。同名入口由使用位置区分：声明前写 `#name` 或 `@name`，表达式位置写 `#name(...)`。公开入口用 `pub fn`，下游包可以写 `import macro kit.name as nameHere` 或 `import decorator kit.trace`；加 `pub import` 可重导出。
+Lyra 宏以 Lyra 编写，入口返回 `Syntax`；编译器解析并检查生成物，运行程序时不加载宏实现。普通声明宏、类型宏、表达式宏和装饰器分别放在源码模块的 `.macros/`、`.typedMacros/`、`.expressions/` 和 `.decorators/`。声明前写 `#name` 或 `@name`，表达式位置写 `#name(...)`；普通声明宏与类型宏在同一作用域不能同名。公开入口用 `pub fn`，下游包可以写 `import macro kit.name as nameHere` 或 `import decorator kit.trace`；加 `pub import` 可重导出。
 
 ```lyra
 fn banner(target: String, argument: String): Syntax {
@@ -28,6 +28,22 @@ pub fn increment(target: String, argument: String): Syntax {
 ```
 
 声明宏可通过 `#derive(Json)` 生成私有辅助实现；若希望生成公开 API，必须在调用处写 `#name(export apiName)`，且生成内容必须恰好提供该公开名称。不能通过生成物发布未点名的 API、`extern`、新的宏或公开重导出。宏能查看目标函数体，但不接收全程序类型检查后的 AST。标准库 JSON 和 TOML 派生器分别见 [`std.json`](../json/README.md) 与 [`std.toml`](../toml/README.md)。
+
+## 类型宏
+
+将下面的实现保存为 `src/.typedMacros/requireString.ly`，即可用 `#requireString` 标记普通函数或方法。`syntaxResultType()` 读取实际结果，包括省略注解时的推断结果；`syntaxTypeOf(node): Syntax?` 可读取目标表达式、局部绑定或签名节点的类型。它们返回与 `syntaxResolvedType` 同样的只读节点。
+
+```lyra
+fn requireString(target: String, argument: String): Syntax {
+    val result = syntaxResultType()
+    if syntaxKind(result) != "builtin" || syntaxText(result) != "String" {
+        return syntaxError(syntaxBody(), "expected a String result")
+    }
+    syntaxCode("")
+}
+```
+
+普通宏和装饰器先展开，再检查类型宏的目标；目标不能依赖类型宏尚未生成的帮助函数。类型宏可以产生私有辅助声明或显式授权的公开声明，也可以只检查并返回空输出。泛型保留符号类型，例如 `T`，不因调用者传入了 `Int` 而变成 `Int`。
 
 ## 装饰器
 

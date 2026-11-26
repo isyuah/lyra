@@ -610,8 +610,14 @@ struct Evaluation {
                 }
             }
             auto result = macro->host(name, values);
-            if (fn.result == syntaxType)
-                return makeComposite(caller, call, syntaxType, std::monostate{}, {ConstScalar{static_cast<std::uint64_t>(std::get<SyntaxRef>(result).index)}});
+            auto syntax = [&](SyntaxRef ref) {
+                return makeComposite(caller, call, syntaxType, std::monostate{}, {ConstScalar{static_cast<std::uint64_t>(ref.index)}});
+            };
+            if (fn.result == syntaxType) return syntax(std::get<SyntaxRef>(result));
+            if (fn.result.kind == Type::Option && module.sumTypes[fn.result.id].success == syntaxType) {
+                if (auto ref = std::get_if<SyntaxRef>(&result)) return makeComposite(caller, call, fn.result, SumTag::Some, {syntax(*ref)});
+                return makeComposite(caller, call, fn.result, SumTag::None);
+            }
             if (fn.result == Type::Int) return std::bit_cast<std::uint64_t>(std::get<std::int64_t>(result));
             if (fn.result == Type::Bool) return std::get<bool>(result);
             if (fn.result == Type::String) return std::get<std::string>(std::move(result));

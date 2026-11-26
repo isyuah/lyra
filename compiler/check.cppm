@@ -85,6 +85,12 @@ using ConstScalar = std::variant<std::monostate, bool, std::uint64_t, double, st
 using MacroValue = std::variant<std::monostate, bool, std::int64_t, std::string, SyntaxRef>;
 using MacroHost = std::function<MacroValue(std::string_view, std::span<const MacroValue>)>;
 struct MacroExecution { std::size_t declaration, prelude; std::string target, argument; MacroHost host; SyntaxRef output{}; };
+struct MacroTypeQuery {
+    std::string result;
+    std::vector<std::optional<std::string>> expressions;
+    std::map<Span, std::string> names;
+};
+inline constexpr std::string_view pendingTypedDeclaration = "$typedStage$";
 struct ConstRef { std::size_t index; bool operator==(const ConstRef&) const = default; };
 using ConstValue = std::variant<ConstScalar, ConstRef>;
 using ConstTag = std::variant<std::monostate, SumTag, VariantTag>;
@@ -126,5 +132,6 @@ const std::optional<ConstValue>& constantValue(const CheckedModule& module, Cons
 std::string typeName(const CheckedModule& module, Type type, bool canonical = false);
 std::optional<Type> hiddenType(const CheckedModule& module, Type type);
 CheckedModule check(Module module, const std::vector<Source>& sources, bool requireEntry = true, MacroExecution* macro = nullptr, EditorIndex* editor = nullptr);
+void checkMacroTypes(Module module, const std::vector<Source>& sources, std::map<std::size_t, MacroTypeQuery>& queries);
 void checkForDiagnostics(Module module, const std::vector<Source>& sources, bool requireEntry, AnalysisDiagnostics& diagnostics, EditorIndex* editor = nullptr);
 }

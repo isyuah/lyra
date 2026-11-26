@@ -560,9 +560,9 @@ private:
 
     bool completingBlock() const { return completion && is("{") && completion->contains(token.span.begin); }
 
-    std::size_t prefixes(Module& module, bool method = false) {
+    std::size_t prefixes(Module& module) {
         auto first = module.expansions.size();
-        while (is("@") || (!method && is("#"))) {
+        while (is("@") || is("#")) {
             bool decorator = text(consume()) == "@";
             completeAt(decorator ? CompletionPlace::Decorator : CompletionPlace::DeclarationMacro);
             auto name = identifier();
@@ -921,7 +921,7 @@ private:
         if (is(";")) {
             consume();
             while (!is("}")) {
-                auto firstPrefix = prefixes(module, true);
+                auto firstPrefix = prefixes(module);
                 auto publicMember = visibility();
                 completeAt(CompletionPlace::EnumMethod);
                 if (!is("fn") && !is("async")) throw at(source, token.span, "LYP0001", "enum 分支之后只允许实例方法");
@@ -1015,13 +1015,13 @@ private:
         if (!primary || is("{")) {
             require("{");
             while (!is("}")) {
-                auto firstPrefix = prefixes(module, true);
+                auto firstPrefix = prefixes(module);
                 auto marks = attributes();
                 bool publicMember = visibility();
                 if (token.kind == Kind::Hole && completion) completion->result.afterPublic = publicMember;
                 completeAt(CompletionPlace::MemberDeclaration);
                 if (firstPrefix != module.expansions.size() && !is("fn") && !is("async"))
-                    throw at(source, module.expansions[firstPrefix].name.span, "LYM0001", "成员装饰器只适用于实例方法");
+                    throw at(source, module.expansions[firstPrefix].name.span, "LYM0001", "成员前缀只适用于方法");
                 if (is("type")) {
                     if (!marks.empty()) throw at(source, marks.front().name.span, "LYM0003", "此处的标记只适用于字段和形参");
                     consume();
@@ -2016,7 +2016,7 @@ SyntaxCompletion completeSyntax(const Source& source, std::size_t offset) {
     Module module;
     std::vector<ExpressionExpansion> expansions;
     auto directory = source.path.parent_path().filename();
-    bool macroImplementation = directory == ".expressions" || directory == ".macros" || directory == ".decorators";
+    bool macroImplementation = macroSourceDirectory(directory);
     try { Parser(source, 0, &expansions, macroImplementation, &tokens, &scope).appendTo(module); }
     catch (const CompletionReached&) {}
     auto offer = [&](std::initializer_list<std::string_view> words) {
@@ -2072,7 +2072,7 @@ Module indexFileSyntax(const Source& source, std::vector<ExpressionExpansion>* e
     Module module;
     std::vector<ExpressionExpansion> expansions;
     auto directory = source.path.parent_path().filename();
-    auto macro = directory == ".macros" || directory == ".expressions" || directory == ".decorators" ||
+    auto macro = macroSourceDirectory(directory) ||
         directory == "macros" || directory == "expressions" || directory == "decorators";
     Parser(source, 0, expressions ? expressions : &expansions, macro, &tokens).appendTo(module);
     return module;
@@ -2108,7 +2108,7 @@ std::vector<OutlineSymbol> editorOutline(const Source& source, const Module& syn
     for (const auto& exception : syntax.exceptions) result.push_back(symbol(exception.name, EditorKind::Class, exception.span));
     auto directory = source.path.parent_path().filename();
     auto topFunction = directory == ".decorators" ? EditorKind::Decorator :
-        directory == ".macros" || directory == ".expressions" ? EditorKind::Macro : EditorKind::Function;
+        macroSourceDirectory(directory) ? EditorKind::Macro : EditorKind::Function;
     for (const auto& fn : syntax.functions) {
         if ((!fn.initializer && !fn.conversion && fn.name.text.contains('$')) || fn.name.text == "_") continue;
         auto where = fn.header;

@@ -346,6 +346,7 @@ struct Symbols {
     std::function<void(std::size_t)> checkGeneric{};
     EditorIndex* editor{};
     AnalysisDiagnostics* diagnostics{};
+    bool typeQuery{};
 
     std::optional<SourceAnchor> typeDeclaration(Type type) const {
         auto anchor = [](const auto& syntax) -> std::optional<SourceAnchor> {
@@ -1279,6 +1280,10 @@ struct Symbols {
 
     template<class Lookup>
     std::optional<Type> resolveWith(const TypeForm& form, const Source& source, Span span, std::span<const Identifier> parameters, const Lookup& lookup) {
+        auto phaseName = std::string_view(form.name);
+        if (phaseName.starts_with("$dyn:")) phaseName.remove_prefix(5);
+        if (phaseName.starts_with(pendingTypedDeclaration))
+            throw at(source, span, "LYM0004", "编译期阶段环：类型查询依赖尚未生成的类型宏声明");
         if (form.name.starts_with("$dyn:")) {
             auto name = form.name.substr(5);
             auto found = traitNames.find(name);
@@ -1450,6 +1455,7 @@ struct Checker {
     EditorIndex* editor{};
     std::size_t indexedReferences{};
     std::size_t indexedLocals{};
+    std::vector<bool>* observedExpressions{};
 
     Checker trial(CheckedFunction& body) const {
         Checker trial{body, source, module, symbols, scopes, variables, loops, workers,
@@ -1463,7 +1469,7 @@ struct Checker {
         if (!unsafeDepth) throw at(source, site, "LYF0002", "此原生操作必须写在 unsafe { ... } 内");
     }
 
-    bool materializing() const { return variables.empty() && !probing && !inferredReturn; }
+    bool materializing() const { return variables.empty() && !probing && !inferredReturn && !symbols.typeQuery; }
 
     void requireValueOperation(Type type, ValueOperation operation, Span site) {
         auto support = symbols.valueSupport(type, operation);
@@ -1849,6 +1855,7 @@ struct Checker {
         auto type = std::visit([&](const auto& node) { return infer(id, node, hint, discard); }, expr.node);
         if (const auto* call = std::get_if<Call>(&expr.node); call && fn.expressions[id].callee != Callee::Function)
             rejectReferenceArguments(*call);
+        if (observedExpressions && id < observedExpressions->size()) (*observedExpressions)[id] = true;
         return fn.expressions[id].type = type;
     }
 
@@ -2557,6 +2564,8 @@ struct Checker {
 
     Type infer(ExprId id, const Identifier& name, std::optional<Type> expected, bool) {
         if (auto slot = lookupLocal(name)) return readLocal(id, name, *slot);
+        if (linkedName(name).starts_with(pendingTypedDeclaration))
+            throw at(source, name.span, "LYM0004", "编译期阶段环：类型查询依赖尚未生成的类型宏声明：" + name.text);
         if (name.moduleAlias) throw at(source, name.span, "LYN0003", "模块不是运行时值；请用点号访问公开声明：" + name.text);
         auto candidates = symbols.visibleFunctions(source, name);
         if (candidates.empty()) throw missingName(source, name.span, "LYN0001", "找不到绑定：" + name.text, MissingNameKind::Value, name.text);
@@ -3405,6 +3414,7 @@ struct Checker {
         if (call.function) return invoke(visit(*call.function));
         const auto& key = call.name.linked.empty() ? call.name.text : call.name.linked;
         if (!call.receiver && !call.typeOwner) if (auto local = lookupLocal(call.name)) return invoke(readLocal(id, call.name, *local));
+        if (key.starts_with(pendingTypedDeclaration)) throw at(source, call.name.span, "LYM0004", "编译期阶段环：类型查询依赖尚未生成的类型宏声明：" + call.name.text);
         if (call.name.moduleAlias) throw at(source, call.name.span, "LYN0003", "模块不是函数；请用点号访问公开声明：" + call.name.text);
         if (call.receiver && !call.typeOwner) {
             const auto* qualifier = std::get_if<Identifier>(&fn.syntax.expressions[*call.receiver].node);
@@ -4131,6 +4141,7 @@ const Identifier& Symbols::resultAnnotation(const Callable& candidate, const Sou
     const auto& syntax = declaration(candidate);
     if (!syntax.result.text.empty()) return syntax.result;
     if (diagnostics && (syntax.incompleteBody || candidate.failedInference)) throw BlockedAnalysis{};
+    if (typeQuery && syntax.incompleteBody) throw at(sources[syntax.file], syntax.name.span, "LYM0004", "待推断的函数体尚未完整解析");
     if (syntax.pendingExpansion) throw at(use, site, "LYM0004", "编译期阶段环：宏依赖的函数需要展开后才能推断返回类型：" + syntax.name.text);
     if (candidate.inferredResult) return *candidate.inferredResult;
     if (candidate.inferring) throw at(use, site, "LYT0020", "递归函数需要标注返回类型：" + declarationSite(syntax));
@@ -4165,17 +4176,18 @@ const Identifier& Symbols::resultAnnotation(const Callable& candidate, const Sou
 }
 
 static CheckedModule checkProgram(Module module, const std::vector<Source>& sources, bool requireEntry, MacroExecution* macro, EditorIndex* editor,
-    AnalysisDiagnostics* diagnostics) {
+    AnalysisDiagnostics* diagnostics, std::map<std::size_t, MacroTypeQuery>* queries = nullptr) {
     if (!module.expansions.empty()) {
         auto& use = module.expansions.front();
         throw at(sources[use.file], use.name.span, "LYM0001", "声明前缀未展开：" + use.name.text);
     }
     CheckedModule checked{};
-    if (!diagnostics) for (const auto& fn : module.functions)
+    if (!diagnostics && !queries) for (const auto& fn : module.functions)
         if (fn.incompleteBody) throw at(sources[fn.file], fn.name.span, "LYM0004", "编译期依赖的函数体未完整解析");
     Symbols symbols{checked, sources, {}, {}, {}, {}, {}, {}, {}, {}};
     symbols.editor = editor;
     symbols.diagnostics = diagnostics;
+    symbols.typeQuery = queries != nullptr;
     auto expose = [&](Type type, const Source& source, Span site) {
         if (auto hidden = hiddenType(checked, type)) throw at(source, site, "LYN0003", "公开签名不能暴露模块私有类型：" + typeName(checked, *hidden));
     };
@@ -4487,6 +4499,28 @@ static CheckedModule checkProgram(Module module, const std::vector<Source>& sour
     for (std::size_t index = 0; index < checked.functions.size(); ++index) if (checked.functions[index].syntax.conversion) registerConversion(symbols.conversions, checked, sources, index);
     symbols.boundsReady = true;
     symbols.validateNominalBounds();
+    if (queries) {
+        for (auto& [index, query] : *queries) {
+            const auto& callable = symbols.callables[symbols.functionCallables[index]];
+            auto declaration = symbols.declaration(callable);
+            const auto& source = sources[declaration.file];
+            if (declaration.incompleteBody) throw at(source, declaration.name.span, "LYM0004", "类型宏的目标函数体尚未完整解析");
+            declaration.result = symbols.resultAnnotation(callable, source, declaration.name.span);
+            auto body = symbols.prepare(std::move(declaration), callable.variables);
+            query.result = typeName(checked, body.result, true);
+            std::vector<bool> observed(body.expressions.size());
+            auto checker = Checker{body, source, checked, symbols, {}, callable.variables};
+            checker.observedExpressions = &observed;
+            checker.run();
+            query.expressions.resize(observed.size());
+            for (ExprId id = 0; id < observed.size(); ++id) if (observed[id]) {
+                const auto& info = body.expressions[id];
+                query.expressions[id] = typeName(checked, info.sourceType.value_or(info.type), true);
+            }
+            for (const auto& local : body.locals) if (local.declaration) query.names.emplace(*local.declaration, typeName(checked, local.type, true));
+        }
+        return checked;
+    }
     if (editor && editor->probe) {
         const auto& probe = *editor->probe;
         for (const auto& callable : symbols.callables) {
@@ -4744,6 +4778,10 @@ static CheckedModule checkProgram(Module module, const std::vector<Source>& sour
 
 CheckedModule check(Module module, const std::vector<Source>& sources, bool requireEntry, MacroExecution* macro, EditorIndex* editor) {
     return checkProgram(std::move(module), sources, requireEntry, macro, editor, nullptr);
+}
+
+void checkMacroTypes(Module module, const std::vector<Source>& sources, std::map<std::size_t, MacroTypeQuery>& queries) {
+    checkProgram(std::move(module), sources, false, nullptr, nullptr, nullptr, &queries);
 }
 
 void checkForDiagnostics(Module module, const std::vector<Source>& sources, bool requireEntry, AnalysisDiagnostics& diagnostics, EditorIndex* editor) {

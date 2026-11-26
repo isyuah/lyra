@@ -32,8 +32,10 @@ export namespace lyra {
 inline constexpr std::size_t macroInputByteLimit = 1024 * 1024;
 using MacroFiles = std::map<std::string, std::map<std::string, std::filesystem::path>>;
 struct MacroPackage { std::filesystem::path root; std::string id; MacroFiles inputs; const SourceOverlay* overlays{}; std::filesystem::path cache{}; };
-enum class MacroKind { Declaration, Expression, Decorator };
-struct MacroOrigin { std::filesystem::path path; std::string package, name; bool imported; bool bundled{}; };
+enum class MacroKind { Declaration, TypedDeclaration, Expression, Decorator };
+constexpr MacroKind macroUseKind(MacroKind kind) { return kind == MacroKind::TypedDeclaration ? MacroKind::Declaration : kind; }
+inline constexpr MacroKind macroKinds[] = {MacroKind::Declaration, MacroKind::TypedDeclaration, MacroKind::Expression, MacroKind::Decorator};
+struct MacroOrigin { std::filesystem::path path; std::string package, name; bool imported; bool bundled{}; bool typed{}; };
 using MacroResolver = std::function<MacroOrigin(const Source&, const Identifier&, MacroKind)>;
 using MacroLinker = std::function<std::string(const MacroOrigin&, Module&, std::vector<Source>&)>;
 struct MacroEnvironment { const MacroResolver& resolve; const MacroLinker& link; };
@@ -41,9 +43,11 @@ struct MacroType { std::string kind, name, module; std::vector<MacroType> argume
 using MacroTypeResolver = std::function<MacroType(std::size_t, const Identifier&, std::span<const Identifier>)>;
 struct HttpRouteContribution { std::string factory; std::vector<std::string> dependencies; };
 using HttpRoutes = std::map<std::string, std::vector<HttpRouteContribution>>;
+struct TypedMacroUse { Expansion prefix; std::size_t body; };
+using MacroTypeQueries = std::map<std::size_t, MacroTypeQuery>;
 void expandMacros(Module& syntax, std::vector<Source>& sources, const std::map<std::string, MacroPackage>& packages,
     std::vector<std::filesystem::path>& inputs, const MacroTypeResolver& resolveType, std::string_view typeEnvironment, const MacroEnvironment& environment,
-    HttpRoutes& routes);
+    HttpRoutes& routes, std::vector<TypedMacroUse>& typed, const MacroTypeQueries* queries = nullptr);
 void expandExpressions(Source& source, std::size_t file, const MacroPackage& package, std::vector<std::filesystem::path>& inputs,
     const MacroEnvironment& environment, bool recovering = false);
 void assembleHttpRoutes(Module& syntax, const std::vector<Source>& sources, const std::map<std::string, MacroPackage>& packages, const HttpRoutes& routes);
@@ -56,6 +60,7 @@ namespace fs = std::filesystem;
 std::string_view macroDirectory(MacroKind kind) {
     switch (kind) {
         case MacroKind::Declaration: return "macros";
+        case MacroKind::TypedDeclaration: return "typedMacros";
         case MacroKind::Expression: return "expressions";
         case MacroKind::Decorator: return "decorators";
     }
@@ -98,6 +103,8 @@ fn syntaxColumn(node: Syntax): Int { 0 }
 fn syntaxCode(text: String): Syntax { Syntax(0) }
 fn syntaxCodeAt(node: Syntax, text: String): Syntax { node }
 fn syntaxResolvedType(node: Syntax): Syntax { node }
+fn syntaxTypeOf(node: Syntax): Syntax? { None }
+fn syntaxResultType(): Syntax { Syntax(0) }
 fn syntaxTypeModule(node: Syntax): String { "" }
 fn syntaxString(text: String): Syntax { Syntax(0) }
 fn syntaxInt(number: Int): Syntax { Syntax(0) }
@@ -366,6 +373,8 @@ struct MacroContext {
     std::map<std::string, std::string> inputs{};
     std::set<std::size_t> defaultFields{};
     std::string routeOrigin{};
+    bool typePhase{};
+    const MacroTypeQuery* checked{};
 
     [[noreturn]] void error(const std::string& message) const { throw at(use, expansion.name.span, "LYM0002", message); }
     MacroValue input(const std::string& key) {
@@ -375,6 +384,15 @@ struct MacroContext {
         auto value = prepared ? prepared->at(key) : readInput(use, expansion, package, key, grants->second.at(key));
         files.push_back(std::move(value.path));
         return inputs.emplace(key, std::move(value.text)).first->second;
+    }
+
+    SyntaxRef typeNode(std::string canonical, Span span) {
+        auto append = [&](auto&& self, const MacroType& type) -> SyntaxRef {
+            std::vector<SyntaxRef> arguments;
+            for (const auto& part : type.arguments) arguments.push_back(self(self, part));
+            return arena.add({SyntaxForm::Type, type.kind, type.name, std::move(arguments), span, {}, type.module});
+        };
+        return append(append, (*resolveType)(expansion.file, Identifier{std::move(canonical), span}, parameters));
     }
 
     MacroValue host(std::string_view name, std::span<const MacroValue> args) {
@@ -406,6 +424,10 @@ struct MacroContext {
             auto ref = name == "syntaxTarget" ? target : body;
             if (!ref) error("此位置没有 " + std::string(name) + " 所需的语法节点");
             return *ref;
+        }
+        if (name == "syntaxResultType") {
+            if (!typePhase || !checked) error("syntaxResultType 只适用于检查过的函数或方法类型宏");
+            return typeNode(checked->result, expansion.name.span);
         }
         if (name == "optionInner" || name == "listElement") {
             auto& type = std::get<std::string>(args.front());
@@ -464,13 +486,18 @@ struct MacroContext {
             auto& node = arena.get(ref);
             if (name == "syntaxResolvedType") {
                 if (!resolveType || node.canonical.empty()) error("已解析类型查询只适用于目标声明的显式类型标注");
-                auto span = *node.span;
-                auto append = [&](auto&& self, const MacroType& type) -> SyntaxRef {
-                    std::vector<SyntaxRef> arguments;
-                    for (const auto& part : type.arguments) arguments.push_back(self(self, part));
-                    return arena.add({SyntaxForm::Type, type.kind, type.name, std::move(arguments), span, {}, type.module});
-                };
-                return append(append, (*resolveType)(expansion.file, Identifier{node.canonical, span}, parameters));
+                return typeNode(node.canonical, *node.span);
+            }
+            if (name == "syntaxTypeOf") {
+                if (!typePhase) error("syntaxTypeOf 只适用于 .typedMacros 中的类型宏");
+                if (node.form != SyntaxForm::Input || !node.span) return {};
+                if (checked && node.expression && *node.expression < checked->expressions.size()) {
+                    if (const auto& type = checked->expressions[*node.expression]) return typeNode(*type, *node.span);
+                }
+                if (checked && node.kind == "name") if (auto found = checked->names.find(*node.span); found != checked->names.end())
+                    return typeNode(found->second, *node.span);
+                if (!node.canonical.empty()) return typeNode(node.canonical, *node.span);
+                return {};
             }
             if (name == "syntaxTypeModule") {
                 if (node.form != SyntaxForm::Type) error("syntaxTypeModule 需要已解析类型节点");
@@ -531,6 +558,7 @@ struct MacroDeclaration {
     const MacroTypeResolver* resolveType{};
     std::string_view typeEnvironment{};
     std::string routeOrigin{};
+    const MacroTypeQuery* checked{};
 };
 
 ExpandedMacro expand(const Source& source, const Expansion& prefix, const MacroPackage& package, const Identifier* target,
@@ -585,9 +613,11 @@ ExpandedMacro expand(const Source& source, const Expansion& prefix, const MacroP
             return std::move(*hit);
         }
     }
-    auto [function, aggregate, enumeration, resolveType, typeEnvironment, routeOrigin] = declaration;
+    auto [function, aggregate, enumeration, resolveType, typeEnvironment, routeOrigin, checked] = declaration;
     MacroContext machine{source, prefix, fields, kind, package, files, expression, {source, prefix.name.span}, prepared ? &*prepared : nullptr, resolveType};
     machine.routeOrigin = std::move(routeOrigin);
+    machine.typePhase = origin.typed;
+    machine.checked = checked;
     auto generics = [&](const auto& item) { machine.parameters = item.typeParameters; machine.bounds = item.bounds; };
     if (function) generics(*function);
     if (aggregate) generics(*aggregate);
@@ -698,16 +728,28 @@ void expandExpressions(Source& source, std::size_t file, const MacroPackage& pac
 
 void expandMacros(Module& syntax, std::vector<Source>& sources, const std::map<std::string, MacroPackage>& packages,
     std::vector<fs::path>& inputs, const MacroTypeResolver& resolveType, std::string_view typeEnvironment, const MacroEnvironment& environment,
-    HttpRoutes& routes) {
+    HttpRoutes& routes, std::vector<TypedMacroUse>& typed, const MacroTypeQueries* queries) {
     auto prefixes = std::exchange(syntax.expansions, {});
+    std::map<std::pair<std::size_t, Span>, std::size_t> typedBodies;
+    if (queries) for (const auto& use : typed) {
+        prefixes.push_back(use.prefix);
+        if (use.prefix.kind == ExpansionTarget::Function) typedBodies.emplace(std::pair{use.prefix.file, use.prefix.name.span}, use.body);
+    }
     std::vector<std::pair<Expansion, ExpandedMacro>> decorators;
     using RouteShape = std::vector<std::pair<bool, std::string>>;
     std::map<std::tuple<std::string, std::string, RouteShape>, Site> routeShapes;
+    std::set<std::pair<std::string, std::string>> reservedFunctions;
+    if (queries) for (const auto& function : syntax.functions) if (!function.owner && !function.extensionGroup)
+        reservedFunctions.emplace(sources[function.file].moduleId, function.name.text);
     std::size_t routeNumber = 0;
     for (const auto& prefix : prefixes) {
         const auto& source = sources[prefix.file];
         const auto& package = packages.at(source.moduleId);
         auto origin = environment.resolve(source, prefix.name, prefix.decorator ? MacroKind::Decorator : MacroKind::Declaration);
+        if (!queries && origin.typed) {
+            typed.push_back({prefix, prefix.target});
+            continue;
+        }
         auto routeMethod = origin.bundled && !prefix.decorator ? origin.name == "get" ? "GET" : origin.name == "post" ? "POST" : "" : "";
         std::vector<Field> fields;
         MacroDeclaration declaration{.resolveType = &resolveType, .typeEnvironment = typeEnvironment};
@@ -717,14 +759,22 @@ void expandMacros(Module& syntax, std::vector<Source>& sources, const std::map<s
         } else if (prefix.kind == ExpansionTarget::Enumeration) {
             declaration.enumeration = &syntax.enums[prefix.target];
         } else {
-            declaration.function = &syntax.functions[prefix.target];
+            auto body = queries ? typedBodies.at({prefix.file, prefix.name.span}) : prefix.target;
+            declaration.function = &syntax.functions[body];
+            if (!prefix.decorator && !origin.typed && declaration.function->owner)
+                throw at(source, prefix.name.span, "LYM0001", "普通声明宏不能标记方法；类型宏和装饰器可以");
+            if (queries) {
+                if (declaration.function->foreignSymbol || declaration.function->conversion)
+                    throw at(source, prefix.name.span, "LYM0002", "函数类型宏需要普通函数体");
+                declaration.checked = &queries->at(body);
+            }
             if (prefix.decorator && (declaration.function->foreignSymbol || declaration.function->conversion)) throw at(source, prefix.name.span, "LYM0002", "装饰器需要普通函数体");
             for (auto slot = static_cast<std::size_t>(declaration.function->hasReceiver); slot < declaration.function->parameters.size(); ++slot) {
                 const auto& param = declaration.function->parameters[slot];
                 fields.push_back({param.name, param.type, false, true, param.attributes});
             }
         }
-        const auto& name = declaration.enumeration ? declaration.enumeration->name : declaration.aggregate ? declaration.aggregate->name : declaration.function->name;
+        const auto& name = declaration.enumeration ? declaration.enumeration->name : declaration.aggregate ? declaration.aggregate->name : syntax.functions[prefix.target].name;
         auto kind = declaration.enumeration ? "enum" : declaration.aggregate ? declaration.aggregate->reference ? "class" : "struct" : "fn";
         std::optional<HttpRouteContribution> route;
         if (*routeMethod) {
@@ -763,6 +813,17 @@ void expandMacros(Module& syntax, std::vector<Source>& sources, const std::map<s
                 }
             }
             declaration.routeOrigin = pathText(relative) + ':' + std::to_string(site.start.line) + ':' + std::to_string(site.start.column);
+        }
+        auto fingerprint = std::string(typeEnvironment);
+        if (const auto* types = declaration.checked) {
+            auto append = [&](std::string_view text) { fingerprint += std::to_string(text.size()) + ':'; fingerprint.append(text); };
+            append(types->result);
+            append(std::to_string(types->expressions.size()));
+            for (const auto& expression : types->expressions) append(expression.value_or(""));
+            for (const auto& [span, type] : types->names) {
+                append(std::to_string(span.begin)); append(std::to_string(span.end)); append(type);
+            }
+            declaration.typeEnvironment = fingerprint;
         }
         auto generated = expand(source, prefix, package, &name, fields, kind, inputs, environment, origin, nullptr, declaration);
         if (prefix.decorator) {
@@ -815,11 +876,19 @@ void expandMacros(Module& syntax, std::vector<Source>& sources, const std::map<s
             if (candidate == allowed.end() || name == "main") reject();
             if (topLevel) candidate->second = true;
         };
+        std::set<std::pair<std::string, std::string>> helpers;
         for (auto index = start; index < syntax.functions.size(); ++index) {
             const auto& fn = syntax.functions[index];
             if (fn.foreignSymbol || (!fn.owner && !fn.extensionGroup && fn.name.text == "main")) reject();
+            if (queries && fn.conversion) throw at(original, prefix.name.span, "LYM0002", "类型宏不能生成影响类型检查的隐式转换");
+            if (queries && !fn.owner && !fn.extensionGroup) {
+                auto identity = std::pair{original.moduleId, fn.name.text};
+                if (reservedFunctions.contains(identity)) throw at(original, prefix.name.span, "LYM0002", "类型宏的辅助函数需要新名称，不能添加现有函数的重载：" + fn.name.text);
+                helpers.insert(std::move(identity));
+            }
             if (fn.isPublic) publish(fn.owner ? fn.owner->text : fn.extensionGroup ? fn.extensionGroup->text : fn.name.text, !fn.owner && !fn.extensionGroup);
         }
+        reservedFunctions.merge(helpers);
         auto publishAll = [&](const auto& declarations, std::size_t from) {
             for (auto index = from; index < declarations.size(); ++index)
                 if (declarations[index].isPublic) publish(declarations[index].name.text, true);
@@ -827,6 +896,8 @@ void expandMacros(Module& syntax, std::vector<Source>& sources, const std::map<s
         publishAll(syntax.traits, traits); publishAll(syntax.aggregates, records); publishAll(syntax.enums, enums);
         publishAll(syntax.extensions, extensions); publishAll(syntax.exceptions, exceptions); publishAll(syntax.aliases, aliases);
         if (!syntax.expansions.empty() || std::any_of(syntax.imports.begin() + imports, syntax.imports.end(), [](const auto& use) { return use.isPublic || use.kind != ImportKind::Runtime; })) reject();
+        if (queries && syntax.extensions.size() != extensions)
+            throw at(original, prefix.name.span, "LYM0002", "类型宏不能生成影响类型检查的扩展声明");
         for (const auto& request : prefix.exports) if (!allowed.at(request.text))
             throw at(original, request.span, "LYM0002", "宏没有生成所请求的公开声明：" + request.text);
         storeExpansion(generated);
@@ -882,6 +953,8 @@ void expandMacros(Module& syntax, std::vector<Source>& sources, const std::map<s
         hidden.pendingExpansion.reset();
         for (auto& param : hidden.parameters) param.defaultValue.reset();
         auto name = hidden.name.text;
+        for (auto& use : typed) if (use.prefix.kind == ExpansionTarget::Function && use.body == prefix.target)
+            use.body = syntax.functions.size();
         syntax.functions.push_back(std::move(hidden));
         auto& fn = syntax.functions[prefix.target];
         fn.pendingExpansion.reset();
