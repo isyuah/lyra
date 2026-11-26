@@ -1,6 +1,40 @@
-# 并行性能基准
+# 性能基准
 
-在仓库根目录，使用已构建或已安装的 Lyra 编译器运行。脚本只依赖 Python 3；编译应用仍需要各平台的原生链接工具链。Windows 使用 x64 Developer PowerShell。
+在仓库根目录，使用已构建或已安装的 Lyra SDK 运行。脚本使用 Python 3.11 以上版本，应用对照另需本机 Go。Lyra SDK 自带原生编译和链接工具。
+
+## 应用对照
+
+```powershell
+python tests/benchmarks/applications.py build/windows-release/bin/lyra.exe --output build/benchmarks/windows-applications.json
+```
+
+```sh
+python3 tests/benchmarks/applications.py build/release/bin/lyra --output build/benchmarks/linux-applications.json
+```
+
+Lyra 和 Go 分别生成本机 Release 应用，以相同的 64 位整数结果核对 CLI；HTTP 应用使用相同的路径、状态码、JSON 正文和 HTTP/1 长连接。两端都限制同时处理的 handler 为 64。负载由同一个 Python asyncio 客户端产生，每条连接顺序发送请求，校验响应状态、长度与正文。
+
+- 构建使用包含 200 个函数的程序，分别记录冷缓存、无修改、函数体修改及再次无修改的耗时。临时 `LYRA_CACHE` 和 `GOCACHE` 相互隔离，Go 冷缓存阶段包含标准库编译。`--functions` 可以扩大输入规模。
+- 启动测量包含创建进程、输出一个已验证结果和退出，以预热后样本报告 p50/p95。默认记录 10 次，`--runs` 可调整。
+- HTTP 默认测 1、16、64 条连接，各启动三个全新的服务进程。每条连接先预热 10 次，再记录 200 次请求。报告各轮吞吐、单请求延迟 p50/p95，以及吞吐的样本分布。
+- 内存记录服务接入负载前后的 RSS 和峰值 RSS。Windows 读取进程 Working Set，Linux 读取 `/proc/<pid>/status`。可执行文件大小单独记录。
+- JSON 报告包含工具版本、编译器 SHA-256、Python 版本、平台和负载参数。脚本正常结束时通过应用的停机入口回收服务。
+
+该负载的并发连接数固定，结果包含 Python 客户端和 loopback 开销。比较时保留同一台机器、相同参数和同一客户端，独立运行各平台基准，保存完整 JSON。需要研究最大吞吐时，应另用独立压测机提高到达率并观察服务端与客户端 CPU。
+
+## 多包 LSP
+
+```powershell
+python tests/benchmarks/lsp.py build/windows-release/bin/lyra.exe --output build/benchmarks/windows-lsp.json
+```
+
+```sh
+python3 tests/benchmarks/lsp.py build/release/bin/lyra --packages 2 8 24 --functions 40 --runs 10
+```
+
+脚本创建有 2、8、24 个本地依赖包的应用，每个依赖公开 40 个函数。编辑器同时打开调用者和一个依赖文件，连续发送未保存的函数体修改，测量 `didChange` 到对应文档版本诊断发布的 p50/p95，计入服务端防抖。开始和结束时都用 CLI 全量检查确认程序有效；诊断出现错误、版本不符或服务退出会使测量失败。`--packages` 和 `--functions` 控制项目规模，完整检查耗时一并写入 JSON。
+
+## 并行计算
 
 ```powershell
 python tests/benchmarks/parallel_for.py build/windows-release/bin/lyra.exe
