@@ -147,6 +147,8 @@ llvm::Value* emitCallback(llvm::IRBuilder<>& builder, Type type, const FunctionS
         auto unregisterThread = module.getOrInsertFunction("lyraGcLeaveWorker", emit.getVoidTy(), emit.getInt32Ty());
         auto getClosure = module.getOrInsertFunction("lyraCallbackClosure", pointer, pointer);
         auto recordError = module.getOrInsertFunction("lyraCallbackRecordError", emit.getVoidTy(), pointer, pointer);
+        auto enterShield = module.getOrInsertFunction("lyraCancellationShieldEnter", emit.getVoidTy());
+        auto leaveShield = module.getOrInsertFunction("lyraCancellationShieldLeave", emit.getVoidTy());
         auto* registration = emit.CreateCall(registerThread);
         auto* callable = emit.CreateCall(getClosure, {callback});
         std::vector<llvm::Value*> inputs;
@@ -157,9 +159,11 @@ llvm::Value* emitCallback(llvm::IRBuilder<>& builder, Type type, const FunctionS
             inputs.push_back(param == Type::Bool ? emit.CreateIsNotNull(argument) : argument);
         }
         if (auto attr = extension(shape.result); attr != llvm::Attribute::None) trampoline->addRetAttr(attr);
-        auto* slot = NativeExceptions{emit}.slot();
+        auto* slot = NativeExceptions{emit}.outcomeSlot();
+        emit.CreateCall(enterShield);
         auto* value = NativeClosures{emit}.invoke(closureSignature, callable, inputs, nullptr, slot);
-        auto* error = emit.CreateLoad(pointer, slot);
+        emit.CreateCall(leaveShield);
+        auto* error = NativeExceptions{emit}.outcomeError(slot);
         emit.CreateCondBr(emit.CreateIsNotNull(error), failed, finished);
         emit.SetInsertPoint(failed);
         emit.CreateCall(recordError, {callback, error});

@@ -2,6 +2,8 @@ module;
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <llvm/ADT/SCCIterator.h>
+#include <llvm/Analysis/CallGraph.h>
 #include <llvm/IR/DIBuilder.h>
 #include <llvm/IR/DebugInfoMetadata.h>
 #include <llvm/IR/IRBuilder.h>
@@ -9,6 +11,7 @@ module;
 #include <llvm/IR/Module.h>
 #include <llvm/IR/Verifier.h>
 #include <llvm/Support/MathExtras.h>
+#include <llvm/Transforms/Utils/Local.h>
 #include <lyra/value_hash.hpp>
 #include <map>
 #include <optional>
@@ -45,9 +48,11 @@ struct Layouts {
     mutable std::map<std::vector<std::size_t>, llvm::Constant*> interfaceTables{};
     mutable std::map<std::pair<Type, ValueOperation>, llvm::Function*> valueHelpers{};
     mutable std::map<Type, llvm::Function*> channelPackers{};
+    mutable std::vector<llvm::CallInst*> recursionPolls{};
+    bool cooperative;
     bool workers{};
 
-    Layouts(const CheckedModule& program, Builder& builder) : program(program) {
+    Layouts(const CheckedModule& program, Builder& builder) : program(program), cooperative(program.functions[*program.entry].syntax.isAsync) {
         for (const auto& fn : program.functions) {
             workers |= std::ranges::any_of(fn.syntax.expressions, [](const Expr& expr) {
                 const auto* block = std::get_if<AsyncBlock>(&expr.node);
@@ -345,7 +350,7 @@ struct NativeValues {
                 auto result = emit(builder, fields[slot], operation, first, second, error);
                 if (result.mayThrow) {
                     auto success = label("field.returned");
-                    builder.CreateCondBr(builder.CreateIsNull(builder.CreateLoad(builder.getPtrTy(), error)), success, failure);
+                    builder.CreateCondBr(NativeExceptions{builder}.failed(error), failure, success);
                     builder.SetInsertPoint(success);
                 }
                 if (equality) {
@@ -382,7 +387,7 @@ struct NativeValues {
             auto result = emit(builder, element, operation, first, equality ? load(right) : nullptr, error);
             if (result.mayThrow) {
                 auto success = label("list.returned");
-                builder.CreateCondBr(builder.CreateIsNull(builder.CreateLoad(builder.getPtrTy(), error)), success, failure);
+                builder.CreateCondBr(NativeExceptions{builder}.failed(error), failure, success);
                 builder.SetInsertPoint(success);
             }
             if (equality) {
@@ -634,6 +639,8 @@ struct Emitter {
     std::optional<ExprId> worker{};
     llvm::AllocaInst* cleanupHead{};
     llvm::AllocaInst* errorSlot{};
+    llvm::AllocaInst* callOutcome{};
+    Label cancellationLanding{};
     struct Handler { Label landing; Value mark; };
     std::vector<Handler> handlers{};
     std::vector<Value> caught{};
@@ -680,7 +687,7 @@ struct Emitter {
             builder.CreateUnreachable();
         } else {
             if (cleanupHead) error = cleanupUntil(builder, cleanupHead, nullptr, error);
-            builder.CreateStore(error, native->getArg(native->arg_size() - 1));
+            NativeExceptions{builder}.publishError(native->getArg(native->arg_size() - 1), error);
             builder.CreateRet(llvm::Constant::getNullValue(native->getReturnType()));
         }
         end();
@@ -697,6 +704,43 @@ struct Emitter {
 
     void guardSlot(Span site, const char* role = nullptr) {
         guard(builder.CreateLoad(builder.getPtrTy(), errorSlot), handlers.size(), site, role);
+    }
+
+    void branchOnCancellation(Value cancelled) {
+        auto* next = label("no.cancellation");
+        if (!cancellationLanding) {
+            cancellationLanding = label("cancel.unwind");
+            Builder::InsertPointGuard insertion(builder);
+            builder.SetInsertPoint(cancellationLanding);
+            auto* cleanup = builder.CreateLoad(builder.getPtrTy(), errorSlot);
+            if (asyncBody()) {
+                asyncCancellation(builder, cleanup);
+                builder.CreateUnreachable();
+            } else {
+                Value error = cleanup;
+                if (cleanupHead) error = cleanupUntil(builder, cleanupHead, nullptr, error);
+                NativeExceptions{builder}.cancel(native->getArg(native->arg_size() - 1), error);
+                builder.CreateRet(llvm::Constant::getNullValue(native->getReturnType()));
+            }
+        }
+        builder.CreateCondBr(cancelled, cancellationLanding, next);
+        builder.SetInsertPoint(next);
+    }
+
+    void pollCancellation(bool immediate = false, bool ifRecursive = false) {
+        if (!layouts.cooperative || deferred()) return;
+        auto poll = module.getOrInsertFunction("lyraCancellationPoll", builder.getInt32Ty(), builder.getInt32Ty());
+        auto* result = builder.CreateCall(poll, {builder.getInt32(immediate)});
+        if (ifRecursive) layouts.recursionPolls.push_back(result);
+        branchOnCancellation(builder.CreateIsNotNull(result));
+    }
+
+    void guardCall(Span site) {
+        NativeExceptions exceptions{builder};
+        auto* error = exceptions.outcomeError(callOutcome);
+        builder.CreateStore(error, errorSlot);
+        if (layouts.cooperative) branchOnCancellation(exceptions.cancelled(callOutcome));
+        guard(error, handlers.size(), site, "call");
     }
 
     Value listItem(Value list, Value index, Span site) {
@@ -724,15 +768,15 @@ struct Emitter {
         if (syntax.foreignSymbol) return builder.CreateCall(functions[target], args);
         if (syntax.isAsync) return NativeExceptions{builder}.created(builder.CreateCall(functions[target], args), source, site);
         std::vector<Value> nativeArgs(args.begin(), args.end());
-        nativeArgs.push_back(errorSlot);
+        nativeArgs.push_back(callOutcome);
         auto result = builder.CreateCall(functions[target], nativeArgs);
-        guard(builder.CreateLoad(builder.getPtrTy(), errorSlot), handlers.size(), site, "call");
+        guardCall(site);
         return result;
     }
 
     Value valueOperation(Type type, ValueOperation operation, Value left, Value right, Span site) {
-        auto result = NativeValues{layouts, functions}.emit(builder, type, operation, left, right, errorSlot);
-        if (result.mayThrow) guard(builder.CreateLoad(builder.getPtrTy(), errorSlot), handlers.size(), site, "call");
+        auto result = NativeValues{layouts, functions}.emit(builder, type, operation, left, right, callOutcome);
+        if (result.mayThrow) guardCall(site);
         return result.value;
     }
 
@@ -777,6 +821,7 @@ struct Emitter {
             debugLocation(site);
         }
         errorSlot = NativeExceptions{builder}.slot();
+        callOutcome = NativeExceptions{builder}.outcomeSlot();
         if (std::ranges::find(fn.cleanupOwners, worker) != fn.cleanupOwners.end()) cleanupHead = cleanupStack(builder);
         locals.resize(fn.locals.size());
         for (std::size_t slot = 0; slot < fn.locals.size(); ++slot) {
@@ -804,6 +849,7 @@ struct Emitter {
             } else if (fn.locals[arg.getArgNo()].passing == Passing::Value) initialize(arg.getArgNo(), &arg);
         }
         if (initializer()) initialize(fn.syntax.parameters.size(), asyncCell(builder, layouts.objects[fn.result.id]));
+        if (!asyncBody() && (!worker || !lambda())) pollCancellation(false, !worker);
         auto tail = emit(bodyId());
         if (live()) leave(initializer() ? read(fn.syntax.parameters.size()) : deferred() ? unit() : tail);
     }
@@ -1567,13 +1613,18 @@ struct Emitter {
             NativeClosures nativeCall{builder};
             const auto& shape = layouts.program.signatures[info.callableType->id];
             auto site = shape.result.kind == Type::Task ? nativeCall.location(source, call.name.span) : nullptr;
-            auto value = nativeCall.invoke(signature(shape), closure, args, site, errorSlot);
-            guard(builder.CreateLoad(builder.getPtrTy(), errorSlot), handlers.size(), call.name.span, "call");
+            if (shape.result.kind != Type::Task) pollCancellation();
+            auto value = nativeCall.invoke(signature(shape), closure, args, site, callOutcome);
+            if (shape.result.kind != Type::Task) guardCall(call.name.span);
             if (shape.result == Type::Never) { builder.CreateUnreachable(); end(); }
             return value;
         }
-        if (info.callee == Callee::TaskCancelled) return asyncTaskCancelled(builder);
-        if (info.callee == Callee::TaskCheckCancellation) { asyncCheckCancellation(builder); return unit(); }
+        if (info.callee == Callee::TaskCancelled) {
+            if (!layouts.cooperative) return builder.getFalse();
+            auto requested = module.getOrInsertFunction("lyraCancellationRequested", builder.getInt32Ty());
+            return builder.CreateIsNotNull(builder.CreateCall(requested));
+        }
+        if (info.callee == Callee::TaskCheckCancellation) { pollCancellation(true); return unit(); }
         bool namespaceCall = info.callee == Callee::Variant || info.callee == Callee::PtrNull ||
             info.callee == Callee::PtrAllocate || info.callee == Callee::CallbackRegister;
         auto skip = static_cast<std::size_t>(call.receiver && !namespaceCall);
@@ -1712,13 +1763,16 @@ struct Emitter {
                 auto table = builder.CreateExtractValue(receiver, 1);
                 auto method = builder.CreateLoad(pointer, builder.CreateInBoundsGEP(pointer, table, builder.getInt64(info.target)));
                 args[0] = builder.CreateExtractValue(receiver, 0);
-                if (!info.interfaceAsync) args.push_back(errorSlot);
+                if (!info.interfaceAsync) {
+                    pollCancellation();
+                    args.push_back(callOutcome);
+                }
                 std::vector<llvm::Type*> parameters;
                 for (auto value : args) parameters.push_back(value->getType());
                 auto signature = llvm::FunctionType::get(layouts.native(builder, rawType(id)), parameters, false);
                 auto value = builder.CreateCall(signature, method, args);
                 if (info.interfaceAsync) return NativeExceptions{builder}.created(value, source, call.name.span);
-                guard(builder.CreateLoad(pointer, errorSlot), handlers.size(), call.name.span, "call");
+                guardCall(call.name.span);
                 return value;
             }
             case Callee::ReflectTypeName: return pointerCall("lyraReflectTypeName", {builder.CreateExtractValue(receiver, 0)});
@@ -2043,6 +2097,15 @@ struct Emitter {
         if (live()) builder.CreateBr(next);
     }
 
+    void repeatBody(ExprId body, Label test, Label done) {
+        if (!layouts.cooperative || deferred()) { loopBody(body, test, done); return; }
+        auto* back = label("loop.back");
+        loopBody(body, back, done);
+        builder.SetInsertPoint(back);
+        pollCancellation();
+        builder.CreateBr(test);
+    }
+
     Value emitNode(ExprId id, const While& loop) {
         auto test = label("while.test");
         builder.CreateBr(test);
@@ -2056,7 +2119,7 @@ struct Emitter {
             builder.CreateCondBr(condition, body, done);
             builder.SetInsertPoint(body);
         }
-        loopBody(loop.body, test, done);
+        repeatBody(loop.body, test, done);
         builder.SetInsertPoint(done);
         return unit();
     }
@@ -2092,6 +2155,7 @@ struct Emitter {
             builder.CreateCondBr(builder.CreateICmpEQ(index, last), done, increment);
             builder.SetInsertPoint(increment);
         }
+        pollCancellation();
         index->addIncoming(advance(index, current), builder.GetInsertBlock());
         builder.CreateBr(test);
         builder.SetInsertPoint(done);
@@ -2123,7 +2187,7 @@ struct Emitter {
             builder.CreateCondBr(builder.CreateExtractValue(next, 0), body, done);
             builder.SetInsertPoint(body);
             bindIrrefutable(pattern, builder.CreateExtractValue(next, 1), loop.item.span);
-            loopBody(loop.body, test, done);
+            repeatBody(loop.body, test, done);
             builder.SetInsertPoint(done);
             return unit();
         }
@@ -2176,6 +2240,7 @@ struct Emitter {
         auto error = builder.CreateLoad(builder.getPtrTy(), errorSlot);
         NativeExceptions exceptions{builder};
         builder.CreateStore(exceptions.none(), errorSlot);
+        exceptions.publishError(callOutcome, exceptions.none());
         const auto& checked = fn.expressions[id].catches;
         for (std::size_t slot = 0; slot < attempt.arms.size(); ++slot) {
             const auto& arm = attempt.arms[slot];
@@ -2220,6 +2285,28 @@ struct Emitter {
         return unit();
     }
 };
+
+void keepRecursivePolls(llvm::Module& module, const std::vector<llvm::CallInst*>& polls) {
+    if (polls.empty()) return;
+    llvm::CallGraph graph(module);
+    std::set<llvm::Function*> recursive;
+    for (auto component = llvm::scc_begin(&graph); !component.isAtEnd(); ++component) {
+        if (!component.hasCycle()) continue;
+        for (auto* node : *component) if (auto* function = node->getFunction()) recursive.insert(function);
+    }
+    std::set<llvm::Function*> changed;
+    for (auto* poll : polls) {
+        if (recursive.contains(poll->getFunction())) continue;
+        changed.insert(poll->getFunction());
+        auto* compare = llvm::cast<llvm::Instruction>(*poll->user_begin());
+        auto* block = compare->getParent();
+        compare->replaceAllUsesWith(llvm::ConstantInt::getFalse(module.getContext()));
+        compare->eraseFromParent();
+        poll->eraseFromParent();
+        llvm::ConstantFoldTerminator(block);
+    }
+    for (auto* function : changed) llvm::removeUnreachableBlocks(*function);
+}
 
 }
 
@@ -2278,9 +2365,9 @@ std::unique_ptr<llvm::Module> lower(const CheckedModule& program, const std::vec
         builder.CreateRet(asyncEntry(builder, result, layouts.typeToken(builder, taskCycleError), root.result == Type::Unit ? nullptr : layouts.native(builder, root.result),
             root.result.kind == Type::Result && program.sumTypes[root.result.id].failure == Type::Error));
     } else {
-        auto slot = NativeExceptions{builder}.slot();
+        auto slot = NativeExceptions{builder}.outcomeSlot();
         auto result = builder.CreateCall(functions[entry], {slot});
-        auto error = builder.CreateLoad(builder.getPtrTy(), slot);
+        auto error = NativeExceptions{builder}.outcomeError(slot);
         auto failed = llvm::BasicBlock::Create(context, "failed", main), success = llvm::BasicBlock::Create(context, "success", main);
         builder.CreateCondBr(builder.CreateIsNotNull(error), failed, success);
         builder.SetInsertPoint(failed);
@@ -2289,6 +2376,7 @@ std::unique_ptr<llvm::Module> lower(const CheckedModule& program, const std::vec
         builder.SetInsertPoint(success);
         builder.CreateRet(root.result == Type::Int ? nativeExitCode(builder, result) : builder.getInt32(0));
     }
+    keepRecursivePolls(*module, layouts.recursionPolls);
     std::string reason;
     llvm::raw_string_ostream log(reason);
     if constexpr (!windows) for (auto& fn : *module) if (!fn.isDeclaration()) fn.setUWTableKind(llvm::UWTableKind::Async);

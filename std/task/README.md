@@ -17,7 +17,7 @@ async fn main(): Unit {
 
 `remainingMs()` 返回当前有效截止时间的剩余毫秒；没有时为 `-1`，已到期为 `0`。时间用单调时钟计算，子作用域只可缩短期限，非正超时立即请求取消。到期取消面对的是当前任务树；如果传入的是**已经由另一个作用域启动**的任务，只终止这里的等待。取消不强停同步 C 调用，已启动的工作必须安全收尾。
 
-异步执行体可调用 `Task.cancelled()` 轮询当前任务的取消请求，并用 `Task.checkCancellation()` 在 CPU 密集循环中及时响应。检查会以取消控制效果退出，不会被普通 `catch` 捕获；退出时仍执行已登记的 `defer`。
+编译器在 Lyra 循环回边和递归调用处自动检查取消，包括同步调用及 `blocking` 中的 Lyra 计算。`Task.cancelled()` 可只查询当前请求，`Task.checkCancellation()` 可显式添加检查点。取消跳过普通 `catch`，仍执行已登记的 `defer`。
 
 任意类型的作用域值用 `TaskLocal<T>()` 创建键，通过 `key.get(): Option<T>` 读取，以 `await withLocal(key, value, task)` 激活一个冷作用域。相同类型的两个键互不影响。`taskGroup { ... }` 在当前域运行并等待组内孩子收尾；`parallel { ... }` 在另一执行域启动异步块并返回已启动的 Task。共享读改写可用 [std.sync](../sync/README.md) 显式同步。
 

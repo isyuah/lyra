@@ -209,8 +209,8 @@ int main() {
     check(lyraTaskState(group) == LYRA_TASK_FAILED && lyraTaskState(peers.victim) == LYRA_TASK_CANCELLED, "fail-fast cancelled the group instead of reporting its primary failure");
     auto *cause = lyraTaskException(group);
     check(lyraExceptionMessage(cause) == lyraExceptionMessage(peers.failure) && lyraExceptionSuppressedCount(cause) == 1, "sibling cleanup replaced the originating failure");
-    auto *worker = lyraTaskBlocking([](void *, const LyraException **error) -> void * {
-        *error = raised("worker");
+    auto *worker = lyraTaskBlocking([](void *, LyraCallOutcome *outcome) -> void * {
+        outcome->error = raised("worker");
         lyraGcCollect();
         return nullptr;
     }, nullptr);

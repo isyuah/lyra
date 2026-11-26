@@ -3264,7 +3264,6 @@ struct Checker {
                 (call.name.text == "cancelled" || call.name.text == "checkCancellation")) {
                 noTypeArgs();
                 if (!call.arguments.empty()) throw at(source, call.name.span, "LYT0002", "Task." + call.name.text + " 不接收实参");
-                if (!inAsync()) throw at(source, call.name.span, "LYT0008", "Task." + call.name.text + " 只能在异步执行体中调用");
                 info.callee = call.name.text == "cancelled" ? Callee::TaskCancelled : Callee::TaskCheckCancellation;
                 return call.name.text == "cancelled" ? Type{Type::Bool} : Type{Type::Unit};
             }

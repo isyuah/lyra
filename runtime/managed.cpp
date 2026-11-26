@@ -32,6 +32,7 @@ struct LyraCallback {
 namespace {
 
 uv_once_t initialization = UV_ONCE_INIT;
+thread_local unsigned cancellationShields;
 
 void initialize() {
     GC_INIT();
@@ -81,13 +82,22 @@ void lyraCleanupPush(LyraCleanup **stack, LyraCleanupCall call, void *environmen
 }
 
 const LyraException *lyraCleanupUntil(LyraCleanup **stack, const LyraCleanup *mark, const LyraException *primary) {
+    lyraCancellationShieldEnter();
     while (*stack != mark) {
         auto *top = *stack;
         *stack = top->next;
         if (auto *failure = top->call(top->environment)) primary = lyraExceptionAddCleanupFailure(primary, failure);
     }
+    lyraCancellationShieldLeave();
     return primary;
 }
+
+void lyraCancellationShieldEnter() { ++cancellationShields; }
+void lyraCancellationShieldLeave() {
+    if (!cancellationShields) abort();
+    --cancellationShields;
+}
+int lyraCancellationShielded() { return cancellationShields != 0; }
 
 int lyraGcEnterWorker() {
     if (GC_thread_is_registered()) return 0;

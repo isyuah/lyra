@@ -7,6 +7,7 @@
 #include "strings.h"
 
 #include <algorithm>
+#include <atomic>
 #include <new>
 #include <stdio.h>
 #include <stdlib.h>
@@ -105,7 +106,8 @@ struct LyraTask {
     DeadlineWatch *deadlineWatch;
     LyraTaskState state;
     LyraTaskState pendingState;
-    bool cancelRequested;
+    std::atomic<bool> cancelRequested;
+    std::atomic<int64_t> deadline{-1};
     BlockingRequest *blocking;
     LyraNativeAsync *native;
     NativeCleanup *nativeCleanups;
@@ -156,6 +158,7 @@ thread_local LyraTask *currentTask;
 thread_local LyraTask *blockingTask;
 thread_local const LyraContext *workerContext;
 thread_local Executor *currentExecutor;
+thread_local unsigned deadlinePolls;
 uv_mutex_t taskState;
 uv_once_t taskStateInitialized = UV_ONCE_INIT;
 uv_mutex_t sharedAccess;
@@ -638,6 +641,7 @@ void startTask(LyraDomain *domain, LyraTask *task) {
     task->activeRoot = lyraGcRootCreate(task);
     task->domain = domain;
     task->context = task->owner && !task->nativeShielded ? task->owner->context : nullptr;
+    task->deadline.store(lyraContextDeadline(task->context), std::memory_order_relaxed);
     ++domain->live;
     enqueue(task);
 }
@@ -779,6 +783,7 @@ void publish(TaskLock& lock, LyraTask *task) {
     task->native = nullptr;
     stopDeadline(task);
     task->context = nullptr;
+    task->deadline.store(-1, std::memory_order_relaxed);
     while (auto *waiter = task->firstWaiter) {
         detachWaiter(waiter);
         enqueue(waiter);
@@ -853,23 +858,19 @@ LyraAwaitStatus awaitTask(LyraTask *waiter, LyraTask *target) {
 struct BlockingClosure {
     LyraBlockingBody body;
     void *environment, *result;
-    const LyraException *error;
+    LyraCallOutcome outcome;
     bool submitted;
 };
 
 void runClosure(void *storage) {
     auto *closure = static_cast<BlockingClosure *>(storage);
-    closure->result = closure->body(closure->environment, &closure->error);
+    closure->result = closure->body(closure->environment, &closure->outcome);
 }
 
 void blockingStep(LyraTask *self, void *storage) {
     auto *closure = static_cast<BlockingClosure *>(storage);
-    if (lyraTaskCancelRequested(self)) {
-        TaskLock lock;
-        self->error = closure->error;
-        finish(lock, self, LYRA_TASK_CANCELLED, nullptr);
-    }
-    else if (closure->error) lyraTaskFail(self, closure->error);
+    if (closure->outcome.cancelled || lyraTaskCancelRequested(self)) lyraTaskFinishCancelledWithFailure(self, closure->outcome.error);
+    else if (closure->outcome.error) lyraTaskFail(self, closure->outcome.error);
     else if (closure->submitted) lyraTaskComplete(self, closure->result);
     else { closure->submitted = true; lyraTaskBlock(self, runClosure, closure); }
 }
@@ -947,6 +948,7 @@ uint8_t lyraContextEnter(const LyraContext *context) {
     auto previous = lyraContextDeadline(currentTask->context);
     if (previous >= 0 && (deadline < 0 || previous < deadline)) return false;
     currentTask->context = context;
+    currentTask->deadline.store(deadline, std::memory_order_relaxed);
     if (deadline != previous) {
         stopDeadline(currentTask);
         armDeadline(currentTask, lyraContextRemaining(context));
@@ -1106,7 +1108,7 @@ void lyraTaskCreatedAt(LyraTask *task, const char *file, uint64_t line, uint64_t
 }
 
 LyraTask *lyraTaskBlocking(LyraBlockingBody body, void *environment) {
-    auto *closure = ::new (lyraGcAlloc(sizeof(BlockingClosure))) BlockingClosure{body, environment, nullptr, nullptr, false};
+    auto *closure = ::new (lyraGcAlloc(sizeof(BlockingClosure))) BlockingClosure{body, environment, nullptr, {}, false};
     return lyraTaskCreate(blockingStep, closure);
 }
 
@@ -1245,15 +1247,36 @@ void lyraTaskRequestCancel(LyraTask *task) {
 }
 
 int lyraTaskCancelRequested(LyraTask *task) {
+    if (task->cancelRequested.load(std::memory_order_acquire)) return true;
+    auto deadline = task->deadline.load(std::memory_order_relaxed);
+    if (deadline < 0 || lyraContextClock() < deadline) return false;
     TaskLock lock;
     return cancelled(task);
 }
 
 int lyraBlockingCancelled() { return blockingTask && lyraTaskCancelRequested(blockingTask); }
 
-void lyraTaskFinishCancelled(LyraTask *task) {
+int lyraCancellationRequested() {
+    auto *task = blockingTask ? blockingTask : currentTask;
+    return task && lyraTaskCancelRequested(task);
+}
+
+int lyraCancellationPoll(int immediate) {
+    auto *task = blockingTask ? blockingTask : currentTask;
+    if (!task || lyraCancellationShielded()) return false;
+    if (task->cancelRequested.load(std::memory_order_acquire)) return true;
+    auto deadline = task->deadline.load(std::memory_order_relaxed);
+    if (deadline < 0 || (!immediate && (deadlinePolls++ & 31u)) || lyraContextClock() < deadline) return false;
+    TaskLock lock;
+    return cancelled(task);
+}
+
+void lyraTaskFinishCancelled(LyraTask *task) { lyraTaskFinishCancelledWithFailure(task, nullptr); }
+
+void lyraTaskFinishCancelledWithFailure(LyraTask *task, const LyraException *cleanup) {
     TaskLock lock;
     require(task->cancelRequested, "task has no cancellation request");
+    if (cleanup) task->error = task->error ? lyraExceptionAddCleanupFailure(task->error, cleanup) : cleanup;
     finish(lock, task, LYRA_TASK_CANCELLED, nullptr);
 }
 

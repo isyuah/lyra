@@ -28,11 +28,13 @@ LyraMutex *lyraMutexCreate() {
 
 void lyraMutexLock(LyraMutex *mutex) {
     uv_mutex_lock(&mutex->handle);
+    lyraCancellationShieldEnter();
     GC_reachable_here(mutex);
 }
 
 void lyraMutexUnlock(LyraMutex *mutex) {
     uv_mutex_unlock(&mutex->handle);
+    lyraCancellationShieldLeave();
     GC_reachable_here(mutex);
 }
 
