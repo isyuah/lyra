@@ -41,7 +41,9 @@ struct Request {
     int64_t offerExpires{};
     bool keepAlive{};
     bool http10{};
+    bool streamingBody{};
     int status{};
+    int bodyError{};
     const void* method{};
     const void* target{};
     const void* body{};
@@ -62,12 +64,13 @@ struct RequestParser {
     Request& request;
     std::string target, body, headerBytes;
     std::array<HeaderSpan, maxHeaderFields> headers{};
-    std::size_t total{}, headerCount{}, consumed{}, maxBodyBytes, maxWireBytes;
+    std::size_t total{}, headerCount{}, consumed{}, maxBodyBytes, maxWireBytes, bodyBytes{};
     int error{};
-    bool headersComplete{}, complete{};
+    bool headersComplete{}, headersPaused{}, complete{};
 
     explicit RequestParser(Request&, std::size_t maxBodyBytes, std::size_t maxWireBytes);
     int feed(std::string_view bytes);
+    void resumeBody();
     RequestParser(const RequestParser&) = delete;
 };
 

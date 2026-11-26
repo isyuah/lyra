@@ -436,6 +436,118 @@ async fn main(): Unit {
                 self.assertEqual(output.line().strip(), b"handler cleanup")
                 self.assertEqual(exchange(port, "GET", "/ready"), (200, "text/plain", b"ready"))
 
+    def test_stream_request_head_backpressure_limits_and_keep_alive(self):
+        package = self.root / 'upload'
+        (package / 'src').mkdir(parents=True)
+        (package / 'lyra.json5').write_text("{name:'test/upload',version:'1.0.0'}", encoding='utf-8')
+        (package / 'src/main.ly').write_text(HTTP_HELPERS + '''
+import std.http.{Request, Router}
+import std.io.{readLine}
+
+async fn upload(request: Request): Response {
+    #assert(request.bodyStreaming())
+    if request.target() == "/gated" {
+        print("upload entered")
+        val first = spawn request.readBody()
+        await sleepMs(0)
+        #assert(failed(await request.readBody(), HttpErrorKind.Busy))
+        print("waiting for first chunk")
+        #assert(requireHttp(await first) == Some("x".toBytes()))
+        print("first chunk received")
+    }
+    var count = if request.target() == "/gated" { 1 } else { 0 }
+    while true {
+        match await request.readBody() {
+            Ok(Some(chunk)) => { #assert(chunk.size <= 8192); count += chunk.size },
+            Ok(None) => break,
+            Err(error) => { print(error.message()); return Response.text(400, "invalid body") },
+        }
+    }
+    #assert(requireHttp(await request.readBody()) == None)
+    Response.text(200, "${count}")
+}
+
+async fn main(): Unit {
+    val listener = requireHttp(listen(0, options: HttpServerOptions(capacity: 2, requestTimeoutMs: 15000,
+        idleReadTimeoutMs: Some(1000), maxBodyBytes: 10485760, maxRequestBytes: 16777216, streamRequestBody: true)))
+    val routes = Router()
+    routes.post("/gated", upload)
+    routes.post("/chunked", upload)
+    routes.post("/oversized", upload)
+    routes.post("/reject", async (request: Request) => { Response.text(415, "rejected") })
+    routes.post("/cancel", async (request: Request) => {
+        val reading = spawn request.readBody()
+        await sleepMs(0)
+        print("waiting for cancellation")
+        await blocking { val _ = readLine() }
+        reading.cancel()
+        #assert(match awaitOutcome(reading) { Cancelled(_) => true, _ => false })
+        Response.text(200, "must not write")
+    })
+    routes.get("/ok", async (request: Request) => {
+        #assert(requireHttp(await request.readBody()) == None)
+        Response.text(200, "ok")
+    })
+    print(listener.port())
+    await routes.serve(listener)
+}
+''', encoding='utf-8')
+        for profile, app in self.profiles(package):
+            with self.subTest(profile=profile), server(app) as (port, process, output):
+                with contextlib.closing(http.client.HTTPConnection('127.0.0.1', port, timeout=5)) as connection:
+                    length = 10 * 1024 * 1024
+                    connection.putrequest('POST', '/gated')
+                    connection.putheader('Content-Length', str(length))
+                    connection.endheaders()
+                    self.assertEqual(output.line(), b'upload entered\n')
+                    self.assertEqual(output.line(), b'waiting for first chunk\n')
+                    connection.send(b'x')
+                    self.assertEqual(output.line(), b'first chunk received\n')
+                    block = bytes(range(256)) * 256
+                    connection.send(block[1:])
+                    for _ in range(159):
+                        connection.send(block)
+                    response = connection.getresponse()
+                    self.assertEqual((response.status, response.getheader('Connection'), response.read()), (200, 'keep-alive', str(length).encode()))
+                    socket_before = connection.sock
+                    connection.request('POST', '/chunked', iter([b'a', b'\x00xyz', b'last']), encode_chunked=True)
+                    response = connection.getresponse()
+                    self.assertEqual((response.status, response.read()), (200, b'9'))
+                    self.assertIs(connection.sock, socket_before)
+                with socket.create_connection(('127.0.0.1', port), timeout=5) as connection:
+                    connection.sendall(b'POST /reject HTTP/1.1\r\nHost: localhost\r\nContent-Length: 4096\r\n\r\n')
+                    with contextlib.closing(http.client.HTTPResponse(connection)) as response:
+                        response.begin()
+                        self.assertEqual((response.status, response.getheader('Connection'), response.read()), (415, 'close', b'rejected'))
+                    connection.sendall(b'a' * 4096)
+                    connection.shutdown(socket.SHUT_WR)
+                    self.assertEqual(connection.recv(1), b'')
+                with socket.create_connection(('127.0.0.1', port), timeout=5) as connection:
+                    connection.sendall(b'POST /oversized HTTP/1.1\r\nHost: localhost\r\nContent-Length: 10485761\r\n\r\n')
+                    with contextlib.closing(http.client.HTTPResponse(connection)) as response:
+                        response.begin()
+                        self.assertEqual((response.status, response.read()), (413, b''))
+                with socket.create_connection(('127.0.0.1', port), timeout=5) as connection:
+                    connection.sendall(b'POST /chunked HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\na00001\r\n')
+                    with contextlib.closing(http.client.HTTPResponse(connection)) as response:
+                        response.begin()
+                        self.assertEqual((response.status, response.read()), (413, b''))
+                self.assertEqual(output.line(), b'request.readBody: HTTP message exceeds its size limit\n')
+                with socket.create_connection(('127.0.0.1', port), timeout=5) as connection:
+                    connection.sendall(b'POST /chunked HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n')
+                    with contextlib.closing(http.client.HTTPResponse(connection)) as response:
+                        response.begin()
+                        self.assertEqual((response.status, response.read()), (408, b''))
+                    self.assertEqual(output.line(), b'request.readBody: HTTP operation timed out\n')
+                with socket.create_connection(('127.0.0.1', port), timeout=5) as connection:
+                    connection.sendall(b'POST /cancel HTTP/1.1\r\nHost: localhost\r\nContent-Length: 10\r\n\r\n')
+                    self.assertEqual(output.line(), b'waiting for cancellation\n')
+                    process.stdin.write(b'cancel\n')
+                    process.stdin.flush()
+                    self.assertEqual(connection.recv(1), b'')
+                self.assertEqual(exchange(port, 'GET', '/ok'), (200, 'text/plain', b'ok'))
+                self.assertIsNone(process.poll())
+
     def test_streamed_response_backpressure_cancellation_and_producer_failure(self):
         package = self.root / 'streaming'
         (package / 'src').mkdir(parents=True)

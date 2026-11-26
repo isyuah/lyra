@@ -53,6 +53,7 @@ void validateForeign(const CheckedFunction& fn, const CheckedModule& program, co
     struct SdkBinding { std::string_view module, symbol; std::vector<Type> parameters; Type result; bool task; };
     static const std::vector<SdkBinding> bindings{
         {"$std/http", "lyraHttpAcceptAsync", {Type::CPtr, Type::Int, Type::Bool, Type::Bool}, Type::CPtr, true},
+        {"$std/http", "lyraHttpReadBodyAsync", {Type::CPtr}, Type::CPtr, true},
         {"$std/http", "lyraHttpRespondAsync", {Type::CPtr, Type::Int, Type::String, Type::Bytes, Type::CPtr}, Type::Int, true},
         {"$std/http", "lyraHttpStartStreamAsync", {Type::CPtr, Type::Int, Type::String, Type::CPtr}, Type::Int, true},
         {"$std/http", "lyraHttpWriteStreamAsync", {Type::CPtr, Type::Bytes, Type::Bool}, Type::Int, true},

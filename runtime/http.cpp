@@ -42,6 +42,7 @@ int appendHeader(llhttp_t* parser, const char* data, std::size_t size, bool name
 }
 
 int parseHeaders(const llhttp_t& parser, const RequestParser& parsed);
+int setRequestHead(const llhttp_t& parser, const RequestParser& parsed);
 
 constexpr auto parserSettings = [] {
     llhttp_settings_t config{};
@@ -51,7 +52,16 @@ constexpr auto parserSettings = [] {
     };
     config.on_body = [](llhttp_t* parser, const char* bytes, std::size_t count) {
         auto& parsed = *static_cast<RequestParser*>(parser->data);
-        return append(parsed, parsed.body, parsed.maxBodyBytes, bytes, count);
+        if (count > parsed.maxBodyBytes - parsed.bodyBytes) { parsed.error = EMSGSIZE; return -1; }
+        parsed.bodyBytes += count;
+        parsed.body.append(bytes, count);
+        return 0;
+    };
+    config.on_chunk_header = [](llhttp_t* parser) {
+        auto& parsed = *static_cast<RequestParser*>(parser->data);
+        if (parser->content_length <= parsed.maxBodyBytes - parsed.bodyBytes) return 0;
+        parsed.error = EMSGSIZE;
+        return -1;
     };
     config.on_header_field = [](llhttp_t* parser, const char* bytes, std::size_t count) { return appendHeader(parser, bytes, count, true); };
     config.on_header_value = [](llhttp_t* parser, const char* bytes, std::size_t count) { return appendHeader(parser, bytes, count, false); };
@@ -63,8 +73,11 @@ constexpr auto parserSettings = [] {
     config.on_headers_complete = [](llhttp_t* parser) {
         auto& parsed = *static_cast<RequestParser*>(parser->data);
         parsed.headersComplete = true;
-        parsed.error = parseHeaders(*parser, parsed);
-        return parsed.error ? -1 : 0;
+        parsed.error = setRequestHead(*parser, parsed);
+        if (parsed.error) return -1;
+        parsed.headersPaused = parsed.request.streamingBody && ((parser->flags & F_CHUNKED) ||
+            ((parser->flags & F_CONTENT_LENGTH) && parser->content_length != 0));
+        return parsed.headersPaused ? static_cast<int>(HPE_PAUSED) : 0;
     };
     config.on_message_complete = [](llhttp_t* parser) { static_cast<RequestParser*>(parser->data)->complete = true; return static_cast<int>(HPE_PAUSED); };
     return config;
@@ -196,6 +209,20 @@ int parseHeaders(const llhttp_t& parser, const RequestParser& parsed) {
     return expect ? unsupportedExpectation : 0;
 }
 
+int setRequestHead(const llhttp_t& parser, const RequestParser& parsed) {
+    if (parser.upgrade) return EPROTO;
+    if (auto status = parseHeaders(parser, parsed)) return status;
+    auto& request = parsed.request;
+    auto& target = parsed.target;
+    if (!target.starts_with('/') || !lyraUtf8Valid(target.data(), target.size()) || !parseTarget(&request, target)) return EPROTO;
+    auto method = llhttp_method_name(static_cast<llhttp_method_t>(parser.method));
+    request.method = lyraStringFromBytes(method, std::strlen(method));
+    request.target = lyraStringFromBytes(target.data(), target.size());
+    request.keepAlive = llhttp_should_keep_alive(&parser);
+    request.http10 = parser.http_minor == 0;
+    return 0;
+}
+
 const char* reason(int64_t status) {
     switch (status) {
         case 200: return "OK"; case 201: return "Created"; case 202: return "Accepted"; case 204: return "No Content";
@@ -224,19 +251,19 @@ RequestParser::RequestParser(Request& message, std::size_t maxBodyBytes, std::si
 
 int RequestParser::feed(std::string_view bytes) {
     auto code = llhttp_execute(&parser, bytes.data(), bytes.size());
-    consumed = code == HPE_PAUSED && complete ? static_cast<std::size_t>(llhttp_get_error_pos(&parser) - bytes.data()) : bytes.size();
+    auto paused = code == HPE_PAUSED && (complete || headersPaused);
+    consumed = paused ? static_cast<std::size_t>(llhttp_get_error_pos(&parser) - bytes.data()) : bytes.size();
     total += consumed;
     if (total > maxWireBytes) return EMSGSIZE;
-    if (code != HPE_OK && !(code == HPE_PAUSED && complete)) return error ? error : EPROTO;
-    if (!complete) return 0;
-    if (!target.starts_with('/') || !lyraUtf8Valid(target.data(), target.size()) || !parseTarget(&request, target)) return EPROTO;
-    auto method = llhttp_method_name(static_cast<llhttp_method_t>(llhttp_get_method(&parser)));
-    request.method = lyraStringFromBytes(method, std::strlen(method));
-    request.target = lyraStringFromBytes(target.data(), target.size());
-    request.body = lyraStringFromBytes(body.data(), body.size());
-    request.keepAlive = llhttp_should_keep_alive(&parser);
-    request.http10 = parser.http_minor == 0;
+    if (code != HPE_OK && !paused) return error ? error : EPROTO;
+    if (complete && !request.streamingBody) request.body = lyraStringFromBytes(body.data(), body.size());
     return 0;
+}
+
+void RequestParser::resumeBody() {
+    if (!headersPaused) return;
+    llhttp_resume(&parser);
+    headersPaused = false;
 }
 
 }
@@ -245,6 +272,7 @@ extern "C" int64_t lyraHttpRequestStatus(const Request* req) { return req->statu
 extern "C" const void* lyraHttpMethod(const Request* req) { return req->method; }
 extern "C" const void* lyraHttpTarget(const Request* req) { return req->target; }
 extern "C" const void* lyraHttpBody(const Request* req) { return req->body; }
+extern "C" uint8_t lyraHttpBodyStreaming(const Request* req) { return req->streamingBody; }
 extern "C" int64_t lyraHttpQueryCount(const Request* req) { return req->queryCount; }
 extern "C" const void* lyraHttpQueryName(const Request* req, int64_t index) { return req->query[index].name; }
 extern "C" const void* lyraHttpQueryValue(const Request* req, int64_t index) { return req->query[index].value; }

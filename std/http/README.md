@@ -32,7 +32,7 @@ val handled = await server.withAccepted<Unit>(5000, async (request: Request) => 
 })
 ```
 
-`withAccepted` 在回调及其子任务退出后，等待当前请求释放再结束。成功响应可复用连接，异常、取消或未响应时关闭连接。`await listener.accept(timeoutMs)` 返回裸请求，若不立即响应，调用 `request.claim()` 认领，并自行关闭。请求默认在发放 5000ms 后仍未被认领就关闭。两种接收的 `timeoutMs` 控制等待已解析请求，`-1` 无期限，`0` 只取当前就绪项，已登记的手动接收也可能得到客户端解析或握手错误。请求接入后的独立计时见 [`HttpServerOptions`](../../rfc/http-reactor.md#接入超时与背压)。
+`withAccepted` 在回调及其子任务退出后，等待当前请求释放再结束。成功响应可复用连接，异常、取消或未响应时关闭连接。`await listener.accept(timeoutMs)` 返回裸请求，可显式 `request.claim()`；开始读流式正文或写响应也会认领，调用者仍负责关闭。请求默认在发放 5000ms 后仍未被认领就关闭。两种接收的 `timeoutMs` 控制等待就绪请求，`-1` 无期限，`0` 只取当前就绪项，已登记的手动接收也可能得到客户端解析或握手错误。请求接入后的独立计时见 [`HttpServerOptions`](../../rfc/http-reactor.md#接入超时与背压)。
 
 ## 请求、路由、响应
 
@@ -49,6 +49,15 @@ HTTP/1.1 默认支持 keep-alive，HTTP/1.0 通过 `Connection: keep-alive` 开�
 `HttpServerOptions` 的 `maxBodyBytes` 默认 8 MiB，`maxRequestBytes` 默认 16 MiB，分别限制解码后正文和整条请求的传输字节。目标最多 8 KiB，头部最多 100 项且字段名和值合计最多 32 KiB。`keepAliveTimeoutMs` 默认 5000，控制两条请求之间的空闲时间，设为 0 关闭复用。`maxRequestsPerConnection` 默认 1000。同一连接顺序处理请求，管线输入只保留有界读取窗口。
 
 超限回 `413`，格式或头部文本非法回 `400`。HTTP/1.1 必须有且只有一个有效的 `Host`，携带 `Expect` 的请求在读完首部后回 `417`。响应在写前验证失败可改正后重试。TLS 复用同一套请求和生命周期语义，见 [`std.httpTls`](../httpTls/README.md)。
+
+### 流式上传
+
+将监听器设置为 `HttpServerOptions(streamRequestBody: true)`，Router 在首部就绪后即可调用 handler，无需等整个上传完成。通过 `await request.readBody()` 逐块消费传输解码后的 `Bytes`，正常读完返回 `Ok(None)`；请求行、字段和路由读取方式不变。
+
+- 分块由传输决定，每次最多 8 KiB；不读取时暂停接收。并发读取返回 `Busy`，取消挂起读取会关闭当前连接并等原生回收。
+- `maxBodyBytes` 和 `maxRequestBytes` 依然累计限制整条请求。总请求预算包含应用暂停读取的时间，空闲预算只在等待网络时计时。解码协议错误或超限时库会发错误响应并终止本次传输。
+- 读完后可以复用连接。未读完就响应时，本次响应后关闭连接，并在写端关闭后限时排空剩余输入；正在读时尝试发送响应返回 `Busy`。
+- `bodyStreaming()` 可查询监听器使用的模式。`body()`、`text()`、`json(codec)` 与宏 `[body]` 使用默认缓冲模式；开启流式上传时由 handler 按需读取和解码。
 
 ### 流式响应
 

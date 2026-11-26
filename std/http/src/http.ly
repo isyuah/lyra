@@ -4,7 +4,7 @@ import std.sync.{Locked}
 import std.task.{withTimeout}
 
 extern fn lyraHttpListen(host: String, port: Int, options: CPtr): CPtr;
-extern fn lyraHttpOptions(capacity: Int, requestTimeoutMs: Int, idleReadTimeoutMs: Int, writeTimeoutMs: Int, handshakeTimeoutMs: Int, graceMs: Int, claimTimeoutMs: Int, maxBodyBytes: Int, maxRequestBytes: Int, keepAliveTimeoutMs: Int, maxRequestsPerConnection: Int): CPtr;
+extern fn lyraHttpOptions(capacity: Int, requestTimeoutMs: Int, idleReadTimeoutMs: Int, writeTimeoutMs: Int, handshakeTimeoutMs: Int, graceMs: Int, claimTimeoutMs: Int, maxBodyBytes: Int, maxRequestBytes: Int, keepAliveTimeoutMs: Int, maxRequestsPerConnection: Int, streamRequestBody: Bool): CPtr;
 extern fn lyraHttpStatus(server: CPtr): Int;
 extern fn lyraHttpStatusDetail(server: CPtr): String;
 extern fn lyraHttpErrorKind(status: Int): Int;
@@ -21,6 +21,11 @@ extern fn lyraHttpRequestStatus(request: CPtr): Int;
 extern fn lyraHttpMethod(request: CPtr): String;
 extern fn lyraHttpTarget(request: CPtr): String;
 extern fn lyraHttpBody(request: CPtr): Bytes;
+extern fn lyraHttpBodyStreaming(request: CPtr): Bool;
+extern fn lyraHttpReadBodyAsync(request: CPtr): Task<CPtr>;
+extern fn lyraHttpBodyReadStatus(result: CPtr): Int;
+extern fn lyraHttpBodyReadHasBytes(result: CPtr): Bool;
+extern fn lyraHttpBodyReadBytes(result: CPtr): Bytes;
 extern fn lyraHttpDisconnected(request: CPtr): Bool;
 extern fn lyraHttpWaitDisconnectAsync(request: CPtr, timeoutMs: Int): Task<Int>;
 extern fn lyraHttpClaim(request: CPtr): Int;
@@ -109,6 +114,7 @@ pub struct HttpServerOptions(
     pub val maxRequestBytes: Int = 16777216,
     pub val keepAliveTimeoutMs: Int = 5000,
     pub val maxRequestsPerConnection: Int = 1000,
+    pub val streamRequestBody: Bool = false,
 )
 
 fn serverOptions(options: HttpServerOptions): CPtr {
@@ -116,7 +122,7 @@ fn serverOptions(options: HttpServerOptions): CPtr {
         None => -1,
         Some(milliseconds) => if milliseconds < 1 { 0 } else { milliseconds },
     }
-    lyraHttpOptions(options.capacity, options.requestTimeoutMs, idle, options.writeTimeoutMs, options.handshakeTimeoutMs, options.graceMs, options.claimTimeoutMs, options.maxBodyBytes, options.maxRequestBytes, options.keepAliveTimeoutMs, options.maxRequestsPerConnection)
+    lyraHttpOptions(options.capacity, options.requestTimeoutMs, idle, options.writeTimeoutMs, options.handshakeTimeoutMs, options.graceMs, options.claimTimeoutMs, options.maxBodyBytes, options.maxRequestBytes, options.keepAliveTimeoutMs, options.maxRequestsPerConnection, options.streamRequestBody)
 }
 
 fn acceptResult(request: CPtr): Result<Request, HttpError> {
@@ -179,8 +185,19 @@ pub class Request {
 
     pub fn method(): String { lyraHttpMethod(handle) }
     pub fn target(): String { lyraHttpTarget(handle) }
-    pub fn body(): Bytes { lyraHttpBody(handle) }
+    pub fn bodyStreaming(): Bool { lyraHttpBodyStreaming(handle) }
+    pub fn body(): Bytes {
+        if bodyStreaming() { throw Exception("request.body is buffered-only; use await request.readBody()") }
+        lyraHttpBody(handle)
+    }
+    pub async fn readBody(): Result<Bytes?, HttpError> {
+        val result = await lyraHttpReadBodyAsync(handle)
+        val status = lyraHttpBodyReadStatus(result)
+        if status != 0 { return Err(httpError("request.readBody", status)) }
+        Ok(if lyraHttpBodyReadHasBytes(result) { Some(lyraHttpBodyReadBytes(result)) } else { None })
+    }
     pub fn text(): Result<String, HttpError> {
+        if bodyStreaming() { return Err(HttpError(HttpErrorKind.Invalid, "request.text", "use await request.readBody()")) }
         match body().toString() {
             Some(text) => Ok(text),
             None => Err(HttpError(HttpErrorKind.InvalidUtf8, "request.text")),

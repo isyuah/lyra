@@ -83,14 +83,30 @@ async fn healthy(request: Request): Response { Response.text(200, "ok") }
 
 async fn main(): Int {
     val values = match args() { Ok(arguments) => arguments, Err(error) => throw Exception(error.message()) }
-    val listener = match listenTls(0, pem(values[0]), pem(values[1]), options: HttpServerOptions(capacity: 2, handshakeTimeoutMs: 1000)) {
+    val listener = match listenTls(0, pem(values[0]), pem(values[1]), options: HttpServerOptions(capacity: 2,
+        handshakeTimeoutMs: 1000, streamRequestBody: true)) {
         Ok(value) => value,
         Err(error) => { print(error.message()); return 2 },
     }
     val router = Router()
     router.get("/slow", slow)
     router.get("/health", healthy)
-    router.post("/echo", async (request: Request) => { Response.bytes(200, "application/octet-stream", request.body()) })
+    router.post("/echo", async (request: Request) => {
+        #assert(request.bodyStreaming())
+        val expected: List<UInt8> = [0, 255, 65, 66]
+        var count = 0
+        while true {
+            match await request.readBody() {
+                Ok(Some(chunk)) => {
+                    for index in 0..<chunk.size { #assert(chunk[index] == expected[count]); count += 1 }
+                },
+                Ok(None) => break,
+                Err(error) => throw Exception(error.message()),
+            }
+        }
+        #assert(count == expected.size)
+        Response.bytes(200, "application/octet-stream", b"\\x00\\xffAB")
+    })
     router.get("/large", async (request: Request) => {
         val large = await blocking { pem(values[2]) }
         Response.bytes(200, "application/octet-stream", large)

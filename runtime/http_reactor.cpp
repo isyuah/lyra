@@ -31,8 +31,8 @@ constexpr int64_t rejectionTimeoutMs = 1000;
 constexpr std::string_view overloadResponse = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nRetry-After: 1\r\nConnection: close\r\n\r\n";
 
 enum class Stop { Open, Drain, Close };
-enum class OperationKind { Accept, Respond, StartStream, WriteStream, Observe, CloseRequest, CloseListener, ListenerScope };
-enum class Phase { Handshake, Idle, Reading, Ready, StreamReady, Writing, EndingTls, EndingTcp, RejectDrain, Closing };
+enum class OperationKind { Accept, ReadBody, Respond, StartStream, WriteStream, Observe, CloseRequest, CloseListener, ListenerScope };
+enum class Phase { Handshake, Idle, Reading, ReadingBody, Ready, StreamReady, Writing, EndingTls, EndingTcp, RejectDrain, Closing };
 
 void require(bool condition, const char* message) {
     if (condition) return;
@@ -209,6 +209,7 @@ void* box(Value value) {
 }
 
 Request* acceptError(int status) { return ::new (lyraGcAlloc(sizeof(Request))) Request{.status = status}; }
+struct BodyRead { int status; const void* bytes; };
 
 uint8_t unit{};
 
@@ -217,6 +218,7 @@ void finish(Operation& operation, int status = 0) {
     operation.task = nullptr;
     switch (operation.kind) {
         case OperationKind::Accept: lyraNativeComplete(task, box(acceptError(status))); break;
+        case OperationKind::ReadBody: lyraNativeComplete(task, box(box(BodyRead{status, nullptr}))); break;
         case OperationKind::Respond: case OperationKind::StartStream: case OperationKind::WriteStream:
         case OperationKind::Observe: lyraNativeComplete(task, box<int64_t>(status)); break;
         default: lyraNativeComplete(task, &unit); break;
@@ -228,6 +230,7 @@ LyraTask* nativeTask(Operation input) {
     void* rejected = nullptr;
     switch (operation->kind) {
         case OperationKind::Accept: rejected = box(acceptError(EBUSY)); break;
+        case OperationKind::ReadBody: rejected = box(box(BodyRead{EBUSY, nullptr})); break;
         case OperationKind::Respond: case OperationKind::StartStream: case OperationKind::WriteStream: rejected = box<int64_t>(EBUSY); break;
         case OperationKind::Observe: rejected = box<int64_t>(-EBUSY); break;
         default: rejected = &unit; break;
@@ -240,7 +243,7 @@ LyraTask* nativeTask(Operation input) {
         operation.task = task;
         if (operation.kind == OperationKind::Accept || operation.kind == OperationKind::Observe)
             operation.expires = validWait(operation.argument) ? deadline(operation.argument) : forever;
-        const bool limited = operation.kind == OperationKind::Accept || operation.kind == OperationKind::Respond ||
+        const bool limited = operation.kind == OperationKind::Accept || operation.kind == OperationKind::ReadBody || operation.kind == OperationKind::Respond ||
             operation.kind == OperationKind::StartStream || operation.kind == OperationKind::WriteStream || operation.kind == OperationKind::Observe;
         return operation.reactor->post<&Operation::start>(operation, limited);
     }, [](void* data) {
@@ -282,8 +285,9 @@ struct Connection {
     Phase phase{Phase::Reading};
     unsigned closingHandles{};
     int closeStatus{}, ingressError{};
-    int64_t phaseDue{forever}, idleDue{forever};
+    int64_t phaseDue{forever}, idleDue{forever}, claimDue{forever};
     bool tcpEof{}, readActive{}, writePending{}, pumpQueued{}, bioInputEnded{}, tlsReadEnded{}, tlsShutdownDone{}, tlsWriteRetry{};
+    bool discardBody{};
     std::size_t inputOffset{}, inputSize{}, completedRequests{}, discarded{};
     std::array<char, readChunk> input;
     struct TlsBuffers { std::array<char, writeChunk> ciphertext; std::array<char, readChunk> plaintext; };
@@ -292,16 +296,22 @@ struct Connection {
     std::string responseHead, pendingInput;
     std::string_view outgoingHead, outgoingBody, outgoingTail;
     Operation* response{};
+    Operation* bodyReader{};
     std::list<Operation*> observers, closeWaiters;
 
     explicit Connection(Session& session) : session(session), request(session.request), reactor(*session.reactor), transport(session.endpoint->transport) {}
     void open();
     void readFromSocket();
+    void pauseRead();
     void readResult(std::ptrdiff_t count);
     void beginMessage();
     void finishResponse();
     void completeWrite();
     void messageBytes(std::string_view bytes);
+    void holdInput(std::string_view bytes);
+    void offerRequest();
+    void readBody(Operation& operation);
+    void completeBodyRead(int status, const void* chunk = nullptr);
     void startResponse(Operation& operation);
     void writeStream(Operation& operation);
     void sendRejection(std::string_view wire, int status);
@@ -389,6 +399,7 @@ void Connection::open() {
 
 void Connection::readFromSocket() {
     if (readActive || tcpEof || phase == Phase::Closing || !pendingInput.empty() || (tls && inputOffset != inputSize)) return;
+    if ((phase == Phase::ReadingBody && !bodyReader) || (discardBody && phase != Phase::RejectDrain)) return;
     auto status = uv_read_start(reinterpret_cast<uv_stream_t*>(&tcp), [](uv_handle_t* handle, std::size_t, uv_buf_t* buffer) {
         auto& connection = *static_cast<Connection*>(handle->data);
         *buffer = uv_buf_init(connection.input.data(), static_cast<unsigned>(connection.input.size()));
@@ -397,6 +408,12 @@ void Connection::readFromSocket() {
     });
     if (status) { beginClose(statusCode(status), true); return; }
     readActive = true;
+}
+
+void Connection::pauseRead() {
+    if (!readActive) return;
+    uv_read_stop(reinterpret_cast<uv_stream_t*>(&tcp));
+    readActive = false;
 }
 
 void Connection::readResult(std::ptrdiff_t count) {
@@ -413,7 +430,7 @@ void Connection::readResult(std::ptrdiff_t count) {
         readActive = false;
         if (count != UV_EOF) { beginClose(statusCode(static_cast<int>(count)), true); return; }
         tcpEof = true;
-        if (!tls && (phase == Phase::Reading || phase == Phase::Idle)) { beginClose(ECONNRESET, true); return; }
+        if (!tls && (phase == Phase::Reading || phase == Phase::ReadingBody || phase == Phase::Idle)) { beginClose(ECONNRESET, true); return; }
     } else if (tls) {
         inputOffset = 0;
         inputSize = static_cast<std::size_t>(count);
@@ -425,6 +442,7 @@ void Connection::beginMessage() {
     if (session.overload) { sendRejection(overloadResponse, 0); return; }
     phase = Phase::Reading;
     const auto& options = session.endpoint->options;
+    request->streamingBody = options.streamRequestBody;
     parser = std::make_unique<RequestParser>(*request, options.maxBodyBytes, options.maxRequestBytes);
     auto time = tls || completedRequests ? now() : session.acceptedAt;
     phaseDue = deadline(options.requestTimeoutMs, time);
@@ -432,44 +450,97 @@ void Connection::beginMessage() {
     refreshTimer();
 }
 
+void Connection::holdInput(std::string_view bytes) {
+    require(pendingInput.size() + bytes.size() <= readChunk, "HTTP input exceeded its read window");
+    pendingInput.append(bytes);
+    pauseRead();
+}
+
+void Connection::offerRequest() {
+    session.endpoint->reactor->post<[](Request& request) { request.session->endpoint->server->offer(request); }>(*request);
+}
+
 void Connection::messageBytes(std::string_view bytes) {
     if (phase == Phase::Idle) beginMessage();
-    if (phase != Phase::Reading) {
-        if (ingressError || session.overload) {
+    const auto readingBody = phase == Phase::ReadingBody;
+    if (phase != Phase::Reading && !readingBody) {
+        if (discardBody || ingressError || session.overload) {
             discarded += bytes.size();
             if (discarded > static_cast<std::size_t>(session.endpoint->options.maxRequestBytes)) beginClose();
             return;
         }
-        if (phase == Phase::Ready || phase == Phase::StreamReady || phase == Phase::Writing) {
-            require(pendingInput.size() + bytes.size() <= readChunk, "pipelined input exceeded its read window");
-            pendingInput.append(bytes);
-            if (readActive) { uv_read_stop(reinterpret_cast<uv_stream_t*>(&tcp)); readActive = false; }
-        }
+        if (phase == Phase::Ready || phase == Phase::StreamReady || phase == Phase::Writing) holdInput(bytes);
         return;
     }
     if (auto status = parser->feed(bytes)) { sendRejection(rejection(status), status); return; }
-    if (!parser->complete) {
-        if (auto idle = session.endpoint->options.idleReadTimeoutMs; idle >= 0) {
-            idleDue = deadline(idle);
-            refreshTimer();
-        }
+    bytes.remove_prefix(parser->consumed);
+    if (parser->headersPaused) {
+        phase = Phase::ReadingBody;
+        idleDue = forever;
+        holdInput(bytes);
+        refreshTimer();
+        offerRequest();
         return;
     }
-    bytes.remove_prefix(parser->consumed);
+    const void* chunk = nullptr;
+    if (readingBody && !parser->body.empty()) {
+        chunk = lyraStringFromBytes(parser->body.data(), parser->body.size());
+        parser->body.clear();
+    }
+    if (!parser->complete) {
+        idleDue = deadline(session.endpoint->options.idleReadTimeoutMs);
+        if (chunk) {
+            idleDue = forever;
+            pauseRead();
+            completeBodyRead(0, chunk);
+        }
+        refreshTimer();
+        return;
+    }
     parser.reset();
     phase = Phase::Ready;
     phaseDue = idleDue = forever;
+    if (!bytes.empty()) holdInput(bytes);
     refreshTimer();
-    request->session->endpoint->reactor->post<[](Request& request) { request.session->endpoint->server->offer(request); }>(*request);
-    if (!bytes.empty()) messageBytes(bytes);
+    if (readingBody) completeBodyRead(0, chunk);
+    else offerRequest();
+}
+
+void Connection::readBody(Operation& operation) {
+    if (!request->streamingBody) { finish(operation, EINVAL); return; }
+    if (request->bodyError) { finish(operation, request->bodyError); return; }
+    if (request->delivery.load() >= Delivery::Closing) { finish(operation, EBADF); return; }
+    if (phase != Phase::Ready && phase != Phase::ReadingBody) { finish(operation, EBADF); return; }
+    if (bodyReader) { finish(operation, EBUSY); return; }
+    if (auto status = claim(*request)) { finish(operation, status); return; }
+    if (phase == Phase::Ready) { finish(operation); return; }
+    bodyReader = &operation;
+    if (now() >= phaseDue) { sendRejection(rejection(ETIMEDOUT), ETIMEDOUT); pump(); return; }
+    idleDue = deadline(session.endpoint->options.idleReadTimeoutMs);
+    parser->resumeBody();
+    auto buffered = std::move(pendingInput);
+    pendingInput.clear();
+    if (!buffered.empty()) messageBytes(buffered);
+    readFromSocket();
+    refreshTimer();
+    pump();
+}
+
+void Connection::completeBodyRead(int status, const void* chunk) {
+    auto& reader = *bodyReader;
+    if (!lyraNativeTryComplete(reader.task, box(box(BodyRead{status, chunk})))) { beginClose(ECANCELED); return; }
+    reader.task = nullptr;
+    bodyReader = nullptr;
 }
 
 void Connection::startResponse(Operation& operation) {
     if (response && phase != Phase::Closing) { finish(operation, EBUSY); return; }
-    if (phase != Phase::Ready || request->delivery.load() >= Delivery::Closing) { finish(operation, EBADF); return; }
+    if (bodyReader) { finish(operation, EBUSY); return; }
+    auto unread = phase == Phase::ReadingBody;
+    if ((phase != Phase::Ready && !unread) || request->delivery.load() >= Delivery::Closing) { finish(operation, EBADF); return; }
     const bool stream = operation.kind == OperationKind::StartStream;
     const bool chunked = stream && !request->http10;
-    const bool persistent = request->keepAlive && (!stream || chunked) && session.endpoint->options.keepAliveTimeoutMs != 0 &&
+    const bool persistent = !unread && request->keepAlive && (!stream || chunked) && session.endpoint->options.keepAliveTimeoutMs != 0 &&
         completedRequests + 1 < static_cast<std::size_t>(session.endpoint->options.maxRequestsPerConnection) &&
         session.endpoint->requested.load() == Stop::Open && !tcpEof;
     if (auto status = formatResponse(responseHead, operation.argument, operation.mediaType, operation.body, *operation.headers, persistent, chunked, stream)) {
@@ -477,6 +548,13 @@ void Connection::startResponse(Operation& operation) {
         return;
     }
     if (auto status = claim(*request)) { finish(operation, status); return; }
+    if (unread) {
+        discardBody = true;
+        parser.reset();
+        discarded = pendingInput.size();
+        pendingInput.clear();
+        pauseRead();
+    }
     request->keepAlive = persistent;
     response = &operation;
     outgoingHead = responseHead;
@@ -519,8 +597,10 @@ void Connection::writeStream(Operation& operation) {
 }
 
 void Connection::sendRejection(std::string_view wire, int status) {
+    if (phase == Phase::ReadingBody) request->bodyError = status;
     ingressError = status;
     parser.reset();
+    pendingInput.clear();
     if (wire.empty()) { beginClose(status); return; }
     phase = Phase::Writing;
     outgoingHead = wire;
@@ -560,7 +640,7 @@ void Connection::finishTcp() {
     phase = Phase::EndingTcp;
     auto status = uv_shutdown(&shutdown, reinterpret_cast<uv_stream_t*>(&tcp), [](uv_shutdown_t* shutdown, int status) {
         auto& connection = *static_cast<Connection*>(shutdown->data);
-        if (!status && connection.ingressError && !connection.tcpEof) {
+        if (!status && (connection.ingressError || connection.discardBody) && !connection.tcpEof) {
             connection.phase = Phase::RejectDrain;
             connection.phaseDue = deadline(rejectionTimeoutMs);
             connection.idleDue = forever;
@@ -589,7 +669,7 @@ void Connection::finishResponse() {
     request = session.request = ::new (lyraGcAlloc(sizeof(Request))) Request{.session = &session, .connection = this};
     phase = Phase::Idle;
     phaseDue = deadline(session.endpoint->options.keepAliveTimeoutMs);
-    idleDue = forever;
+    idleDue = claimDue = forever;
     auto buffered = std::move(pendingInput);
     pendingInput.clear();
     finish(*operation);
@@ -639,7 +719,7 @@ void Connection::pumpTls() {
         if (step.progress == TlsProgress::Done) messageBytes({buffer.data(), step.bytes});
         if (step.progress == TlsProgress::End) {
             tlsReadEnded = true;
-            if (phase == Phase::Reading || phase == Phase::Idle) beginClose(ECONNRESET, true);
+            if (phase == Phase::Reading || phase == Phase::ReadingBody || phase == Phase::Idle) beginClose(ECONNRESET, true);
         }
         return step.progress;
     };
@@ -665,8 +745,8 @@ void Connection::pumpTls() {
                 beginClose(ingressError, true);
                 return;
             }
-        } else if (phase == Phase::Idle || phase == Phase::Reading || phase == Phase::Ready || phase == Phase::StreamReady) {
-            if (tlsReadEnded || !pendingInput.empty()) return;
+        } else if (phase == Phase::Idle || phase == Phase::Reading || phase == Phase::ReadingBody || phase == Phase::Ready || phase == Phase::StreamReady) {
+            if (tlsReadEnded || !pendingInput.empty() || (phase == Phase::ReadingBody && !bodyReader)) return;
             progress = receive();
         } else if (bioInputEnded && !tlsReadEnded && !tlsWriteRetry && pendingInput.empty()) progress = receive();
         else if (phase == Phase::Writing) {
@@ -714,7 +794,7 @@ void Connection::observe(Operation& operation) {
 
 void Connection::refreshTimer() {
     if (phase == Phase::Closing) return;
-    auto due = std::min(phaseDue, idleDue);
+    auto due = std::min({phaseDue, idleDue, claimDue});
     for (auto* operation : observers) due = std::min(due, operation->expires);
     arm(timer, [](uv_timer_t* timer) { static_cast<Connection*>(timer->data)->expire(); }, due);
 }
@@ -727,17 +807,16 @@ void Connection::expire() {
         iterator = observers.erase(iterator);
         finish(operation, request->peerLost.load());
     }
+    if (claimDue <= time) {
+        claimDue = forever;
+        auto offered = Delivery::Offered;
+        if (request->delivery.compare_exchange_strong(offered, Delivery::Closing)) { beginClose(ETIMEDOUT); return; }
+    }
     if (phaseDue <= time || idleDue <= time) {
         switch (phase) {
             case Phase::Handshake: ingressError = handshakeTimeout; beginClose(ingressError); return;
             case Phase::Idle: beginClose(); return;
-            case Phase::Reading: sendRejection(rejection(ETIMEDOUT), ETIMEDOUT); pump(); return;
-            case Phase::Ready: {
-                auto pending = Delivery::Offered;
-                if (request->delivery.compare_exchange_strong(pending, Delivery::Closing)) { beginClose(ETIMEDOUT); return; }
-                phaseDue = forever;
-                break;
-            }
+            case Phase::Reading: case Phase::ReadingBody: sendRejection(rejection(ETIMEDOUT), ETIMEDOUT); pump(); return;
             default: beginClose(ETIMEDOUT); return;
         }
     }
@@ -749,8 +828,9 @@ void Connection::beginClose(int status, bool peer) {
     auto previous = request->delivery.exchange(Delivery::Closing);
     if (previous == Delivery::Closing && peer) status = EBADF;
     else if (peer) request->peerLost.store(true);
-    if (peer && !ingressError && (phase == Phase::Reading || phase == Phase::Handshake))
+    if (peer && !ingressError && (phase == Phase::Reading || phase == Phase::ReadingBody || phase == Phase::Handshake))
         ingressError = phase == Phase::Handshake ? handshakeFailed : status;
+    if ((phase == Phase::ReadingBody || bodyReader) && !request->bodyError) request->bodyError = status ? status : EBADF;
     phase = Phase::Closing;
     closeStatus = status;
     parser.reset();
@@ -772,6 +852,8 @@ void Connection::finalize() {
     auto* root = lyraGcRootCreate(closed);
     auto pendingObservers = std::move(observers), pendingCloses = std::move(closeWaiters);
     auto* pendingResponse = response;
+    auto* pendingBody = bodyReader;
+    auto bodyError = request->bodyError;
     auto status = closeStatus;
     auto lost = request->peerLost.load();
     closed->connection = request->connection = nullptr;
@@ -780,6 +862,7 @@ void Connection::finalize() {
     notifyClosed(*closed);
     for (auto* operation : pendingObservers) finish(*operation, lost);
     if (pendingResponse) finish(*pendingResponse, status);
+    if (pendingBody) finish(*pendingBody, bodyError);
     for (auto* operation : pendingCloses) finish(*operation);
     lyraGcRootDrop(root);
 }
@@ -1010,9 +1093,10 @@ void Server::released(Request& request) {
 }
 
 void Server::closed(Session& session) {
+    auto entry = connections.find(&session);
+    auto delivered = entry->second.issued;
     released(*session.request);
     session.request = nullptr;
-    auto entry = connections.find(&session);
     if (session.overload) rejecting = false;
     else --ordinary;
     endpoint.reactor->pool->release(*session.reactor);
@@ -1020,7 +1104,7 @@ void Server::closed(Session& session) {
     connections.erase(entry);
     if (stopping != Stop::Open) { maybeFinish(); return; }
     if (endpoint.requested.load() != Stop::Open) { applyStop(endpoint); return; }
-    if (!session.overload && session.ingressError) reportRejected(session.ingressError);
+    if (!session.overload && !delivered && session.ingressError) reportRejected(session.ingressError);
     dispatch();
     if (auto status = pollForAccept()) stop(Stop::Close, status);
 }
@@ -1056,8 +1140,8 @@ void Server::dispatch() {
             request.offerExpires = deadline(endpoint.options.claimTimeoutMs);
             request.session->reactor->post<[](Request& request) {
                 auto* connection = request.connection;
-                if (connection && connection->phase == Phase::Ready && request.delivery.load() == Delivery::Offered) {
-                    connection->phaseDue = request.offerExpires;
+                if (connection && request.delivery.load() == Delivery::Offered) {
+                    connection->claimDue = request.offerExpires;
                     connection->refreshTimer();
                 }
             }>(request);
@@ -1166,6 +1250,10 @@ void Operation::start() {
             if (auto* server = endpoint->server) server->registerAccept(*this);
             else finish(*this, EBADF);
             break;
+        case OperationKind::ReadBody:
+            if (auto* connection = request->connection) connection->readBody(*this);
+            else finish(*this, request->bodyError ? request->bodyError : EBADF);
+            break;
         case OperationKind::Respond: case OperationKind::StartStream:
             if (auto* connection = request->connection) connection->startResponse(*this);
             else finish(*this, EBADF);
@@ -1204,7 +1292,7 @@ void Operation::cancel() {
             finish(*this, ECANCELED);
             break;
         }
-        case OperationKind::Respond: case OperationKind::StartStream: case OperationKind::WriteStream:
+        case OperationKind::ReadBody: case OperationKind::Respond: case OperationKind::StartStream: case OperationKind::WriteStream:
             request->connection->beginClose(ECANCELED);
             break;
         case OperationKind::Observe: {
@@ -1238,10 +1326,10 @@ namespace net = lyraRuntime::net;
 
 extern "C" const ServerOptions* lyraHttpOptions(int64_t capacity, int64_t requestTimeoutMs, int64_t idleReadTimeoutMs,
     int64_t writeTimeoutMs, int64_t handshakeTimeoutMs, int64_t graceMs, int64_t claimTimeoutMs,
-    int64_t maxBodyBytes, int64_t maxRequestBytes, int64_t keepAliveTimeoutMs, int64_t maxRequestsPerConnection) {
+    int64_t maxBodyBytes, int64_t maxRequestBytes, int64_t keepAliveTimeoutMs, int64_t maxRequestsPerConnection, uint8_t streamRequestBody) {
     return ::new (lyraGcAllocAtomic(sizeof(ServerOptions))) ServerOptions{
         capacity, requestTimeoutMs, idleReadTimeoutMs, writeTimeoutMs, handshakeTimeoutMs, graceMs, claimTimeoutMs,
-        maxBodyBytes, maxRequestBytes, keepAliveTimeoutMs, maxRequestsPerConnection,
+        maxBodyBytes, maxRequestBytes, keepAliveTimeoutMs, maxRequestsPerConnection, streamRequestBody != 0,
     };
 }
 
@@ -1331,6 +1419,14 @@ extern "C" LyraTask* lyraHttpAcceptAsync(Endpoint* endpoint, int64_t timeoutMs, 
 extern "C" LyraTask* lyraHttpRespondAsync(Request* request, int64_t code, const void* mediaType, const void* body, const ResponseFields* headers) {
     return nativeTask({OperationKind::Respond, request->session->reactor, request->session->endpoint, request, code, mediaType, body, headers});
 }
+
+extern "C" LyraTask* lyraHttpReadBodyAsync(Request* request) {
+    return nativeTask({OperationKind::ReadBody, request->session->reactor, request->session->endpoint, request});
+}
+
+extern "C" int64_t lyraHttpBodyReadStatus(const BodyRead* result) { return result->status; }
+extern "C" uint8_t lyraHttpBodyReadHasBytes(const BodyRead* result) { return result->bytes != nullptr; }
+extern "C" const void* lyraHttpBodyReadBytes(const BodyRead* result) { return result->bytes; }
 
 extern "C" LyraTask* lyraHttpStartStreamAsync(Request* request, int64_t code, const void* mediaType, const ResponseFields* headers) {
     return nativeTask({OperationKind::StartStream, request->session->reactor, request->session->endpoint, request, code, mediaType,
