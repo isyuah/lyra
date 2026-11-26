@@ -1451,6 +1451,120 @@ class LanguageServer(unittest.TestCase):
             self.assertIn('String', diagnostics[-1][0]['message'])
             self.assertEqual(diagnostics[-1][0]['range']['start']['character'], invalid_edit.index('"wrong"'))
 
+    def test_incremental_dependency_body_matches_a_cold_analysis(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source, dependency = root / 'app/src/main.ly', root / 'kit/src/api.ly'
+            text = 'import kit as kit\nfn main(): Unit { val prefix = "中文🙂"; val value = kit.answer(1); print(value) }\n'
+            original = ('pub fn change(value: Int): Int { value + 1 }\n'
+                        'pub fn answer(value: Int): Int { val result = change(value); result }\n')
+            for path, content in ((source, text), (dependency, original),
+                    (root / 'app/lyra.json5', '{name:"app",version:"0.1.0",dependencies:{kit:{name:"kit",version:"^0.1.0",path:"../kit"}}}'),
+                    (root / 'kit/lyra.json5', '{name:"kit",version:"0.1.0",kind:"lib"}')):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(content, encoding='utf-8', newline='\n')
+
+            def queries(start):
+                return [document_request(start, source, 'definition', position=position_at(text, text.index('answer'))),
+                        document_request(start + 1, source, 'semanticTokens/full'),
+                        document_request(start + 2, dependency, 'inlayHint', range={
+                            'start': {'line': 0, 'character': 0}, 'end': {'line': 20, 'character': 0}})]
+
+            versions = [original.replace('value + 1', '\n    val prefix = "中文🙂"\n    value + 18\n'),
+                        original.replace('value + 1', '\n    val prefix = "中文🙂"; value + false\n')]
+            requests = [{'jsonrpc': '2.0', 'method': '$/setTrace', 'params': {'value': 'verbose'}}]
+            for version, current in enumerate(versions, 2):
+                requests.append({'jsonrpc': '2.0', 'method': 'textDocument/didChange', 'params': {
+                    'textDocument': {'uri': uri(dependency), 'version': version}, 'contentChanges': [{'text': current}]}})
+                requests.extend(queries(version * 10))
+            warm = run_server([(source, text), (dependency, original)], requests)
+            traces = [item['params']['message'] for item in warm if item.get('method') == '$/logTrace']
+            self.assertTrue(any('function bodies, checked' in trace for trace in traces), traces)
+
+            def result(output, request):
+                return next(item['result'] for item in output if item.get('id') == request)
+
+            def diagnostics(output, version):
+                return next(item['params']['diagnostics'] for item in output if item.get('method') == 'textDocument/publishDiagnostics'
+                            and item['params']['uri'] == uri(dependency) and item['params'].get('version') == version)
+
+            for version, current in enumerate(versions, 2):
+                with self.subTest(version=version):
+                    dependency.write_text(current, encoding='utf-8', newline='\n')
+                    request = version * 10
+                    cold = run_server([(source, text), (dependency, current)], queries(request))
+                    for offset in range(3):
+                        self.assertEqual(result(warm, request + offset), result(cold, request + offset))
+                    self.assertEqual(diagnostics(warm, version), diagnostics(cold, 1))
+                    definition, = result(warm, request)
+                    self.assertEqual(definition['range']['start'], position_at(current, current.index('answer')))
+                    hints = result(warm, request + 2)
+                    self.assertIn({'position': position_at(current, current.index('result') + len('result')),
+                                   'label': ': Int', 'kind': 1}, hints)
+            self.assertEqual(diagnostics(warm, 2), [])
+            error, = diagnostics(warm, 3)
+            self.assertEqual(error['range']['start'], position_at(versions[-1], versions[-1].index('false')))
+
+    def test_incremental_invalidation_matches_a_cold_analysis(self):
+        cases = [
+            ('inferred result',
+             'fn infer() { 7 }\nfn consume(): Int { infer() }\nfn main(): Unit { print(consume()) }\n',
+             [('7', 'false', 'LYT0001')]),
+            ('generic body',
+             'fn identity<T>(value: T): T { value }\nfn main(): Unit { val result = identity(2); print(result) }\n',
+             [(' { value }', ' { false }', 'LYT0001')]),
+            ('constant dependency',
+             'fn seed(): Int { 4 }\nfn read(): Int { val saved = seed(); saved }\nfn main(): Unit { print(read()) }\n',
+             [('print(read())', 'const Value: Int = read(); print(Value)', None), ('{ 4 }', '{ 4 / 0 }', 'LYCT0003')]),
+            ('failed constant dependency',
+             'fn seed(): Int { 4 / 0 }\nconst Value: Int = seed()\nfn main(): Unit { print(Value) }\n',
+             [('{ print(Value) }', '{ val marker = 1; print(Value) }', 'LYCT0003')]),
+            ('constant pattern',
+             'const Expected: Bool = true\nfn choose(value: Bool): Int { match value { Expected => 1, false => 0 } }\n'
+             'fn main(): Unit { print(choose(true)) }\n',
+             [('Expected: Bool = true', 'Expected: Bool = false', 'LYT0012')]),
+            ('inferred recursion',
+             'fn infer() { value() }\nfn value(): Int { 1 }\nfn main(): Unit { print(infer()) }\n',
+             [('{ 1 }', '{ infer() }', 'LYT0020')]),
+            ('macro expansion',
+             'fn ready(): Unit { #assert(true) }\nfn main(): Unit { ready() }\n',
+             [('#assert(true)', '#assert(1)', 'LYT0001')]),
+        ]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / 'src/main.ly'
+            source.parent.mkdir()
+            (root / 'lyra.json5').write_text('{name:"app",version:"0.1.0"}', encoding='utf-8')
+            for name, original, edits in cases:
+                with self.subTest(case=name):
+                    source.write_text(original, encoding='utf-8', newline='\n')
+                    requests = [{'jsonrpc': '2.0', 'method': '$/setTrace', 'params': {'value': 'verbose'}}]
+                    versions = []
+                    current = original
+                    for version, (target, replacement, _) in enumerate(edits, 2):
+                        current = current.replace(target, replacement, 1)
+                        versions.append(current)
+                        requests.append({'jsonrpc': '2.0', 'method': 'textDocument/didChange', 'params': {
+                            'textDocument': {'uri': uri(source), 'version': version}, 'contentChanges': [{'text': current}]}})
+                    warm = run_server([(source, original)], requests)
+
+                    def diagnostics(output, version):
+                        return next(item['params']['diagnostics'] for item in output if item.get('method') == 'textDocument/publishDiagnostics'
+                                    and item['params']['uri'] == uri(source) and item['params'].get('version') == version)
+
+                    self.assertEqual([item['code'] for item in diagnostics(warm, 1)],
+                                     ['LYCT0003'] if name == 'failed constant dependency' else [])
+                    traces = [item['params']['message'] for item in warm if item.get('method') == '$/logTrace']
+                    if name != 'inferred recursion':
+                        self.assertFalse(any('function bodies, checked' in trace for trace in traces), traces)
+                    if name == 'constant dependency':
+                        self.assertTrue(any('requires an uncached check' in trace for trace in traces), traces)
+                    for version, (current, (_, _, code)) in enumerate(zip(versions, edits), 2):
+                        source.write_text(current, encoding='utf-8', newline='\n')
+                        cold = run_server([(source, current)], [])
+                        self.assertEqual(diagnostics(warm, version), diagnostics(cold, 1))
+                        self.assertEqual([item['code'] for item in diagnostics(warm, version)], [code] if code else [])
+
 
 if __name__ == '__main__':
     unittest.main()

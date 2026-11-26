@@ -64,6 +64,7 @@ struct Workspace {
     EditorIndex editor;
     AnalysisDiagnostics diagnostics;
     std::vector<EditorDeclaration> generated;
+    EditorBodyAnalysis bodies;
 };
 
 const Source* sourceFor(const Workspace& workspace, const fs::path& path);
@@ -207,7 +208,7 @@ AnalysisView analysisView(const fs::path& path) {
 }
 
 Workspace loadWorkspace(const fs::path& root, const SourceOverlay& overlays, const std::optional<PackageGraph>& graph, ParseCache& parseCache,
-                        EditorProbe* probe = nullptr, const std::optional<fs::path>& testFile = {}) {
+                        EditorProbe* probe = nullptr, const std::optional<fs::path>& testFile = {}, const EditorBodyBaseline* previous = nullptr) {
     Workspace workspace;
     workspace.editor.probe = probe;
     try {
@@ -229,7 +230,9 @@ Workspace loadWorkspace(const fs::path& root, const SourceOverlay& overlays, con
         if (probe) check(std::move(program.syntax), workspace.sources, false, nullptr, &workspace.editor);
         else if (!program.incompleteDeclaration) {
             workspace.generated = editorDeclarations(program.syntax, workspace.sources, true);
-            checkForDiagnostics(std::move(program.syntax), workspace.sources, testFile.has_value(), workspace.diagnostics, &workspace.editor);
+            if (previous) workspace.bodies = checkForEditor(std::move(program.syntax), workspace.sources, testFile.has_value(), workspace.diagnostics,
+                workspace.editor, *previous);
+            else checkForDiagnostics(std::move(program.syntax), workspace.sources, testFile.has_value(), workspace.diagnostics, &workspace.editor);
         }
     } catch (const Diagnostic& error) { workspace.diagnostics.add(error); }
     catch (const EditorProbeFinished&) {}
@@ -1713,6 +1716,7 @@ private:
         auto [base, overlays] = collectInputs(view, documents);
         auto inputs = std::shared_ptr<const AnalysisInputs>(base, &base->inputs);
         auto label = pathText(view.test.value_or(view.root));
+        EditorBodyBaseline previousBodies;
 
         auto found = snapshots.find(view);
         if (found != snapshots.end() && (found->second.inputs == inputs || *found->second.inputs == *inputs)) {
@@ -1728,9 +1732,19 @@ private:
                 trace("Lyra analysis: reused checked workspace after trivia-only document edits for " + label);
                 return previous.workspace;
             }
+            previousBodies = {previous.workspace.bodies.cache.get(), previous.workspace.sources};
         }
         trace("Lyra analysis: rebuilt workspace and reran semantic checks for " + label);
-        auto workspace = loadWorkspace(view.root, overlays, base->graph, parseCache, nullptr, view.test);
+        auto workspace = [&] {
+            try { return loadWorkspace(view.root, overlays, base->graph, parseCache, nullptr, view.test, &previousBodies); }
+            catch (const EditorBodyRequired&) {
+                trace("Lyra analysis: compiling a new constant requires an uncached check for " + label);
+                const EditorBodyBaseline fresh;
+                return loadWorkspace(view.root, overlays, base->graph, parseCache, nullptr, view.test, &fresh);
+            }
+        }();
+        if (workspace.bodies.reused) trace("Lyra analysis: reused " + std::to_string(workspace.bodies.reused) + " function bodies, checked " +
+            std::to_string(workspace.bodies.checked) + " for " + label);
         checkAnalysisCancellation();
         return snapshots.insert_or_assign(view, Snapshot{std::move(inputs), std::move(overlays), std::move(workspace)}).first->second.workspace;
     }

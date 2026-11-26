@@ -26,7 +26,7 @@ import lyra.check;
 import lyra.numbers;
 
 export namespace lyra {
-void evaluateConstants(CheckedModule& module, const std::vector<Source>& sources);
+void evaluateConstants(CheckedModule& module, const std::vector<Source>& sources, const std::function<void(std::size_t)>& requireBody = {});
 void evaluateMacro(CheckedModule& module, const std::vector<Source>& sources, MacroExecution& macro, std::size_t entry,
     const std::function<void(std::size_t)>& checkBody);
 }
@@ -94,6 +94,7 @@ struct Validation {
     std::vector<std::size_t> pending;
     const MacroExecution* macro{};
     std::set<std::size_t> blocks{};
+    const std::function<void(std::size_t)>* requireBody{};
 };
 
 struct Validator {
@@ -118,6 +119,7 @@ struct Validator {
         if (state.visited.size() < state.module.functions.size()) state.visited.resize(state.module.functions.size());
         if (state.visited[index]) return;
         state.visited[index] = true;
+        if (state.requireBody) (*state.requireBody)(index);
         state.pending.push_back(index);
     }
 
@@ -267,6 +269,7 @@ struct Validator {
     }
 
     void run() const {
+        if (fn.expressions.empty() && !fn.syntax.expressions.empty()) throw EditorBodyRequired{};
         if (fn.syntax.constant == ConstKind::Value && !state.types.supports(fn.result, false))
             reject(fn.syntax.result.span, "编译期常量必须是不可变值类型；函数值、Class 和 List 只能作为编译期临时值");
         if (!state.types.supports(fn.result)) reject(fn.syntax.result.span, "编译期函数返回类型不受支持");
@@ -596,6 +599,7 @@ struct Evaluation {
     }
 
     EvalValue invoke(const CheckedFunction& fn, std::vector<EvalValue> args, const CheckedFunction& caller, Span call, const Closure* closure = nullptr, const BlockConstant* block = nullptr) {
+        if (fn.expressions.empty() && !fn.syntax.expressions.empty()) throw EditorBodyRequired{};
         if (macro && fn.syntax.file == macro->prelude) {
             auto name = std::string_view(fn.syntax.name.text);
             if (auto separator = name.rfind("::"); separator != name.npos) name.remove_prefix(separator + 2);
@@ -1187,8 +1191,9 @@ struct Evaluation {
 
 }
 
-void evaluateConstants(CheckedModule& module, const std::vector<Source>& sources) {
+void evaluateConstants(CheckedModule& module, const std::vector<Source>& sources, const std::function<void(std::size_t)>& requireBody) {
     Validation state{module, sources, ValueTypes{module, {}}, std::vector<bool>(module.functions.size()), {}};
+    if (requireBody) state.requireBody = &requireBody;
     for (std::size_t index = 0; index < module.functions.size(); ++index) {
         const auto& fn = module.functions[index];
         if (fn.syntax.constant != ConstKind::None) Validator{state, fn}.validateFunction(index, fn.syntax.name.span);

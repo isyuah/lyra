@@ -5,6 +5,7 @@ module;
 #include <cstdint>
 #include <functional>
 #include <map>
+#include <memory>
 #include <optional>
 #include <set>
 #include <span>
@@ -191,7 +192,110 @@ std::vector<EditorSymbol> editorBuiltins(bool types, bool constraints) {
     return symbols;
 }
 
+struct EditorBodyCache {
+    struct Frame { SourceAnchor name; Span body; };
+    struct Body { EditorIndex editor; std::vector<SourceAnchor> calls; };
+    std::vector<std::vector<Frame>> frames;
+    std::map<SourceAnchor, Body> bodies;
+};
+
 namespace {
+
+SourceAnchor functionAnchor(const Function& fn) { return {fn.file, fn.name.span}; }
+
+bool tracksEditorBody(const Function& fn) {
+    auto name = std::string_view(fn.name.text);
+    if (auto separator = name.rfind("::"); separator != name.npos) name.remove_prefix(separator + 2);
+    return !fn.result.text.empty() && fn.typeParameters.empty() && fn.constant == ConstKind::None && !fn.pendingExpansion &&
+        !name.contains('$') && !fn.expressions.empty() && std::holds_alternative<Block>(fn.expressions[fn.body].node);
+}
+
+struct EditorBodySession {
+    struct Change { Span before, after; };
+    std::shared_ptr<EditorBodyCache> cache;
+    std::map<SourceAnchor, const EditorBodyCache::Body*> candidates;
+    std::vector<std::vector<Change>> changes;
+    std::size_t checked{}, reused{};
+
+    EditorBodySession(const Module& module, std::span<const Source> sources, const EditorBodyBaseline& previous) {
+        if (!module.expansions.empty() || std::ranges::any_of(module.imports, [](const auto& use) { return use.kind != ImportKind::Runtime; }) ||
+            std::ranges::any_of(sources, [](const Source& source) { return source.origin || source.previous; })) return;
+        cache = std::make_shared<EditorBodyCache>();
+        cache->frames.resize(sources.size());
+        for (const auto& fn : module.functions) if (tracksEditorBody(fn))
+            cache->frames[fn.file].push_back({functionAnchor(fn), fn.expressions[fn.body].span});
+        for (auto& frames : cache->frames) std::ranges::sort(frames, {}, &EditorBodyCache::Frame::body);
+        if (!previous.cache || previous.sources.size() != sources.size() || previous.cache->bodies.empty()) return;
+
+        changes.resize(sources.size());
+        for (std::size_t file = 0; file < sources.size(); ++file) {
+            checkAnalysisCancellation();
+            const auto& before = previous.sources[file];
+            const auto& after = sources[file];
+            const auto& oldFrames = previous.cache->frames[file];
+            const auto& newFrames = cache->frames[file];
+            if (before.path != after.path || before.moduleId != after.moduleId || before.importParent != after.importParent ||
+                oldFrames.size() != newFrames.size()) { candidates.clear(); return; }
+            std::string_view oldText = before.text, newText = after.text;
+            std::size_t oldEnd = 0, newEnd = 0;
+            for (std::size_t index = 0; index < oldFrames.size(); ++index) {
+                const auto& oldFrame = oldFrames[index];
+                const auto& newFrame = newFrames[index];
+                if (oldFrame.body.begin < oldEnd || newFrame.body.begin < newEnd ||
+                    oldText.substr(oldEnd, oldFrame.body.begin - oldEnd) != newText.substr(newEnd, newFrame.body.begin - newEnd)) {
+                    candidates.clear();
+                    return;
+                }
+                if (oldText.substr(oldFrame.body.begin, oldFrame.body.end - oldFrame.body.begin) ==
+                    newText.substr(newFrame.body.begin, newFrame.body.end - newFrame.body.begin)) {
+                    if (auto entry = previous.cache->bodies.find(oldFrame.name); entry != previous.cache->bodies.end())
+                        candidates.emplace(newFrame.name, &entry->second);
+                } else changes[file].push_back({oldFrame.body, newFrame.body});
+                oldEnd = oldFrame.body.end;
+                newEnd = newFrame.body.end;
+            }
+            if (oldText.substr(oldEnd) != newText.substr(newEnd)) { candidates.clear(); return; }
+        }
+    }
+
+    bool relocate(SourceAnchor& anchor) const {
+        const auto& file = changes[anchor.file];
+        auto next = std::ranges::upper_bound(file, anchor.span.begin, {}, [](const Change& change) { return change.before.end; });
+        if (next != file.end() && next->before.begin < anchor.span.end) return false;
+        if (next != file.begin()) {
+            const auto& shift = *(next - 1);
+            anchor.span = {shift.after.end + anchor.span.begin - shift.before.end, shift.after.end + anchor.span.end - shift.before.end};
+        }
+        return true;
+    }
+
+    std::optional<EditorBodyCache::Body> find(SourceAnchor name) const {
+        auto found = candidates.find(name);
+        if (found == candidates.end()) return {};
+        const auto& old = *found->second;
+        EditorBodyCache::Body body;
+        body.editor.references = old.editor.references;
+        for (auto& reference : body.editor.references) if (!relocate(reference.use) || !relocate(reference.declaration) ||
+            (reference.renameTarget && !relocate(*reference.renameTarget))) return {};
+        body.editor.inferredTypes = old.editor.inferredTypes;
+        for (auto& hint : body.editor.inferredTypes) if (!relocate(hint.anchor)) return {};
+        for (const auto& [anchor, binding] : old.editor.bindings) {
+            auto current = anchor;
+            auto entry = binding;
+            if (!relocate(current) || (entry.typeDefinition && !relocate(*entry.typeDefinition))) return {};
+            body.editor.bindings.emplace(current, entry);
+        }
+        body.calls = old.calls;
+        for (auto& call : body.calls) if (!relocate(call)) return {};
+        return body;
+    }
+};
+
+void appendEditorBody(EditorIndex& editor, const EditorIndex& body) {
+    editor.references.insert(editor.references.end(), body.references.begin(), body.references.end());
+    editor.inferredTypes.insert(editor.inferredTypes.end(), body.inferredTypes.begin(), body.inferredTypes.end());
+    editor.bindings.insert(body.bindings.begin(), body.bindings.end());
+}
 
 struct BlockedAnalysis {};
 
@@ -347,6 +451,7 @@ struct Symbols {
     EditorIndex* editor{};
     AnalysisDiagnostics* diagnostics{};
     bool typeQuery{};
+    bool editorBodyEffect{};
 
     std::optional<SourceAnchor> typeDeclaration(Type type) const {
         auto anchor = [](const auto& syntax) -> std::optional<SourceAnchor> {
@@ -360,10 +465,14 @@ struct Symbols {
         return {};
     }
 
-    void indexBinding(std::size_t file, const Identifier& name, EditorKind kind, std::optional<Type> type = {}, unsigned modifiers = 0) const {
-        if (!editor || editor->probe || name.span.begin == name.span.end || name.text == "_") return;
+    void indexBinding(EditorIndex* index, std::size_t file, const Identifier& name, EditorKind kind, std::optional<Type> type, unsigned modifiers) const {
+        if (!index || index->probe || name.span.begin == name.span.end || name.text == "_") return;
         auto definition = type ? typeDeclaration(*type) : std::nullopt;
-        editor->bindings.try_emplace({file, name.span}, EditorBinding{kind, definition, modifiers});
+        index->bindings.try_emplace({file, name.span}, EditorBinding{kind, definition, modifiers});
+    }
+
+    void indexBinding(std::size_t file, const Identifier& name, EditorKind kind, std::optional<Type> type = {}, unsigned modifiers = 0) const {
+        indexBinding(editor, file, name, kind, type, modifiers);
     }
 
     void indexSignature(const CheckedFunction& fn) const {
@@ -419,7 +528,16 @@ struct Symbols {
         Symbols& symbols;
         TypeTrial types{symbols};
         std::size_t functions = symbols.module.functions.size(), coverage = symbols.module.matchCoverage.size(),
-            constants = symbols.module.blockConstants.size(), warnings = symbols.module.warnings.size(), casts = symbols.module.dynamicCasts.size();
+            constants = symbols.module.blockConstants.size(), warnings = symbols.module.warnings.size(), casts = symbols.module.dynamicCasts.size(),
+            valueOverrides = symbols.module.valueOverrides.size();
+
+        bool retainsEffects() const {
+            const auto& module = symbols.module;
+            return symbols.editorBodyEffect || functions != module.functions.size() || coverage != module.matchCoverage.size() ||
+                constants != module.blockConstants.size() || warnings != module.warnings.size() || casts != module.dynamicCasts.size() ||
+                valueOverrides != module.valueOverrides.size() || types.aggregates != module.aggregates.size() ||
+                types.enums != module.enums.size() || types.deferredPatterns != module.deferredPatternChecks.size();
+        }
 
         ~BodyTrial() {
             if (types.committed) return;
@@ -682,6 +800,7 @@ struct Symbols {
     }
 
     void bindValueOperations(ValueOperation operation, const ValueSupport& support, const Source& use, Span site) {
+        editorBodyEffect |= !support.overrides.empty();
         for (auto [type, index] : support.overrides) {
             auto key = std::pair{type, operation};
             if (module.valueOverrides.contains(key)) continue;
@@ -788,6 +907,7 @@ struct Symbols {
     }
 
     std::size_t builtinImplementation(Type owner, const std::string& name, const BuiltinMember& builtin, std::size_t file, Span site) {
+        editorBodyEffect = true;
         auto [entry, inserted] = builtinImplementations.try_emplace({owner, name}, module.functions.size());
         if (!inserted) return entry->second;
         auto annotation = [&](Type type) { return Identifier{typeName(module, type, true), site}; };
@@ -1193,6 +1313,7 @@ struct Symbols {
     }
 
     Type recordType(std::size_t declaration, std::vector<Type> arguments, const Source& source, Span span) {
+        editorBodyEffect |= !arguments.empty();
         const auto& syntax = recordDeclarations[declaration];
         if (arguments.size() != syntax.typeParameters.size())
             throw at(source, span, "LYG0001", syntax.name.text + " 需要 " + std::to_string(syntax.typeParameters.size()) + " 个类型实参");
@@ -1249,6 +1370,7 @@ struct Symbols {
     }
 
     Type enumType(std::size_t declaration, std::vector<Type> arguments, const Source& source, Span span) {
+        editorBodyEffect |= !arguments.empty();
         const auto& syntax = enumDeclarations[declaration];
         if (arguments.size() != syntax.typeParameters.size())
             throw at(source, span, "LYG0001", syntax.name.text + " 需要 " + std::to_string(syntax.typeParameters.size()) + " 个类型实参");
@@ -1385,6 +1507,7 @@ struct Symbols {
     }
 
     std::size_t instantiate(std::size_t declaration, const std::vector<Type>& arguments, const Source& source, Span site) {
+        editorBodyEffect = true;
         GenericInstanceKey key{declaration, {}};
         for (auto type : arguments) key.arguments.push_back(typeName(module, type, true));
         if (auto found = specializations.find(key); found != specializations.end()) return found->second;
@@ -1400,6 +1523,7 @@ struct Symbols {
     }
 
     void bindFieldDefaults(Type type, std::span<const std::size_t> slots, const Source& source, Span site) {
+        editorBodyEffect = true;
         auto& record = module.aggregates[type.id];
         record.defaultFunctions.resize(record.fields.size());
         for (auto slot : slots) {
@@ -1524,7 +1648,7 @@ struct Checker {
         indexedReferences = fn.references.size();
         for (const auto& local : std::span(fn.locals).subspan(indexedLocals)) if (local.declaration) {
             auto kind = local.parameter ? EditorKind::Parameter : local.constant ? EditorKind::Constant : EditorKind::Variable;
-            symbols.indexBinding(fn.syntax.file, {local.name, *local.declaration}, kind, local.type, local.writable ? 0u : Readonly);
+            symbols.indexBinding(editor, fn.syntax.file, {local.name, *local.declaration}, kind, local.type, local.writable ? 0u : Readonly);
         }
         indexedLocals = fn.locals.size();
     }
@@ -3369,6 +3493,7 @@ struct Checker {
         auto result = symbols.resolve(signature, method.result, types);
         if (owner.kind != Type::Variable && materializing()) {
             auto useDynamic = [&](const TraitMethod& implementation) {
+                symbols.editorBodyEffect = true;
                 const auto& methods = symbols.interfaceTrait(owner).methods;
                 info.callee = Callee::Dynamic;
                 info.dynamicMethod = DynamicMethodKey{owner, static_cast<std::size_t>(&implementation - methods.data()), {arguments.begin(), arguments.end()}};
@@ -4176,7 +4301,7 @@ const Identifier& Symbols::resultAnnotation(const Callable& candidate, const Sou
 }
 
 static CheckedModule checkProgram(Module module, const std::vector<Source>& sources, bool requireEntry, MacroExecution* macro, EditorIndex* editor,
-    AnalysisDiagnostics* diagnostics, std::map<std::size_t, MacroTypeQuery>* queries = nullptr) {
+    AnalysisDiagnostics* diagnostics, std::map<std::size_t, MacroTypeQuery>* queries = nullptr, EditorBodySession* bodies = nullptr) {
     if (!module.expansions.empty()) {
         auto& use = module.expansions.front();
         throw at(sources[use.file], use.name.span, "LYM0001", "声明前缀未展开：" + use.name.text);
@@ -4544,17 +4669,19 @@ static CheckedModule checkProgram(Module module, const std::vector<Source>& sour
     using FunctionSite = std::pair<std::size_t, std::size_t>;
     std::map<FunctionSite, std::vector<FunctionSite>> dependencies;
     std::set<std::size_t> failedInferences;
-    auto rememberCalls = [&](const CheckedFunction& fn) {
-        auto& calls = dependencies[{fn.syntax.file, fn.syntax.name.span.begin}];
-        for (const auto& call : fn.calls) calls.emplace_back(call.file, call.span.begin);
+    auto rememberCalls = [&](SourceAnchor name, std::span<const SourceAnchor> targets) {
+        auto& calls = dependencies[{name.file, name.span.begin}];
+        for (const auto& call : targets) calls.emplace_back(call.file, call.span.begin);
     };
-    auto analyzeBody = [&](auto&& analyze) -> bool {
+    auto analyzeBody = [&](auto&& analyze, bool* retainsEffects = nullptr) -> bool {
         checkAnalysisCancellation();
         if (!diagnostics) { analyze(); return true; }
         if (diagnostics->full()) return false;
         Symbols::BodyTrial transaction{symbols};
+        if (retainsEffects) symbols.editorBodyEffect = false;
         try {
             analyze();
+            if (retainsEffects) *retainsEffects = transaction.retainsEffects();
             transaction.types.committed = true;
             return true;
         } catch (const Diagnostic& error) { diagnostics->add(error); }
@@ -4610,7 +4737,7 @@ static CheckedModule checkProgram(Module module, const std::vector<Source>& sour
             checker.editor = editor;
             checker.run();
             rememberContracts(helper);
-            rememberCalls(helper);
+            rememberCalls(functionAnchor(helper.syntax), helper.calls);
         }
         auto syntax = *callable.generic;
         syntax.result = symbols.resultAnnotation(callable, sources[syntax.file], syntax.name.span);
@@ -4622,7 +4749,7 @@ static CheckedModule checkProgram(Module module, const std::vector<Source>& sour
         checker.run();
         if (callable.generic->result.text.empty()) checker.indexType(body.syntax.result.span, body.syntax.name.text, body.result);
         rememberContracts(body);
-        rememberCalls(body);
+        rememberCalls(functionAnchor(body.syntax), body.calls);
     };
     if (macro) symbols.checkGeneric = checkGeneric;
     else for (std::size_t index = 0; index < symbols.callables.size(); ++index) {
@@ -4639,21 +4766,43 @@ static CheckedModule checkProgram(Module module, const std::vector<Source>& sour
             const auto& result = symbols.resultAnnotation(callable, sources[fn.syntax.file], fn.syntax.name.span);
             fn.result = symbols.resolve(fn.syntax, result, {});
         }
-        auto visit = [&](CheckedFunction& body) {
+        auto visit = [&](CheckedFunction& body, EditorIndex* indexer) {
             auto checker = Checker{body, sources[body.syntax.file], checked, symbols, {}};
             checker.functionIndex = index;
-            if (index < declaredFunctions) checker.editor = editor;
+            if (index < declaredFunctions) checker.editor = indexer;
             checker.run();
             if (body.syntax.result.text.empty()) checker.indexType(body.syntax.result.span, body.syntax.name.text, body.result);
-            rememberCalls(body);
+            rememberCalls(functionAnchor(body.syntax), body.calls);
         };
-        if (!diagnostics) { visit(fn); return; }
+        if (!diagnostics) { visit(fn, editor); return; }
+        checkAnalysisCancellation();
+        if (diagnostics->full()) return;
         if (fn.syntax.incompleteBody || failedInferences.contains(index) || failedGenerics.contains({fn.syntax.file, fn.syntax.name.span.begin})) return;
-        analyzeBody([&] {
+        const auto track = bodies && bodies->cache && index < declaredFunctions && tracksEditorBody(fn.syntax);
+        const auto anchor = functionAnchor(fn.syntax);
+        if (track) if (auto cached = bodies->find(anchor)) {
+            rememberCalls(anchor, cached->calls);
+            appendEditorBody(*editor, cached->editor);
+            bodies->cache->bodies.emplace(anchor, std::move(*cached));
+            fn.expressions.clear();
+            ++bodies->reused;
+            return;
+        }
+        EditorBodyCache::Body result;
+        bool retainsEffects = false;
+        const auto success = analyzeBody([&] {
             auto body = fn;
-            visit(body);
+            if (bodies && !body.syntax.expressions.empty()) ++bodies->checked;
+            visit(body, track ? &result.editor : editor);
             fn = std::move(body);
-        });
+        }, track ? &retainsEffects : nullptr);
+        if (track) {
+            appendEditorBody(*editor, result.editor);
+            if (success && !retainsEffects) {
+                result.calls = fn.calls;
+                bodies->cache->bodies.emplace(anchor, std::move(result));
+            }
+        }
     };
     if (macro) {
         auto entry = symbols.callables[symbols.functionCallables[macro->declaration]].target;
@@ -4758,7 +4907,10 @@ static CheckedModule checkProgram(Module module, const std::vector<Source>& sour
     for (std::size_t id = 0; id < checked.aggregates.size(); ++id) layout(layout, id);
     validateForeignDeclarations(checked, sources);
     if (requireEntry && !checked.entry) throw Diagnostic{"LYN0001", "可执行包缺少入口 fn main()"};
-    if (!macro) evaluateConstants(checked, sources);
+    if (!macro && bodies && bodies->cache) evaluateConstants(checked, sources, [&](auto index) {
+        bodies->cache->bodies.erase(functionAnchor(checked.functions[index].syntax));
+    });
+    else if (!macro) evaluateConstants(checked, sources);
     for (const auto& deferred : checked.deferredPatternChecks) {
         std::vector<const CheckedPattern*> patterns;
         for (const auto& pattern : deferred.patterns) patterns.push_back(&pattern);
@@ -4790,6 +4942,19 @@ void checkForDiagnostics(Module module, const std::vector<Source>& sources, bool
     try { checkProgram(std::move(module), sources, requireEntry, nullptr, editor, &diagnostics); }
     catch (const Diagnostic& error) { diagnostics.add(error); }
     catch (const BlockedAnalysis&) {}
+}
+
+EditorBodyAnalysis checkForEditor(Module module, const std::vector<Source>& sources, bool requireEntry, AnalysisDiagnostics& diagnostics,
+    EditorIndex& editor, const EditorBodyBaseline& previous) {
+    if (!diagnostics.errors.empty()) {
+        checkForDiagnostics(std::move(module), sources, requireEntry, diagnostics, &editor);
+        return {};
+    }
+    EditorBodySession bodies{module, sources, previous};
+    try { checkProgram(std::move(module), sources, requireEntry, nullptr, &editor, &diagnostics, nullptr, &bodies); }
+    catch (const Diagnostic& error) { diagnostics.add(error); }
+    catch (const BlockedAnalysis&) {}
+    return {std::move(bodies.cache), bodies.checked, bodies.reused};
 }
 
 }

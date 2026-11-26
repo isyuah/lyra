@@ -5,6 +5,7 @@ module;
 #include <filesystem>
 #include <functional>
 #include <map>
+#include <memory>
 #include <optional>
 #include <span>
 #include <string>
@@ -127,6 +128,16 @@ struct EditorIndex {
     std::map<SourceAnchor, EditorBinding> bindings;
     EditorProbe* probe{};
 };
+struct EditorBodyCache;
+struct EditorBodyRequired {};
+struct EditorBodyAnalysis {
+    std::shared_ptr<const EditorBodyCache> cache;
+    std::size_t checked{}, reused{};
+};
+struct EditorBodyBaseline {
+    const EditorBodyCache* cache{};
+    std::span<const Source> sources{};
+};
 std::vector<EditorSymbol> editorBuiltins(bool types, bool constraints = false);
 const std::optional<ConstValue>& constantValue(const CheckedModule& module, ConstantUse target);
 std::string typeName(const CheckedModule& module, Type type, bool canonical = false);
@@ -134,4 +145,6 @@ std::optional<Type> hiddenType(const CheckedModule& module, Type type);
 CheckedModule check(Module module, const std::vector<Source>& sources, bool requireEntry = true, MacroExecution* macro = nullptr, EditorIndex* editor = nullptr);
 void checkMacroTypes(Module module, const std::vector<Source>& sources, std::map<std::size_t, MacroTypeQuery>& queries);
 void checkForDiagnostics(Module module, const std::vector<Source>& sources, bool requireEntry, AnalysisDiagnostics& diagnostics, EditorIndex* editor = nullptr);
+EditorBodyAnalysis checkForEditor(Module module, const std::vector<Source>& sources, bool requireEntry, AnalysisDiagnostics& diagnostics,
+    EditorIndex& editor, const EditorBodyBaseline& previous);
 }
