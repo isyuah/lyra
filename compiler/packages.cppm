@@ -45,11 +45,14 @@ struct PackageGraph {
     std::vector<ResolvedPackage> packages;
     std::vector<std::string> warnings, missingOutputs, members;
 };
+struct LocalPackage { std::filesystem::path root; std::string name; };
+struct LocalPackageLayout { std::filesystem::path workspace; std::vector<LocalPackage> packages; };
 struct ManifestCompletion { Span replacement; std::string label, text, detail; bool value{}; };
 
 PackageGraph resolvePackages(const std::filesystem::path& directory, PackageOptions options = {});
 PackageGraph indexPackages(const std::filesystem::path& directory);
 std::vector<std::filesystem::path> indexLocalPackageRoots(const std::filesystem::path& directory);
+LocalPackageLayout localEntryPackages(const std::filesystem::path& directory);
 std::vector<ManifestCompletion> completeManifest(const Source& source, std::size_t offset);
 std::optional<Diagnostic> validateManifest(const Source& source);
 int packageCommand(const std::vector<std::string_view>& args);
@@ -894,6 +897,16 @@ void visitGraph(const string& id, const std::map<string, ResolvedPackage>& packa
     visiting.pop_back(); done.insert(id);
 }
 
+}
+
+LocalPackageLayout localEntryPackages(const fs::path& directory) {
+    auto ws = layout(directory);
+    LocalPackageLayout result{ws.root, {}};
+    for (const auto& root : ws.members) if (ws.entry.empty() || ws.entry == root) {
+        auto file = root / manifestFile;
+        result.packages.push_back({root, manifestFrom(readFile(file), pathText(file)).name});
+    }
+    return result;
 }
 
 PackageGraph resolvePackages(const fs::path& directory, PackageOptions options) {

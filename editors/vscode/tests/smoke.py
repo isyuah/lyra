@@ -34,9 +34,27 @@ def main():
             parser.error('VSIX is missing vscode-languageclient' if options.vsix else 'run npm ci in editors/vscode first')
         project = root / 'JSONL workspace'
         http = root / 'HTTP workspace'
+        debug = root / 'Debug workspace'
         ignores = shutil.ignore_patterns('build', '.lyra', '.lyra-cache')
         shutil.copytree(EXAMPLES / 'jsonlines', project, ignore=ignores)
         shutil.copytree(EXAMPLES / 'http-sqlite', http, ignore=ignores)
+        (debug / 'src').mkdir(parents=True)
+        (debug / 'lyra.json5').write_text('{name:"debug/smoke",version:"0.1.0"}', encoding='utf-8')
+        debug_source = debug / 'src' / 'main.ly'
+        debug_source.write_text(
+            'async fn calculate(base: Int): Int {\n'
+            '    val beforeWait = base + 1\n'
+            '    await sleepMs(30)\n'
+            '    val afterWait = beforeWait + 1\n'
+            '    afterWait\n'
+            '}\n'
+            'async fn main(): Unit { print(await calculate(40)) }\n',
+            encoding='utf-8',
+        )
+        built = subprocess.run([lyra, 'build', debug, '--debug-info'], capture_output=True, text=True, timeout=45)
+        if built.returncode:
+            parser.exit(1, f'Could not build the debugger smoke program:\n{built.stderr}\n')
+        debug_app = debug / 'build' / 'debug' / ('app.exe' if os.name == 'nt' else 'app')
         macro = project / 'stats' / 'src' / '.expressions' / 'identitySyntax.ly'
         macro.parent.mkdir()
         macro.write_text('fn identitySyntax(target: String, raw: String): Syntax { syntaxArgument(0) }\n', encoding='utf-8')
@@ -45,6 +63,7 @@ def main():
         (profile / 'User').mkdir(parents=True)
         (profile / 'User' / 'settings.json').write_text(json.dumps({
             'lyra.serverPath': str(lyra),
+            'lyra.debugAdapterPath': shutil.which('lldb-dap') or 'lldb-dap',
             'chat.disableAIFeatures': True,
             'files.autoSave': 'off',
             'editor.wordBasedSuggestions': 'off',
@@ -56,7 +75,8 @@ def main():
         }), encoding='utf-8')
         report, log = root / 'result.txt', root / 'vscode.log'
         environment = {**os.environ, 'LYRA_CACHE': str(root / 'cache'), 'LYRA_SMOKE_RESULT': str(report),
-                       'LYRA_SMOKE_HTTP': str(http / 'src' / 'main.ly')}
+                       'LYRA_SMOKE_HTTP': str(http / 'src' / 'main.ly'),
+                       'LYRA_SMOKE_DEBUG_APP': str(debug_app), 'LYRA_SMOKE_DEBUG_SOURCE': str(debug_source)}
         for key in ('ELECTRON_RUN_AS_NODE', 'VSCODE_IPC_HOOK_CLI', 'VSCODE_PORTABLE'):
             environment.pop(key, None)
         arguments = [

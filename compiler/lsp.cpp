@@ -185,6 +185,18 @@ fs::path packageRoot(fs::path file) {
     return directory;
 }
 
+struct AnalysisView {
+    fs::path root;
+    std::optional<fs::path> test;
+    auto operator<=>(const AnalysisView&) const = default;
+};
+
+AnalysisView analysisView(const fs::path& path) {
+    auto root = packageRoot(path);
+    auto test = isTestEntry(root, path) && fs::is_regular_file(root / "lyra.json5") ? std::optional(path) : std::nullopt;
+    return {std::move(root), std::move(test)};
+}
+
 Workspace loadWorkspace(const fs::path& root, const SourceOverlay& overlays, const std::optional<PackageGraph>& graph, ParseCache& parseCache,
                         EditorProbe* probe = nullptr, const std::optional<fs::path>& testFile = {}) {
     Workspace workspace;
@@ -1297,7 +1309,7 @@ public:
 private:
     Documents documents;
     std::set<fs::path> workspaceFolders;
-    std::map<fs::path, Snapshot> snapshots;
+    std::map<AnalysisView, Snapshot> snapshots;
     ParseCache parseCache;
     EditorParseCache editorParseCache;
     EditorParseCache workspaceSymbolCache;
@@ -1403,7 +1415,8 @@ private:
         return catalogs.emplace(path, indexModule(graph->second, path, overlays, editorParseCache)).first->second;
     }
 
-    WorkspaceInputs collectInputs(const fs::path& root, const Documents& documents) {
+    WorkspaceInputs collectInputs(const AnalysisView& view, const Documents& documents) {
+        const auto& root = view.root;
         WorkspaceInputs result;
         auto& inputs = result.inputs;
         auto& graph = result.graph;
@@ -1412,6 +1425,10 @@ private:
         trackFile(inputs, root / "lyra.json5");
         trackFile(inputs, root / "lyra.lock");
         recordTree(inputs, root / "src", true);
+        if (view.test) {
+            trackFile(inputs, *view.test);
+            extraOverlayPaths.push_back(*view.test);
+        }
         if (fs::is_regular_file(root / "lyra.json5")) {
             PackageOptions options;
             options.readOnly = true;
@@ -1456,30 +1473,32 @@ private:
         return result;
     }
 
-    const Workspace& analyze(const fs::path& root, const Documents& documents) {
-        auto [inputs, graph, overlays] = collectInputs(root, documents);
+    const Workspace& analyze(const AnalysisView& view, const Documents& documents) {
+        auto [inputs, graph, overlays] = collectInputs(view, documents);
+        auto label = pathText(view.test.value_or(view.root));
 
-        auto found = snapshots.find(root);
+        auto found = snapshots.find(view);
         if (found != snapshots.end() && found->second.inputs == inputs) {
             auto& previous = found->second;
             if (previous.overlays == overlays) {
-                trace("Lyra analysis: reused package analysis for " + pathText(root));
+                trace("Lyra analysis: reused package analysis for " + label);
                 return previous.workspace;
             }
             if (auto updates = triviaOnlyUpdates(previous, inputs, overlays)) {
                 for (auto& [index, source] : *updates) previous.workspace.sources[index] = std::move(source);
                 previous.overlays = std::move(overlays);
-                trace("Lyra analysis: reused checked workspace after trivia-only document edits for " + pathText(root));
+                trace("Lyra analysis: reused checked workspace after trivia-only document edits for " + label);
                 return previous.workspace;
             }
         }
-        trace("Lyra analysis: rebuilt workspace and reran semantic checks for " + pathText(root));
-        auto workspace = loadWorkspace(root, overlays, graph, parseCache);
-        return snapshots.insert_or_assign(root, Snapshot{std::move(inputs), std::move(overlays), std::move(workspace)}).first->second.workspace;
+        trace("Lyra analysis: rebuilt workspace and reran semantic checks for " + label);
+        auto workspace = loadWorkspace(view.root, overlays, graph, parseCache, nullptr, view.test);
+        return snapshots.insert_or_assign(view, Snapshot{std::move(inputs), std::move(overlays), std::move(workspace)}).first->second.workspace;
     }
 
-    json::Value checkedRename(const fs::path& root, const Documents& documents, const Workspace& workspace, SourceAnchor anchor,
+    json::Value checkedRename(const AnalysisView& primary, const Documents& documents, const Workspace& workspace, SourceAnchor anchor,
                               std::string_view newName) {
+        const auto& root = primary.root;
         RenameIndex initial(workspace);
         auto target = initial.authored(anchor);
         if (!target || newName == "_") return nullptr;
@@ -1488,8 +1507,10 @@ private:
         auto spelling = declaration->moduleAlias ? editorModuleAlias(newName) : editorIdentifier(newName);
         if (spelling.empty()) return nullptr;
 
-        auto [inputs, graph, overlays] = collectInputs(root, documents);
-        if (inputs != snapshots.at(root).inputs || overlays != snapshots.at(root).overlays) return nullptr;
+        auto [inputs, graph, overlays] = collectInputs(primary, documents);
+        const auto& snapshot = snapshots.at(primary);
+        if (inputs != snapshot.inputs || overlays != snapshot.overlays) return nullptr;
+        if (primary.test && pathKey(*primary.test) == target->file) declaration->exported = false;
         auto owner = packageRoot(fromUtf8(target->file));
         if ((!declaration->exported || !graph) && owner != root) return nullptr;
         std::set<fs::path> editable{root};
@@ -1522,18 +1543,22 @@ private:
         };
         std::deque<Workspace> additional;
         std::vector<View> views;
-        views.push_back({root, std::move(graph), std::move(overlays), {{std::nullopt, &workspace}}});
+        views.push_back({root, std::move(graph), std::move(overlays), {{primary.test, &workspace}}});
         for (const auto& member : additionalRoots) {
-            auto current = collectInputs(member, documents);
+            auto current = collectInputs({member, {}}, documents);
             additional.push_back(loadWorkspace(member, current.overlays, current.graph, parseCache));
             views.push_back({member, std::move(current.graph), std::move(current.overlays), {{std::nullopt, &additional.back()}}});
         }
         if (declaration->exported && views.front().graph) for (auto& view : views) {
-            auto directory = view.root / "tests";
-            if (!fs::is_directory(directory)) continue;
-            for (const auto& entry : fs::directory_iterator(directory)) {
-                const auto& path = entry.path();
-                if (path.extension() != ".ly" || !entry.is_regular_file()) continue;
+            if (view.root == root && primary.test) {
+                additional.push_back(loadWorkspace(root, view.overlays, view.graph, parseCache));
+                view.checks.emplace_back(std::nullopt, &additional.back());
+            }
+            auto paths = testEntries(view.root);
+            std::set<fs::path> tests(paths.begin(), paths.end());
+            for (const auto& [key, document] : documents) if (auto path = fromUtf8(key); isTestEntry(view.root, path)) tests.insert(std::move(path));
+            for (const auto& path : tests) {
+                if (view.root == root && primary.test == path) continue;
                 if (auto document = documents.find(pathKey(path)); document != documents.end()) view.overlays.insert_or_assign(path, document->second.text);
                 additional.push_back(loadWorkspace(view.root, view.overlays, view.graph, parseCache, nullptr, path));
                 view.checks.emplace_back(path, &additional.back());
@@ -1618,16 +1643,17 @@ private:
         send(json::Object{{"jsonrpc", "2.0"}, {"id", "lyra-" + std::to_string(nextRequest++)}, {"method", std::move(method)}, {"params", std::move(params)}});
     }
 
-    void synchronizeWatchers(const std::map<fs::path, const Document*>& roots) {
+    void synchronizeWatchers(const std::map<AnalysisView, const Document*>& roots) {
         if (!relativeWatchers) return;
         std::set<WatchPattern> desired;
-        for (const auto& [root, owner] : roots) {
-            if (auto found = snapshots.find(root); found != snapshots.end()) {
+        for (const auto& [view, owner] : roots) {
+            if (auto found = snapshots.find(view); found != snapshots.end()) {
                 const auto& watchers = found->second.inputs.watchers;
                 desired.insert(watchers.begin(), watchers.end());
             } else {
-                desired.insert({root, "src/**/*.ly"});
-                for (const auto* name : {"lyra.json5", "lyra.lock"}) desired.insert({root, name});
+                desired.insert({view.root, "src/**/*.ly"});
+                for (const auto* name : {"lyra.json5", "lyra.lock"}) desired.insert({view.root, name});
+                if (view.test) desired.insert(watchFile(*view.test));
             }
         }
         const std::string method = "workspace/didChangeWatchedFiles";
@@ -1799,10 +1825,10 @@ private:
         auto replacement = probeText(source, offset, syntax, result, signature);
         if (!replacement) return result;
         try {
-            auto root = packageRoot(source.path);
-            auto [inputs, graph, overlays] = collectInputs(root, documents);
+            auto view = analysisView(source.path);
+            auto [inputs, graph, overlays] = collectInputs(view, documents);
             overlays.insert_or_assign(source.path, std::move(*replacement));
-            loadWorkspace(root, overlays, graph, parseCache, &result);
+            loadWorkspace(view.root, overlays, graph, parseCache, &result, view.test);
         } catch (const PackageError&) {}
         catch (const fs::filesystem_error&) {}
         return result;
@@ -1874,7 +1900,7 @@ private:
             catch (const fs::filesystem_error&) {}
             enqueue(id, unavailable(method), [this, params, key, index = std::move(index), documents = documents] {
                 const auto& document = documents.at(key);
-                const auto& workspace = analyze(packageRoot(fromUtf8(key)), documents);
+                const auto& workspace = analyze(analysisView(fromUtf8(key)), documents);
                 auto source = sourceFor(workspace, document.path);
                 if (!source || source->text != document.text) return json::Array{};
                 return diagnosticActions(*source, document, workspace.diagnostics.errors, index ? &*index : nullptr, params);
@@ -1934,8 +1960,8 @@ private:
     json::Value checkedRequest(std::string_view method, const json::Object& params, const Document& document, const Documents& documents,
         std::span<const EditorDefinition> macros = {}) {
         const auto& path = document.path;
-        auto root = packageRoot(fromUtf8(pathKey(path)));
-        const auto& workspace = analyze(root, documents);
+        auto view = analysisView(fromUtf8(pathKey(path)));
+        const auto& workspace = analyze(view, documents);
         auto source = sourceFor(workspace, path);
         if (!source || source->text != document.text) return unavailable(method);
         if (method == "textDocument/semanticTokens/full") return semanticTokens(workspace, *source, macros);
@@ -1979,7 +2005,7 @@ private:
             if (!workspace.diagnostics.errors.empty()) return nullptr;
             auto newName = params.getString("newName");
             auto target = reference ? std::optional(renameAnchor(*reference)) : bindingAt(workspace, *source, offset);
-            return newName && target ? checkedRename(root, documents, workspace, *target, *newName) : json::Value(nullptr);
+            return newName && target ? checkedRename(view, documents, workspace, *target, *newName) : json::Value(nullptr);
         }
         if (method == "textDocument/hover") {
             if (!reference) return json::Value(nullptr);
@@ -2012,15 +2038,15 @@ private:
         std::map<std::string, json::Array> byUri;
         auto changedKey = pathKey(job.changed);
         const auto& documents = job.documents;
-        std::map<fs::path, const Document*> roots;
+        std::map<AnalysisView, const Document*> roots;
         for (const auto& [key, document] : documents) {
             auto path = fromUtf8(key);
             if (path.extension() != ".ly") continue;
-            auto root = packageRoot(path);
-            auto relative = path.lexically_relative(root);
+            auto view = analysisView(path);
+            auto relative = path.lexically_relative(view.root);
             if (std::ranges::any_of(relative, [](const auto& part) { return pathText(part).starts_with('.'); })) continue;
-            if (key == changedKey) roots.insert_or_assign(std::move(root), &document);
-            else roots.try_emplace(std::move(root), &document);
+            if (key == changedKey) roots.insert_or_assign(std::move(view), &document);
+            else roots.try_emplace(std::move(view), &document);
         }
         std::erase_if(snapshots, [&](const auto& entry) { return !roots.contains(entry.first); });
         std::map<std::string, std::optional<Source>> reportSources;
@@ -2069,9 +2095,9 @@ private:
             auto source = sourceText(document.path, document.text, {});
             if (auto error = validateManifest(source)) append(*error, document);
         }
-        for (const auto& [root, owner] : roots) {
+        for (const auto& [view, owner] : roots) {
             try {
-                const auto& workspace = analyze(root, documents);
+                const auto& workspace = analyze(view, documents);
                 for (const auto& warning : workspace.diagnostics.warnings) append(warning, *owner, 2);
                 for (const auto& error : workspace.diagnostics.errors) append(error, *owner);
                 for (const auto& [key, document] : documents) if (auto source = sourceFor(workspace, document.path))

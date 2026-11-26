@@ -21,10 +21,42 @@
     "virtualWorkspaces": false
   },
   "main": "./extension.cjs",
+  "activationEvents": ["workspaceContains:**/lyra.json5", "onDebugResolve:lyra", "onDebugInitialConfigurations:lyra"],
   "scripts": {
-    "check": "node --check extension.cjs"
+    "check": "node --check extension.cjs && node --check testing.cjs"
   },
   "contributes": {
+    "commands": [
+      { "command": "lyra.tests.refresh", "title": "Lyra: Refresh Tests" }
+    ],
+    "debuggers": [
+      {
+        "type": "lyra",
+        "label": "Lyra",
+        "languages": ["lyra"],
+        "configurationAttributes": {
+          "launch": {
+            "required": ["program"],
+            "properties": {
+              "program": { "type": "string", "description": "Native executable built with --debug-info." },
+              "args": { "type": "array", "items": { "type": "string" } },
+              "cwd": { "type": "string" },
+              "stopOnEntry": { "type": "boolean" }
+            }
+          }
+        },
+        "initialConfigurations": [
+          {
+            "type": "lyra",
+            "request": "launch",
+            "name": "Lyra: Launch Debug Build",
+            "program": "${workspaceFolder}/build/debug/app",
+            "cwd": "${workspaceFolder}",
+            "args": []
+          }
+        ]
+      }
+    ],
     "configuration": {
       "title": "Lyra",
       "properties": {
@@ -33,6 +65,12 @@
           "default": "lyra",
           "scope": "machine",
           "description": "Lyra SDK executable (absolute path or a name on PATH). Reload the window after changing it."
+        },
+        "lyra.debugAdapterPath": {
+          "type": "string",
+          "default": "lldb-dap",
+          "scope": "machine",
+          "description": "LLDB DAP executable (absolute path or a name on PATH)."
         }
       }
     },

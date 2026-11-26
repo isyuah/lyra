@@ -123,6 +123,47 @@ def interactive_server(root):
 
 
 class LanguageServer(unittest.TestCase):
+    def test_tests_have_separate_analysis_contexts_and_see_unsaved_sources(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            api = root / 'src/api.ly'
+            healthy = root / 'tests/healthy.ly'
+            broken = root / 'tests/broken.ly'
+            api_text = 'pub fn answer(): Int { 42 }\nfn main(): Unit {}\n'
+            healthy_text = 'import self.{answer}\nfn main(): Unit { val outcome = answer(); print(outcome) }\n'
+            broken_text = 'import self.{answer}\nfn main(): Unit { print(missingName) }\n'
+            for path, text in [(root / 'lyra.json5', '{name:"kit",version:"0.1.0"}'), (api, api_text),
+                               (healthy, healthy_text), (broken, 'fn main(): Unit {}\n')]:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(text, encoding='utf-8')
+            site = position_at(healthy_text, healthy_text.rindex('answer'))
+            requests = [document_request(2, healthy, 'hover', position=site), document_request(3, healthy, 'definition', position=site),
+                        document_request(4, healthy, 'inlayHint', range={'start': {'line': 0, 'character': 0}, 'end': {'line': 2, 'character': 0}})]
+            output = run_server([(healthy, healthy_text), (broken, broken_text), (api, api_text)], requests)
+            results = {item['id']: item['result'] for item in output if 'id' in item}
+            self.assertIn('fn answer(): Int', results[2]['contents']['value'])
+            self.assertEqual(results[3][0]['uri'], uri(api))
+            self.assertEqual([hint['label'] for hint in results[4]], [': Int'])
+            diagnostics = {item['params']['uri']: item['params']['diagnostics'] for item in output if item.get('method') == 'textDocument/publishDiagnostics'}
+            self.assertEqual(diagnostics[uri(healthy)], [])
+            self.assertEqual(diagnostics[uri(api)], [])
+            self.assertEqual([error['code'] for error in diagnostics[uri(broken)]], ['LYN0001'])
+            self.assertIn('missingName', diagnostics[uri(broken)][0]['message'])
+            self.assertFalse((root / 'lyra.lock').exists())
+
+    def test_incomplete_decorated_body_does_not_hide_independent_errors(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / 'src/main.ly'
+            text = '@trace\nfn decorated(): Unit { val broken = ; print(1) }\nfn main(): Unit { print(unbound) }\n'
+            source.parent.mkdir()
+            source.write_text(text, encoding='utf-8')
+            (root / 'lyra.json5').write_text('{name:"kit",version:"0.1.0"}', encoding='utf-8')
+            output = run_server([(source, text)], [])
+            errors = next(item['params']['diagnostics'] for item in output if item.get('method') == 'textDocument/publishDiagnostics')
+            self.assertTrue(any(item['range']['start']['line'] == 1 for item in errors), errors)
+            self.assertTrue(any(item['code'] == 'LYN0001' and 'unbound' in item['message'] for item in errors), errors)
+
     def test_navigation_and_semantics_use_current_symbol_identity(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

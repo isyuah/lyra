@@ -51,6 +51,10 @@ code --install-extension lyra-language.vsix --force
 
 **Format Document** 使用和 `lyra fmt` 一样的词法规则，处理编辑器缓冲区并遵循缩进设置，不要求类型检查通过。
 
+**Test Explorer** 从 workspace 的 `tests/*.ly` 发现 Lyra 测试，可运行单个测试或整组测试。测试列表使用本地清单，不解析依赖；运行时复用 `lyra test --format=json`，失败显示编译诊断或退出码，并附带标准输出和错误输出。
+
+**Debug** 使用 LLVM 的 `lldb-dap` 启动原生程序。先用 `lyra build <包目录> --debug-info` 生成调试版，再选择 **Lyra: Launch Debug Build**；默认读取 `build/debug/app`，Windows 会自动补 `.exe`。若 `lldb-dap` 不在 `PATH`，设置 `lyra.debugAdapterPath` 为其绝对路径。跨挂起点的异步断点与局部变量由编译器生成的原生符号提供。
+
 ## 真实编辑器验收
 
 执行 `npm ci` 后，从仓库根目录运行：

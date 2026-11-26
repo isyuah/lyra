@@ -25,6 +25,9 @@ import lyra.syntax;
 
 export namespace lyra {
 struct Compilation { std::vector<Source> sources; Module syntax; std::vector<std::filesystem::path> macroInputs{}; std::vector<NameReference> references{}; bool incompleteDeclaration{}; };
+
+bool isTestEntry(const std::filesystem::path& root, const std::filesystem::path& path);
+std::vector<std::filesystem::path> testEntries(const std::filesystem::path& root);
 struct ParsedFileSyntax { std::string text; RecoveredSyntax parsed; };
 struct ParseCache { std::map<std::string, ParsedFileSyntax> files; };
 Compilation loadProgram(const PackageGraph& graph, const std::string& entry, const std::optional<std::filesystem::path>& testFile = {}, const SourceOverlay* overlays = nullptr,
@@ -1005,7 +1008,13 @@ struct ModuleCatalog {
             auto directory = package.root / "src";
             auto paths = sourcePaths(directory, &overlays, false);
             addModule(package, {});
-            if (id == entry.id && std::ranges::find(paths, path) == paths.end()) paths.push_back(path);
+            if (id == entry.id && std::ranges::find(paths, path) == paths.end()) {
+                if (isTestEntry(entry.root, path)) {
+                    auto module = prefixes.at(id) + "#test";
+                    spaces.emplace(module, Space{&package});
+                    loadFile(path, std::move(module));
+                } else paths.push_back(path);
+            }
             for (const auto& filePath : paths) {
                 auto relative = filePath.parent_path().lexically_relative(directory);
                 if (!relative.empty() && *relative.begin() == "..") relative.clear();
@@ -1091,6 +1100,7 @@ void ModuleCatalog::runtimeSymbols() {
         for (const auto& [name, use] : file->second) imported(use);
     }
     for (const auto& [module, space] : spaces) {
+        if (!directories.contains(module)) continue;
         auto [first, last] = routes.equal_range(space.package->id);
         if (first == last) continue;
         std::vector<std::pair<std::string, EditorSymbol>> exports;
@@ -1249,6 +1259,14 @@ const Module& editorFileSyntax(const Source& source, EditorParseCache& cache) {
     return indexedFile(source, cache).syntax;
 }
 
+bool isTestEntry(const fs::path& root, const fs::path& path) {
+    return path.parent_path() == root / "tests" && path.extension() == ".ly";
+}
+
+std::vector<fs::path> testEntries(const fs::path& root) {
+    return sourcePaths(root / "tests", nullptr, true, false);
+}
+
 Compilation loadLooseProgram(std::vector<Source> sources, AnalysisDiagnostics& diagnostics, ParseCache* parseCache) {
     Compilation program{std::move(sources), {}};
     for (std::size_t file = 0; file < program.sources.size(); ++file) {
@@ -1348,12 +1366,7 @@ Compilation loadProgram(const PackageGraph& graph, const std::string& entry, con
         }
     };
     loadBundled(authored, true);
-    if (diagnostics && (program.incompleteDeclaration || std::ranges::any_of(authored.expansions, [&](const Expansion& prefix) {
-        return prefix.kind == ExpansionTarget::Function && authored.functions[prefix.target].incompleteBody;
-    }))) {
-        program.incompleteDeclaration = true;
-        return program;
-    }
+    if (diagnostics && program.incompleteDeclaration) return program;
     auto hasExpressions = std::ranges::any_of(expressionMacros, [](bool present) { return present; });
     if (!hasExpressions && authored.expansions.empty() && std::ranges::none_of(authored.imports, [](const auto& use) { return use.kind != ImportKind::Runtime; })) {
         program.syntax = std::move(authored);

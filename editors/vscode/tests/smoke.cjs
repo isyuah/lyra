@@ -1,5 +1,6 @@
 const assert = require('node:assert/strict');
 const { writeFile } = require('node:fs/promises');
+const { basename, dirname, resolve } = require('node:path');
 const vscode = require('vscode');
 
 function waitForDiagnostics(uri, predicate, description) {
@@ -32,6 +33,8 @@ async function checkSmoke() {
     const extension = vscode.extensions.getExtension('lyra-lang.lyra-language');
     assert.ok(extension, 'Lyra extension was not loaded');
     await extension.activate();
+    const discoveredTests = await vscode.commands.executeCommand('lyra.tests.refresh');
+    assert.ok(discoveredTests > 0, 'Test Explorer did not discover package tests');
     const editor = await vscode.window.showTextDocument(document);
     const original = await vscode.workspace.fs.readFile(source);
 
@@ -142,6 +145,116 @@ async function checkManifest() {
     await waitForDiagnostics(uri, listing => listing.length === 0, 'manifest diagnostic did not clear after reverting');
 }
 
+async function checkTesting() {
+    const [project] = vscode.workspace.workspaceFolders;
+    const tests = await vscode.workspace.findFiles('**/tests/*.ly');
+    const expected = vscode.Uri.joinPath(project.uri, 'metrics', 'tests', 'readings.ly');
+    assert.ok(tests.some(uri => uri.toString() === expected.toString()), 'workspace test files were not exposed to VS Code');
+}
+
+function debugStopTracker(name) {
+    const events = [];
+    const waiters = [];
+    const registration = vscode.debug.registerDebugAdapterTrackerFactory('lyra', {
+        createDebugAdapterTracker(session) {
+            if (session.configuration.name !== name) return {};
+            return {
+                onDidSendMessage(message) {
+                    if (message.type !== 'event' || message.event !== 'stopped') return;
+                    const waiter = waiters.shift();
+                    if (waiter) waiter(message.body);
+                    else events.push(message.body);
+                },
+            };
+        },
+    });
+    return {
+        next() {
+            if (events.length) return Promise.resolve(events.shift());
+            return new Promise(resolve => waiters.push(resolve));
+        },
+        dispose() { registration.dispose(); },
+    };
+}
+
+async function debugFrameAt(session, threadId, sourcePath, targetLine) {
+    const { stackFrames } = await session.customRequest('stackTrace', { threadId, startFrame: 0, levels: 1 });
+    const frame = stackFrames?.[0];
+    assert.ok(frame, `No stack frame at ${basename(sourcePath)}:${targetLine}`);
+    const expected = resolve(sourcePath);
+    const actual = resolve(frame.source?.path ?? '');
+    const matches = process.platform === 'win32' ? actual.toLowerCase() === expected.toLowerCase() : actual === expected;
+    assert.ok(matches && frame.line === targetLine, `Unexpected stopped frame: ${JSON.stringify(frame)}`);
+    return frame;
+}
+
+async function debugLocals(session, frame) {
+    const deadline = Date.now() + 5000;
+    while (Date.now() < deadline) {
+        try {
+            const { scopes } = await session.customRequest('scopes', { frameId: frame.id });
+            const localScope = scopes.find(scope => scope.name === 'Locals');
+            assert.ok(localScope, `No Locals scope: ${JSON.stringify(scopes)}`);
+            const { variables } = await session.customRequest('variables', { variablesReference: localScope.variablesReference });
+            return new Map(variables.map(variable => [variable.name, variable.value]));
+        } catch (error) {
+            if (!String(error.message).includes('notStopped')) throw error;
+            await new Promise(resolve => setTimeout(resolve, 30));
+        }
+    }
+    throw new Error('Debugger did not pause before locals were inspected');
+}
+
+async function checkDebugging() {
+    const sourcePath = process.env.LYRA_SMOKE_DEBUG_SOURCE;
+    const program = process.env.LYRA_SMOKE_DEBUG_APP;
+    const source = vscode.Uri.file(sourcePath);
+    const text = new TextDecoder('utf-8', { fatal: true }).decode(await vscode.workspace.fs.readFile(source));
+    const lines = text.split(/\r?\n/);
+    const beforeLine = lines.findIndex(line => line.includes('await sleepMs')) + 1;
+    const afterLine = lines.findIndex(line => line.trim() === 'afterWait') + 1;
+    assert.ok(beforeLine > 0 && afterLine > beforeLine);
+    const breakpoints = [beforeLine, afterLine].map(line => new vscode.SourceBreakpoint(
+        new vscode.Location(source, new vscode.Range(line - 1, 0, line - 1, 0)),
+    ));
+    const workspaceFolder = vscode.workspace.workspaceFolders[0];
+    let session;
+    const name = 'Lyra async debugger smoke';
+    const stops = debugStopTracker(name);
+    vscode.debug.addBreakpoints(breakpoints);
+    try {
+        const started = new Promise((resolve, reject) => {
+            const subscription = vscode.debug.onDidStartDebugSession(current => {
+                if (current.type !== 'lyra' || current.configuration.name !== name) return;
+                subscription.dispose();
+                resolve(current);
+            });
+            setTimeout(() => { subscription.dispose(); reject(new Error('Lyra debug session did not start')); }, 10000);
+        });
+        const beforeStopped = stops.next();
+        assert.ok(await vscode.debug.startDebugging(workspaceFolder, {
+            type: 'lyra', request: 'launch', name, program, cwd: dirname(program), args: [], stopOnEntry: false,
+        }), 'VS Code rejected the Lyra debug configuration');
+        session = await started;
+        const beforeStop = await beforeStopped;
+        const beforeFrame = await debugFrameAt(session, beforeStop.threadId, sourcePath, beforeLine);
+        const beforeLocals = await debugLocals(session, beforeFrame);
+        assert.equal(beforeLocals.get('base'), '40', `before-await locals: ${JSON.stringify([...beforeLocals])}`);
+        assert.equal(beforeLocals.get('beforeWait'), '41', `before-await locals: ${JSON.stringify([...beforeLocals])}`);
+        const afterStopped = stops.next();
+        await session.customRequest('continue', { threadId: beforeStop.threadId });
+        const afterStop = await afterStopped;
+        const afterFrame = await debugFrameAt(session, afterStop.threadId, sourcePath, afterLine);
+        const afterLocals = await debugLocals(session, afterFrame);
+        assert.equal(afterLocals.get('beforeWait'), '41', `after-await locals: ${JSON.stringify([...afterLocals])}`);
+        assert.equal(afterLocals.get('afterWait'), '42', `after-await locals: ${JSON.stringify([...afterLocals])}`);
+    } finally {
+        if (session) await vscode.debug.stopDebugging(session);
+        stops.dispose();
+        vscode.debug.removeBreakpoints(breakpoints);
+    }
+}
+
 async function checkTyping() {
     const source = vscode.Uri.file(process.env.LYRA_SMOKE_HTTP);
     const document = await vscode.workspace.openTextDocument(source);
@@ -213,7 +326,9 @@ async function run() {
         await checkSmoke();
         await checkManifest();
         await checkTyping();
-        await writeFile(report, `PASS VS Code ${vscode.version}: cross-package navigation and outline, unsaved manifest editing, module completion and import Quick Fix, Unicode macro diagnostics, signatures and inlay hints\n`);
+        await checkTesting();
+        await checkDebugging();
+        await writeFile(report, `PASS VS Code ${vscode.version}: language navigation, diagnostics, Test Explorer and async debug locals across await\n`);
     } catch (error) {
         await writeFile(report, `${error.stack}\n`);
         throw error;

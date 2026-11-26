@@ -245,12 +245,16 @@ void build(const CheckedModule& functions, const std::vector<Source>& sources, c
     emitExecutable(*module, *machine, fs::absolute(output), options.release, symbols, libraries);
 }
 
-int execute(const fs::path& executable, const std::vector<std::string_view>& arguments) {
+int execute(const fs::path& executable, const std::vector<std::string_view>& arguments, const NativeOutput* output, unsigned timeoutSeconds) {
     auto path = pathText(fs::absolute(executable));
     std::vector<llvm::StringRef> args{path};
     for (auto arg : arguments) args.emplace_back(arg);
     std::string reason;
-    int code = llvm::sys::ExecuteAndWait(path, args, std::nullopt, {}, 0, 0, &reason);
+    auto standard = output ? pathText(output->standard) : std::string{};
+    auto error = output ? pathText(output->error) : std::string{};
+    std::optional<llvm::StringRef> redirected[] = {llvm::StringRef{}, llvm::StringRef(standard), llvm::StringRef(error)};
+    int code = llvm::sys::ExecuteAndWait(path, args, std::nullopt,
+        output ? llvm::ArrayRef(redirected) : llvm::ArrayRef<std::optional<llvm::StringRef>>{}, timeoutSeconds, 0, &reason);
     if (code < 0) throw Diagnostic{"LYB0003", "程序未正常退出：" + reason};
     return code;
 }

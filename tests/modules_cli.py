@@ -46,6 +46,33 @@ class Modules(unittest.TestCase):
         (self.lib / 'tests/port.ly').write_text('import self.{defaultPort}\nfn main(): Unit { print(defaultPort()) }')
         self.assertIn('21\nok lib/port.ly', self.command('test', self.lib).stdout)
 
+    def test_list_filter_and_report_test_results(self):
+        cases = self.app / 'tests'
+        cases.mkdir()
+        (cases / 'bad.ly').write_text('fn main(): Unit { print(missing) }')
+        (cases / 'runtime.ly').write_text('fn main(): Int { print("ran"); 7 }')
+        (cases / 'working.ly').write_text('fn main(): Unit { print(42) }')
+        (self.root / 'lyra.json5').write_text('{workspace:{members:["app","lib"]}}')
+        listed = json.loads(self.command('test', self.root, '--list', '--format=json').stdout)['tests']
+        self.assertEqual([entry['id'] for entry in listed], ['app/tests/bad.ly', 'app/tests/runtime.ly', 'app/tests/working.ly'])
+        self.assertTrue(all(entry['status'] == 'listed' for entry in listed))
+        self.assertFalse((self.root / 'lyra.lock').exists())
+        self.assertFalse((self.app / 'build').exists())
+
+        run = self.command('test', self.root, '--format=json', ok=False)
+        bad, runtime, working = json.loads(run.stdout)['tests']
+        self.assertEqual((bad['status'], bad['error']['code'], bad['error']['phase']), ('failed', 'LYN0001', 'build'))
+        self.assertEqual((runtime['status'], runtime['exitCode'], runtime['stdout']), ('failed', 7, 'ran\n'))
+        self.assertEqual((working['status'], working['stdout']), ('passed', '42\n'))
+        self.assertEqual(self.command('test', self.app, '--list', '--filter', 'working').stdout, 'app/tests/working.ly\n')
+        selected = json.loads(self.command('test', self.app, '--case', 'app/tests/working.ly', '--format=json').stdout)['tests']
+        self.assertEqual([entry['id'] for entry in selected], ['app/tests/working.ly'])
+
+        (self.app / 'tests/timeout.ly').write_text('fn main(): Unit { while true {} }', encoding='utf-8')
+        timed = self.command('test', self.app, '--case', 'app/tests/timeout.ly', '--timeout-seconds', '1', '--format=json', ok=False)
+        result, = json.loads(timed.stdout)['tests']
+        self.assertEqual((result['status'], result['error']['code'], result['error']['phase']), ('failed', 'LYB0003', 'run'))
+
     def test_private_import_alias_and_cycles(self):
         cases = [('import cfg.net.{hidden}', 'LYN0003'), ('import cfg.net.{missing}', 'LYN0003'),
                  ('import other.net.{port}', 'LYN0003'), ('import cfg.net.{port as main}', 'LYN0002')]

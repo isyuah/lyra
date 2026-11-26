@@ -691,6 +691,7 @@ void expandMacros(Module& syntax, std::vector<Source>& sources, const std::map<s
             declaration.enumeration = &syntax.enums[prefix.target];
         } else {
             declaration.function = &syntax.functions[prefix.target];
+            if (declaration.function->incompleteBody) continue;
             if (prefix.decorator && (declaration.function->foreignSymbol || declaration.function->conversion)) throw at(source, prefix.name.span, "LYM0002", "装饰器需要普通函数体");
             for (auto slot = static_cast<std::size_t>(declaration.function->hasReceiver); slot < declaration.function->parameters.size(); ++slot) {
                 const auto& param = declaration.function->parameters[slot];
