@@ -50,6 +50,19 @@ HTTP/1.1 默认支持 keep-alive，HTTP/1.0 通过 `Connection: keep-alive` 开�
 
 超限回 `413`，格式或头部文本非法回 `400`。HTTP/1.1 必须有且只有一个有效的 `Host`，携带 `Expect` 的请求在读完首部后回 `417`。响应在写前验证失败可改正后重试。TLS 复用同一套请求和生命周期语义，见 [`std.httpTls`](../httpTls/README.md)。
 
+### 流式响应
+
+```lyra
+router.get("/events", async (request: Request) => {
+    Response.stream(200, "application/x-ndjson", async (writer: ResponseWriter) => {
+        (await writer.write("{\"event\":1}\n".toBytes()))?
+        await writer.write("{\"event\":2}\n".toBytes())
+    })
+})
+```
+
+从 `std.http` 导入 `ResponseWriter`。库验证并写完响应头后才调用生产函数。顺序 `await writer.write(bytes)`，每次只借用一个 `Bytes` 分块，等网络传输接收这次写入再继续；空块不写到线上，并发写入返回 `Busy`。HTTP/1.1 用分块编码，可以在末尾复用连接；HTTP/1.0 用关连接标记正文结束。`HEAD` 不执行生产函数。生产函数中途失败或被取消会停止传输并关闭连接，不再补成功结束标记。生产函数退出后，旧 writer 不能再写入。`Response.body` 以 `ResponseBody.Buffered` 或 `ResponseBody.Streaming` 区分两种正文。
+
 ## 关闭与断线
 
 `Shutdown.request()` 停止接入并丢弃未认领请求，等待已进入的 handler 最多 `options.graceMs` 毫秒（默认 5000）；到期取消剩余任务，再等原生工作和清理结束。直接取消服务则跳过宽限期。`Listener` 和 `Request` 的 `close()` 只请求关闭，可重复调用；`await closeAndWait()` 等待资源回收。并发响应只有一个胜者，另一个得到 `Busy` 或 `Closed`。

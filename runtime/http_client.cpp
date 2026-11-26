@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <charconv>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -29,7 +30,7 @@ using Url = std::unique_ptr<CURLU, decltype(&curl_url_cleanup)>;
 using Easy = std::unique_ptr<CURL, decltype(&curl_easy_cleanup)>;
 using Headers = std::unique_ptr<curl_slist, decltype(&curl_slist_free_all)>;
 
-enum class Status : int64_t { Ok, InvalidRequest, TimedOut, TooLarge, TooManyRedirects, RedirectRejected, Tls, Network, Cancelled, Busy };
+enum class Status : int64_t { Ok, InvalidRequest, TimedOut, TooLarge, TooManyRedirects, RedirectRejected, Tls, Network, Cancelled, Busy, Closed };
 
 struct Failure {
     Status status = Status::Ok;
@@ -55,18 +56,27 @@ struct Request {
     size_t headerCount;
 };
 
+struct Job;
+struct StreamOperation;
+
 struct Response {
     Failure failure;
     int64_t status = 0;
     const Field* headers = nullptr;
     size_t headerCount = 0;
     const void* body = nullptr;
+    Job* stream = nullptr;
 };
 
 struct Transfer {
     size_t remaining;
+    Job& job;
     std::vector<std::pair<std::string, std::string>> headers;
     std::string body;
+    long status{};
+    bool followRedirects{};
+    bool discardBody{};
+    bool paused{};
     bool readingHeaders = false;
     bool overBudget = false;
 
@@ -76,6 +86,28 @@ struct Transfer {
         return true;
     }
 };
+
+struct Job {
+    const Request* request;
+    const Response* result{};
+    LyraNativeAsync* task{};
+    Clock::time_point deadline{};
+    CURL* active{};
+    bool streaming{};
+    bool closed{};
+    Failure terminal{};
+    const void* chunk{};
+    StreamOperation* reader{};
+};
+
+struct StreamOperation {
+    Job* job;
+    LyraNativeAsync* task{};
+    const Response* result{};
+};
+
+LyraTask* closeStreamTask(Job& job);
+const Response* received(long status, const Transfer& transfer, Job* stream = nullptr);
 
 template<class Value> Value* gcArray(size_t count) {
     if (count == 0) return nullptr;
@@ -163,6 +195,20 @@ std::string_view trimOws(std::string_view value) {
     return value.substr(start, value.find_last_not_of(" \t") - start + 1);
 }
 
+bool redirect(long status) {
+    return status == 301 || status == 302 || status == 303 || status == 307 || status == 308;
+}
+
+void acceptHead(Transfer& transfer) {
+    auto& job = transfer.job;
+    if (!job.streaming || !job.task || transfer.status < 200) return;
+    transfer.discardBody = transfer.followRedirects && redirect(transfer.status) &&
+        std::ranges::any_of(transfer.headers, [](const auto& field) { return sameAscii(field.first, "Location"); });
+    if (transfer.discardBody) return;
+    job.result = received(transfer.status, transfer, &job);
+    if (lyraNativeTryComplete(job.task, &job.result, closeStreamTask(job))) job.task = nullptr;
+}
+
 size_t headerCallback(char* bytes, size_t width, size_t items, void* context) {
     auto& transfer = *static_cast<Transfer*>(context);
     const auto count = width * items;
@@ -173,8 +219,15 @@ size_t headerCallback(char* bytes, size_t width, size_t items, void* context) {
     if (line.starts_with("HTTP/")) {
         transfer.headers.clear();
         transfer.body.clear();
+        auto fields = line.find(' ');
+        transfer.status = 0;
+        if (fields != line.npos) {
+            auto first = line.data() + fields + 1;
+            std::from_chars(first, line.data() + line.size(), transfer.status);
+        }
         transfer.readingHeaders = true;
     } else if (line.empty()) {
+        if (transfer.readingHeaders) acceptHead(transfer);
         transfer.readingHeaders = false;
     } else if (transfer.readingHeaders) {
         if (line.starts_with(' ') || line.starts_with('\t')) {
@@ -196,8 +249,14 @@ size_t headerCallback(char* bytes, size_t width, size_t items, void* context) {
 size_t bodyCallback(char* bytes, size_t width, size_t items, void* context) {
     auto& transfer = *static_cast<Transfer*>(context);
     const auto count = width * items;
+    if (transfer.job.streaming && !transfer.discardBody && transfer.job.chunk) {
+        if (count > transfer.remaining) { transfer.overBudget = true; return 0; }
+        transfer.paused = true;
+        return CURL_WRITEFUNC_PAUSE;
+    }
     if (!transfer.consume(count)) return 0;
-    transfer.body.append(bytes, count);
+    if (!transfer.job.streaming) transfer.body.append(bytes, count);
+    else if (!transfer.discardBody && count) transfer.job.chunk = lyraBytes({bytes, count});
     return count;
 }
 
@@ -234,6 +293,7 @@ Failure configure(CURL* easy, CURLU* url, const Request& request, const std::str
     settings.set(CURLOPT_CUSTOMREQUEST, method.c_str());
     settings.set(CURLOPT_HTTPHEADER, headers.get());
     settings.set(CURLOPT_HEADEROPT, CURLHEADER_SEPARATE);
+    settings.set(CURLOPT_SUPPRESS_CONNECT_HEADERS, 1L);
     settings.set(CURLOPT_NOSIGNAL, 1L);
     settings.set(CURLOPT_CONNECTTIMEOUT_MS, static_cast<long>(std::min(request.connectTimeoutMs, timeout)));
     settings.set(CURLOPT_TIMEOUT_MS, static_cast<long>(timeout));
@@ -275,34 +335,22 @@ Failure configure(CURL* easy, CURLU* url, const Request& request, const std::str
     return curlFailure(settings.status);
 }
 
-bool redirect(long status) {
-    return status == 301 || status == 302 || status == 303 || status == 307 || status == 308;
-}
-
 const Response* failed(Failure failure) {
     auto* output = gcArray<Response>(1);
     *output = Response{failure};
     return output;
 }
 
-const Response* received(long status, const Transfer& transfer) {
+const Response* received(long status, const Transfer& transfer, Job* stream) {
     auto* fields = gcArray<Field>(transfer.headers.size());
     for (size_t index = 0; index < transfer.headers.size(); ++index) {
         const auto& [name, value] = transfer.headers[index];
         fields[index] = Field{lyraBytes(name), lyraBytes(value)};
     }
     auto* output = gcArray<Response>(1);
-    *output = Response{{}, status, fields, transfer.headers.size(), lyraBytes(transfer.body)};
+    *output = Response{{}, status, fields, transfer.headers.size(), stream ? nullptr : lyraBytes(transfer.body), stream};
     return output;
 }
-
-struct Job {
-    const Request* request;
-    const Response* result{};
-    LyraNativeAsync* task{};
-    Clock::time_point deadline{};
-    CURL* active{};
-};
 
 struct Active {
     Job& job;
@@ -316,7 +364,9 @@ struct Active {
     int64_t followed{};
 
     explicit Active(Job& job) : job(job), root(lyraGcRootCreate(&job)), method(bytes(job.request->method)), proxy(bytes(job.request->proxy)),
-        transfer{static_cast<size_t>(job.request->maxResponseBytes), {}, {}} {}
+        transfer{static_cast<size_t>(job.request->maxResponseBytes), job, {}, {}} {
+        transfer.followRedirects = (method == "GET" || method == "HEAD") && job.request->maxRedirects != 0;
+    }
 
     ~Active() { lyraGcRootDrop(root); }
 
@@ -339,7 +389,7 @@ struct Active {
     }
 
     Failure next(long status, bool& again) {
-        if ((method != "GET" && method != "HEAD") || job.request->maxRedirects == 0 || !redirect(status)) return {};
+        if (!transfer.followRedirects || !redirect(status)) return {};
         const std::string* location = nullptr;
         for (const auto& [name, value] : transfer.headers) {
             if (!sameAscii(name, "Location")) continue;
@@ -362,7 +412,8 @@ class ClientLoop {
     static constexpr std::size_t maxJobs = 128, batchSize = 32;
     static constexpr long maxConnections = 64, maxPerHost = 16;
 
-    struct Command { Job* job; LyraGcRoot* root; bool cancel; };
+    enum class CommandKind { Start, Cancel, Read, Close };
+    struct Command { Job* job; StreamOperation* operation; LyraGcRoot* root; CommandKind kind; };
     struct Watch { uv_poll_t poll{}; ClientLoop* client; curl_socket_t socket; };
 
     std::mutex mutex;
@@ -370,6 +421,7 @@ class ClientLoop {
     Failure startup{};
     std::deque<Command> inbox;
     std::size_t outstanding{};
+    std::size_t pendingOperations{};
     uv_loop_t loop{};
     uv_async_t wake{};
     uv_timer_t timer{};
@@ -480,14 +532,19 @@ class ClientLoop {
             for (; count < commands.size() && !inbox.empty(); ++count) {
                 commands[count] = inbox.front();
                 inbox.pop_front();
+                if (commands[count].kind == CommandKind::Read) --pendingOperations;
             }
             shutdown = stopping && inbox.empty();
             if (!inbox.empty()) notify();
         }
         for (std::size_t index = 0; index < count; ++index) {
             auto& command = commands[index];
-            if (command.cancel) cancel(*command.job);
-            else start(*command.job);
+            switch (command.kind) {
+                case CommandKind::Start: start(*command.job); break;
+                case CommandKind::Cancel: cancel(*command.job); break;
+                case CommandKind::Read: read(*command.operation); break;
+                case CommandKind::Close: close(*command.operation); break;
+            }
             lyraGcRootDrop(command.root);
         }
         if (shutdown) {
@@ -499,14 +556,36 @@ class ClientLoop {
         }
     }
 
+    void finishRead(StreamOperation& operation, const Response* result) {
+        operation.result = result;
+        lyraNativeComplete(std::exchange(operation.task, nullptr), &operation.result);
+    }
+
+    bool deliver(Job& job) {
+        auto* reader = job.reader;
+        if (!reader || (!job.chunk && !job.closed)) return false;
+        job.reader = nullptr;
+        if (job.chunk) {
+            auto* result = gcArray<Response>(1);
+            *result = Response{.body = std::exchange(job.chunk, nullptr)};
+            finishRead(*reader, result);
+        } else finishRead(*reader, failed(job.terminal));
+        return true;
+    }
+
     void finish(Job& job, const Response* response) {
         auto* task = std::exchange(job.task, nullptr);
-        job.result = response;
+        job.closed = true;
+        job.terminal = response->failure;
         {
             std::lock_guard lock(mutex);
             --outstanding;
         }
-        lyraNativeComplete(task, &job.result);
+        if (task) {
+            job.result = response;
+            lyraNativeComplete(task, &job.result);
+        }
+        deliver(job);
     }
 
     std::unique_ptr<Active> take(CURL* handle) {
@@ -519,9 +598,42 @@ class ClientLoop {
     }
 
     void cancel(Job& job) {
-        if (!job.task) return;
+        if (job.closed) return;
         take(job.active).reset();
+        job.chunk = nullptr;
         finish(job, failed({Status::Cancelled}));
+    }
+
+    void resume(Job& job) {
+        if (!job.active) return;
+        auto active = transfers.find(job.active);
+        if (!active->second->transfer.paused) return;
+        active->second->transfer.paused = false;
+        auto* handle = job.active;
+        const auto code = curl_easy_pause(handle, CURLPAUSE_CONT);
+        deliver(job);
+        if (code != CURLE_OK && job.active == handle) completed(handle, code);
+    }
+
+    void read(StreamOperation& operation) {
+        auto& job = *operation.job;
+        if (job.reader) { finishRead(operation, failed({Status::Busy})); return; }
+        job.reader = &operation;
+        if (deliver(job)) resume(job);
+    }
+
+    void close(StreamOperation& operation) {
+        auto& job = *operation.job;
+        if (job.active) {
+            take(job.active).reset();
+            job.chunk = nullptr;
+            finish(job, failed({Status::Closed}));
+        }
+        job.chunk = nullptr;
+        job.closed = true;
+        job.terminal = {Status::Closed};
+        deliver(job);
+        finishRead(operation, failed({}));
     }
 
     Failure attach(std::unique_ptr<Active>& active) {
@@ -531,6 +643,8 @@ class ClientLoop {
         auto& transfer = active->transfer;
         transfer.headers.clear();
         transfer.body.clear();
+        transfer.status = 0;
+        transfer.discardBody = transfer.paused = false;
         transfer.readingHeaders = transfer.overBudget = false;
         auto* easy = active->easy.get();
         curl_easy_reset(easy);
@@ -568,7 +682,7 @@ class ClientLoop {
             failure = attach(active);
             if (failure.status == Status::Ok) return;
         }
-        auto* response = failure.status == Status::Ok ? received(status, active->transfer) : failed(failure);
+        auto* response = failure.status == Status::Ok ? received(status, active->transfer, job.streaming ? &job : nullptr) : failed(failure);
         active.reset();
         finish(job, response);
     }
@@ -588,6 +702,9 @@ class ClientLoop {
         while (auto* message = curl_multi_info_read(multi, &messages)) {
             if (message->msg == CURLMSG_DONE) completed(message->easy_handle, message->data.result);
         }
+        std::vector<Job*> resumable;
+        for (const auto& [handle, active] : transfers) if (deliver(active->job)) resumable.push_back(&active->job);
+        for (auto* job : resumable) resume(*job);
     }
 
 public:
@@ -611,7 +728,7 @@ public:
             if (outstanding < maxJobs) {
                 ++outstanding;
                 job.task = task;
-                inbox.push_back({&job, lyraGcRootCreate(&job), false});
+                inbox.push_back({&job, nullptr, lyraGcRootCreate(&job), CommandKind::Start});
                 notify();
                 return true;
             }
@@ -622,8 +739,17 @@ public:
 
     void requestCancel(Job& job) {
         std::lock_guard lock(mutex);
-        inbox.push_back({&job, lyraGcRootCreate(&job), true});
+        inbox.push_back({&job, nullptr, lyraGcRootCreate(&job), CommandKind::Cancel});
         notify();
+    }
+
+    bool submit(StreamOperation& operation, bool closing) {
+        std::lock_guard lock(mutex);
+        if (!closing && pendingOperations >= maxJobs) { operation.result = failed({Status::Busy}); return false; }
+        if (!closing) ++pendingOperations;
+        inbox.push_back({operation.job, &operation, lyraGcRootCreate(&operation), closing ? CommandKind::Close : CommandKind::Read});
+        notify();
+        return true;
     }
 };
 
@@ -631,6 +757,24 @@ ClientLoop& clientLoop() {
     static ClientLoop loop;
     return loop;
 }
+
+LyraTask* streamTask(Job& job, bool closing) {
+    auto* operation = ::new (lyraGcAlloc(sizeof(StreamOperation))) StreamOperation{&job};
+    if (closing) {
+        return lyraTaskNative([](LyraNativeAsync* task, void* data) {
+            auto& operation = *static_cast<StreamOperation*>(data);
+            operation.task = task;
+            return clientLoop().submit(operation, true);
+        }, nullptr, operation, &operation->result);
+    }
+    return lyraTaskNative([](LyraNativeAsync* task, void* data) {
+        auto& operation = *static_cast<StreamOperation*>(data);
+        operation.task = task;
+        return clientLoop().submit(operation, false);
+    }, [](void* data) { clientLoop().requestCancel(*static_cast<StreamOperation*>(data)->job); }, operation, &operation->result);
+}
+
+LyraTask* closeStreamTask(Job& job) { return streamTask(job, true); }
 
 }
 
@@ -653,6 +797,14 @@ extern "C" LyraTask* lyraHttpClientSendAsync(const Request* request) {
     return lyraTaskNative([](LyraNativeAsync* task, void* data) { return clientLoop().submit(task, *static_cast<Job*>(data)); },
         [](void* data) { clientLoop().requestCancel(*static_cast<Job*>(data)); }, job, &job->result);
 }
+extern "C" LyraTask* lyraHttpClientOpenAsync(const Request* request) {
+    auto* job = ::new (lyraGcAlloc(sizeof(Job))) Job{.request = request, .streaming = true};
+    return lyraTaskNative([](LyraNativeAsync* task, void* data) { return clientLoop().submit(task, *static_cast<Job*>(data)); },
+        [](void* data) { clientLoop().requestCancel(*static_cast<Job*>(data)); }, job, &job->result);
+}
+extern "C" LyraTask* lyraHttpClientReadAsync(const Response* response) { return streamTask(*response->stream, false); }
+extern "C" LyraTask* lyraHttpClientCloseAsync(const Response* response) { return closeStreamTask(*response->stream); }
+extern "C" uint8_t lyraHttpClientHasBody(const Response* response) { return response->body != nullptr; }
 extern "C" int64_t lyraHttpClientErrorKind(const Response* response) { return static_cast<int64_t>(response->failure.status); }
 extern "C" int64_t lyraHttpClientErrorCode(const Response* response) { return response->failure.code; }
 extern "C" int64_t lyraHttpClientStatus(const Response* response) { return response->status; }

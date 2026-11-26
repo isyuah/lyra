@@ -29,6 +29,8 @@ extern fn lyraHttpRequestCloseAsync(request: CPtr): Task<Unit>;
 extern fn lyraHttpResponseHeaders(count: Int): CPtr;
 extern fn lyraHttpResponseHeaderSet(headers: CPtr, index: Int, name: String, value: String): Int;
 extern fn lyraHttpRespondAsync(request: CPtr, code: Int, mediaType: String, body: Bytes, headers: CPtr): Task<Int>;
+extern fn lyraHttpStartStreamAsync(request: CPtr, code: Int, mediaType: String, headers: CPtr): Task<Int>;
+extern fn lyraHttpWriteStreamAsync(request: CPtr, body: Bytes, final: Bool): Task<Int>;
 extern fn lyraHttpRouteMethodValid(method: String): Bool;
 extern fn lyraHttpRoutePattern(route: String): CPtr;
 extern fn lyraHttpRouteValid(route: CPtr): Bool;
@@ -140,11 +142,28 @@ pub class Listener {
 
 pub struct Header(pub val name: String, pub val value: String)
 
-pub struct Response(pub val code: Int, pub val contentType: String, pub val body: Bytes, pub val headers: FrozenList<Header> = FrozenList<Header>([])) {
-    pub static fn text(code: Int, body: String): Response { Response(code, "text/plain", body.toBytes()) }
-    pub static fn bytes(code: Int, contentType: String, body: Bytes): Response { Response(code, contentType, body) }
+pub class ResponseWriter {
+    val handle: CPtr
+    init(handle: CPtr) { this.handle = handle }
+
+    pub async fn write(content: Bytes): Result<Unit, HttpError> {
+        val status = await lyraHttpWriteStreamAsync(handle, content, false)
+        if status == 0 { Ok({}) } else { Err(httpError("response.write", status)) }
+    }
+}
+
+pub enum ResponseBody {
+    Buffered(Bytes), Streaming((ResponseWriter) -> Task<Result<Unit, HttpError>>),
+}
+
+pub struct Response(pub val code: Int, pub val contentType: String, pub val body: ResponseBody, pub val headers: FrozenList<Header> = FrozenList<Header>([])) {
+    pub static fn text(code: Int, body: String): Response { Response.bytes(code, "text/plain", body.toBytes()) }
+    pub static fn bytes(code: Int, contentType: String, body: Bytes): Response { Response(code, contentType, ResponseBody.Buffered(body)) }
+    pub static fn stream(code: Int, contentType: String, produce: (ResponseWriter) -> Task<Result<Unit, HttpError>>): Response {
+        Response(code, contentType, ResponseBody.Streaming(produce))
+    }
     pub static fn json<T>(value: T, codec: JsonCodec<T>, code: Int = 200): Response {
-        Response(code, "application/json", codec.encode(value).toBytes())
+        Response.bytes(code, "application/json", codec.encode(value).toBytes())
     }
     pub fn withHeader(name: String, value: String): Response {
         val fields: List<Header> = []
@@ -233,7 +252,15 @@ pub class Request {
             val status = lyraHttpResponseHeaderSet(headers, index, field.name, field.value)
             if status != 0 { return Err(httpError("respond", status)) }
         }
-        val status = await lyraHttpRespondAsync(handle, response.code, response.contentType, response.body, headers)
+        val status = match response.body {
+            Buffered(content) => await lyraHttpRespondAsync(handle, response.code, response.contentType, content, headers),
+            Streaming(produce) => {
+                val started = await lyraHttpStartStreamAsync(handle, response.code, response.contentType, headers)
+                if started != 0 { return Err(httpError("respond", started)) }
+                if method() != "HEAD" { (await produce(ResponseWriter(handle)))? }
+                await lyraHttpWriteStreamAsync(handle, "".toBytes(), true)
+            },
+        }
         if status == 0 { Ok({}) } else { Err(httpError("respond", status)) }
     }
     pub fn close(): Unit { lyraHttpDrop(handle) }
@@ -358,7 +385,10 @@ async fn respond(request: Request, routes: List<Route>): Unit {
         Response.text(500, "internal server error")
     }
     if request.disconnected() { return }
-    val sent = await request.respond(response)
+    val sent = try { await request.respond(response) } catch {
+        val _ = writeError("HTTP response producer raised an exception\n")
+        return
+    }
     if let Err(error) = sent {
         val _ = writeError("HTTP response failed: ${error.message()}\n")
         if error.kind == HttpErrorKind.Invalid || error.kind == HttpErrorKind.TooLarge {

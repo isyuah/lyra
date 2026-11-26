@@ -42,6 +42,7 @@ llhttp 增量解析请求行、首部和正文，检查 UTF-8、`Host` 和 `Expe
 - `accept`、`respond`、`waitDisconnect` 和 `closeAndWait` 都创建冷 Task。`accept` 的 `timeoutMs` 控制等待已解析请求，`-1` 无期限、`0` 只取当前就绪项；只取消这个等待不会取消别的接收。裸结果是有期限的发放，调用 `claim()` 或开始写有效响应后认领。`withAccepted` 在发布请求前登记作用域清理，回调及子任务退出后，等当前请求释放再结束。响应成功后可复用连接，未响应或失败时关闭物理连接。
 - 完整请求后的明文 TCP FIN 只代表读侧结束，仍允许响应。不完整请求 EOF、reset 和没有 `close_notify` 的 TLS 截断是对端断线。`waitDisconnect` 观察当前请求的连接事件，超时、本地关闭或当前响应完成返回 `false`；取消观察不关闭连接。Router 用独立子 Task 观察断线，取消所属请求及其子任务，不影响其他请求。
 - 每条连接最多一个挂起的 `uv_write`；大响应分块，正文直接借用保活的 `Bytes`。写入竞争只有一个胜者。取消写入或显式关闭会停止读写并关闭句柄，等 write callback 和 close callback 回收缓冲、TLS 状态及 roots 后才完成相关 Task。SDK 私有桥接在投递前登记等待和执行器保活；普通 `extern` 仍不接受 `Task`。
+- `Response.stream` 在响应头完成后于 handler 域运行生产函数。`ResponseWriter.write` 逐块等待同一 Reactor 的原生写入，未完成时拒绝第二次写入。HTTP/1.1 用 chunked 定界，HTTP/1.0 用关闭定界。正常返回时由库结束正文；生产失败、断线或取消终止传输。`HEAD` 不执行生产函数，旧 writer 不能用于后续请求。
 - TLS 1.2/1.3 用双向有界的 OpenSSL memory BIO pair 与同一个 `uv_tcp_t` 交换密文。握手、解密和加密只在有输入、写完成或有明确进展时推进；输出阻塞时保留至多一份待写的密文分块。连接复用共享已完成的 TLS 握手，关闭连接时发送 `close_notify`。明文程序不链接 TLS。
 - `close()` 同步、幂等地请求关闭；`closeAndWait()` 等待原生资源回收。`Router.serve(listener, shutdown: …)` 使用 listener 的容量和宽限期。收到 `Shutdown.request()`，先停止接入、关闭未认领连接，再等已认领的 handler；到期取消剩余任务，仍等 SQLite 等原生工作安全返回。直接取消服务跳过宽限期。监听器关闭确认还包括连接及 TLS context 释放。
 

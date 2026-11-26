@@ -54,12 +54,17 @@ void validateForeign(const CheckedFunction& fn, const CheckedModule& program, co
     static const std::vector<SdkBinding> bindings{
         {"$std/http", "lyraHttpAcceptAsync", {Type::CPtr, Type::Int, Type::Bool, Type::Bool}, Type::CPtr, true},
         {"$std/http", "lyraHttpRespondAsync", {Type::CPtr, Type::Int, Type::String, Type::Bytes, Type::CPtr}, Type::Int, true},
+        {"$std/http", "lyraHttpStartStreamAsync", {Type::CPtr, Type::Int, Type::String, Type::CPtr}, Type::Int, true},
+        {"$std/http", "lyraHttpWriteStreamAsync", {Type::CPtr, Type::Bytes, Type::Bool}, Type::Int, true},
         {"$std/http", "lyraHttpWaitDisconnectAsync", {Type::CPtr, Type::Int}, Type::Int, true},
         {"$std/http", "lyraHttpRequestCloseAsync", {Type::CPtr}, Type::Unit, true},
         {"$std/http", "lyraHttpListenerCloseAsync", {Type::CPtr}, Type::Unit, true},
         {"$std/http", "lyraHttpListenerScopeAsync", {Type::CPtr}, Type::Unit, true},
         {"$std/http", "lyraHttpKeepListener", {Type::CPtr}, Type::Unit, false},
         {"$std/httpClient", "lyraHttpClientSendAsync", {Type::CPtr}, Type::CPtr, true},
+        {"$std/httpClient", "lyraHttpClientOpenAsync", {Type::CPtr}, Type::CPtr, true},
+        {"$std/httpClient", "lyraHttpClientReadAsync", {Type::CPtr}, Type::CPtr, true},
+        {"$std/httpClient", "lyraHttpClientCloseAsync", {Type::CPtr}, Type::CPtr, true},
         {"$std/os", "lyraOsWaitSignal", {Type::Int}, Type::Int, true},
     };
     if (auto binding = std::ranges::find(bindings, symbol.text, &SdkBinding::symbol); binding != bindings.end()) {

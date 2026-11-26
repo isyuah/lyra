@@ -69,6 +69,23 @@ class FixtureHandler(http.server.BaseHTTPRequestHandler):
             self.reply(200, b'z' * 32768)
         elif self.path == '/large-header':
             self.reply(200, headers=[('X-Large', 'x' * 256)])
+        elif self.path in ('/stream-gated', '/stream-wait'):
+            prefix = b'first' if self.path == '/stream-gated' else b''
+            self.send_response_only(201)
+            self.send_header('Content-Length', str(len(prefix) + 32768))
+            self.send_header('X-Stream', 'yes')
+            self.end_headers()
+            self.wfile.write(prefix)
+            self.wfile.flush()
+            self.server.pending = self.connection
+            self.server.arrived.set()
+            self.server.release.wait(timeout=30)
+            try:
+                self.wfile.write(b'z' * 32768)
+            except (ConnectionError, ssl.SSLError):
+                self.close_connection = True
+        elif self.path == '/stream-large':
+            self.reply(200, b'z' * (10 * 1024 * 1024))
         elif self.path == '/slow':
             self.server.pending = self.connection
             self.server.arrived.set()
@@ -215,6 +232,7 @@ import std.httpClient.{ClientResponse}
 import std.httpClient.{HttpClientError}
 import std.httpClient.{HttpClientOptions}
 import std.httpClient.{httpGet}
+import std.httpClient.{ClientStream, withHttpResponse}
 import std.io.{readBytes}
 import std.os.{args}
 
@@ -232,6 +250,14 @@ async fn main(): Unit {
     val options = HttpClientOptions(caPem: Some(certificate))
     show(await httpGet(values[0], options))
     show(await httpGet(values[1], options))
+    val streamed = await withHttpResponse("GET", values[0], async (response: ClientStream): Result<Int, HttpClientError> => {
+        var size = 0
+        while true {
+            match (await response.read())? { Some(chunk) => { size += chunk.size }, None => break }
+        }
+        Ok(size)
+    }, options: options)
+    #assert(streamed == Ok(2))
 }
 '''):
             with self.subTest(mode=app.stem), server(tls) as fixture:
@@ -332,6 +358,7 @@ async fn main(): Unit {
     val _ = await blocking { readLine() }
     for job in jobs { job.cancel() }
     for job in jobs { val _ = awaitOutcome(job) }
+    print("joined cancelled jobs")
     match await httpGet(base + "/ok") {
         Ok(response) => print(response.text() ?? "invalid"),
         Err(error) => throw Exception(error.message()),
@@ -346,7 +373,150 @@ async fn main(): Unit {
                         self.assertLessEqual(fixture.connections, 16)
                     process.stdin.write(b'cancel\n')
                     process.stdin.flush()
+                    self.assertEqual(output.line(timeout=5), b'joined cancelled jobs\n')
                     self.assertEqual(output.line(timeout=5), b'ok\n')
+                    self.assertEqual(process.wait(timeout=5), 0, process.stderr.read().decode())
+
+    def test_stream_reads_before_completion_and_reuses_the_connection(self):
+        for app in self.programs('''
+import std.httpClient.{ClientStream, HttpClientError, HttpClientOptions, httpGet, withHttpResponse}
+import std.os.{args}
+
+async fn main(): Unit {
+    val base = match args() { Ok(values) => values[0], Err(error) => throw Exception(error.message()) }
+    val result = await withHttpResponse("GET", base + "/stream-gated", async (stream: ClientStream): Result<Int, HttpClientError> => {
+        #assert(stream.status == 201)
+        #assert(stream.header("x-stream") == Some("yes".toBytes()))
+        val first = (await stream.read())?
+        #assert(first == Some("first".toBytes()))
+        print("received first chunk")
+        var total = 5
+        while true {
+            match (await stream.read())? {
+                Some(chunk) => { total += chunk.size },
+                None => break,
+            }
+        }
+        #assert((await stream.read())? == None)
+        Ok(total)
+    })
+    #assert(result == Ok(32773))
+    val first = match await httpGet(base + "/reuse") { Ok(value) => value, Err(error) => throw Exception(error.message()) }
+    #assert(first.text() == Some("1"))
+    val large = await withHttpResponse("GET", base + "/stream-large", async (stream: ClientStream): Result<Int, HttpClientError> => {
+        var total = 0
+        var blocks = 0
+        while true {
+            match (await stream.read())? {
+                Some(chunk) => {
+                    #assert(chunk.size <= 16384)
+                    total += chunk.size
+                    blocks += 1
+                    if blocks % 100 == 0 { await sleepMs(1) }
+                },
+                None => break,
+            }
+        }
+        Ok(total)
+    }, options: HttpClientOptions(maxResponseBytes: 12 * 1024 * 1024))
+    #assert(large == Ok(10 * 1024 * 1024))
+    print("streamed and reused")
+}
+'''):
+            with self.subTest(mode=app.stem), server() as fixture:
+                with running([app, f'http://127.0.0.1:{fixture.server_port}']) as (process, output):
+                    self.assertEqual(output.line(timeout=5), b'received first chunk\n')
+                    self.assertTrue(fixture.arrived.is_set())
+                    fixture.release.set()
+                    self.assertEqual(output.line(timeout=10), b'streamed and reused\n')
+                    self.assertEqual(process.wait(timeout=5), 0, process.stderr.read().decode())
+
+    def test_stream_timeout_limit_early_exit_and_closed_handle(self):
+        for app in self.programs('''
+import std.httpClient.{ClientStream, HttpClientError, HttpClientErrorKind, HttpClientOptions, httpGet, withHttpResponse}
+import std.os.{args}
+
+async fn main(): Unit {
+    val base = match args() { Ok(values) => values[0], Err(error) => throw Exception(error.message()) }
+    var saved: ClientStream? = None
+    val result = await withHttpResponse("GET", base + "/stream-wait", async (stream: ClientStream): Result<Unit, HttpClientError> => {
+        saved = Some(stream)
+        print("received headers")
+        await sleepMs(400)
+        val pending = (await stream.read())?
+        Ok({})
+    }, options: HttpClientOptions(timeoutMs: 150))
+    #assert(match result { Err(error) => error.kind == HttpClientErrorKind.TimedOut, _ => false })
+    val previous = match saved { Some(value) => value, None => throw Exception("missing stream") }
+    #assert(match await previous.read() { Err(error) => error.kind == HttpClientErrorKind.Closed, _ => false })
+    await previous.close()
+    val limited = await withHttpResponse("GET", base + "/large", async (stream: ClientStream): Result<Unit, HttpClientError> => {
+        while true { if (await stream.read())? == None { break } }
+        Ok({})
+    }, options: HttpClientOptions(maxResponseBytes: 1024))
+    #assert(match limited { Err(error) => error.kind == HttpClientErrorKind.TooLarge, _ => false })
+    val paused = await withHttpResponse("GET", base + "/stream-large", async (stream: ClientStream): Result<Unit, HttpClientError> => {
+        await sleepMs(400)
+        while true { if (await stream.read())? == None { break } }
+        Ok({})
+    }, options: HttpClientOptions(timeoutMs: 150))
+    #assert(match paused { Err(error) => error.kind == HttpClientErrorKind.TimedOut, _ => false })
+    val closed = await withHttpResponse("GET", base + "/stream-wait", async (stream: ClientStream): Result<Unit, HttpClientError> => {
+        val first = spawn stream.read()
+        await sleepMs(0)
+        #assert(match await stream.read() { Err(error) => error.kind == HttpClientErrorKind.Busy, _ => false })
+        await stream.close()
+        #assert(match await first { Err(error) => error.kind == HttpClientErrorKind.Closed, _ => false })
+        Ok({})
+    })
+    #assert(closed == Ok({}))
+    val early = await withHttpResponse("GET", base + "/stream-wait", async (stream: ClientStream): Result<Int, HttpClientError> => {
+        Ok(7)
+    })
+    #assert(early == Ok(7))
+    try {
+        val _ = await withHttpResponse("GET", base + "/stream-wait", async (stream: ClientStream): Result<Unit, HttpClientError> => {
+            if stream.status == 201 { throw Exception("consumer failed") }
+            Ok({})
+        })
+        throw Exception("missing consumer failure")
+    } catch error: Exception { #assert(error.message == "consumer failed") }
+    #assert((match await httpGet(base + "/ok") { Ok(value) => value.text(), Err(error) => None }) == Some("ok"))
+    print("stream errors and cleanup")
+}
+'''):
+            with self.subTest(mode=app.stem), server() as fixture:
+                with running([app, f'http://127.0.0.1:{fixture.server_port}']) as (process, output):
+                    self.assertEqual(output.line(timeout=5), b'received headers\n')
+                    self.assertEqual(output.line(timeout=8), b'stream errors and cleanup\n')
+                    self.assertEqual(process.wait(timeout=5), 0, process.stderr.read().decode())
+
+    def test_stream_cancellation_closes_pending_reads(self):
+        for app in self.programs('''
+import std.httpClient.{ClientStream, HttpClientError, httpGet, withHttpResponse}
+import std.io.{readLine}
+import std.os.{args}
+
+async fn main(): Unit {
+    val base = match args() { Ok(values) => values[0], Err(error) => throw Exception(error.message()) }
+    val task = spawn withHttpResponse("GET", base + "/stream-wait", async (stream: ClientStream): Result<Bytes?, HttpClientError> => {
+        print("reading")
+        val content = (await stream.read())?
+        Ok(content)
+    })
+    val _ = await blocking { readLine() }
+    task.cancel()
+    #assert(match awaitOutcome(task) { Cancelled(_) => true, _ => false })
+    #assert((match await httpGet(base + "/ok") { Ok(value) => value.text(), Err(error) => None }) == Some("ok"))
+    print("stream cancelled")
+}
+'''):
+            with self.subTest(mode=app.stem), server() as fixture:
+                with running([app, f'http://127.0.0.1:{fixture.server_port}']) as (process, output):
+                    self.assertEqual(output.line(timeout=5), b'reading\n')
+                    process.stdin.write(b'cancel\n')
+                    process.stdin.flush()
+                    self.assertEqual(output.line(timeout=5), b'stream cancelled\n')
                     self.assertEqual(process.wait(timeout=5), 0, process.stderr.read().decode())
 
 

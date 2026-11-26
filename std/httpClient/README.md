@@ -20,4 +20,30 @@ async fn main(): Unit {
 - 默认不跟随重定向。将 `maxRedirects` 设置为 `1`–`20` 可跟随同源 `GET`/`HEAD` 跳转；跨协议、主机或端口的目标会被拒绝。
 - `proxy` 可显式指定 HTTP/HTTPS 代理；不自动读取代理环境变量。HTTPS 始终验证主机名与证书；默认用系统信任根，也可用 `caPem: Some(bytes)` 指定专用 PEM 信任根。错误信息不打印目标或代理地址。
 - 调用返回冷 Task，激活后由独立 libuv 事件循环驱动 libcurl Multi socket API。连接池跨请求复用，最多同时处理 128 个请求、建立 64 条连接，每个目标最多 16 条连接。超过请求容量返回 `HttpClientErrorKind.Busy`，应用可以据此实施背压。
-- 取消通过事件循环移除传输，等本次原生操作退出后完成 Task。HTTP 请求不占用文件 I/O 的阻塞池。响应目前完整读入内存，再返回不可变的头与正文快照。
+- 取消通过事件循环移除传输，等本次原生操作退出后完成 Task。HTTP 请求不占用文件 I/O 的阻塞池。`httpRequest` 和 `httpGet` 完整读取正文后返回快照。
+
+## 流式响应
+
+`withHttpResponse` 在收到最终响应头后调用异步消费函数，函数退出后等待原生连接交接或关闭。消费函数的显式返回类型同时确定泛型结果与错误传播目标。
+
+```lyra
+import std.httpClient.{ClientStream, HttpClientError, HttpClientOptions, withHttpResponse}
+
+async fn downloadSize(url: String): Result<Int, HttpClientError> {
+    await withHttpResponse("GET", url, async (response: ClientStream): Result<Int, HttpClientError> => {
+        var size = 0
+        while true {
+            match (await response.read())? {
+                Some(bytes) => { size += bytes.size },
+                None => break,
+            }
+        }
+        Ok(size)
+    }, options: HttpClientOptions(maxResponseBytes: 64 * 1024 * 1024))
+}
+```
+
+- `ClientStream` 提供与完整响应相同的 `status`、`headers`、`header` 和 `headerValues`。`read()` 返回一个不可变字节块，正常结束为 `Ok(None)`；网络分块边界由传输决定。
+- 运行时至多保留一个待消费的正文块，尚未消费时暂停 libcurl 接收并传递网络背压。`maxResponseBytes` 仍限制响应头和完整正文的累计字节数；总超时包含消费函数暂停读取的时间。
+- 每条响应最多一个挂起的读取，竞争者得到 `Busy`。显式 `close()` 等待当前传输关闭，挂起与后续读取得到 `Closed`。取消读取也关闭所属传输。
+- 读完正文后连接可以复用。提前返回、业务错误、异常和取消都会关闭未完成的传输，作用域结束后保留的 `ClientStream` 读取返回 `Closed`。

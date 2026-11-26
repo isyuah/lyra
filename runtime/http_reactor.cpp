@@ -31,8 +31,8 @@ constexpr int64_t rejectionTimeoutMs = 1000;
 constexpr std::string_view overloadResponse = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nRetry-After: 1\r\nConnection: close\r\n\r\n";
 
 enum class Stop { Open, Drain, Close };
-enum class OperationKind { Accept, Respond, Observe, CloseRequest, CloseListener, ListenerScope };
-enum class Phase { Handshake, Idle, Reading, Ready, Writing, EndingTls, EndingTcp, RejectDrain, Closing };
+enum class OperationKind { Accept, Respond, StartStream, WriteStream, Observe, CloseRequest, CloseListener, ListenerScope };
+enum class Phase { Handshake, Idle, Reading, Ready, StreamReady, Writing, EndingTls, EndingTcp, RejectDrain, Closing };
 
 void require(bool condition, const char* message) {
     if (condition) return;
@@ -217,7 +217,8 @@ void finish(Operation& operation, int status = 0) {
     operation.task = nullptr;
     switch (operation.kind) {
         case OperationKind::Accept: lyraNativeComplete(task, box(acceptError(status))); break;
-        case OperationKind::Respond: case OperationKind::Observe: lyraNativeComplete(task, box<int64_t>(status)); break;
+        case OperationKind::Respond: case OperationKind::StartStream: case OperationKind::WriteStream:
+        case OperationKind::Observe: lyraNativeComplete(task, box<int64_t>(status)); break;
         default: lyraNativeComplete(task, &unit); break;
     }
 }
@@ -227,7 +228,7 @@ LyraTask* nativeTask(Operation input) {
     void* rejected = nullptr;
     switch (operation->kind) {
         case OperationKind::Accept: rejected = box(acceptError(EBUSY)); break;
-        case OperationKind::Respond: rejected = box<int64_t>(EBUSY); break;
+        case OperationKind::Respond: case OperationKind::StartStream: case OperationKind::WriteStream: rejected = box<int64_t>(EBUSY); break;
         case OperationKind::Observe: rejected = box<int64_t>(-EBUSY); break;
         default: rejected = &unit; break;
     }
@@ -239,7 +240,8 @@ LyraTask* nativeTask(Operation input) {
         operation.task = task;
         if (operation.kind == OperationKind::Accept || operation.kind == OperationKind::Observe)
             operation.expires = validWait(operation.argument) ? deadline(operation.argument) : forever;
-        const bool limited = operation.kind == OperationKind::Accept || operation.kind == OperationKind::Respond || operation.kind == OperationKind::Observe;
+        const bool limited = operation.kind == OperationKind::Accept || operation.kind == OperationKind::Respond ||
+            operation.kind == OperationKind::StartStream || operation.kind == OperationKind::WriteStream || operation.kind == OperationKind::Observe;
         return operation.reactor->post<&Operation::start>(operation, limited);
     }, [](void* data) {
         auto& operation = *static_cast<Operation*>(data);
@@ -288,7 +290,7 @@ struct Connection {
     std::unique_ptr<TlsBuffers> tlsBuffers;
     std::unique_ptr<RequestParser> parser;
     std::string responseHead, pendingInput;
-    std::string_view outgoingHead, outgoingBody;
+    std::string_view outgoingHead, outgoingBody, outgoingTail;
     Operation* response{};
     std::list<Operation*> observers, closeWaiters;
 
@@ -298,14 +300,17 @@ struct Connection {
     void readResult(std::ptrdiff_t count);
     void beginMessage();
     void finishResponse();
+    void completeWrite();
     void messageBytes(std::string_view bytes);
     void startResponse(Operation& operation);
+    void writeStream(Operation& operation);
     void sendRejection(std::string_view wire, int status);
     void pump();
     void pumpTls();
     void queueWrite(std::string_view bytes);
     void finishTcp();
-    std::string_view nextChunk() const;
+    std::string_view& nextBuffer();
+    std::string_view nextChunk();
     void consumeChunk(std::size_t count);
     void observe(Operation& operation);
     void refreshTimer();
@@ -435,7 +440,7 @@ void Connection::messageBytes(std::string_view bytes) {
             if (discarded > static_cast<std::size_t>(session.endpoint->options.maxRequestBytes)) beginClose();
             return;
         }
-        if (phase == Phase::Ready || phase == Phase::Writing) {
+        if (phase == Phase::Ready || phase == Phase::StreamReady || phase == Phase::Writing) {
             require(pendingInput.size() + bytes.size() <= readChunk, "pipelined input exceeded its read window");
             pendingInput.append(bytes);
             if (readActive) { uv_read_stop(reinterpret_cast<uv_stream_t*>(&tcp)); readActive = false; }
@@ -462,17 +467,51 @@ void Connection::messageBytes(std::string_view bytes) {
 void Connection::startResponse(Operation& operation) {
     if (response && phase != Phase::Closing) { finish(operation, EBUSY); return; }
     if (phase != Phase::Ready || request->delivery.load() >= Delivery::Closing) { finish(operation, EBADF); return; }
-    request->keepAlive = request->keepAlive && session.endpoint->options.keepAliveTimeoutMs != 0 &&
+    const bool stream = operation.kind == OperationKind::StartStream;
+    const bool chunked = stream && !request->http10;
+    const bool persistent = request->keepAlive && (!stream || chunked) && session.endpoint->options.keepAliveTimeoutMs != 0 &&
         completedRequests + 1 < static_cast<std::size_t>(session.endpoint->options.maxRequestsPerConnection) &&
         session.endpoint->requested.load() == Stop::Open && !tcpEof;
-    if (auto status = formatResponse(responseHead, operation.argument, operation.mediaType, operation.body, *operation.headers, request->keepAlive)) {
+    if (auto status = formatResponse(responseHead, operation.argument, operation.mediaType, operation.body, *operation.headers, persistent, chunked, stream)) {
         finish(operation, status);
         return;
     }
     if (auto status = claim(*request)) { finish(operation, status); return; }
+    request->keepAlive = persistent;
     response = &operation;
     outgoingHead = responseHead;
     if (text(request->method) != "HEAD") outgoingBody = text(operation.body);
+    phase = Phase::Writing;
+    phaseDue = deadline(session.endpoint->options.writeTimeoutMs);
+    refreshTimer();
+    pump();
+}
+
+void Connection::writeStream(Operation& operation) {
+    if (request->delivery.load() >= Delivery::Closing) { finish(operation, EBADF); return; }
+    if (phase != Phase::StreamReady) {
+        finish(operation, phase == Phase::Writing && response && response->kind != OperationKind::Respond ? EBUSY : EBADF);
+        return;
+    }
+    const auto content = text(operation.body);
+    const auto final = operation.argument != 0;
+    if (!final && content.empty()) { finish(operation); return; }
+    response = &operation;
+    responseHead.clear();
+    if (text(request->method) != "HEAD") {
+        if (request->http10) outgoingBody = content;
+        else if (final) responseHead = "0\r\n\r\n";
+        else {
+            char count[2 * sizeof(std::size_t)];
+            auto [end, error] = std::to_chars(count, count + sizeof(count), content.size(), 16);
+            require(error == std::errc{}, "cannot format HTTP chunk length");
+            responseHead.assign(count, end);
+            responseHead.append("\r\n");
+            outgoingBody = content;
+            outgoingTail = "\r\n";
+        }
+    }
+    outgoingHead = responseHead;
     phase = Phase::Writing;
     phaseDue = deadline(session.endpoint->options.writeTimeoutMs);
     refreshTimer();
@@ -490,12 +529,18 @@ void Connection::sendRejection(std::string_view wire, int status) {
     refreshTimer();
 }
 
-std::string_view Connection::nextChunk() const {
-    return (outgoingHead.empty() ? outgoingBody : outgoingHead).substr(0, writeChunk);
+std::string_view& Connection::nextBuffer() {
+    if (!outgoingHead.empty()) return outgoingHead;
+    if (!outgoingBody.empty()) return outgoingBody;
+    return outgoingTail;
+}
+
+std::string_view Connection::nextChunk() {
+    return nextBuffer().substr(0, writeChunk);
 }
 
 void Connection::consumeChunk(std::size_t count) {
-    (outgoingHead.empty() ? outgoingBody : outgoingHead).remove_prefix(count);
+    nextBuffer().remove_prefix(count);
 }
 
 void Connection::queueWrite(std::string_view bytes) {
@@ -553,13 +598,31 @@ void Connection::finishResponse() {
     readFromSocket();
 }
 
+void Connection::completeWrite() {
+    if (!response || response->kind == OperationKind::Respond || (response->kind == OperationKind::WriteStream && response->argument)) {
+        finishResponse();
+        return;
+    }
+    if (response->kind == OperationKind::StartStream) {
+        if (!lyraNativeTryComplete(response->task, box<int64_t>(0), requestCloseTask(*request))) {
+            beginClose(ECANCELED);
+            return;
+        }
+        response->task = nullptr;
+    } else finish(*response);
+    response = nullptr;
+    phase = Phase::StreamReady;
+    phaseDue = forever;
+    refreshTimer();
+}
+
 void Connection::pump() {
     if (phase == Phase::Closing || phase == Phase::EndingTcp || phase == Phase::RejectDrain) return;
     if (request->delivery.load() == Delivery::Closing) { beginClose(EBADF); return; }
     if (tls) { pumpTls(); return; }
     if (writePending || phase != Phase::Writing) return;
     auto bytes = nextChunk();
-    if (bytes.empty()) finishResponse();
+    if (bytes.empty()) completeWrite();
     else { consumeChunk(bytes.size()); queueWrite(bytes); }
 }
 
@@ -602,13 +665,13 @@ void Connection::pumpTls() {
                 beginClose(ingressError, true);
                 return;
             }
-        } else if (phase == Phase::Idle || phase == Phase::Reading || phase == Phase::Ready) {
+        } else if (phase == Phase::Idle || phase == Phase::Reading || phase == Phase::Ready || phase == Phase::StreamReady) {
             if (tlsReadEnded || !pendingInput.empty()) return;
             progress = receive();
-        } else if (bioInputEnded && !tlsReadEnded && !tlsWriteRetry) progress = receive();
+        } else if (bioInputEnded && !tlsReadEnded && !tlsWriteRetry && pendingInput.empty()) progress = receive();
         else if (phase == Phase::Writing) {
             auto bytes = nextChunk();
-            if (bytes.empty()) { finishResponse(); continue; }
+            if (bytes.empty()) { completeWrite(); continue; }
             auto step = transport->write(tls, bytes.data(), bytes.size());
             progress = step.progress;
             tlsWriteRetry = progress == TlsProgress::WantInput || progress == TlsProgress::WantOutput;
@@ -948,6 +1011,7 @@ void Server::released(Request& request) {
 
 void Server::closed(Session& session) {
     released(*session.request);
+    session.request = nullptr;
     auto entry = connections.find(&session);
     if (session.overload) rejecting = false;
     else --ordinary;
@@ -1102,8 +1166,12 @@ void Operation::start() {
             if (auto* server = endpoint->server) server->registerAccept(*this);
             else finish(*this, EBADF);
             break;
-        case OperationKind::Respond:
+        case OperationKind::Respond: case OperationKind::StartStream:
             if (auto* connection = request->connection) connection->startResponse(*this);
+            else finish(*this, EBADF);
+            break;
+        case OperationKind::WriteStream:
+            if (auto* connection = request->connection) connection->writeStream(*this);
             else finish(*this, EBADF);
             break;
         case OperationKind::Observe:
@@ -1136,7 +1204,9 @@ void Operation::cancel() {
             finish(*this, ECANCELED);
             break;
         }
-        case OperationKind::Respond: request->connection->beginClose(ECANCELED); break;
+        case OperationKind::Respond: case OperationKind::StartStream: case OperationKind::WriteStream:
+            request->connection->beginClose(ECANCELED);
+            break;
         case OperationKind::Observe: {
             auto& connection = *request->connection;
             if (connection.phase == Phase::Closing) break;
@@ -1260,6 +1330,16 @@ extern "C" LyraTask* lyraHttpAcceptAsync(Endpoint* endpoint, int64_t timeoutMs, 
 
 extern "C" LyraTask* lyraHttpRespondAsync(Request* request, int64_t code, const void* mediaType, const void* body, const ResponseFields* headers) {
     return nativeTask({OperationKind::Respond, request->session->reactor, request->session->endpoint, request, code, mediaType, body, headers});
+}
+
+extern "C" LyraTask* lyraHttpStartStreamAsync(Request* request, int64_t code, const void* mediaType, const ResponseFields* headers) {
+    return nativeTask({OperationKind::StartStream, request->session->reactor, request->session->endpoint, request, code, mediaType,
+        lyraStringFromBytes(nullptr, 0), headers});
+}
+
+extern "C" LyraTask* lyraHttpWriteStreamAsync(Request* request, const void* body, uint8_t final) {
+    return nativeTask({OperationKind::WriteStream, request->session->reactor, request->session->endpoint, request, final,
+        nullptr, body});
 }
 
 extern "C" LyraTask* lyraHttpWaitDisconnectAsync(Request* request, int64_t timeoutMs) {

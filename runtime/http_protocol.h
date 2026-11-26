@@ -40,6 +40,7 @@ struct Request {
     std::atomic<bool> peerLost{};
     int64_t offerExpires{};
     bool keepAlive{};
+    bool http10{};
     int status{};
     const void* method{};
     const void* target{};
@@ -71,6 +72,7 @@ struct RequestParser {
 };
 
 std::string_view text(const void* value);
-int formatResponse(std::string& wire, int64_t status, const void* type, const void* body, const ResponseFields& headers, bool keepAlive);
+int formatResponse(std::string& wire, int64_t status, const void* type, const void* body, const ResponseFields& headers,
+    bool keepAlive, bool chunked, bool streaming = false);
 
 }

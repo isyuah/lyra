@@ -436,6 +436,106 @@ async fn main(): Unit {
                 self.assertEqual(output.line().strip(), b"handler cleanup")
                 self.assertEqual(exchange(port, "GET", "/ready"), (200, "text/plain", b"ready"))
 
+    def test_streamed_response_backpressure_cancellation_and_producer_failure(self):
+        package = self.root / 'streaming'
+        (package / 'src').mkdir(parents=True)
+        (package / 'lyra.json5').write_text("{name:'test/streaming',version:'1.0.0'}")
+        (package / 'src/main.ly').write_text(HTTP_HELPERS + '''
+import std.http.{Request, Router, ResponseWriter}
+import std.io.{readBytes, readLine}
+import std.os.{args}
+
+async fn main(): Unit {
+    val arguments = match args() { Ok(value) => value, Err(error) => throw Exception(error.message()) }
+    val chunk = match readBytes(arguments[0]) { Ok(value) => value, Err(error) => throw Exception(error.message()) }
+    val writers: List<ResponseWriter> = []
+    val listener = requireHttp(listen(0, options: HttpServerOptions(capacity: 2)))
+    val router = Router()
+    router.get("/stream", async (request: Request) => {
+        Response.stream(200, "application/octet-stream", async (writer: ResponseWriter) => {
+            writers.add(writer)
+            defer print("producer-cleanup")
+            (await writer.write("A".toBytes()))?
+            print("first-written")
+            await blocking { #assert(match readLine() { Ok(Some(value)) => value == "continue", _ => false }) }
+            (await writer.write("".toBytes()))?
+            for index in 0..<160 { (await writer.write(chunk))? }
+            print("body-complete")
+            Ok({})
+        })
+    })
+    router.get("/cancel", async (request: Request) => {
+        Response.stream(200, "application/octet-stream", async (writer: ResponseWriter) => {
+            writers.add(writer)
+            defer print("stream-cancelled")
+            (await writer.write("A".toBytes()))?
+            print("stream-waiting")
+            await sleepMs(30000)
+            Ok({})
+        })
+    })
+    router.get("/fail", async (request: Request) => {
+        Response.stream(200, "application/octet-stream", async (writer: ResponseWriter) => {
+            writers.add(writer)
+            (await writer.write("A".toBytes()))?
+            throw Exception("producer failed")
+        })
+    })
+    router.get("/ready", async (request: Request) => {
+        for writer in writers { #assert(failed(await writer.write("stale".toBytes()), HttpErrorKind.Closed)) }
+        Response.text(200, "ready")
+    })
+    print(listener.port())
+    await router.serve(listener)
+}
+''', encoding='utf-8')
+        payload = self.root / 'chunk.bin'
+        chunk = bytes(range(256)) * 256
+        payload.write_bytes(chunk)
+        for profile, app in self.profiles(package):
+            with self.subTest(profile=profile), server(app, payload) as (port, process, output):
+                with contextlib.closing(http.client.HTTPConnection('127.0.0.1', port, timeout=8)) as connection:
+                    connection.connect()
+                    connection.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 65536)
+                    connection.request('GET', '/stream')
+                    identity = connection.sock
+                    response = connection.getresponse()
+                    self.assertEqual((response.status, response.getheader('Transfer-Encoding')), (200, 'chunked'))
+                    self.assertEqual(response.read(1), b'A')
+                    self.assertEqual(output.line(), b'first-written\n')
+                    process.stdin.write(b'continue\n')
+                    process.stdin.flush()
+                    with self.assertRaises(queue.Empty):
+                        output.pending.get(timeout=0.15)
+                    self.assertEqual(response.read(), chunk * 160)
+                    self.assertEqual(output.line(), b'body-complete\n')
+                    self.assertEqual(output.line(), b'producer-cleanup\n')
+                    connection.request('HEAD', '/stream')
+                    response = connection.getresponse()
+                    self.assertEqual((response.status, response.read()), (200, b''))
+                    connection.request('GET', '/ready')
+                    response = connection.getresponse()
+                    self.assertEqual((response.status, response.read()), (200, b'ready'))
+                    self.assertIs(connection.sock, identity)
+                with socket.create_connection(('127.0.0.1', port), timeout=5) as connection:
+                    connection.sendall(b'GET /cancel HTTP/1.1\r\nHost: localhost\r\n\r\n')
+                    response = http.client.HTTPResponse(connection)
+                    response.begin()
+                    self.assertEqual(response.read(1), b'A')
+                    self.assertEqual(output.line(), b'stream-waiting\n')
+                    reset_on_close(connection)
+                    response.close()
+                self.assertEqual(output.line(), b'stream-cancelled\n')
+                self.assertEqual(exchange(port, 'GET', '/ready'), (200, 'text/plain', b'ready'))
+                with contextlib.closing(http.client.HTTPConnection('127.0.0.1', port, timeout=5)) as connection:
+                    connection.request('GET', '/fail')
+                    response = connection.getresponse()
+                    self.assertEqual(response.status, 200)
+                    with self.assertRaises(http.client.IncompleteRead):
+                        response.read()
+                self.assertEqual(exchange(port, 'GET', '/ready'), (200, 'text/plain', b'ready'))
+                self.assertIsNone(process.poll())
+
     def test_router_shutdown_drains_active_requests_before_stopping(self):
         package = self.root / "shutdown"
         (package / "src").mkdir(parents=True)

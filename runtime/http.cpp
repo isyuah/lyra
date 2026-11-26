@@ -235,6 +235,7 @@ int RequestParser::feed(std::string_view bytes) {
     request.target = lyraStringFromBytes(target.data(), target.size());
     request.body = lyraStringFromBytes(body.data(), body.size());
     request.keepAlive = llhttp_should_keep_alive(&parser);
+    request.http10 = parser.http_minor == 0;
     return 0;
 }
 
@@ -361,18 +362,20 @@ extern "C" int64_t lyraHttpResponseHeaderSet(ResponseFields* headers, int64_t in
     return 0;
 }
 
-int lyraRuntime::http::formatResponse(std::string& wire, int64_t status, const void* mediaType, const void* body, const ResponseFields& headers, bool keepAlive) {
+int lyraRuntime::http::formatResponse(std::string& wire, int64_t status, const void* mediaType, const void* body, const ResponseFields& headers,
+    bool keepAlive, bool chunked, bool streaming) {
     auto type = text(mediaType);
     auto length = lyraStringLength(body);
     auto noBody = status == 204 || status == 304;
-    if (status < 200 || status > 599 || type.empty() || type.size() > 200 || ((noBody || status == 205) && length) ||
+    if (status < 200 || status > 599 || type.empty() || type.size() > 200 || ((noBody || status == 205) && (length || streaming)) ||
         !std::ranges::all_of(type, [](unsigned char byte) { return byte >= 0x20 && byte <= 0x7e; })) return EINVAL;
     char basic[512];
     auto count = std::snprintf(basic, sizeof(basic), "HTTP/1.1 %lld %s\r\nContent-Type: %.*s\r\nConnection: %s\r\n",
         static_cast<long long>(status), reason(status), static_cast<int>(type.size()), type.data(), keepAlive ? "keep-alive" : "close");
     wire.assign(basic, count);
     wire.reserve(wire.size() + 40 + headers.wireSize);
-    if (!noBody) {
+    if (chunked) wire.append("Transfer-Encoding: chunked\r\n");
+    else if (!streaming && !noBody) {
         auto fieldSize = std::snprintf(basic, sizeof(basic), "Content-Length: %zu\r\n", length);
         wire.append(basic, fieldSize);
     }

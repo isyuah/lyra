@@ -62,7 +62,7 @@ class HttpTls(unittest.TestCase):
             (root / 'lyra.json5').write_text('{name:"test/http-tls",version:"0.1.0"}', encoding='utf-8')
             source.write_text('''
 import std.http.{Request}
-import std.http.{Response}
+import std.http.{Response, ResponseWriter}
 import std.http.{Router}
 import std.httpTls.{HttpServerOptions, listenTls}
 import std.io.{readBytes}
@@ -94,6 +94,12 @@ async fn main(): Int {
     router.get("/large", async (request: Request) => {
         val large = await blocking { pem(values[2]) }
         Response.bytes(200, "application/octet-stream", large)
+    })
+    router.get("/stream", async (request: Request) => {
+        Response.stream(200, "text/plain", async (writer: ResponseWriter) => {
+            (await writer.write("hello ".toBytes()))?
+            await writer.write("TLS".toBytes())
+        })
     })
     print(listener.port())
     await router.serve(listener)
@@ -136,11 +142,19 @@ async fn main(): Int {
                             connection = stream.sock
                             response = stream.getresponse()
                             self.assertEqual((response.status, response.read()), (200, expected_payload))
+                            stream.request('GET', '/stream')
+                            response = stream.getresponse()
+                            self.assertEqual((response.status, response.getheader('Transfer-Encoding'), response.read()), (200, 'chunked', b'hello TLS'))
                             for _ in range(3):
                                 stream.request('GET', '/health')
                                 response = stream.getresponse()
                                 self.assertEqual((response.status, response.read()), (200, b'ok'))
                                 self.assertIs(stream.sock, connection)
+                        with trusted.wrap_socket(socket.create_connection(('127.0.0.1', port), timeout=5), server_hostname='localhost') as raw:
+                            raw.sendall(b'GET /stream HTTP/1.0\r\nConnection: keep-alive\r\n\r\n')
+                            response = http.client.HTTPResponse(raw)
+                            response.begin()
+                            self.assertEqual((response.status, response.getheader('Transfer-Encoding'), response.read()), (200, None, b'hello TLS'))
 
                         with self.assertRaises(ssl.SSLCertVerificationError), contextlib.closing(
                                 http.client.HTTPSConnection('localhost', port, context=ssl.create_default_context(), timeout=5)) as untrusted:
