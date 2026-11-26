@@ -7,6 +7,7 @@ module;
 #include <vector>
 
 #ifdef _WIN32
+#include <algorithm>
 #include <cstddef>
 #include <cstring>
 #include <memory>
@@ -15,6 +16,27 @@ module;
 #endif
 
 export module lyra.platform;
+
+#ifdef _WIN32
+namespace {
+
+HANDLE acquirePublishGuard(const std::filesystem::path& output) {
+    constexpr DWORD maxWaitMs = 200, maxBackoffMs = 16;
+    const auto deadline = GetTickCount64() + maxWaitMs;
+    DWORD backoff = 1;
+    for (;;) {
+        auto guard = CreateFileW(output.c_str(), DELETE | FILE_WRITE_DATA, FILE_SHARE_DELETE,
+                                 nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (guard != INVALID_HANDLE_VALUE || GetLastError() != ERROR_SHARING_VIOLATION) return guard;
+        const auto now = GetTickCount64();
+        if (now >= deadline) return INVALID_HANDLE_VALUE;
+        Sleep(static_cast<DWORD>(std::min<ULONGLONG>(backoff, deadline - now)));
+        backoff = std::min(backoff * 2, maxBackoffMs);
+    }
+}
+
+}
+#endif
 
 export namespace lyra {
 
@@ -101,8 +123,17 @@ void publishExecutable(const std::filesystem::path& staged, const std::filesyste
                               nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (handle == INVALID_HANDLE_VALUE)
         throw std::filesystem::filesystem_error("open staged executable", staged, std::error_code(GetLastError(), std::system_category()));
-    auto renamed = SetFileInformationByHandle(handle, FileRenameInfoEx, rename, size);
-    auto status = renamed ? ERROR_SUCCESS : GetLastError();
+    auto tryRename = [&]() -> DWORD {
+        return SetFileInformationByHandle(handle, FileRenameInfoEx, rename, size) ? ERROR_SUCCESS : GetLastError();
+    };
+    auto status = tryRename();
+    if (replace && (status == ERROR_ACCESS_DENIED || status == ERROR_SHARING_VIOLATION)) {
+        auto guard = acquirePublishGuard(name);
+        if (guard != INVALID_HANDLE_VALUE) {
+            status = tryRename();
+            CloseHandle(guard);
+        }
+    }
     CloseHandle(handle);
     if (status == ERROR_ACCESS_DENIED || status == ERROR_SHARING_VIOLATION)
         throw std::filesystem::filesystem_error("无法替换可执行文件；若仍在运行，请先退出或指定另一输出路径", staged, output, std::error_code(status, std::system_category()));

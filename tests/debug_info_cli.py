@@ -143,6 +143,7 @@ class DebugInfoTest(unittest.TestCase):
             original = executable.read_bytes()
             symbols = self.symbols_for(executable)
             original_symbols = symbols.read_bytes()
+            original_symbol_files = set(executable.parent.glob('*.pdb'))
             with subprocess.Popen([executable], stdin=subprocess.PIPE, creationflags=subprocess.CREATE_NO_WINDOW) as running:
                 try:
                     source.write_text('fn main(): Unit { print(43) }\n', encoding="utf-8")
@@ -150,6 +151,7 @@ class DebugInfoTest(unittest.TestCase):
                     self.assertNotEqual(replacement.returncode, 0, replacement.stderr)
                     self.assertEqual(executable.read_bytes(), original)
                     self.assertEqual(symbols.read_bytes(), original_symbols)
+                    self.assertEqual(set(executable.parent.glob('*.pdb')), original_symbol_files)
                 finally:
                     running.communicate(b"\n", timeout=10)
             replacement = subprocess.run(command, capture_output=True, timeout=40)
