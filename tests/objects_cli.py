@@ -187,6 +187,82 @@ fn widen(in value: Int): Int { value }
                 diagnostic, = json.loads(result.stderr)
                 self.assertEqual(diagnostic['code'], code, diagnostic)
 
+    def test_large_record_results_and_arguments_keep_value_semantics(self):
+        (self.package / 'lyra.json5').write_text('''{
+            name:"example/app", version:"0.1.0",
+            dependencies:{models:{name:"example/models", version:"^0.1.0", path:"models"}}
+        }''')
+        models = self.package / 'models'
+        (models / 'src').mkdir(parents=True)
+        (models / 'lyra.json5').write_text('{name:"example/models", version:"0.1.0", kind:"lib"}')
+        (models / 'src/data.ly').write_text('''
+pub struct Packet(pub var id: Int, pub val first: String, pub val second: String, pub val payload: List<Int>) {
+    pub fn duplicate(): Packet { this }
+    pub fn equals(other: Self): Bool { id == other.id }
+    pub fn hashCode(): Int { id }
+}
+pub struct Bundle(pub val packet: Packet, pub val note: String)
+pub trait Duplicate { fn duplicate(): Packet }
+pub fn packet(id: Int): Packet { Packet(id, "原稿", "copy", [8]) }
+pub fn forward(id: Int): Packet {
+    if id == 1 { return packet(id) }
+    packet(id)
+}
+pub fn withDefault(first: Packet, second: Packet = packet(first.id + 1)): Packet { second }
+pub fn snapshot(before: Packet, ref after: Packet): Int {
+    after.id = 99
+    before.id
+}
+pub fn lateCleanupFails(): Packet {
+    defer { throw Exception("cleanup") }
+    packet(0)
+}
+pub fn returnedSnapshot(): Packet {
+    var value = packet(6)
+    defer { value.id = 0 }
+    return value
+}
+pub fn capture(value: Packet): () -> Packet { () => { gcCollect(); value } }
+''', encoding='utf-8')
+        self.run_source('''
+import models
+class Storage(var value: models.Packet)
+fn pair(value: models.Packet, changed: Int): Int { value.id }
+fn change(storage: Storage): Int { storage.value.id = 13; 1 }
+fn result(early: Bool): models.Packet {
+    if early { models.forward(1) }
+    else { models.withDefault(models.packet(2)) }
+}
+async fn main(): Unit {
+    val stable = result(true)
+    var independent = stable
+    print(models.snapshot(independent, ref independent))
+    print(independent.id)
+    print(stable.id)
+    val storage = Storage(stable)
+    val changeTask = async { val worker = parallel { change(storage) }; await worker }
+    print(pair(storage.value, await changeTask))
+    print(storage.value.id)
+    val source: (Int) -> models.Packet = models.forward
+    val direct = source(4)
+    val bound: () -> models.Packet = direct.duplicate
+    val dynValue: dyn models.Duplicate = direct as dyn models.Duplicate
+    print(bound().id)
+    print(dynValue.duplicate().id)
+    print(direct == stable)
+    var target = models.Bundle(result(false), "keep")
+    val retained = models.capture(target.packet)
+    target = try { models.Bundle(models.lateCleanupFails(), "discard") }
+        catch error: Exception { print(error.message); target }
+    print(target.note)
+    print(models.returnedSnapshot().id)
+    val restored = retained()
+    print(restored.id)
+    print(restored.first)
+    print(restored.payload[0])
+}
+''', '1\n99\n1\n1\n13\n4\n4\nfalse\ncleanup\nkeep\n6\n3\n原稿\n8\n'.encode())
+
     def test_order_and_single_receiver_evaluation(self):
         self.run_source("""
 class Counter(var value: Int)

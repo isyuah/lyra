@@ -129,23 +129,23 @@ llvm::AllocaInst* scratch(Builder& builder, llvm::Type* type) {
     return prologue.CreateAlloca(type);
 }
 
-void sharedCopy(Builder& builder, llvm::Value* destination, llvm::Value* source, llvm::Type* type) {
+}
+
+export void copyShared(llvm::IRBuilder<>& builder, llvm::Value* destination, llvm::Value* source, llvm::Type* type) {
     auto* pointer = builder.getPtrTy();
     builder.CreateCall(runtime(builder, "lyraTaskSharedCopy", builder.getVoidTy(), {pointer, pointer, builder.getInt64Ty()}), {destination, source, llvm::ConstantExpr::getSizeOf(type)});
 }
 
-}
-
 export llvm::Value* sharedRead(llvm::IRBuilder<>& builder, llvm::Type* type, llvm::Value* address) {
     auto* cell = scratch(builder, type);
-    sharedCopy(builder, cell, address, type);
+    copyShared(builder, cell, address, type);
     return builder.CreateLoad(type, cell);
 }
 
 export void sharedWrite(llvm::IRBuilder<>& builder, llvm::Value* value, llvm::Value* address) {
     auto* cell = scratch(builder, value->getType());
     builder.CreateStore(value, cell);
-    sharedCopy(builder, address, cell, value->getType());
+    copyShared(builder, address, cell, value->getType());
 }
 
 export struct BlockingCode {
