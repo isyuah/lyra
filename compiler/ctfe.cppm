@@ -110,6 +110,8 @@ struct Validator {
         if (state.macro && syntax.file == state.macro->prelude) return;
         if (syntax.pendingExpansion)
             throw at(state.sources[fn.syntax.file], site, "LYM0004", "编译期阶段环：依赖尚未展开或装饰的函数：" + syntax.name.text);
+        if (std::ranges::any_of(syntax.parameters, [](const auto& param) { return param.passing != Passing::Value; }))
+            reject(site, "编译期不能调用含 in/ref 形参的函数：" + syntax.name.text);
         if (syntax.isAsync || syntax.foreignSymbol || syntax.conversion ||
             (!syntax.parameters.empty() && syntax.parameters.back().variadic))
             reject(site, "编译期不能调用异步、外部、隐式转换或变长函数：" + syntax.name.text);
@@ -608,8 +610,14 @@ struct Evaluation {
                 }
             }
             auto result = macro->host(name, values);
-            if (fn.result == syntaxType)
-                return makeComposite(caller, call, syntaxType, std::monostate{}, {ConstScalar{static_cast<std::uint64_t>(std::get<SyntaxRef>(result).index)}});
+            auto syntax = [&](SyntaxRef ref) {
+                return makeComposite(caller, call, syntaxType, std::monostate{}, {ConstScalar{static_cast<std::uint64_t>(ref.index)}});
+            };
+            if (fn.result == syntaxType) return syntax(std::get<SyntaxRef>(result));
+            if (fn.result.kind == Type::Option && module.sumTypes[fn.result.id].success == syntaxType) {
+                if (auto ref = std::get_if<SyntaxRef>(&result)) return makeComposite(caller, call, fn.result, SumTag::Some, {syntax(*ref)});
+                return makeComposite(caller, call, fn.result, SumTag::None);
+            }
             if (fn.result == Type::Int) return std::bit_cast<std::uint64_t>(std::get<std::int64_t>(result));
             if (fn.result == Type::Bool) return std::get<bool>(result);
             if (fn.result == Type::String) return std::get<std::string>(std::move(result));

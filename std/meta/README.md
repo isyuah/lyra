@@ -1,6 +1,6 @@
 # 编译期 Lyra
 
-Lyra 宏以 Lyra 编写，入口返回 `Syntax`；编译器解析并检查生成物，运行程序时不加载宏实现。声明宏、表达式宏和装饰器分别放在源码模块的 `.macros/`、`.expressions/` 和 `.decorators/`。同名入口由使用位置区分：声明前写 `#name` 或 `@name`，表达式位置写 `#name(...)`。公开入口用 `pub fn`，下游包可以写 `import macro kit.name as nameHere` 或 `import decorator kit.trace`；加 `pub import` 可重导出。
+Lyra 宏以 Lyra 编写，入口返回 `Syntax`；编译器解析并检查生成物，运行程序时不加载宏实现。普通声明宏、类型宏、表达式宏和装饰器分别放在源码模块的 `.macros/`、`.typedMacros/`、`.expressions/` 和 `.decorators/`。声明前写 `#name` 或 `@name`，表达式位置写 `#name(...)`；普通声明宏与类型宏在同一作用域不能同名。公开入口用 `pub fn`，下游包可以写 `import macro kit.name as nameHere` 或 `import decorator kit.trace`；加 `pub import` 可重导出。
 
 ```lyra
 fn banner(target: String, argument: String): Syntax {
@@ -29,6 +29,22 @@ pub fn increment(target: String, argument: String): Syntax {
 
 声明宏可通过 `#derive(Json)` 生成私有辅助实现；若希望生成公开 API，必须在调用处写 `#name(export apiName)`，且生成内容必须恰好提供该公开名称。不能通过生成物发布未点名的 API、`extern`、新的宏或公开重导出。宏能查看目标函数体，但不接收全程序类型检查后的 AST。标准库 JSON 和 TOML 派生器分别见 [`std.json`](../json/README.md) 与 [`std.toml`](../toml/README.md)。
 
+## 类型宏
+
+将下面的实现保存为 `src/.typedMacros/requireString.ly`，即可用 `#requireString` 标记普通函数或方法。`syntaxResultType()` 读取实际结果，包括省略注解时的推断结果；`syntaxTypeOf(node): Syntax?` 可读取目标表达式、局部绑定或签名节点的类型。它们返回与 `syntaxResolvedType` 同样的只读节点。
+
+```lyra
+fn requireString(target: String, argument: String): Syntax {
+    val result = syntaxResultType()
+    if syntaxKind(result) != "builtin" || syntaxText(result) != "String" {
+        return syntaxError(syntaxBody(), "expected a String result")
+    }
+    syntaxCode("")
+}
+```
+
+普通宏和装饰器先展开，再检查类型宏的目标；目标不能依赖类型宏尚未生成的帮助函数。类型宏可以产生私有辅助声明或显式授权的公开声明，也可以只检查并返回空输出。泛型保留符号类型，例如 `T`，不因调用者传入了 `Int` 而变成 `Int`。
+
 ## 装饰器
 
 函数和实例方法装饰器可返回 `syntaxAround(before, after, failure)`：`before` 先运行，`after` 只在成功后执行并可读取 `result: Any`，`failure` 可读取 `exception: Exception`。包装器重抛原异常，异常钩子自身失败时附加到 `cleanupFailures`。方法钩子可通过 `this` 读取接收者。多层装饰器从外向内进入，按内向外处理返回值和异常。对异步函数，包装保留冷 `Task`：构造任务时不运行钩子，首次激活时执行包装体。
@@ -51,4 +67,4 @@ fn trace(target: String, argument: String): Syntax {
 
 `macroQuote` 将文本编码成 Lyra 字符串字面量，`macroContains` 做大小写敏感、按字节的子串匹配，`macroInput` 读取授权快照。宏展开受嵌套深度、语法节点、源码字节数及求值步数限制；耗尽预算会给出宏诊断。表达式宏必须生成一个表达式，最多嵌套 32 层。**不要把 `syntaxCode` 的文本与 `syntaxArgument` 的源码节点混为一谈**：前者是宏作者构造的代码，后者保留实参作用域与错误映射。
 
-示例 HTTP 的 `#post` 读取 `[path]`、`[query("tag")]`、`[body]` 标记，生成同模块的适配器与显式路由注册函数；调用业务 handler 仍经过其装饰器。标记本身不引入运行时反射，手写 handler 也使用相同的 Router API。
+示例 HTTP 的 `#get` / `#post` 读取 `[path]`、`[query("tag")]`、`[body]` 和 `[inject]` 标记，生成私有适配器。`#mountRoutes` 由编译器按包汇总，并把适配器一次交给 Router。调用业务 handler 仍经过装饰器；运行时不扫描声明。

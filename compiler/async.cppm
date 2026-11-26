@@ -11,6 +11,7 @@ module;
 #include <llvm/Transforms/Utils/Local.h>
 
 export module lyra.async;
+import lyra.exceptions;
 
 namespace lyra {
 namespace {
@@ -73,16 +74,12 @@ export llvm::Value* asyncSpawn(llvm::IRBuilder<>& builder, llvm::Value* task, bo
     return marker(builder, parallel ? "lyra.parallel" : "lyra.spawn", builder.getPtrTy(), {task});
 }
 
-export llvm::Value* asyncTaskCancelled(llvm::IRBuilder<>& builder) {
-    return marker(builder, "lyra.taskCancelled", builder.getInt1Ty(), {});
-}
-
-export void asyncCheckCancellation(llvm::IRBuilder<>& builder) {
-    marker(builder, "lyra.checkCancellation", builder.getVoidTy(), {});
-}
-
 export void asyncFailure(llvm::IRBuilder<>& builder, llvm::Value* error) {
     marker(builder, "lyra.fail", builder.getVoidTy(), {error});
+}
+
+export void asyncCancellation(llvm::IRBuilder<>& builder, llvm::Value* cleanup) {
+    marker(builder, "lyra.cancel", builder.getVoidTy(), {cleanup});
 }
 
 export llvm::Value* nativeExitCode(llvm::IRBuilder<>& builder, llvm::Value* result) {
@@ -133,23 +130,23 @@ llvm::AllocaInst* scratch(Builder& builder, llvm::Type* type) {
     return prologue.CreateAlloca(type);
 }
 
-void sharedCopy(Builder& builder, llvm::Value* destination, llvm::Value* source, llvm::Type* type) {
+}
+
+export void copyShared(llvm::IRBuilder<>& builder, llvm::Value* destination, llvm::Value* source, llvm::Type* type) {
     auto* pointer = builder.getPtrTy();
     builder.CreateCall(runtime(builder, "lyraTaskSharedCopy", builder.getVoidTy(), {pointer, pointer, builder.getInt64Ty()}), {destination, source, llvm::ConstantExpr::getSizeOf(type)});
 }
 
-}
-
 export llvm::Value* sharedRead(llvm::IRBuilder<>& builder, llvm::Type* type, llvm::Value* address) {
     auto* cell = scratch(builder, type);
-    sharedCopy(builder, cell, address, type);
+    copyShared(builder, cell, address, type);
     return builder.CreateLoad(type, cell);
 }
 
 export void sharedWrite(llvm::IRBuilder<>& builder, llvm::Value* value, llvm::Value* address) {
     auto* cell = scratch(builder, value->getType());
     builder.CreateStore(value, cell);
-    sharedCopy(builder, address, cell, value->getType());
+    copyShared(builder, address, cell, value->getType());
 }
 
 export struct BlockingCode {
@@ -175,15 +172,14 @@ std::pair<llvm::Value*, llvm::Value*> closureThunk(llvm::IRBuilder<>& builder, B
     Builder worker(llvm::BasicBlock::Create(builder.getContext(), "capture", thunk));
     std::vector<llvm::Value*> args;
     for (std::size_t index = 0; index < cells.size(); ++index) args.push_back(worker.CreateLoad(pointer, worker.CreateStructGEP(code.environment, thunk->getArg(0), index)));
-    llvm::Value* errorSlot = boxResult ? static_cast<llvm::Value*>(thunk->getArg(1)) : worker.CreateAlloca(pointer);
-    worker.CreateStore(llvm::ConstantPointerNull::get(pointer), errorSlot);
+    llvm::Value* errorSlot = boxResult ? static_cast<llvm::Value*>(thunk->getArg(1)) : NativeExceptions{worker}.outcomeSlot();
     args.push_back(errorSlot);
     auto* value = worker.CreateCall(code.body, args);
-    auto* error = worker.CreateLoad(pointer, errorSlot);
+    auto* error = NativeExceptions{worker}.outcomeError(errorSlot);
     if (boxResult) {
         auto* success = llvm::BasicBlock::Create(builder.getContext(), "completed", thunk);
         auto* failure = llvm::BasicBlock::Create(builder.getContext(), "failed", thunk);
-        worker.CreateCondBr(worker.CreateIsNull(error), success, failure);
+        worker.CreateCondBr(NativeExceptions{worker}.failed(errorSlot), failure, success);
         worker.SetInsertPoint(failure);
         worker.CreateRet(llvm::ConstantPointerNull::get(pointer));
         worker.SetInsertPoint(success);
@@ -227,7 +223,7 @@ export void lowerAsync(llvm::Function& factory, llvm::Function& body, llvm::Allo
     auto* pointer = builder.getPtrTy();
     auto* noResult = builder.getVoidTy();
     auto* integer = builder.getInt32Ty();
-    std::vector<llvm::CallInst*> waits, spawns, cancellationChecks, cancellationQueries, failures;
+    std::vector<llvm::CallInst*> waits, spawns, cancellations, failures;
     std::vector<llvm::PHINode*> phis;
     std::vector<llvm::ReturnInst*> returns;
     for (auto& instruction : llvm::instructions(body)) {
@@ -237,8 +233,7 @@ export void lowerAsync(llvm::Function& factory, llvm::Function& body, llvm::Allo
                 auto name = callee->getFnAttribute("lyra.suspension").getValueAsString();
                 if (name == "lyra.await" || name == "lyra.awaitOutcome") waits.push_back(call);
                 else if (name == "lyra.spawn" || name == "lyra.parallel") spawns.push_back(call);
-                else if (name == "lyra.checkCancellation") cancellationChecks.push_back(call);
-                else if (name == "lyra.taskCancelled") cancellationQueries.push_back(call);
+                else if (name == "lyra.cancel") cancellations.push_back(call);
                 else failures.push_back(call);
             }
         } else if (auto* phi = llvm::dyn_cast<llvm::PHINode>(&instruction)) phis.push_back(phi);
@@ -395,18 +390,12 @@ export void lowerAsync(llvm::Function& factory, llvm::Function& body, llvm::Allo
         spawn->replaceAllUsesWith(builder.CreateCall(start, {task, spawn->getArgOperand(0)}));
         eraseMarker(spawn);
     }
-    for (auto* query : cancellationQueries) {
-        builder.SetInsertPoint(query);
-        query->replaceAllUsesWith(cancellationRequested(builder, task));
-        eraseMarker(query);
-    }
-    for (auto* check : cancellationChecks) {
-        auto* checked = check->getParent();
-        auto* continuation = checked->splitBasicBlock(check->getNextNode(), "cancel.continue");
-        checked->getTerminator()->eraseFromParent();
-        eraseMarker(check);
-        builder.SetInsertPoint(checked);
-        builder.CreateCondBr(cancellationRequested(builder, task), cancelled, continuation);
+    for (auto* cancel : cancellations) {
+        builder.SetInsertPoint(cancel);
+        builder.CreateCall(runtime(builder, "lyraTaskFinishCancelledWithFailure", noResult, {pointer, pointer}), {task, cancel->getArgOperand(0)});
+        builder.CreateRetVoid();
+        cancel->getParent()->getTerminator()->eraseFromParent();
+        eraseMarker(cancel);
     }
     for (auto* failure : failures) {
         builder.SetInsertPoint(failure);

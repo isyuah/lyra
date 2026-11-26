@@ -14,10 +14,39 @@ struct NativeExceptions {
     llvm::Module& module() const { return *builder.GetInsertBlock()->getModule(); }
     llvm::Constant* none() const { return llvm::ConstantPointerNull::get(builder.getPtrTy()); }
 
+    llvm::StructType* outcomeType() const { return llvm::StructType::get(builder.getContext(), {builder.getPtrTy(), builder.getInt8Ty()}); }
+
     llvm::AllocaInst* slot() const {
         auto* cell = builder.CreateAlloca(builder.getPtrTy(), nullptr, "exception.slot");
         builder.CreateStore(none(), cell);
         return cell;
+    }
+
+    llvm::AllocaInst* outcomeSlot() const {
+        auto* cell = builder.CreateAlloca(outcomeType(), nullptr, "outcome.slot");
+        builder.CreateStore(llvm::Constant::getNullValue(outcomeType()), cell);
+        return cell;
+    }
+
+    llvm::Value* outcomeError(llvm::Value* slot) const {
+        return builder.CreateLoad(builder.getPtrTy(), builder.CreateStructGEP(outcomeType(), slot, 0));
+    }
+
+    llvm::Value* cancelled(llvm::Value* slot) const {
+        return builder.CreateIsNotNull(builder.CreateLoad(builder.getInt8Ty(), builder.CreateStructGEP(outcomeType(), slot, 1)));
+    }
+
+    llvm::Value* failed(llvm::Value* slot) const {
+        return builder.CreateOr(cancelled(slot), builder.CreateIsNotNull(outcomeError(slot)));
+    }
+
+    void cancel(llvm::Value* slot, llvm::Value* failure) const {
+        publishError(slot, failure);
+        builder.CreateStore(builder.getInt8(1), builder.CreateStructGEP(outcomeType(), slot, 1));
+    }
+
+    void publishError(llvm::Value* slot, llvm::Value* error) const {
+        builder.CreateStore(error, builder.CreateStructGEP(outcomeType(), slot, 0));
     }
 
     llvm::Value* create(llvm::Value* message) const {

@@ -13,9 +13,23 @@ pub class Mutex {
 }
 
 pub fn withLock<T>(mutex: Mutex, body: () -> T): T {
-    lyraMutexLock(mutex.handle)
-    defer lyraMutexUnlock(mutex.handle)
-    body()
+    val result = {
+        lyraMutexLock(mutex.handle)
+        defer lyraMutexUnlock(mutex.handle)
+        body()
+    }
+    Task.checkCancellation()
+    result
+}
+
+/// A shared value whose read/compute/replace operation is serialized.
+pub class Locked<T> {
+    val mutex: Mutex = Mutex()
+    var value: T
+
+    pub init(initial: T) { value = initial }
+    pub fn snapshot(): T { withLock(mutex) { value } }
+    pub fn update(change: (T) -> T): Unit { withLock(mutex) { value = change(value) } }
 }
 
 pub class AtomicInt {

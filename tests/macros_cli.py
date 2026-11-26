@@ -788,6 +788,90 @@ fn main(): Unit { print(generated()) }
         main.write_text('#checkBody\nfn target(): Int {\n    return 42\n}\nfn main(): Unit {}\n')
         self.diagnostic('LYM0002', '公开')
 
+    def test_typed_macro_observes_inference_after_expansion_and_invalidates_cache(self):
+        directory = self.src / '.typedMacros'
+        directory.mkdir()
+        (directory / 'describe.ly').write_text('''fn describe(target: String, argument: String): Syntax {
+    val body = syntaxBody()
+    val binding = syntaxChild(body, 0)
+    val name = syntaxChild(binding, 0)
+    val initializer = syntaxChild(binding, 1)
+    val valueType = match syntaxTypeOf(initializer) { Some(node) => node, None => return syntaxError(initializer, "missing expression type") }
+    val localType = match syntaxTypeOf(name) { Some(node) => node, None => return syntaxError(name, "missing binding type") }
+    if syntaxTypeOf(syntaxString("generated")) != None { return syntaxError(name, "generated syntax should have no type") }
+    val text = target + ":" + syntaxText(syntaxResultType()) + ":" + syntaxText(valueType) + ":" + syntaxText(localType)
+    syntaxCode("pub fn observed(): String { " + macroQuote(text) + " }")
+}''')
+        self.macro('"fn generated() { inferredDependency() }"')
+        dependency = self.src / 'dependency.ly'
+        dependency.write_text('fn inferredDependency() { 7 }\n')
+        source = '''#make
+struct Anchor()
+#describe(export observed)
+@trace
+fn target() { val picked = generated(); picked }
+fn main(): Unit { print(observed()) }
+'''
+        self.native(source, ['target:Int:Int:Int'])
+        dependency.write_text('fn inferredDependency() { "text" }\n')
+        self.native(source, ['target:String:String:String'])
+
+    def test_imported_type_macro_preserves_generic_method_types_and_allows_later_consumers(self):
+        provider = self.library('provider')
+        directory = provider / 'src/.typedMacros'
+        directory.mkdir()
+        (directory / 'inspect.ly').write_text('''pub fn inspect(target: String, argument: String): Syntax {
+    val result = syntaxResultType()
+    val field = syntaxChild(syntaxChild(syntaxTarget(), 1), 1)
+    val param = match syntaxTypeOf(field) { Some(value) => value, None => return syntaxError(field, "missing signature type") }
+    val description = syntaxKind(result) + ":" + syntaxText(result) + ":" + syntaxText(param)
+    syntaxCode("pub struct Report(pub val text: String = " + macroQuote(description) + ")")
+}''')
+        facade = self.library('facade', dependencies={'provider': self.dependency('provider')})
+        (facade / 'src/export.ly').write_text('pub import macro provider.inspect as inspectMethod\n')
+        self.manifest(dependencies={'facade': self.dependency('facade')})
+        module = self.src / 'widgets'
+        module.mkdir()
+        (module / 'widget.ly').write_text('''import macro facade.inspectMethod
+struct Widget() {
+    #inspectMethod(export Report)
+    fn select<Item>(value: Item) { val local = value; local }
+}
+''')
+        self.native('''import self.widgets.{Report}
+fn describe(report: Report): String { report.text }
+fn main(): Unit { print(describe(Report())) }
+''', ['parameter:Item:Item'])
+
+    def test_type_macro_phase_cycle_points_to_the_dependency(self):
+        directory = self.src / '.typedMacros'
+        directory.mkdir()
+        code = 'fn makeLater(target: String, argument: String): Syntax { syntaxCode("pub fn later(): Int { 5 }") }'
+        (directory / 'makeLater.ly').write_text(code)
+        main = self.src / 'main.ly'
+        main.write_text('''#makeLater(export later)
+fn target() { dependency() }
+fn dependency() { later() }
+fn main(): Unit {}
+''')
+        error = self.diagnostic('LYM0004', '阶段环')
+        self.assertEqual(error['range']['start']['offset'], main.read_bytes().index(b'later()'))
+        (self.src / '.macros/makeLater.ly').write_text(code)
+        self.diagnostic('LYM0001', '同名')
+
+    def test_type_macro_cannot_add_an_overload_that_changes_the_observed_target(self):
+        directory = self.src / '.typedMacros'
+        directory.mkdir()
+        (directory / 'addOverload.ly').write_text('''fn addOverload(target: String, argument: String): Syntax {
+    quote { fn choice(value: Int): String { "changed" } }
+}''')
+        (self.src / 'main.ly').write_text('''fn choice(value: Any): Int { 7 }
+#addOverload
+fn target() { choice(1) }
+fn main(): Unit {}
+''')
+        self.diagnostic('LYM0002', '不能添加现有函数的重载')
+
     def test_decorator_composes_success_and_failure_without_eager_async_execution(self):
         decorators = self.src / '.decorators'
         decorators.mkdir()

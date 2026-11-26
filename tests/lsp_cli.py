@@ -360,13 +360,13 @@ class LanguageServer(unittest.TestCase):
             items = {item['id']: {entry['label']: entry['kind'] for entry in item['result']['items']}
                      for item in output if item.get('id', 0) > 1}
             self.assertEqual(items[2], {})
-            self.assertEqual(items[3], {'derive': 3, 'post': 3})
+            self.assertEqual(items[3], {'derive': 3, 'get': 3, 'post': 3})
             self.assertEqual(items[4], {'trace': 23})
             self.assertEqual(items[5], {'String': 7})
             self.assertEqual(items[6]['print'], 3)
             self.assertNotIn('import', items[7])
             self.assertNotIn('implicit', items[7])
-            self.assertEqual(items[8], {'assert': 3})
+            self.assertEqual(items[8], {'assert': 3, 'mountRoutes': 3})
             self.assertEqual(items[9], {})
 
     def test_generated_completion_preserves_only_necessary_escapes(self):
@@ -1195,6 +1195,51 @@ class LanguageServer(unittest.TestCase):
                              and item['params']['uri'] == uri(source)]
             self.assertEqual(notifications[-2]['params']['diagnostics'][0]['code'], 'LYT0001')
             self.assertEqual(notifications[-1]['params']['diagnostics'], [])
+
+    def test_type_macro_follows_unsaved_inference_dependency_and_reports_utf16(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            package = Path(temporary) / 'app'
+            source = package / 'src/main.ly'
+            macro = package / 'src/.typedMacros/requireInt.ly'
+            macro.parent.mkdir(parents=True)
+            (package / 'lyra.json5').write_text('{name:"app",version:"0.1.0"}', encoding='utf-8')
+            implementation = '''fn requireInt(target: String, argument: String): Syntax {
+    if syntaxText(syntaxResultType()) != "Int" { return syntaxError(syntaxChild(syntaxBody(), 1), "result must be Int") }
+    syntaxCode("")
+}
+'''
+            macro.write_text(implementation, encoding='utf-8')
+            dependency = package / 'src/value.ly'
+            helper = 'fn sourceValue() { 7 }\n'
+            dependency.write_text(helper, encoding='utf-8')
+            text = '#requireInt\nfn target() { val caption = "你好 😀"; sourceValue() }\nfn main(): Unit {}\n'
+            source.write_text(text, encoding='utf-8')
+            def change(path, revision):
+                return {'jsonrpc': '2.0', 'method': 'textDocument/didChange', 'params': {
+                    'textDocument': {'uri': uri(path), 'version': 2}, 'contentChanges': [{'text': revision}],
+                }}
+
+            def close(path):
+                return {'jsonrpc': '2.0', 'method': 'textDocument/didClose', 'params': {'textDocument': {'uri': uri(path)}}}
+
+            output = run_server([(source, text), (dependency, helper), (macro, implementation)], [
+                document_request(2, source, 'definition', position=position_at(text, 3)),
+                change(dependency, 'fn sourceValue() { "changed" }\n'),
+                change(macro, implementation.replace('!= "Int"', '!= "String"')),
+                close(macro), close(dependency),
+            ])
+            definition = next(item['result'] for item in output if item.get('id') == 2)
+            self.assertEqual([target['uri'] for target in definition], [uri(macro)])
+            diagnostics = [item['params']['diagnostics'] for item in output if item.get('method') == 'textDocument/publishDiagnostics'
+                           and item['params']['uri'] == uri(source)]
+            self.assertEqual(diagnostics[0], [])
+            self.assertEqual(diagnostics[-1], [])
+            self.assertEqual(diagnostics[-3], [])
+            self.assertEqual(diagnostics[-4], diagnostics[-2])
+            issue, = diagnostics[-2]
+            use = text.index('sourceValue()')
+            self.assertEqual(issue['code'], 'LYM0002')
+            self.assertEqual(issue['range'], {'start': position_at(text, use), 'end': position_at(text, use + len('sourceValue()'))})
 
     def test_navigation_in_a_file_with_an_expression_expansion_uses_original_utf16(self):
         with tempfile.TemporaryDirectory() as temporary:

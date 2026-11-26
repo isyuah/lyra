@@ -1,6 +1,7 @@
 module;
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -14,6 +15,11 @@ export import lyra.sums;
 export namespace lyra {
 
 using ExprId = std::size_t;
+inline constexpr const char* macroSourceDirectories[] = {".macros", ".typedMacros", ".expressions", ".decorators"};
+inline bool macroSourceDirectory(const std::filesystem::path& directory) {
+    for (const auto* name : macroSourceDirectories) if (directory == name) return true;
+    return false;
+}
 
 struct Identifier {
     std::string text;
@@ -23,9 +29,14 @@ struct Identifier {
     std::optional<SourceAnchor> renameTarget{};
     std::optional<SourceAnchor> moduleAlias{};
     bool moduleMember{};
+    bool internalReference{};
 };
 struct Attribute { Identifier name; std::optional<Identifier> argument; };
-struct Argument { std::optional<Identifier> label; ExprId value; std::optional<Span> spread{}, trailing{}; };
+enum class Passing { Value, In, Ref };
+constexpr std::string_view passingName(Passing passing) {
+    return passing == Passing::In ? "in" : passing == Passing::Ref ? "ref" : "";
+}
+struct Argument { std::optional<Identifier> label; ExprId value; std::optional<Span> spread{}, trailing{}; Passing passing{}; };
 struct TypeQualifier { Identifier name; std::vector<Identifier> arguments{}; std::optional<ExprId> moduleReceiver{}; };
 struct Call {
     Identifier name;
@@ -35,6 +46,7 @@ struct Call {
     std::optional<ExprId> function{};
     std::optional<TypeQualifier> typeOwner{};
     std::optional<std::string> boundTrait{};
+    std::vector<std::string> alternateTraits{};
 };
 struct Member { ExprId receiver; Identifier name; };
 struct QualifiedMember { TypeQualifier owner; Identifier name; };
@@ -110,12 +122,21 @@ struct Expr {
     std::variant<IntegerLiteral, RealLiteral, bool, StringLiteral, BytesLiteral, CharLiteral, DisplayValue, TextTemplate, Identifier, This, Call, Member, QualifiedMember, Unary, Binary, RangeValue, TypeOperation, Block, Binding, PatternBinding, Conditional, While, For, Return, Raise, Attempt, Jump, TaskOp, Blocking, UnsafeBlock, AsyncBlock, Deferred, EmptyOption, Propagate, Match, Select, ListLiteral, Index, Lambda> node;
 };
 
-struct Parameter { Identifier name, type; bool variadic{}; std::optional<ExprId> defaultValue{}; std::vector<Attribute> attributes{}; };
+struct Parameter { Identifier name, type; bool variadic{}; std::optional<ExprId> defaultValue{}; std::vector<Attribute> attributes{}; Passing passing{}; };
 struct AssociatedBinding { Identifier member, type; };
 struct Bound { std::size_t parameter; Identifier trait; std::vector<AssociatedBinding> bindings{}; };
 struct ExtensionProperty { Identifier name, type; std::size_t getter; };
 struct Extension { std::size_t file; Identifier name, receiver; bool isPublic; std::vector<Identifier> typeParameters{}; std::vector<Bound> bounds{}; std::vector<ExtensionProperty> properties{}; Span span{}; };
-struct TraitMethod { Identifier name; std::vector<Parameter> parameters; Identifier result; bool asynchronous; Span span{}; };
+struct TraitMethod {
+    Identifier name;
+    std::vector<Parameter> parameters;
+    Identifier result;
+    bool asynchronous;
+    Span span{};
+    std::vector<Identifier> typeParameters{};
+    std::vector<Bound> bounds{};
+    std::optional<Identifier> defaultFunction{};
+};
 struct Trait { std::size_t file; Identifier name; std::vector<TraitMethod> methods; bool isPublic; std::vector<Identifier> associated{}; Span span{}; };
 enum class ConstKind { None, Value, Function };
 struct Function {
@@ -141,6 +162,7 @@ struct Function {
     std::optional<Span> pendingExpansion{};
     Span header{};
     bool incompleteBody{};
+    std::optional<Identifier> traitOwner{};
 };
 
 struct FieldDefault { std::size_t function; bool emptyOption; };

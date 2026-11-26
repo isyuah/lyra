@@ -10,6 +10,8 @@ import std.log
 import std.sqlite
 import std.text.{StringOps}
 
+struct AppDeps(val path: String, val logger: log.Logger)
+
 fn text(code: Int, body: String): http.Response { http.Response.text(code, body) }
 
 fn databaseFailure(logger: log.Logger, route: String, error: sqlite.DbError): http.Response {
@@ -36,11 +38,8 @@ async fn retryBusy<T>(action: () -> Result<T, sqlite.DbError>): Result<T, sqlite
     result
 }
 
-async fn getUser(request: http.Request, path: String, logger: log.Logger): http.Response {
-    val id = match request.pathInt("id") {
-        Ok(Some(value)) => value,
-        _ => return text(400, "invalid id"),
-    }
+#get("/users/{id}")
+async fn getUser([path] id: Int, [inject] path: String, [inject] logger: log.Logger): http.Response {
     val result = await retryBusy<users.User?>(() => { users.findUser(path, id) })
     match result {
         Ok(Some(user)) => http.Response.json(user, users.userCodec()),
@@ -119,7 +118,6 @@ async fn main(): Int {
     defer listener.close()
     val logger = log.Logger("users", format: log.LogFormat.Json)
     val router = http.Router()
-    router.get("/users/{id}", (request: http.Request) => { getUser(request, path, logger) })
     router.post("/users", (request: http.Request) => { postUser(request, path, logger) })
     router.get("/barrier", (request: http.Request) => { barrier(request) })
     if let Some(url) = arguments.value("--upstream") {
@@ -127,7 +125,7 @@ async fn main(): Int {
         val options = httpClient.HttpClientOptions(caPem: ca)
         router.get("/upstream", (request: http.Request) => { getUpstream(url, options, logger) })
     }
-    createUserRoute(router)
+    #mountRoutes(router, AppDeps(path, logger))
     print(listener.port())
     await router.serve(listener)
     0

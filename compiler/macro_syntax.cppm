@@ -21,6 +21,7 @@ struct SyntaxNode {
     std::optional<Span> span{};
     std::string canonical{};
     std::string module{};
+    std::optional<ExprId> expression{};
 };
 struct SyntaxPiece { std::string text; std::optional<Span> span{}; bool copied{}; };
 struct SyntaxOutput { std::vector<SyntaxPiece> code; std::optional<std::vector<std::vector<SyntaxPiece>>> hooks{}; };
@@ -39,7 +40,10 @@ struct SyntaxArena {
         nodes.push_back(std::move(node));
         return ref;
     }
-    const SyntaxNode& get(SyntaxRef ref) const { return nodes[ref.index]; }
+    const SyntaxNode& get(SyntaxRef ref) const {
+        if (ref.index >= nodes.size()) throw at(source, site, "LYM0002", "无效的宏语法节点；请使用语法查询或构造接口");
+        return nodes[ref.index];
+    }
     std::string text(Span span) const { return source.text.substr(span.begin, span.end - span.begin); }
     SyntaxRef input(std::string kind, Span span, std::vector<SyntaxRef> children = {}, bool argument = false) {
         return add({argument ? SyntaxForm::Argument : SyntaxForm::Input, std::move(kind), {}, std::move(children), span});
@@ -70,9 +74,9 @@ struct SyntaxArena {
             } else if constexpr (std::is_same_v<Node, Return> || std::is_same_v<Node, Raise>) {
                 optional(node.value); return std::is_same_v<Node, Return> ? "return" : "throw";
             } else if constexpr (std::is_same_v<Node, Binding>) {
-                named("name", node.name); if (node.annotation) named("type", *node.annotation); child(node.value); return node.constant ? "const" : node.writable ? "var" : "val";
+                named("name", node.name); if (node.annotation) children.push_back(annotation(*node.annotation)); child(node.value); return node.constant ? "const" : node.writable ? "var" : "val";
             } else if constexpr (std::is_same_v<Node, PatternBinding>) {
-                children.push_back(input("pattern", node.pattern.span)); if (node.annotation) named("type", *node.annotation); child(node.value); return "val";
+                children.push_back(input("pattern", node.pattern.span)); if (node.annotation) children.push_back(annotation(*node.annotation)); child(node.value); return "val";
             } else if constexpr (std::is_same_v<Node, Conditional>) {
                 child(node.condition); child(node.yes); optional(node.no); return "if";
             } else if constexpr (std::is_same_v<Node, While>) {
@@ -136,7 +140,7 @@ struct SyntaxArena {
             else if constexpr (std::is_same_v<Node, bool>) return "bool";
             else return "expression";
         }, expr.node);
-        return input(kind, expr.span, std::move(children));
+        return add({.form = SyntaxForm::Input, .kind = kind, .text = {}, .children = std::move(children), .span = expr.span, .expression = id});
     }
 
     SyntaxRef annotation(const Identifier& type) {

@@ -36,6 +36,14 @@ val result = join(right: mark("R"), left: mark("L"))
 - 通过 `val` 不能重赋值绑定或修改值类型字段；若 `val` 持有 Class 引用，仍能经该引用修改对象声明为可变的字段。
 - 不支持带状态的 class 单继承；优先通过组合复用实现。
 
+同步具名函数和方法可显式借用调用者的槽位：`fn inspect(in packet: Packet): Int` 读取原槽，`fn edit(ref packet: Packet): Unit` 可改写原槽。调用对应写 `inspect(in packet)`、`edit(ref packet)`，命名实参写 `edit(packet: ref packet)`。普通形参继续按值；即使后面的实参改动原变量，前面已求值的按值实参仍保留当时的快照。
+
+编译器在同步具名调用中对较大的 Struct 复用只读槽、实参临时槽和返回槽。可写、捕获或共享的实参在原求值位置取快照；返回值可以直接写入新局部绑定或外层返回槽，但不会提前覆盖已有绑定。这个优化不改变赋值、异常和 `defer` 的可观察语义，也不改变 C ABI。
+
+`in`/`ref` 只接受类型精确一致的局部绑定或稳定的真实字段；临时值、计算属性、列表下标和隐式类型转换不适用。`ref` 需要可写位置，`in` 保持原来的浅只读语义（Class 引用指向的可变字段不因此冻结）。同一槽可同时传给多个形参，改写立即对别名可见，包括函数抛出异常的情况。`ref` 不是锁，复合共享更新仍需同步。
+
+引用形参不构成第一类引用值：读取或返回 `packet` 得到按值快照，可显式转传 `in`/`ref`，不能捕获到 lambda、`defer` 或任务中。`in`/`ref` 参与重载区分，不用于函数值、异步函数、入口、`init`、`extern`、`implicit`、变长、默认值或编译期求值。
+
 ```text
 struct Profile { var name: String; var owner: User }
 class User { var name: String }

@@ -329,7 +329,7 @@ void recordMacroSources(AnalysisInputs& inputs, const fs::path& package, std::ve
         else if (!item->is_symlink()) modules.push_back(item->path());
     }
     for (const auto& module : modules) {
-        for (const auto* name : {".macros", ".expressions", ".decorators"}) {
+        for (const auto* name : macroSourceDirectories) {
             auto directory = module / name;
             if (!recordInput(inputs, directory, InputContents::Metadata, package)) continue;
             trackTree(inputs, directory, "*.ly");
@@ -799,8 +799,7 @@ json::Array workspaceSymbols(std::string query, const std::set<fs::path>& folder
         for (auto entry = fs::recursive_directory_iterator(src, options); entry != fs::recursive_directory_iterator{}; ++entry) {
             const auto& path = entry->path();
             if (entry->is_directory()) {
-                auto name = path.filename();
-                bool macros = name == ".macros" || name == ".expressions" || name == ".decorators";
+                bool macros = macroSourceDirectory(path.filename());
                 if (entry->is_symlink() || (ignoredDirectory(path) && !macros) || excluded(path)) entry.disable_recursion_pending();
             } else if (path.extension() == ".ly" && !entry->is_symlink() && entry->is_regular_file()) files.insert(path);
         }

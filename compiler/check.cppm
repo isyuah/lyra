@@ -37,7 +37,7 @@ inline std::optional<Type> builtinException(std::string_view name) {
     return std::nullopt;
 }
 struct ConstantUse { enum Kind { Global, Block, Uninstantiated }; Kind kind; std::size_t index{}; };
-struct Local { Type type; bool writable; std::optional<ExprId> worker{}; bool captured{}; std::optional<Span> declaration{}; std::string name{}; std::optional<ConstantUse> constant{}; bool parameter{}; };
+struct Local { Type type; bool writable; std::optional<ExprId> worker{}; bool captured{}; std::optional<Span> declaration{}; std::string name{}; std::optional<ConstantUse> constant{}; bool parameter{}; Passing passing{}; };
 enum class Callee { Function, Constructor, Variant, Print, Collect, Sum, ListAdd, ListSlice, ListRemoveAt, FreezeList, TaskCancel, TaskCancelled, TaskCheckCancellation, AwaitOutcome, Exception, Indirect, ToReal, ToIntegerChecked, ToString, ToBytes, DecodeUtf8, Dynamic, BusinessError, ErrorSuppress, FailureInfo, LocalKey, LocalGet, WithLocal, ExtensionProperty, BoundMethod, ReflectTypeName, ReflectFieldCount, ReflectFieldName, ReflectField, Size, ValueEqual, ValueHash, ChannelCreate, ChannelIterator, ChannelSend, ChannelReceive, ChannelClose, Sleep, PtrAllocate, PtrNull, PtrIsNull, PtrFree, PtrOffset, PtrRead, PtrWrite, CallbackRegister, CallbackContext, CallbackFunction, CallbackClose, CallbackTakeError };
 enum class ValueOperation { Equal, Hash };
 struct PatternSlot { std::size_t local; };
@@ -62,9 +62,10 @@ struct IteratorPlan { std::size_t open, next; std::optional<Type> awaited{}; };
 struct CheckedIteration { Type element; std::optional<IteratorPlan> methods; };
 struct CheckedCatch { Type type; std::optional<std::size_t> local; };
 struct ErrorDisplay { std::optional<std::size_t> method; std::string fallback; };
+struct DynamicMethodKey { Type owner; std::size_t method; std::vector<Type> arguments; auto operator<=>(const DynamicMethodKey&) const = default; };
 enum class ErrorMember { Message, Original, Cause, Suppressed };
 enum class ExceptionMember { Message, TaskFailures, CleanupFailures };
-struct CheckedExpr { Type type; std::size_t target{}; std::vector<std::size_t> argumentSlots{}; Callee callee{}; std::optional<Type> sourceType{}; std::vector<std::size_t> captures{}; std::vector<std::size_t> omittedDefaults{}; std::optional<std::size_t> conversion{}, errorConversion{}, functionRef{}; std::optional<ConstantUse> constantRef{}; std::optional<Type> callableType{}; std::optional<CheckedIteration> iteration{}; std::vector<CheckedPattern> patterns{}; std::optional<double> realLiteral{}; std::optional<Type> narrowed{}; std::optional<std::string> boundTrait{}; std::optional<Type> testedType{}; bool boxedSpread{}; std::vector<std::size_t> interfaceMethods{}; bool interfaceAsync{}; std::vector<CheckedCatch> catches{}; ErrorDisplay errorDisplay{}, errorPromotion{}; std::vector<std::optional<std::size_t>> selectSlots{}; };
+struct CheckedExpr { Type type; std::size_t target{}; std::vector<std::size_t> argumentSlots{}; Callee callee{}; std::optional<Type> sourceType{}; std::vector<std::size_t> captures{}; std::vector<std::size_t> omittedDefaults{}; std::optional<std::size_t> conversion{}, errorConversion{}, functionRef{}; std::optional<ConstantUse> constantRef{}; std::optional<Type> callableType{}; std::optional<CheckedIteration> iteration{}; std::vector<CheckedPattern> patterns{}; std::optional<double> realLiteral{}; std::optional<Type> narrowed{}; std::optional<std::string> boundTrait{}; std::vector<std::string> alternateTraits{}; std::optional<Type> testedType{}; bool boxedSpread{}; std::optional<DynamicMethodKey> dynamicMethod{}; bool interfaceAsync{}; std::vector<CheckedCatch> catches{}; ErrorDisplay errorDisplay{}, errorPromotion{}; std::vector<std::optional<std::size_t>> selectSlots{}; };
 struct CheckedFunction {
     Function syntax;
     Type result;
@@ -84,6 +85,12 @@ using ConstScalar = std::variant<std::monostate, bool, std::uint64_t, double, st
 using MacroValue = std::variant<std::monostate, bool, std::int64_t, std::string, SyntaxRef>;
 using MacroHost = std::function<MacroValue(std::string_view, std::span<const MacroValue>)>;
 struct MacroExecution { std::size_t declaration, prelude; std::string target, argument; MacroHost host; SyntaxRef output{}; };
+struct MacroTypeQuery {
+    std::string result;
+    std::vector<std::optional<std::string>> expressions;
+    std::map<Span, std::string> names;
+};
+inline constexpr std::string_view pendingTypedDeclaration = "$typedStage$";
 struct ConstRef { std::size_t index; bool operator==(const ConstRef&) const = default; };
 using ConstValue = std::variant<ConstScalar, ConstRef>;
 using ConstTag = std::variant<std::monostate, SumTag, VariantTag>;
@@ -91,7 +98,14 @@ struct ConstComposite { Type type; ConstTag tag; std::vector<ConstValue> fields;
 struct BlockConstant { std::size_t function; ExprId initializer; Type type; Identifier name; std::optional<ConstValue> value{}; };
 struct TypeProjection { Type owner; std::string member; bool operator==(const TypeProjection&) const = default; };
 struct DynamicType { std::size_t trait; std::vector<Type> bindings; bool operator==(const DynamicType&) const = default; };
-struct CheckedModule { std::deque<CheckedFunction> functions; std::optional<std::size_t> entry; std::deque<CheckedAggregate> aggregates; std::vector<std::string> variableNames; std::vector<Type> taskResults; std::vector<SumTypes> sumTypes; std::vector<Type> listElements; std::deque<FunctionShape> signatures{}; std::deque<CheckedEnum> enums{}; std::vector<Trait> traits{}; std::vector<ExceptionType> exceptions{}; std::vector<Type> taskLocalValues{}; std::vector<std::optional<ConstValue>> constants{}; std::vector<TypeProjection> projections{}; std::deque<ConstComposite> constantComposites{}; std::map<std::pair<Type, ValueOperation>, std::size_t> valueOverrides{}; std::vector<DeferredPatternCheck> deferredPatternChecks{}; std::vector<Type> channelElements{}; std::vector<DynamicType> dynamicTypes{}; std::vector<MatchCoverage> matchCoverage{}; std::vector<Diagnostic> warnings{}; std::vector<BlockConstant> blockConstants{}; };
+struct DynamicMethodUse { DynamicMethodKey key; std::size_t slot; std::vector<Type> parameters; Type result; bool asynchronous; };
+struct DynamicEntry {
+    enum Kind { Concrete, Source } kind;
+    std::size_t target;
+    auto operator<=>(const DynamicEntry&) const = default;
+};
+struct DynamicCast { std::size_t function; ExprId expression; Type from, to; Span site; std::map<std::size_t, DynamicEntry> entries{}; };
+struct CheckedModule { std::deque<CheckedFunction> functions; std::optional<std::size_t> entry; std::deque<CheckedAggregate> aggregates; std::vector<std::string> variableNames; std::vector<Type> taskResults; std::vector<SumTypes> sumTypes; std::vector<Type> listElements; std::deque<FunctionShape> signatures{}; std::deque<CheckedEnum> enums{}; std::vector<Trait> traits{}; std::vector<ExceptionType> exceptions{}; std::vector<Type> taskLocalValues{}; std::vector<std::optional<ConstValue>> constants{}; std::vector<TypeProjection> projections{}; std::deque<ConstComposite> constantComposites{}; std::map<std::pair<Type, ValueOperation>, std::size_t> valueOverrides{}; std::vector<DeferredPatternCheck> deferredPatternChecks{}; std::vector<Type> channelElements{}; std::vector<DynamicType> dynamicTypes{}; std::vector<MatchCoverage> matchCoverage{}; std::vector<Diagnostic> warnings{}; std::vector<BlockConstant> blockConstants{}; std::vector<DynamicMethodUse> dynamicMethods{}; std::vector<DynamicCast> dynamicCasts{}; };
 
 struct InferredTypeHint { SourceAnchor anchor; std::string type; };
 struct EditorDescription { SourceAnchor anchor; std::string detail, documentation; };
@@ -118,5 +132,6 @@ const std::optional<ConstValue>& constantValue(const CheckedModule& module, Cons
 std::string typeName(const CheckedModule& module, Type type, bool canonical = false);
 std::optional<Type> hiddenType(const CheckedModule& module, Type type);
 CheckedModule check(Module module, const std::vector<Source>& sources, bool requireEntry = true, MacroExecution* macro = nullptr, EditorIndex* editor = nullptr);
+void checkMacroTypes(Module module, const std::vector<Source>& sources, std::map<std::size_t, MacroTypeQuery>& queries);
 void checkForDiagnostics(Module module, const std::vector<Source>& sources, bool requireEntry, AnalysisDiagnostics& diagnostics, EditorIndex* editor = nullptr);
 }

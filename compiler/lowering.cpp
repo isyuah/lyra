@@ -2,6 +2,8 @@ module;
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <llvm/ADT/SCCIterator.h>
+#include <llvm/Analysis/CallGraph.h>
 #include <llvm/IR/DIBuilder.h>
 #include <llvm/IR/DebugInfoMetadata.h>
 #include <llvm/IR/IRBuilder.h>
@@ -9,6 +11,7 @@ module;
 #include <llvm/IR/Module.h>
 #include <llvm/IR/Verifier.h>
 #include <llvm/Support/MathExtras.h>
+#include <llvm/Transforms/Utils/Local.h>
 #include <lyra/value_hash.hpp>
 #include <map>
 #include <optional>
@@ -36,18 +39,27 @@ using Builder = llvm::IRBuilder<>;
 using Value = llvm::Value*;
 using Label = llvm::BasicBlock*;
 
+llvm::AllocaInst* temporary(Builder& builder, llvm::Type* type, llvm::StringRef name) {
+    auto& entry = builder.GetInsertBlock()->getParent()->getEntryBlock();
+    return Builder(&entry, entry.getFirstInsertionPt()).CreateAlloca(type, nullptr, name);
+}
+
 struct Layouts {
     const CheckedModule& program;
+    const llvm::DataLayout& dataLayout;
     std::vector<llvm::StructType*> objects;
     std::vector<std::vector<llvm::StructType*>> payloads;
     mutable std::map<Type, llvm::GlobalVariable*> typeTokens{};
     mutable std::set<Type> initializedTypeTokens{};
-    mutable std::map<std::vector<std::size_t>, llvm::Constant*> interfaceTables{};
+    mutable std::map<std::tuple<Type, Type, std::map<std::size_t, DynamicEntry>>, llvm::Constant*> interfaceTables{};
     mutable std::map<std::pair<Type, ValueOperation>, llvm::Function*> valueHelpers{};
     mutable std::map<Type, llvm::Function*> channelPackers{};
+    mutable std::vector<llvm::CallInst*> recursionPolls{};
+    bool cooperative;
     bool workers{};
 
-    Layouts(const CheckedModule& program, Builder& builder) : program(program) {
+    Layouts(const CheckedModule& program, const llvm::DataLayout& dataLayout, Builder& builder)
+        : program(program), dataLayout(dataLayout), cooperative(program.functions[*program.entry].syntax.isAsync) {
         for (const auto& fn : program.functions) {
             workers |= std::ranges::any_of(fn.syntax.expressions, [](const Expr& expr) {
                 const auto* block = std::get_if<AsyncBlock>(&expr.node);
@@ -74,6 +86,70 @@ struct Layouts {
     }
 
     bool reference(Type type) const { return program.aggregates[type.id].syntax.reference; }
+    bool valueRecord(Type type) const { return type.kind == Type::Record && !reference(type); }
+    bool largeRecord(Type type) const {
+        return valueRecord(type) && dataLayout.getTypeAllocSize(objects[type.id]) > 2 * dataLayout.getPointerSize();
+    }
+
+    bool slotParameter(const CheckedFunction& fn, std::size_t slot) const {
+        const auto& local = fn.locals[slot];
+        return !fn.syntax.isAsync && !fn.syntax.foreignSymbol && local.passing == Passing::Value && largeRecord(local.type);
+    }
+
+    bool slotResult(const CheckedFunction& fn) const {
+        return !fn.syntax.isAsync && !fn.syntax.foreignSymbol && largeRecord(fn.result);
+    }
+
+    llvm::FunctionType* namedSignature(Builder& builder, const CheckedFunction& fn, bool slots = true) const {
+        auto pointer = builder.getPtrTy();
+        bool resultSlot = slots && slotResult(fn);
+        std::vector<llvm::Type*> parameters;
+        if (resultSlot) parameters.push_back(pointer);
+        for (std::size_t index = 0; index < fn.syntax.parameters.size(); ++index) {
+            const auto& local = fn.locals[index];
+            parameters.push_back(local.passing != Passing::Value || (slots && slotParameter(fn, index)) ? pointer : native(builder, local.type));
+        }
+        if (!fn.syntax.isAsync && !fn.syntax.foreignSymbol) parameters.push_back(pointer);
+        auto* result = fn.syntax.isAsync ? pointer : resultSlot ? builder.getVoidTy() : native(builder, fn.result);
+        return llvm::FunctionType::get(result, parameters, false);
+    }
+
+    llvm::CallInst* callNamed(Builder& builder, const CheckedFunction& fn, llvm::Function* code, std::vector<Value> arguments,
+            Value resultSlot = nullptr) const {
+        for (std::size_t index = 0; index < fn.syntax.parameters.size(); ++index) {
+            auto& argument = arguments[index];
+            if (!slotParameter(fn, index) || argument->getType()->isPointerTy()) continue;
+            auto* snapshot = temporary(builder, argument->getType(), "argument.snapshot");
+            builder.CreateStore(argument, snapshot);
+            argument = snapshot;
+        }
+        if (resultSlot) arguments.insert(arguments.begin(), resultSlot);
+        auto* call = builder.CreateCall(code, arguments);
+        if (resultSlot) call->addParamAttr(0, code->getAttributes().getParamAttr(0, llvm::Attribute::StructRet));
+        return call;
+    }
+
+    Value callValue(Builder& builder, std::size_t target, llvm::Function* code, std::vector<Value> arguments) const {
+        const auto& fn = program.functions[target];
+        auto* result = slotResult(fn) ? temporary(builder, native(builder, fn.result), "result.value") : nullptr;
+        auto* call = callNamed(builder, fn, code, std::move(arguments), result);
+        return result ? static_cast<Value>(builder.CreateLoad(result->getAllocatedType(), result)) : call;
+    }
+
+    llvm::Function* valueEntry(Builder& builder, std::size_t target, llvm::Function* code) const {
+        const auto& fn = program.functions[target];
+        auto* signature = namedSignature(builder, fn, false);
+        if (signature == code->getFunctionType()) return code;
+        auto& module = *code->getParent();
+        auto name = (code->getName() + "$byValue").str();
+        if (auto* existing = module.getFunction(name)) return existing;
+        auto* bridge = llvm::Function::Create(signature, llvm::Function::InternalLinkage, name, module);
+        Builder emit(llvm::BasicBlock::Create(builder.getContext(), "entry", bridge));
+        std::vector<Value> arguments;
+        for (auto& parameter : bridge->args()) arguments.push_back(&parameter);
+        emit.CreateRet(callValue(emit, target, code, std::move(arguments)));
+        return bridge;
+    }
 
     std::string typeName(Type type) const {
         auto nested = [&](Type item) { return typeName(item); };
@@ -208,24 +284,31 @@ struct Layouts {
         return entry->second;
     }
 
-    llvm::Constant* interfaceTable(Builder& builder, const std::vector<std::size_t>& methods,
+    llvm::Constant* interfaceTable(Builder& builder, const DynamicCast& cast,
             std::span<llvm::Function* const> functions) const {
-        auto [entry, inserted] = interfaceTables.try_emplace(methods);
+        auto [entry, inserted] = interfaceTables.try_emplace({cast.from, cast.to, cast.entries});
         if (!inserted) return entry->second;
         auto& module = *builder.GetInsertBlock()->getModule();
-        std::vector<llvm::Constant*> addresses;
-        for (auto method : methods) {
-            auto* implementation = functions[method];
-            auto shape = implementation->getFunctionType()->params();
-            std::vector<llvm::Type*> parameters(shape.begin(), shape.end());
-            parameters[0] = builder.getPtrTy();
-            auto* signature = llvm::FunctionType::get(implementation->getReturnType(), parameters, false);
-            auto* bridge = llvm::Function::Create(signature, llvm::Function::InternalLinkage, implementation->getName() + ".interface", module);
+        auto* pointer = builder.getPtrTy();
+        std::vector<llvm::Constant*> addresses(cast.entries.size());
+        for (const auto& [index, plan] : cast.entries) {
+            const auto& method = program.dynamicMethods[index];
+            std::vector<llvm::Type*> parameters{pointer};
+            for (auto type : method.parameters) parameters.push_back(native(builder, type));
+            if (!method.asynchronous) parameters.push_back(pointer);
+            auto* signature = llvm::FunctionType::get(method.asynchronous ? pointer : native(builder, method.result), parameters, false);
+            auto* bridge = llvm::Function::Create(signature, llvm::Function::InternalLinkage, "lyra.interface.bridge", module);
             Builder thunk(llvm::BasicBlock::Create(builder.getContext(), "dispatch", bridge));
-            std::vector<Value> arguments{thunk.CreateLoad(shape[0], bridge->getArg(0))};
+            auto* receiver = thunk.CreateLoad(native(thunk, cast.from), bridge->getArg(0));
+            std::vector<Value> arguments{receiver};
             for (std::size_t slot = 1; slot < parameters.size(); ++slot) arguments.push_back(bridge->getArg(slot));
-            thunk.CreateRet(thunk.CreateCall(implementation, arguments));
-            addresses.push_back(bridge);
+            if (plan.kind == DynamicEntry::Source) {
+                arguments[0] = thunk.CreateExtractValue(receiver, 0);
+                auto* table = thunk.CreateExtractValue(receiver, 1);
+                auto* function = thunk.CreateLoad(pointer, thunk.CreateInBoundsGEP(pointer, table, thunk.getInt64(program.dynamicMethods[plan.target].slot)));
+                thunk.CreateRet(thunk.CreateCall(signature, function, arguments));
+            } else thunk.CreateRet(callValue(thunk, plan.target, functions[plan.target], std::move(arguments)));
+            addresses[method.slot] = bridge;
         }
         auto* type = llvm::ArrayType::get(builder.getPtrTy(), addresses.size());
         entry->second = new llvm::GlobalVariable(module, type, true, llvm::GlobalValue::PrivateLinkage,
@@ -295,7 +378,7 @@ struct NativeValues {
         args.push_back(error);
         auto& module = *builder.GetInsertBlock()->getModule();
         if (auto found = layouts.program.valueOverrides.find({type, operation}); found != layouts.program.valueOverrides.end())
-            return {builder.CreateCall(functions[found->second], args), true};
+            return {layouts.callValue(builder, found->second, functions[found->second], std::move(args)), true};
         if ((type.kind == Type::Record && !layouts.reference(type)) || type.kind == Type::Enum || type.kind == Type::Option || type.kind == Type::Result || type.kind == Type::FrozenList || type == Type::IntRange)
             return {builder.CreateCall(helper(builder, module, type, operation), args), true};
         auto pointer = builder.getPtrTy();
@@ -345,7 +428,7 @@ struct NativeValues {
                 auto result = emit(builder, fields[slot], operation, first, second, error);
                 if (result.mayThrow) {
                     auto success = label("field.returned");
-                    builder.CreateCondBr(builder.CreateIsNull(builder.CreateLoad(builder.getPtrTy(), error)), success, failure);
+                    builder.CreateCondBr(NativeExceptions{builder}.failed(error), failure, success);
                     builder.SetInsertPoint(success);
                 }
                 if (equality) {
@@ -382,7 +465,7 @@ struct NativeValues {
             auto result = emit(builder, element, operation, first, equality ? load(right) : nullptr, error);
             if (result.mayThrow) {
                 auto success = label("list.returned");
-                builder.CreateCondBr(builder.CreateIsNull(builder.CreateLoad(builder.getPtrTy(), error)), success, failure);
+                builder.CreateCondBr(NativeExceptions{builder}.failed(error), failure, success);
                 builder.SetInsertPoint(success);
             }
             if (equality) {
@@ -634,6 +717,9 @@ struct Emitter {
     std::optional<ExprId> worker{};
     llvm::AllocaInst* cleanupHead{};
     llvm::AllocaInst* errorSlot{};
+    llvm::AllocaInst* callOutcome{};
+    Value resultSlot{};
+    Label cancellationLanding{};
     struct Handler { Label landing; Value mark; };
     std::vector<Handler> handlers{};
     std::vector<Value> caught{};
@@ -669,6 +755,13 @@ struct Emitter {
         return worker ? asyncBlock() != nullptr : fn.syntax.isAsync;
     }
 
+    void returnFailure() {
+        if (resultSlot) {
+            builder.CreateStore(llvm::Constant::getNullValue(layouts.native(builder, fn.result)), resultSlot);
+            builder.CreateRetVoid();
+        } else builder.CreateRet(llvm::Constant::getNullValue(native->getReturnType()));
+    }
+
     void propagate(Value error, std::size_t depth) {
         if (depth) {
             const auto& handler = handlers[depth - 1];
@@ -680,8 +773,8 @@ struct Emitter {
             builder.CreateUnreachable();
         } else {
             if (cleanupHead) error = cleanupUntil(builder, cleanupHead, nullptr, error);
-            builder.CreateStore(error, native->getArg(native->arg_size() - 1));
-            builder.CreateRet(llvm::Constant::getNullValue(native->getReturnType()));
+            NativeExceptions{builder}.publishError(native->getArg(native->arg_size() - 1), error);
+            returnFailure();
         }
         end();
     }
@@ -697,6 +790,43 @@ struct Emitter {
 
     void guardSlot(Span site, const char* role = nullptr) {
         guard(builder.CreateLoad(builder.getPtrTy(), errorSlot), handlers.size(), site, role);
+    }
+
+    void branchOnCancellation(Value cancelled) {
+        auto* next = label("no.cancellation");
+        if (!cancellationLanding) {
+            cancellationLanding = label("cancel.unwind");
+            Builder::InsertPointGuard insertion(builder);
+            builder.SetInsertPoint(cancellationLanding);
+            auto* cleanup = builder.CreateLoad(builder.getPtrTy(), errorSlot);
+            if (asyncBody()) {
+                asyncCancellation(builder, cleanup);
+                builder.CreateUnreachable();
+            } else {
+                Value error = cleanup;
+                if (cleanupHead) error = cleanupUntil(builder, cleanupHead, nullptr, error);
+                NativeExceptions{builder}.cancel(native->getArg(native->arg_size() - 1), error);
+                returnFailure();
+            }
+        }
+        builder.CreateCondBr(cancelled, cancellationLanding, next);
+        builder.SetInsertPoint(next);
+    }
+
+    void pollCancellation(bool immediate = false, bool ifRecursive = false) {
+        if (!layouts.cooperative || deferred()) return;
+        auto poll = module.getOrInsertFunction("lyraCancellationPoll", builder.getInt32Ty(), builder.getInt32Ty());
+        auto* result = builder.CreateCall(poll, {builder.getInt32(immediate)});
+        if (ifRecursive) layouts.recursionPolls.push_back(result);
+        branchOnCancellation(builder.CreateIsNotNull(result));
+    }
+
+    void guardCall(Span site) {
+        NativeExceptions exceptions{builder};
+        auto* error = exceptions.outcomeError(callOutcome);
+        builder.CreateStore(error, errorSlot);
+        if (layouts.cooperative) branchOnCancellation(exceptions.cancelled(callOutcome));
+        guard(error, handlers.size(), site, "call");
     }
 
     Value listItem(Value list, Value index, Span site) {
@@ -716,23 +846,27 @@ struct Emitter {
     void leave(Value value) {
         exitHandlers(0);
         if (!asyncBody()) unwind(nullptr, 0);
-        builder.CreateRet(value);
+        if (resultSlot) builder.CreateRetVoid();
+        else builder.CreateRet(value);
     }
 
-    Value callFunction(std::size_t target, llvm::ArrayRef<Value> args, Span site) {
-        const auto& syntax = layouts.program.functions[target].syntax;
+    Value callFunction(std::size_t target, llvm::ArrayRef<Value> args, Span site, Value destination = nullptr) {
+        const auto& callee = layouts.program.functions[target];
+        const auto& syntax = callee.syntax;
         if (syntax.foreignSymbol) return builder.CreateCall(functions[target], args);
         if (syntax.isAsync) return NativeExceptions{builder}.created(builder.CreateCall(functions[target], args), source, site);
+        auto* type = layouts.native(builder, callee.result);
+        auto* output = layouts.slotResult(callee) ? (destination ? destination : temporary(builder, type, "call.result")) : nullptr;
         std::vector<Value> nativeArgs(args.begin(), args.end());
-        nativeArgs.push_back(errorSlot);
-        auto result = builder.CreateCall(functions[target], nativeArgs);
-        guard(builder.CreateLoad(builder.getPtrTy(), errorSlot), handlers.size(), site, "call");
-        return result;
+        nativeArgs.push_back(callOutcome);
+        auto result = layouts.callNamed(builder, callee, functions[target], std::move(nativeArgs), output);
+        guardCall(site);
+        return output ? (destination ? nullptr : static_cast<Value>(builder.CreateLoad(type, output))) : result;
     }
 
     Value valueOperation(Type type, ValueOperation operation, Value left, Value right, Span site) {
-        auto result = NativeValues{layouts, functions}.emit(builder, type, operation, left, right, errorSlot);
-        if (result.mayThrow) guard(builder.CreateLoad(builder.getPtrTy(), errorSlot), handlers.size(), site, "call");
+        auto result = NativeValues{layouts, functions}.emit(builder, type, operation, left, right, callOutcome);
+        if (result.mayThrow) guardCall(site);
         return result.value;
     }
 
@@ -743,7 +877,8 @@ struct Emitter {
     Value read(std::size_t slot) {
         auto* type = layouts.native(builder, fn.locals[slot].type);
         auto address = cell(slot);
-        return fn.locals[slot].captured && layouts.workers ? sharedRead(builder, type, address) : builder.CreateLoad(type, address);
+        return layouts.workers && (fn.locals[slot].captured || fn.locals[slot].passing != Passing::Value) ?
+            sharedRead(builder, type, address) : builder.CreateLoad(type, address);
     }
 
     llvm::FunctionType* signature(const FunctionShape& shape) {
@@ -763,6 +898,8 @@ struct Emitter {
     void run(std::optional<ExprId> workerId = {}, const llvm::Function* factory = nullptr) {
         worker = workerId;
         builder.SetInsertPoint(label("entry"));
+        if (!worker && layouts.slotResult(fn)) resultSlot = native->getArg(0);
+        auto parameter = [&](std::size_t slot) { return native->getArg(slot + static_cast<bool>(resultSlot)); };
         if (debug) {
             const auto declaration = worker ? fn.syntax.expressions[*worker].span : fn.syntax.name.span;
             const auto site = source.userSite(declaration);
@@ -777,12 +914,15 @@ struct Emitter {
             debugLocation(site);
         }
         errorSlot = NativeExceptions{builder}.slot();
+        callOutcome = NativeExceptions{builder}.outcomeSlot();
         if (std::ranges::find(fn.cleanupOwners, worker) != fn.cleanupOwners.end()) cleanupHead = cleanupStack(builder);
         locals.resize(fn.locals.size());
         for (std::size_t slot = 0; slot < fn.locals.size(); ++slot) {
             const auto& local = fn.locals[slot];
             if (local.worker == worker && !local.constant) {
-                locals[slot] = builder.CreateAlloca(local.captured ? builder.getPtrTy() : layouts.native(builder, local.type));
+                bool passedSlot = local.passing != Passing::Value || (!worker && slot < fn.syntax.parameters.size() && layouts.slotParameter(fn, slot) && !local.captured);
+                locals[slot] = passedSlot ? static_cast<Value>(parameter(slot)) :
+                    builder.CreateAlloca(local.captured ? builder.getPtrTy() : layouts.native(builder, local.type));
                 if (debug && local.declaration && !local.name.empty()) declareDebugLocal(slot, local);
             }
         }
@@ -794,17 +934,28 @@ struct Emitter {
                 builder.CreateStore(NativeClosures{builder}.capture(native->getArg(0), literal.captures.size(), index), locals[slot]);
             }
             for (std::size_t index = 0; index < literal.argumentSlots.size(); ++index) initialize(literal.argumentSlots[index], native->getArg(index + 1));
-        } else for (auto& arg : native->args()) {
-            if (!asyncBody() && arg.getArgNo() + 1 == native->arg_size()) break;
-            if (worker) {
-                auto slot = fn.expressions[*worker].captures[arg.getArgNo()];
+        } else if (worker) {
+            const auto& captures = fn.expressions[*worker].captures;
+            for (std::size_t index = 0; index < captures.size(); ++index) {
+                auto slot = captures[index];
                 locals[slot] = builder.CreateAlloca(builder.getPtrTy());
-                builder.CreateStore(&arg, locals[slot]);
-            } else initialize(arg.getArgNo(), &arg);
+                builder.CreateStore(parameter(index), locals[slot]);
+            }
+        } else for (std::size_t slot = 0; slot < fn.syntax.parameters.size(); ++slot) {
+            if (fn.locals[slot].passing != Passing::Value) continue;
+            if (layouts.slotParameter(fn, slot)) {
+                if (fn.locals[slot].captured) initialize(slot, builder.CreateLoad(layouts.native(builder, fn.locals[slot].type), parameter(slot)));
+            } else initialize(slot, parameter(slot));
         }
         if (initializer()) initialize(fn.syntax.parameters.size(), asyncCell(builder, layouts.objects[fn.result.id]));
-        auto tail = emit(bodyId());
-        if (live()) leave(initializer() ? read(fn.syntax.parameters.size()) : deferred() ? unit() : tail);
+        if (!asyncBody() && (!worker || !lambda())) pollCancellation(false, !worker);
+        if (resultSlot) {
+            emit(bodyId(), resultSlot);
+            if (live()) leave(nullptr);
+        } else {
+            auto tail = emit(bodyId());
+            if (live()) leave(initializer() ? read(fn.syntax.parameters.size()) : deferred() ? unit() : tail);
+        }
     }
 
     llvm::DILocation* location(const Site& site) {
@@ -905,17 +1056,37 @@ struct Emitter {
         return merged;
     }
 
-    Value emit(ExprId id) {
+    Value emit(ExprId id, Value destination = nullptr) {
         if (debug) debugLocation(source.userSite(fn.syntax.expressions[id].span));
-        auto value = std::visit([&](const auto& node) { return emitNode(id, node); }, fn.syntax.expressions[id].node);
         const auto& info = fn.expressions[id];
-        if (!live() || !info.sourceType) return value;
-        if (info.conversion) return callFunction(*info.conversion, {value}, fn.syntax.expressions[id].span);
-        if (info.type.kind == Type::Option) return makeSum(info.type, SumTag::Some, value);
-        if (info.type == Type::Exception && info.sourceType->kind == Type::Exception) return value;
-        if (info.type == Type::Any) return boxAny(value, *info.sourceType);
-        if (info.type == Type::Error) return wrapError(value, *info.sourceType, info.errorPromotion, nullPointer(), fn.syntax.expressions[id].span);
-        return castNumber(value, *info.sourceType, info.type);
+        if (destination && directlyAddressable(id)) {
+            auto place = address(id);
+            if (live()) {
+                auto* type = layouts.native(builder, info.type);
+                if (layouts.workers && place.shared) copyShared(builder, destination, place.pointer, type);
+                else {
+                    auto align = layouts.dataLayout.getABITypeAlign(type);
+                    builder.CreateMemCpy(destination, align, place.pointer, align, layouts.dataLayout.getTypeStoreSize(type));
+                }
+            }
+            return nullptr;
+        }
+        auto into = info.sourceType || info.type == Type::Never ? nullptr : destination;
+        auto value = std::visit([&](const auto& node) {
+            if constexpr (requires { emitNode(id, node, destination); })
+                return emitNode(id, node, into);
+            else return emitNode(id, node);
+        }, fn.syntax.expressions[id].node);
+        if (!live()) return value;
+        if (info.sourceType) {
+            if (info.conversion) value = callFunction(*info.conversion, {value}, fn.syntax.expressions[id].span, destination);
+            else if (info.type.kind == Type::Option) value = makeSum(info.type, SumTag::Some, value);
+            else if (info.type == Type::Any) value = boxAny(value, *info.sourceType);
+            else if (info.type == Type::Error) value = wrapError(value, *info.sourceType, info.errorPromotion, nullPointer(), fn.syntax.expressions[id].span);
+            else if (info.type.kind != Type::Exception) value = castNumber(value, *info.sourceType, info.type);
+        }
+        if (destination && value && live() && info.type != Type::Never) builder.CreateStore(value, destination);
+        return destination ? nullptr : value;
     }
 
     Value nullPointer() { return llvm::ConstantPointerNull::get(builder.getPtrTy()); }
@@ -1045,7 +1216,8 @@ struct Emitter {
         if (info.functionRef) {
             const auto& syntax = layouts.program.functions[*info.functionRef].syntax;
             const auto& shape = layouts.program.signatures[rawType(id).id];
-            return NativeClosures{builder}.named(functions[*info.functionRef], signature(shape), shape.parameters.size(), syntax.isAsync, syntax.foreignSymbol.has_value());
+            auto* code = layouts.valueEntry(builder, *info.functionRef, functions[*info.functionRef]);
+            return NativeClosures{builder}.named(code, signature(shape), shape.parameters.size(), syntax.isAsync, syntax.foreignSymbol.has_value());
         }
         return readNarrowed(info);
     }
@@ -1417,11 +1589,15 @@ struct Emitter {
         Type element{};
         Span site{};
         std::vector<unsigned> path{};
+        bool shared{};
     };
 
     Place address(ExprId id) {
         const auto& node = fn.syntax.expressions[id].node;
-        if (std::holds_alternative<Identifier>(node) || std::holds_alternative<This>(node)) return {cell(fn.expressions[id].target)};
+        if (std::holds_alternative<Identifier>(node) || std::holds_alternative<This>(node)) {
+            auto slot = fn.expressions[id].target;
+            return {.pointer = cell(slot), .shared = fn.locals[slot].captured || fn.locals[slot].passing != Passing::Value};
+        }
         if (auto indexed = std::get_if<Index>(&node)) {
             auto list = emit(indexed->receiver);
             if (!live()) return {};
@@ -1431,12 +1607,42 @@ struct Emitter {
         }
         const auto& member = std::get<Member>(node);
         auto owner = fn.expressions[member.receiver].type;
-        auto place = layouts.reference(owner) ? Place{emit(member.receiver)} : address(member.receiver);
+        auto place = layouts.reference(owner) ? Place{.pointer = emit(member.receiver), .shared = true} : address(member.receiver);
         if (!live()) return {};
         auto slot = static_cast<unsigned>(fn.expressions[id].target);
         place.pointer = builder.CreateStructGEP(layouts.objects[owner.id], place.pointer, slot);
         if (place.list) place.path.push_back(slot);
         return place;
+    }
+
+    bool directlyAddressable(ExprId id) const {
+        const auto& info = fn.expressions[id];
+        if (info.sourceType || info.narrowed || info.constantRef || info.callableType || info.callee != Callee::Function) return false;
+        const auto& node = fn.syntax.expressions[id].node;
+        if (std::holds_alternative<Identifier>(node) || std::holds_alternative<This>(node)) return true;
+        const auto* member = std::get_if<Member>(&node);
+        return member && fn.expressions[member->receiver].type.kind == Type::Record && directlyAddressable(member->receiver);
+    }
+
+    Value valueArgument(ExprId id) {
+        if (directlyAddressable(id)) {
+            auto root = id;
+            while (const auto* member = std::get_if<Member>(&fn.syntax.expressions[root].node)) {
+                if (!layouts.valueRecord(rawType(member->receiver))) break;
+                root = member->receiver;
+            }
+            const auto& node = fn.syntax.expressions[root].node;
+            if (std::holds_alternative<Identifier>(node) || std::holds_alternative<This>(node)) {
+                const auto& local = fn.locals[fn.expressions[root].target];
+                if (!local.writable && !local.captured && local.passing == Passing::Value) {
+                    if (debug) debugLocation(source.userSite(fn.syntax.expressions[id].span));
+                    return address(id).pointer;
+                }
+            }
+        }
+        auto* snapshot = temporary(builder, layouts.native(builder, fn.expressions[id].type), "argument.snapshot");
+        emit(id, snapshot);
+        return snapshot;
     }
 
     Value emitNode(ExprId id, const QualifiedMember&) { return makeVariant(id); }
@@ -1449,13 +1655,19 @@ struct Emitter {
 
     Value emitNode(ExprId id, const Member& member) {
         if (fn.expressions[id].callee == Callee::Variant) return makeVariant(id);
+        if (directlyAddressable(id)) {
+            auto place = address(id);
+            auto* type = layouts.native(builder, rawType(id));
+            return layouts.workers && place.shared ? sharedRead(builder, type, place.pointer) : builder.CreateLoad(type, place.pointer);
+        }
         auto object = emit(member.receiver);
         if (!live()) return unit();
         if (fn.expressions[id].callee == Callee::BoundMethod) {
             auto target = *fn.expressions[id].functionRef;
             const auto& shape = layouts.program.signatures[rawType(id).id];
             auto receiver = NativeLists{builder}.box(object);
-            return NativeClosures{builder}.named(functions[target], signature(shape), shape.parameters.size(),
+            auto* code = layouts.valueEntry(builder, target, functions[target]);
+            return NativeClosures{builder}.named(code, signature(shape), shape.parameters.size(),
                 layouts.program.functions[target].syntax.isAsync, false, receiver);
         }
         if (fn.expressions[id].callee == Callee::ExtensionProperty)
@@ -1497,8 +1709,12 @@ struct Emitter {
 
     Value emitNode(ExprId id, const Binding& binding) {
         if (binding.constant) return unit();
-        auto value = emit(binding.value);
-        if (live()) initialize(fn.expressions[id].target, value);
+        auto slot = fn.expressions[id].target;
+        if (!fn.locals[slot].captured && layouts.largeRecord(fn.locals[slot].type)) emit(binding.value, locals[slot]);
+        else {
+            auto value = emit(binding.value);
+            if (live()) initialize(slot, value);
+        }
         return unit();
     }
 
@@ -1509,11 +1725,11 @@ struct Emitter {
         return unit();
     }
 
-    Value emitNode(ExprId id, const Block& block) {
+    Value emitNode(ExprId id, const Block& block, Value destination) {
         auto mark = id == bodyId() ? nullptr : cleanupMark();
         Value tail = unit();
         for (const auto& statement : block.statements) {
-            tail = emit(statement.expression);
+            tail = emit(statement.expression, !statement.semicolon && &statement == &block.statements.back() ? destination : nullptr);
             if (!live()) break;
             if (statement.semicolon) tail = unit();
         }
@@ -1521,9 +1737,9 @@ struct Emitter {
         return rawType(id) == Type::Unit ? unit() : tail;
     }
 
-    Value emitNode(ExprId, const UnsafeBlock& block) { return emit(block.body); }
+    Value emitNode(ExprId, const UnsafeBlock& block, Value destination) { return emit(block.body, destination); }
 
-    Value emitNode(ExprId id, const Call& call) {
+    Value emitNode(ExprId id, const Call& call, Value destination) {
         const auto& info = fn.expressions[id];
         if (info.callee == Callee::Indirect) {
             Value closure;
@@ -1548,22 +1764,28 @@ struct Emitter {
             NativeClosures nativeCall{builder};
             const auto& shape = layouts.program.signatures[info.callableType->id];
             auto site = shape.result.kind == Type::Task ? nativeCall.location(source, call.name.span) : nullptr;
-            auto value = nativeCall.invoke(signature(shape), closure, args, site, errorSlot);
-            guard(builder.CreateLoad(builder.getPtrTy(), errorSlot), handlers.size(), call.name.span, "call");
+            if (shape.result.kind != Type::Task) pollCancellation();
+            auto value = nativeCall.invoke(signature(shape), closure, args, site, callOutcome);
+            if (shape.result.kind != Type::Task) guardCall(call.name.span);
             if (shape.result == Type::Never) { builder.CreateUnreachable(); end(); }
             return value;
         }
-        if (info.callee == Callee::TaskCancelled) return asyncTaskCancelled(builder);
-        if (info.callee == Callee::TaskCheckCancellation) { asyncCheckCancellation(builder); return unit(); }
+        if (info.callee == Callee::TaskCancelled) {
+            if (!layouts.cooperative) return builder.getFalse();
+            auto requested = module.getOrInsertFunction("lyraCancellationRequested", builder.getInt32Ty());
+            return builder.CreateIsNotNull(builder.CreateCall(requested));
+        }
+        if (info.callee == Callee::TaskCheckCancellation) { pollCancellation(true); return unit(); }
         bool namespaceCall = info.callee == Callee::Variant || info.callee == Callee::PtrNull ||
             info.callee == Callee::PtrAllocate || info.callee == Callee::CallbackRegister;
         auto skip = static_cast<std::size_t>(call.receiver && !namespaceCall);
+        auto* target = info.callee == Callee::Function ? &layouts.program.functions[info.target] : nullptr;
+        auto passedInSlot = [&](auto slot) { return target && layouts.slotParameter(*target, slot); };
         Value receiver = nullptr;
         if (skip) {
-            receiver = emit(*call.receiver);
+            receiver = passedInSlot(0) ? valueArgument(*call.receiver) : emit(*call.receiver);
             if (!live()) return unit();
         }
-        auto* target = info.callee == Callee::Function ? &layouts.program.functions[info.target] : nullptr;
         auto count = target ? target->syntax.parameters.size() : call.arguments.size() + skip;
         if (info.callee == Callee::Constructor) count = layouts.program.aggregates[info.target].fields.size();
         std::vector<Value> args(count);
@@ -1573,7 +1795,9 @@ struct Emitter {
         if (variadic) args.back() = lists.create();
         for (std::size_t index = 0; index < call.arguments.size(); ++index) {
             auto slot = info.argumentSlots[index] + skip;
-            auto value = emit(call.arguments[index].value);
+            const auto& argument = call.arguments[index];
+            auto value = argument.passing != Passing::Value ? address(argument.value).pointer :
+                passedInSlot(slot) ? valueArgument(argument.value) : emit(argument.value);
             if (!live()) return unit();
             if (variadic && slot == args.size() - 1) {
                 if (fn.expressions[call.arguments[index].value].boxedSpread) {
@@ -1585,7 +1809,12 @@ struct Emitter {
         }
         for (auto slot : info.omittedDefaults) {
             const auto& defaults = target ? target->defaultFunctions : layouts.program.aggregates[info.target].defaultFunctions;
-            args[slot] = callFunction(*defaults[slot], llvm::ArrayRef<Value>(args).take_front(slot), call.name.span);
+            auto earlier = llvm::ArrayRef<Value>(args).take_front(slot);
+            if (passedInSlot(slot)) {
+                auto* output = temporary(builder, layouts.native(builder, target->locals[slot].type), "argument.default");
+                callFunction(*defaults[slot], earlier, call.name.span, output);
+                args[slot] = output;
+            } else args[slot] = callFunction(*defaults[slot], earlier, call.name.span);
         }
         switch (info.callee) {
             case Callee::BoundMethod: case Callee::Indirect: llvm_unreachable("invalid indirect call plan");
@@ -1692,13 +1921,16 @@ struct Emitter {
                 auto table = builder.CreateExtractValue(receiver, 1);
                 auto method = builder.CreateLoad(pointer, builder.CreateInBoundsGEP(pointer, table, builder.getInt64(info.target)));
                 args[0] = builder.CreateExtractValue(receiver, 0);
-                if (!info.interfaceAsync) args.push_back(errorSlot);
+                if (!info.interfaceAsync) {
+                    pollCancellation();
+                    args.push_back(callOutcome);
+                }
                 std::vector<llvm::Type*> parameters;
                 for (auto value : args) parameters.push_back(value->getType());
                 auto signature = llvm::FunctionType::get(layouts.native(builder, rawType(id)), parameters, false);
                 auto value = builder.CreateCall(signature, method, args);
                 if (info.interfaceAsync) return NativeExceptions{builder}.created(value, source, call.name.span);
-                guard(builder.CreateLoad(pointer, errorSlot), handlers.size(), call.name.span, "call");
+                guardCall(call.name.span);
                 return value;
             }
             case Callee::ReflectTypeName: return pointerCall("lyraReflectTypeName", {builder.CreateExtractValue(receiver, 0)});
@@ -1793,6 +2025,10 @@ struct Emitter {
             case Callee::ExtensionProperty: llvm_unreachable("extension property getter is not a Call expression");
             case Callee::Constructor: {
                 auto storage = layouts.objects[info.target];
+                if (destination) {
+                    for (unsigned slot = 0; slot < args.size(); ++slot) builder.CreateStore(args[slot], builder.CreateStructGEP(storage, destination, slot));
+                    return nullptr;
+                }
                 if (layouts.program.aggregates[info.target].syntax.reference) {
                     auto alloc = module.getOrInsertFunction("lyraGcAlloc", builder.getPtrTy(), builder.getInt64Ty());
                     auto object = builder.CreateCall(alloc, {llvm::ConstantExpr::getSizeOf(storage)});
@@ -1803,7 +2039,11 @@ struct Emitter {
                 for (unsigned slot = 0; slot < args.size(); ++slot) value = builder.CreateInsertValue(value, args[slot], slot);
                 return value;
             }
-            case Callee::Function: return callFunction(info.target, args, call.name.span);
+            case Callee::Function: {
+                auto value = callFunction(info.target, args, call.name.span, destination);
+                if (rawType(id) == Type::Never) { builder.CreateUnreachable(); end(); }
+                return value;
+            }
         }
         llvm_unreachable("invalid Lyra callee");
     }
@@ -1867,21 +2107,8 @@ struct Emitter {
         if (operation.op == TypeOperator::InterfaceCast) {
             auto from = fn.expressions[operation.value].type;
             if (from == target) return value;
-            const auto& methods = fn.expressions[id].interfaceMethods;
-            Value data, table;
-            if (from.kind == Type::Dyn) {
-                auto* pointer = builder.getPtrTy();
-                auto original = builder.CreateExtractValue(value, 1);
-                data = builder.CreateExtractValue(value, 0);
-                table = asyncCell(builder, llvm::ArrayType::get(pointer, methods.size()));
-                for (std::size_t slot = 0; slot < methods.size(); ++slot) {
-                    auto method = builder.CreateLoad(pointer, builder.CreateInBoundsGEP(pointer, original, builder.getInt64(methods[slot])));
-                    builder.CreateStore(method, builder.CreateInBoundsGEP(pointer, table, builder.getInt64(slot)));
-                }
-            } else {
-                data = NativeLists{builder}.box(value);
-                table = layouts.interfaceTable(builder, methods, functions);
-            }
+            auto* data = NativeLists{builder}.box(value);
+            auto* table = layouts.interfaceTable(builder, layouts.program.dynamicCasts[fn.expressions[id].target], functions);
             auto record = builder.CreateInsertValue(llvm::PoisonValue::get(layouts.native(builder, target)), data, 0);
             return builder.CreateInsertValue(record, table, 1);
         }
@@ -1927,7 +2154,7 @@ struct Emitter {
             auto place = address(binary.left);
             if (!live()) return unit();
             auto type = fn.expressions[binary.left].type;
-            auto shared = !place.list && layouts.workers && (!std::holds_alternative<Identifier>(fn.syntax.expressions[binary.left].node) || fn.locals[fn.expressions[binary.left].target].captured);
+            auto shared = layouts.workers && place.shared;
             auto left = op == Op::Set ? nullptr : shared ? sharedRead(builder, layouts.native(builder, type), place.pointer) : builder.CreateLoad(layouts.native(builder, type), place.pointer);
             auto right = emit(binary.right);
             if (!live()) return unit();
@@ -1993,21 +2220,22 @@ struct Emitter {
         return builder.CreateCall(module.getOrInsertFunction("lyraStringConcat", pointer, pointer, pointer), {left, right});
     }
 
-    Value emitNode(ExprId id, const Conditional& branch) {
+    Value emitNode(ExprId id, const Conditional& branch, Value destination) {
         auto condition = emit(branch.condition);
         if (!live()) return unit();
         auto yes = label("then"), no = label("else"), join = label("if.end");
         builder.CreateCondBr(condition, yes, no);
         builder.SetInsertPoint(yes);
-        auto trueValue = emit(branch.yes);
+        auto trueValue = emit(branch.yes, destination);
         auto trueEnd = builder.GetInsertBlock();
         if (trueEnd) builder.CreateBr(join);
         builder.SetInsertPoint(no);
-        auto falseValue = branch.no ? emit(*branch.no) : unit();
+        auto falseValue = branch.no ? emit(*branch.no, destination) : unit();
         auto falseEnd = builder.GetInsertBlock();
         if (falseEnd) builder.CreateBr(join);
         if (!trueEnd && !falseEnd) { join->eraseFromParent(); end(); return unit(); }
         builder.SetInsertPoint(join);
+        if (destination) return nullptr;
         auto type = rawType(id);
         if (type == Type::Unit) return unit();
         auto value = builder.CreatePHI(layouts.native(builder, type), 2);
@@ -2023,6 +2251,15 @@ struct Emitter {
         if (live()) builder.CreateBr(next);
     }
 
+    void repeatBody(ExprId body, Label test, Label done) {
+        if (!layouts.cooperative || deferred()) { loopBody(body, test, done); return; }
+        auto* back = label("loop.back");
+        loopBody(body, back, done);
+        builder.SetInsertPoint(back);
+        pollCancellation();
+        builder.CreateBr(test);
+    }
+
     Value emitNode(ExprId id, const While& loop) {
         auto test = label("while.test");
         builder.CreateBr(test);
@@ -2036,7 +2273,7 @@ struct Emitter {
             builder.CreateCondBr(condition, body, done);
             builder.SetInsertPoint(body);
         }
-        loopBody(loop.body, test, done);
+        repeatBody(loop.body, test, done);
         builder.SetInsertPoint(done);
         return unit();
     }
@@ -2072,6 +2309,7 @@ struct Emitter {
             builder.CreateCondBr(builder.CreateICmpEQ(index, last), done, increment);
             builder.SetInsertPoint(increment);
         }
+        pollCancellation();
         index->addIncoming(advance(index, current), builder.GetInsertBlock());
         builder.CreateBr(test);
         builder.SetInsertPoint(done);
@@ -2103,7 +2341,7 @@ struct Emitter {
             builder.CreateCondBr(builder.CreateExtractValue(next, 0), body, done);
             builder.SetInsertPoint(body);
             bindIrrefutable(pattern, builder.CreateExtractValue(next, 1), loop.item.span);
-            loopBody(loop.body, test, done);
+            repeatBody(loop.body, test, done);
             builder.SetInsertPoint(done);
             return unit();
         }
@@ -2128,7 +2366,7 @@ struct Emitter {
     }
 
     Value emitNode(ExprId, const Return& ret) {
-        auto value = initializer() ? read(fn.syntax.parameters.size()) : ret.value ? emit(*ret.value) : unit();
+        auto value = initializer() ? read(fn.syntax.parameters.size()) : ret.value ? emit(*ret.value, resultSlot) : unit();
         if (live()) leave(value);
         end();
         return unit();
@@ -2156,6 +2394,7 @@ struct Emitter {
         auto error = builder.CreateLoad(builder.getPtrTy(), errorSlot);
         NativeExceptions exceptions{builder};
         builder.CreateStore(exceptions.none(), errorSlot);
+        exceptions.publishError(callOutcome, exceptions.none());
         const auto& checked = fn.expressions[id].catches;
         for (std::size_t slot = 0; slot < attempt.arms.size(); ++slot) {
             const auto& arm = attempt.arms[slot];
@@ -2201,6 +2440,28 @@ struct Emitter {
     }
 };
 
+void keepRecursivePolls(llvm::Module& module, const std::vector<llvm::CallInst*>& polls) {
+    if (polls.empty()) return;
+    llvm::CallGraph graph(module);
+    std::set<llvm::Function*> recursive;
+    for (auto component = llvm::scc_begin(&graph); !component.isAtEnd(); ++component) {
+        if (!component.hasCycle()) continue;
+        for (auto* node : *component) if (auto* function = node->getFunction()) recursive.insert(function);
+    }
+    std::set<llvm::Function*> changed;
+    for (auto* poll : polls) {
+        if (recursive.contains(poll->getFunction())) continue;
+        changed.insert(poll->getFunction());
+        auto* compare = llvm::cast<llvm::Instruction>(*poll->user_begin());
+        auto* block = compare->getParent();
+        compare->replaceAllUsesWith(llvm::ConstantInt::getFalse(module.getContext()));
+        compare->eraseFromParent();
+        poll->eraseFromParent();
+        llvm::ConstantFoldTerminator(block);
+    }
+    for (auto* function : changed) llvm::removeUnreachableBlocks(*function);
+}
+
 }
 
 std::unique_ptr<llvm::Module> lower(const CheckedModule& program, const std::vector<Source>& sources,
@@ -2213,17 +2474,15 @@ std::unique_ptr<llvm::Module> lower(const CheckedModule& program, const std::vec
         module->setPIELevel(llvm::PIELevel::Large);
     }
     Builder builder(context);
-    Layouts layouts(program, builder);
+    Layouts layouts(program, layout, builder);
     std::optional<DebugInfo> debug;
     if (symbols) debug.emplace(*module, layouts, sources, builder, optimized);
     std::vector<llvm::Function*> functions;
     for (const auto& fn : program.functions) {
         if (fn.syntax.constant == ConstKind::Value) { functions.push_back(nullptr); continue; }
-        std::vector<llvm::Type*> params;
-        for (std::size_t index = 0; index < fn.syntax.parameters.size(); ++index) params.push_back(layouts.native(builder, fn.locals[index].type));
-        if (!fn.syntax.isAsync && !fn.syntax.foreignSymbol) params.push_back(builder.getPtrTy());
-        auto signature = llvm::FunctionType::get(fn.syntax.isAsync ? builder.getPtrTy() : layouts.native(builder, fn.result), params, false);
-        functions.push_back(llvm::Function::Create(signature, llvm::Function::InternalLinkage, "lyra.fn." + fn.syntax.name.text, *module));
+        auto* code = llvm::Function::Create(layouts.namedSignature(builder, fn), llvm::Function::InternalLinkage, "lyra.fn." + fn.syntax.name.text, *module);
+        if (layouts.slotResult(fn)) code->addParamAttr(0, llvm::Attribute::getWithStructRetType(context, layouts.native(builder, fn.result)));
+        functions.push_back(code);
     }
     for (std::size_t index = 0; index < functions.size(); ++index) {
         const auto& fn = program.functions[index];
@@ -2257,9 +2516,9 @@ std::unique_ptr<llvm::Module> lower(const CheckedModule& program, const std::vec
         builder.CreateRet(asyncEntry(builder, result, layouts.typeToken(builder, taskCycleError), root.result == Type::Unit ? nullptr : layouts.native(builder, root.result),
             root.result.kind == Type::Result && program.sumTypes[root.result.id].failure == Type::Error));
     } else {
-        auto slot = NativeExceptions{builder}.slot();
+        auto slot = NativeExceptions{builder}.outcomeSlot();
         auto result = builder.CreateCall(functions[entry], {slot});
-        auto error = builder.CreateLoad(builder.getPtrTy(), slot);
+        auto error = NativeExceptions{builder}.outcomeError(slot);
         auto failed = llvm::BasicBlock::Create(context, "failed", main), success = llvm::BasicBlock::Create(context, "success", main);
         builder.CreateCondBr(builder.CreateIsNotNull(error), failed, success);
         builder.SetInsertPoint(failed);
@@ -2268,6 +2527,7 @@ std::unique_ptr<llvm::Module> lower(const CheckedModule& program, const std::vec
         builder.SetInsertPoint(success);
         builder.CreateRet(root.result == Type::Int ? nativeExitCode(builder, result) : builder.getInt32(0));
     }
+    keepRecursivePolls(*module, layouts.recursionPolls);
     std::string reason;
     llvm::raw_string_ostream log(reason);
     if constexpr (!windows) for (auto& fn : *module) if (!fn.isDeclaration()) fn.setUWTableKind(llvm::UWTableKind::Async);

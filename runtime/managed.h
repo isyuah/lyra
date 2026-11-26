@@ -22,6 +22,9 @@ void lyraCleanupPush(LyraCleanup **stack, LyraCleanupCall call, void *environmen
 const LyraException *lyraCleanupUntil(LyraCleanup **stack, const LyraCleanup *mark, const LyraException *primary);
 int lyraGcEnterWorker(void);
 void lyraGcLeaveWorker(int registration);
+void lyraCancellationShieldEnter(void);
+void lyraCancellationShieldLeave(void);
+int lyraCancellationShielded(void);
 
 #ifdef __cplusplus
 }
