@@ -14,6 +14,7 @@ fn main(): Unit {
 
 - `substring(start, end)` 取半开标量区间；省略 `end` 则取到末尾。`slice(range)` 接受 `..<` 和 `..`，与列表切片的边界一致。空切片合法；负数、倒序或越界抛异常。
 - `startsWith(prefix)` 和 `endsWith(suffix)` 区分大小写；空前缀或后缀总是匹配。
+- `contains(fragment)` 区分大小写；空片段总是匹配。`replace(fragment, replacement)` 从左到右替换全部非重叠的字面匹配，不重复搜索替换产物。空片段在每个 Unicode 标量边界插入，包括首尾；空文本只插入一次。
 - `split(separator)` 从左到右按非重叠的字面分隔符分割，保留首尾和相邻分隔符间的空段。空字符串分割得到单个空段；空分隔符抛异常。
 - `trim()` 去掉两端具有 Unicode `White_Space` 属性的标量，不改变内部空白。
 - `parseInt(radix: Int = 10): Result<Int, ParseIntError>` 接受 `2` 至 `36` 进制和可选的前导 `+`／`-`，按 ASCII 数字和英文字母解析完整输入。空值或只有符号返回 `Empty`，非法基数返回 `InvalidRadix`，非法数位返回 `InvalidDigit`（零基位置），超出有符号 64 位范围返回 `Overflow`。不会忽略空格、进制前缀或分隔符。

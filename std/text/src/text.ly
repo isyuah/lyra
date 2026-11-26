@@ -1,4 +1,8 @@
 extern fn lyraTextCopyRange(text: String, start: Int, end: Int): String;
+extern fn lyraTextParts(count: Int): CPtr;
+extern fn lyraTextPart(parts: CPtr, index: Int, text: String): Unit;
+extern fn lyraStringJoin(count: Int, parts: CPtr): String;
+extern fn lyraTextInsertAtScalars(text: String, inserted: String): String;
 
 pub enum ParseIntError { Empty, InvalidRadix, InvalidDigit(Int), Overflow }
 
@@ -31,6 +35,17 @@ fn prefixLengths(pattern: Bytes): List<Int> {
     lengths
 }
 
+fn nextMatch(text: Bytes, pattern: Bytes, lengths: List<Int>, start: Int): Int {
+    var matched = 0
+    for index in start..<text.size {
+        val byte = text[index]
+        while matched > 0 && byte != pattern[matched] { matched = lengths[matched - 1] }
+        if byte == pattern[matched] { matched += 1 }
+        if matched == pattern.size { return index + 1 }
+    }
+    -1
+}
+
 fn asciiDigit(byte: UInt8): Int {
     if 0x30 <= byte && byte <= 0x39 { byte - 0x30 }
     else if 0x41 <= byte && byte <= 0x5A { byte - 0x41 + 10 }
@@ -50,6 +65,13 @@ pub extension StringOps for String {
         val pattern = suffix.toBytes()
         val start = text.size - pattern.size
         start >= 0 && byteMatch(text, pattern, start)
+    }
+
+    fn contains(fragment: String): Bool {
+        val pattern = fragment.toBytes()
+        if pattern.size == 0 { return true }
+        val text = this.toBytes()
+        pattern.size <= text.size && nextMatch(text, pattern, prefixLengths(pattern), 0) >= 0
     }
 
     fn substring(start: Int, end: Int): String {
@@ -84,21 +106,29 @@ pub extension StringOps for String {
         val lengths = prefixLengths(pattern)
         val text = this.toBytes()
         val output: List<String> = []
-        var matched = 0
         var start = 0
-        for index in 0..<text.size {
-            val byte = text[index]
-            while matched > 0 && byte != pattern[matched] { matched = lengths[matched - 1] }
-            if byte == pattern[matched] { matched += 1 }
-            if matched == pattern.size {
-                val next = index + 1
-                output.add(lyraTextCopyRange(this, start, next - pattern.size))
-                start = next
-                matched = 0
-            }
+        while true {
+            val next = nextMatch(text, pattern, lengths, start)
+            if next < 0 { break }
+            output.add(lyraTextCopyRange(this, start, next - pattern.size))
+            start = next
         }
         output.add(lyraTextCopyRange(this, start, text.size))
         output
+    }
+
+    fn replace(fragment: String, replacement: String): String {
+        if fragment == replacement { return this }
+        if fragment == "" { return lyraTextInsertAtScalars(this, replacement) }
+        val pieces = this.split(fragment)
+        if pieces.size == 1 { return this }
+        val count = pieces.size * 2 - 1
+        val parts = lyraTextParts(count)
+        for index in 0..<pieces.size {
+            if index > 0 { lyraTextPart(parts, index * 2 - 1, replacement) }
+            lyraTextPart(parts, index * 2, pieces[index])
+        }
+        lyraStringJoin(count, parts)
     }
 
     fn trim(): String {

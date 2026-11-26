@@ -86,6 +86,23 @@ fn main(): Unit {
 }
 ''', '127\n35\n0\n9223372036854775807\n-9223372036854775808\noverflow\noverflow\ndigit 25\ndigit 2\ndigit 1\ndigit 2\ndigit 1\ndigit 0\nempty\nempty\nradix\n')
 
+    def test_contains_and_replace_use_literal_non_overlapping_matches(self):
+        self.run_program(r'''
+import std.text.{StringOps}
+
+fn main(): Unit {
+    #assert("ababcababd".contains("ababd") && !"ababcababd".contains("ababe"))
+    #assert("中🙂\0".contains("🙂\0") && "".contains("") && !"".contains("中"))
+    #assert("ababa".replace("aba", "X") == "Xba")
+    #assert("🙂\0🙂\0".replace("🙂\0", "中") == "中中")
+    #assert("中🙂".replace("", "+") == "+中+🙂+")
+    #assert("".replace("", "-") == "-")
+    #assert("unchanged".replace("missing", "!") == "unchanged")
+    #assert("aaaa".replace("a", "aa") == "aaaaaaaa")
+    #assert("data-data".replace("data", "") == "-")
+}
+''', '')
+
     def test_stable_sorted_by_sum_distinct_and_independent_shallow_keys(self):
         self.run_program('''
 import std.collections.{ListOps}

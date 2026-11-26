@@ -189,6 +189,53 @@ fn main(): Unit {
 }
 ''')
 
+    def test_stat_and_explicit_overwrite_keep_file_contents(self):
+        self.run_app(r'''
+import std.fs.{FileKind, copy, cwd, exists, isDir, mkdirAll, pathJoin, removeDir, removeFile, rename, stat}
+import std.io.{readBytes, writeBytes}
+
+fn main(): Unit {
+    val folder = "复制 目录🙂"
+    require(mkdirAll(folder))
+    val source = pathJoin(folder, "来源.txt")
+    val target = pathJoin(folder, "目标.txt")
+    #assert(!require(exists(source)) && !require(isDir(source)))
+    #assert(require(stat(source)) == None)
+    #assert(require(isDir(pathJoin(require(cwd()), folder))))
+    require(writeBytes(source, b"content\0"))
+    require(writeBytes(target, b"original"))
+    #assert(match require(stat(source)) { Some(info) => info.kind == FileKind.Regular && info.size == 8, None => false })
+    #assert(match copy(source, target) { Err(_) => true, Ok(_) => false })
+    #assert(match rename(source, target) { Err(_) => true, Ok(_) => false })
+    #assert(require(readBytes(source)) == b"content\0" && require(readBytes(target)) == b"original")
+    require(copy(source, target, replace: true))
+    #assert(require(readBytes(target)) == b"content\0")
+    require(writeBytes(source, b"moved"))
+    require(rename(source, target, replace: true))
+    #assert(!require(exists(source)) && require(readBytes(target)) == b"moved")
+    require(rename(target, source))
+    #assert(require(exists(source)) && !require(exists(target)))
+    #assert(match removeDir(folder) { Err(_) => true, Ok(_) => false })
+    #assert(hasError(exists("\0"), IoErrorKind.Invalid))
+    require(removeFile(source))
+    require(removeDir(folder))
+    #assert(!require(exists(folder)))
+}
+''')
+
+    @unittest.skipIf(os.name == 'nt', 'creating symlinks may require Windows developer mode')
+    def test_stat_can_inspect_dangling_symlinks(self):
+        (self.package / 'dangling').symlink_to('absent')
+        self.run_app('''
+import std.fs.{FileKind, exists, stat}
+
+fn main(): Unit {
+    #assert(!require(exists("dangling")))
+    #assert(require(exists("dangling", followSymlinks: false)))
+    #assert(match require(stat("dangling", followSymlinks: false)) { Some(info) => info.kind == FileKind.Symlink, None => false })
+}
+''')
+
 
 if __name__ == '__main__':
     unittest.main()

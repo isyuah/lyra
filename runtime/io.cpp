@@ -2,6 +2,7 @@
 #include "locks.h"
 #include "managed.h"
 #include "strings.h"
+#include "sigpipe.h"
 
 #include <atomic>
 #include <cerrno>
@@ -19,9 +20,11 @@
 #include <io.h>
 #include <windows.h>
 #else
-#include <pthread.h>
-#include <signal.h>
+#include <fcntl.h>
+#include <linux/fs.h>
+#include <sys/syscall.h>
 #include <sys/types.h>
+#include <unistd.h>
 #endif
 
 struct LyraIoText {
@@ -60,6 +63,11 @@ struct LyraFsTempFile {
     int status;
     const void* path;
     LyraIoFile* file;
+};
+
+struct LyraFsInfo {
+    int status, kind;
+    int64_t size, modifiedSeconds, modifiedNanosecond;
 };
 
 LyraIoText* lyraIoDecode(const char* data, std::size_t size, int status);
@@ -121,22 +129,8 @@ std::FILE* openFile(const void* path, FileMode mode) {
 
 template <typename Operation>
 int streamOutput(Operation perform) {
-#ifndef _WIN32
-    sigset_t blocked, previous, pending;
-    sigemptyset(&blocked);
-    sigaddset(&blocked, SIGPIPE);
-    if (pthread_sigmask(SIG_BLOCK, &blocked, &previous) || sigpending(&pending)) std::abort();
-    const bool alreadyPending = sigismember(&pending, SIGPIPE) == 1;
-#endif
-    const auto status = perform();
-#ifndef _WIN32
-    if (status == EPIPE && !alreadyPending) {
-        constexpr timespec immediate{};
-        while (sigtimedwait(&blocked, nullptr, &immediate) == -1 && errno == EINTR) {}
-    }
-    if (pthread_sigmask(SIG_SETMASK, &previous, nullptr)) std::abort();
-#endif
-    return status;
+    [[maybe_unused]] lyraRuntime::SuppressSigpipe signal;
+    return perform();
 }
 
 int write(std::FILE* file, const void* content) {
@@ -245,6 +239,22 @@ struct FsRequest {
 };
 
 int fsStatus(int status) { return status < 0 ? -status : 0; }
+
+int nativePath(const void* value, ByteBuffer& buffer) {
+    auto path = pathView(value);
+    if (!validPath(path)) return fileInvalid;
+    return buffer.append(path.data(), path.size()) && buffer.append("", 1) ? 0 : EOVERFLOW;
+}
+
+#ifdef _WIN32
+wchar_t* widePath(const char* path) {
+    auto count = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, nullptr, 0);
+    if (!count) return nullptr;
+    auto* output = static_cast<wchar_t*>(memory(std::malloc(static_cast<std::size_t>(count) * sizeof(wchar_t))));
+    MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, output, count);
+    return output;
+}
+#endif
 
 int removePath(const char* path) {
     FsRequest remove;
@@ -548,6 +558,85 @@ extern "C" int64_t lyraFsRemoveFile(const void* path) {
     ByteBuffer name;
     if (!name.append(source.data(), source.size()) || !name.append("", 1)) return EOVERFLOW;
     return removePath(name.data);
+}
+
+extern "C" LyraFsInfo* lyraFsStat(const void* path, uint8_t follow) {
+    auto* result = static_cast<LyraFsInfo*>(lyraGcAllocAtomic(sizeof(LyraFsInfo)));
+    *result = {};
+    ByteBuffer name;
+    if (auto status = nativePath(path, name)) { result->status = status; return result; }
+    FsRequest info;
+    auto status = follow ? uv_fs_stat(nullptr, &info.request, name.data, nullptr) : uv_fs_lstat(nullptr, &info.request, name.data, nullptr);
+    if (status == UV_ENOENT || status == UV_ENOTDIR) return result;
+    if (status < 0) { result->status = fsStatus(status); return result; }
+    const auto& data = info.request.statbuf;
+    if (data.st_size > std::numeric_limits<int64_t>::max()) { result->status = EOVERFLOW; return result; }
+    switch (data.st_mode & S_IFMT) {
+        case S_IFREG: result->kind = 1; break;
+        case S_IFDIR: result->kind = 2; break;
+        case S_IFLNK: result->kind = 3; break;
+        default: result->kind = 4; break;
+    }
+    result->size = static_cast<int64_t>(data.st_size);
+    result->modifiedSeconds = data.st_mtim.tv_sec;
+    result->modifiedNanosecond = data.st_mtim.tv_nsec;
+    return result;
+}
+
+extern "C" int64_t lyraFsInfoStatus(const LyraFsInfo* info) { return info->status; }
+extern "C" int64_t lyraFsInfoKind(const LyraFsInfo* info) { return info->kind; }
+extern "C" int64_t lyraFsInfoSize(const LyraFsInfo* info) { return info->size; }
+extern "C" int64_t lyraFsInfoModifiedSeconds(const LyraFsInfo* info) { return info->modifiedSeconds; }
+extern "C" int64_t lyraFsInfoModifiedNanosecond(const LyraFsInfo* info) { return info->modifiedNanosecond; }
+
+extern "C" int64_t lyraFsRename(const void* from, const void* to, uint8_t replace) {
+    ByteBuffer source, target;
+    if (auto status = nativePath(from, source)) return status;
+    if (auto status = nativePath(to, target)) return status;
+    if (replace) {
+        FsRequest rename;
+        return fsStatus(uv_fs_rename(nullptr, &rename.request, source.data, target.data, nullptr));
+    }
+#ifdef _WIN32
+    auto* sourceName = widePath(source.data);
+    auto* targetName = widePath(target.data);
+    int status = fileInvalid;
+    if (sourceName && targetName) status = MoveFileExW(sourceName, targetName, 0) ? 0 : fsStatus(uv_translate_sys_error(GetLastError()));
+    std::free(sourceName);
+    std::free(targetName);
+    return status;
+#else
+    return syscall(SYS_renameat2, AT_FDCWD, source.data, AT_FDCWD, target.data, RENAME_NOREPLACE) == 0 ? 0 : systemStatus();
+#endif
+}
+
+extern "C" int64_t lyraFsCopy(const void* from, const void* to, uint8_t replace) {
+    ByteBuffer source, target;
+    if (auto status = nativePath(from, source)) return status;
+    if (auto status = nativePath(to, target)) return status;
+    FsRequest copy;
+    return fsStatus(uv_fs_copyfile(nullptr, &copy.request, source.data, target.data, replace ? 0 : UV_FS_COPYFILE_EXCL, nullptr));
+}
+
+extern "C" int64_t lyraFsRemoveDir(const void* path) {
+    ByteBuffer name;
+    if (auto status = nativePath(path, name)) return status;
+    FsRequest remove;
+    return fsStatus(uv_fs_rmdir(nullptr, &remove.request, name.data, nullptr));
+}
+
+extern "C" LyraIoText* lyraFsCwd() {
+    char buffer[4096];
+    std::size_t size = sizeof(buffer);
+    auto status = uv_cwd(buffer, &size);
+    if (status == UV_ENOBUFS) {
+        auto* large = static_cast<char*>(memory(std::malloc(size)));
+        status = uv_cwd(large, &size);
+        auto* result = lyraIoDecode(large, status == 0 ? size : 0, fsStatus(status));
+        std::free(large);
+        return result;
+    }
+    return lyraIoDecode(buffer, status == 0 ? size : 0, fsStatus(status));
 }
 
 extern "C" LyraFsTempFile* lyraFsCreateTempFile(const void* directory, const void* prefix) {
