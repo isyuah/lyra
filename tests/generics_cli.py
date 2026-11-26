@@ -59,6 +59,83 @@ class Generics(unittest.TestCase):
         ''')
         self.run_native('7\nAda\nyes\n')
 
+    def test_trait_defaults_and_generic_dynamic_slots_across_packages(self):
+        (self.package / 'lyra.json5').write_text('''{name:"test/interfaces",version:"0.1.0",
+            dependencies:{api:{name:"test/api",version:"^0.1.0",path:"api"}}}''')
+        api = self.package / 'api'
+        (api / 'src').mkdir(parents=True)
+        (api / 'lyra.json5').write_text('{name:"test/api",version:"0.1.0",kind:"lib"}')
+        (api / 'src' / 'contracts.ly').write_text('''
+pub trait Codec {
+    type Item
+    fn prefix(): Item
+    fn write<T>(value: T): Item { this.prefix() }
+    fn identity<T>(value: T): T { value }
+}
+pub trait View {
+    fn write<U>(value: U): String
+    fn identity<U>(value: U): U
+    fn twice<U>(value: U): U { this.identity(this.identity(value)) }
+}
+pub fn write<T: Codec<Item=String>, U>(codec: T, value: U): String { codec.write(value) }
+pub fn callOnDyn(codec: dyn Codec<Item=String>): Int { codec.identity(7) }
+''')
+        self.program('''
+            import api
+            class Default(pub val text: String) {
+                pub type Item = String
+                pub fn prefix(): String { text }
+            }
+            struct Override() {
+                pub type Item = String
+                pub fn prefix(): String { "unused" }
+                pub fn write<V>(value: V): String { "override" }
+            }
+            fn main(): Unit {
+                print(api.write(Default("static"), 9))
+                print(api.write(Override(), "text"))
+                val dynamic = [Default("dynamic") as dyn api.Codec<Item=String>, Override() as dyn api.Codec<Item=String>]
+                for codec in dynamic {
+                    print(codec.write<Int>(7))
+                    print(codec.write("second type"))
+                    print(api.callOnDyn(codec))
+                    val view = codec as dyn api.View
+                    print(view.write("forwarded"))
+                    print(view.twice("from fallback"))
+                }
+            }
+        ''')
+        self.run_native('static\noverride\ndynamic\ndynamic\n7\ndynamic\nfrom fallback\noverride\noverride\n7\noverride\nfrom fallback\n')
+
+    def test_trait_default_conflict_is_only_reported_without_a_matching_implementation(self):
+        declarations = '''
+            trait First { fn name<T>(value: T): String { "first" } }
+            trait Second { fn name<T>(value: T): String { "second" } }
+            fn take<T: First & Second>(target: T): String { target.name(1) }
+            struct Shared() { fn name<U>(value: U): String { "shared" } }
+            struct Missing()
+        '''
+        self.program(declarations + '\n            fn main(): Unit { print(take(Shared())) }')
+        self.run_native('shared\n')
+        self.program(declarations + '\n            fn main(): Unit { print(take(Missing())) }')
+        self.rejects('LYG0006', '多个适用的 trait 默认实现', 'name')
+        self.program(declarations + '\n            fn main(): Unit { print(Missing().name(1)) }')
+        self.rejects('LYN0001', '没有成员', 'name')
+
+    def test_generic_trait_implementation_cannot_narrow_method_contract(self):
+        self.program('''
+            trait Compare { fn same<T: Eq>(left: T, right: T): Bool }
+            struct Default() { fn same<V>(left: V, right: V): Bool { true } }
+            struct Narrow() { fn same<U: Eq & Hash>(left: U, right: U): Bool { left == right } }
+            fn main(): Unit {
+                val output = Default() as dyn Compare
+                print(output.same(1, 2))
+            }
+        ''')
+        self.run_native('true\n')
+        self.program(self.source.read_text().replace('Default() as dyn Compare', 'Narrow() as dyn Compare'))
+        self.rejects('LYG0005', '不满足')
+
     def test_transparent_type_aliases_cross_module(self):
         (self.package / 'lyra.json5').write_text('{name:"demo",version:"0.1.0"}')
         module = self.package / 'src/types'

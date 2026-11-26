@@ -62,9 +62,10 @@ struct IteratorPlan { std::size_t open, next; std::optional<Type> awaited{}; };
 struct CheckedIteration { Type element; std::optional<IteratorPlan> methods; };
 struct CheckedCatch { Type type; std::optional<std::size_t> local; };
 struct ErrorDisplay { std::optional<std::size_t> method; std::string fallback; };
+struct DynamicMethodKey { Type owner; std::size_t method; std::vector<Type> arguments; auto operator<=>(const DynamicMethodKey&) const = default; };
 enum class ErrorMember { Message, Original, Cause, Suppressed };
 enum class ExceptionMember { Message, TaskFailures, CleanupFailures };
-struct CheckedExpr { Type type; std::size_t target{}; std::vector<std::size_t> argumentSlots{}; Callee callee{}; std::optional<Type> sourceType{}; std::vector<std::size_t> captures{}; std::vector<std::size_t> omittedDefaults{}; std::optional<std::size_t> conversion{}, errorConversion{}, functionRef{}; std::optional<ConstantUse> constantRef{}; std::optional<Type> callableType{}; std::optional<CheckedIteration> iteration{}; std::vector<CheckedPattern> patterns{}; std::optional<double> realLiteral{}; std::optional<Type> narrowed{}; std::optional<std::string> boundTrait{}; std::optional<Type> testedType{}; bool boxedSpread{}; std::vector<std::size_t> interfaceMethods{}; bool interfaceAsync{}; std::vector<CheckedCatch> catches{}; ErrorDisplay errorDisplay{}, errorPromotion{}; std::vector<std::optional<std::size_t>> selectSlots{}; };
+struct CheckedExpr { Type type; std::size_t target{}; std::vector<std::size_t> argumentSlots{}; Callee callee{}; std::optional<Type> sourceType{}; std::vector<std::size_t> captures{}; std::vector<std::size_t> omittedDefaults{}; std::optional<std::size_t> conversion{}, errorConversion{}, functionRef{}; std::optional<ConstantUse> constantRef{}; std::optional<Type> callableType{}; std::optional<CheckedIteration> iteration{}; std::vector<CheckedPattern> patterns{}; std::optional<double> realLiteral{}; std::optional<Type> narrowed{}; std::optional<std::string> boundTrait{}; std::vector<std::string> alternateTraits{}; std::optional<Type> testedType{}; bool boxedSpread{}; std::optional<DynamicMethodKey> dynamicMethod{}; bool interfaceAsync{}; std::vector<CheckedCatch> catches{}; ErrorDisplay errorDisplay{}, errorPromotion{}; std::vector<std::optional<std::size_t>> selectSlots{}; };
 struct CheckedFunction {
     Function syntax;
     Type result;
@@ -91,7 +92,14 @@ struct ConstComposite { Type type; ConstTag tag; std::vector<ConstValue> fields;
 struct BlockConstant { std::size_t function; ExprId initializer; Type type; Identifier name; std::optional<ConstValue> value{}; };
 struct TypeProjection { Type owner; std::string member; bool operator==(const TypeProjection&) const = default; };
 struct DynamicType { std::size_t trait; std::vector<Type> bindings; bool operator==(const DynamicType&) const = default; };
-struct CheckedModule { std::deque<CheckedFunction> functions; std::optional<std::size_t> entry; std::deque<CheckedAggregate> aggregates; std::vector<std::string> variableNames; std::vector<Type> taskResults; std::vector<SumTypes> sumTypes; std::vector<Type> listElements; std::deque<FunctionShape> signatures{}; std::deque<CheckedEnum> enums{}; std::vector<Trait> traits{}; std::vector<ExceptionType> exceptions{}; std::vector<Type> taskLocalValues{}; std::vector<std::optional<ConstValue>> constants{}; std::vector<TypeProjection> projections{}; std::deque<ConstComposite> constantComposites{}; std::map<std::pair<Type, ValueOperation>, std::size_t> valueOverrides{}; std::vector<DeferredPatternCheck> deferredPatternChecks{}; std::vector<Type> channelElements{}; std::vector<DynamicType> dynamicTypes{}; std::vector<MatchCoverage> matchCoverage{}; std::vector<Diagnostic> warnings{}; std::vector<BlockConstant> blockConstants{}; };
+struct DynamicMethodUse { DynamicMethodKey key; std::size_t slot; std::vector<Type> parameters; Type result; bool asynchronous; };
+struct DynamicEntry {
+    enum Kind { Concrete, Source } kind;
+    std::size_t target;
+    auto operator<=>(const DynamicEntry&) const = default;
+};
+struct DynamicCast { std::size_t function; ExprId expression; Type from, to; Span site; std::map<std::size_t, DynamicEntry> entries{}; };
+struct CheckedModule { std::deque<CheckedFunction> functions; std::optional<std::size_t> entry; std::deque<CheckedAggregate> aggregates; std::vector<std::string> variableNames; std::vector<Type> taskResults; std::vector<SumTypes> sumTypes; std::vector<Type> listElements; std::deque<FunctionShape> signatures{}; std::deque<CheckedEnum> enums{}; std::vector<Trait> traits{}; std::vector<ExceptionType> exceptions{}; std::vector<Type> taskLocalValues{}; std::vector<std::optional<ConstValue>> constants{}; std::vector<TypeProjection> projections{}; std::deque<ConstComposite> constantComposites{}; std::map<std::pair<Type, ValueOperation>, std::size_t> valueOverrides{}; std::vector<DeferredPatternCheck> deferredPatternChecks{}; std::vector<Type> channelElements{}; std::vector<DynamicType> dynamicTypes{}; std::vector<MatchCoverage> matchCoverage{}; std::vector<Diagnostic> warnings{}; std::vector<BlockConstant> blockConstants{}; std::vector<DynamicMethodUse> dynamicMethods{}; std::vector<DynamicCast> dynamicCasts{}; };
 
 struct InferredTypeHint { SourceAnchor anchor; std::string type; };
 struct EditorDescription { SourceAnchor anchor; std::string detail, documentation; };

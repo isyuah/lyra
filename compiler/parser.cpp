@@ -380,7 +380,7 @@ private:
             }
             if (is("trait")) {
                 if (firstPrefix != module.expansions.size()) throw at(source, module.expansions[firstPrefix].name.span, "LYM0001", "不能修饰 trait 约束声明");
-                module.traits.push_back(trait(pub));
+                module.traits.push_back(trait(pub, module));
                 return;
             }
             if (is("type")) {
@@ -782,7 +782,7 @@ private:
         return bindings;
     }
 
-    Trait trait(bool pub) {
+    Trait trait(bool pub, Module& module) {
         auto start = require("trait").span.begin;
         Trait declaration{file, identifier(), {}, pub};
         require("{");
@@ -797,6 +797,10 @@ private:
                 if (asynchronous) consume();
                 require("fn");
                 auto name = identifier();
+                std::vector<Identifier> generics;
+                std::vector<Bound> bounds;
+                auto previousNames = completion ? std::optional(completion->names) : std::nullopt;
+                typeParameters(generics, bounds);
                 require("(");
                 std::vector<Parameter> parameters;
                 while (!is(")")) {
@@ -808,7 +812,37 @@ private:
                 require(")"); require(":");
                 auto result = type();
                 auto end = result.span.end;
-                declaration.methods.push_back({std::move(name), std::move(parameters), std::move(result), asynchronous, {begin, end}});
+                TraitMethod method{std::move(name), std::move(parameters), std::move(result), asynchronous, {begin, end}, std::move(generics), std::move(bounds)};
+                if (is("{")) {
+                    if (completingBlock()) {
+                        for (const auto& parameter : method.parameters) completion->add(parameter.name, EditorKind::Parameter);
+                        completion->receiver = true;
+                        completion->asynchronous = asynchronous;
+                    }
+                    auto failures = bodyFailures;
+                    auto body = block();
+                    method.span.end = nodes[body].span.end;
+                    Identifier helper{"$traitDefault$" + declaration.name.text + "$" + method.name.text, method.name.span};
+                    Identifier self{"$Self", {}};
+                    Function fn{file, helper, {{{"$this", {}}, self}}, method.result, std::exchange(nodes, {}), body};
+                    fn.typeParameters.push_back(self);
+                    fn.typeParameters.insert(fn.typeParameters.end(), method.typeParameters.begin(), method.typeParameters.end());
+                    fn.bounds.push_back({0, declaration.name});
+                    for (auto bound : method.bounds) { ++bound.parameter; fn.bounds.push_back(std::move(bound)); }
+                    fn.parameters.insert(fn.parameters.end(), method.parameters.begin(), method.parameters.end());
+                    fn.hasReceiver = true;
+                    fn.isAsync = asynchronous;
+                    fn.header = {begin, end};
+                    fn.incompleteBody = bodyFailures != failures;
+                    fn.traitOwner = declaration.name;
+                    module.functions.push_back(std::move(fn));
+                    method.defaultFunction = std::move(helper);
+                }
+                if (completion) {
+                    completion->names = std::move(*previousNames);
+                    completion->receiver = completion->asynchronous = false;
+                }
+                declaration.methods.push_back(std::move(method));
             }
             if (is(";")) consume();
             else if (!is("}") && !token.newlineBefore) throw at(source, token.span, "LYP0001", "结构约束成员之间需要换行或分号");

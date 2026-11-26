@@ -39,6 +39,7 @@ struct Call {
     std::optional<ExprId> function{};
     std::optional<TypeQualifier> typeOwner{};
     std::optional<std::string> boundTrait{};
+    std::vector<std::string> alternateTraits{};
 };
 struct Member { ExprId receiver; Identifier name; };
 struct QualifiedMember { TypeQualifier owner; Identifier name; };
@@ -119,7 +120,16 @@ struct AssociatedBinding { Identifier member, type; };
 struct Bound { std::size_t parameter; Identifier trait; std::vector<AssociatedBinding> bindings{}; };
 struct ExtensionProperty { Identifier name, type; std::size_t getter; };
 struct Extension { std::size_t file; Identifier name, receiver; bool isPublic; std::vector<Identifier> typeParameters{}; std::vector<Bound> bounds{}; std::vector<ExtensionProperty> properties{}; Span span{}; };
-struct TraitMethod { Identifier name; std::vector<Parameter> parameters; Identifier result; bool asynchronous; Span span{}; };
+struct TraitMethod {
+    Identifier name;
+    std::vector<Parameter> parameters;
+    Identifier result;
+    bool asynchronous;
+    Span span{};
+    std::vector<Identifier> typeParameters{};
+    std::vector<Bound> bounds{};
+    std::optional<Identifier> defaultFunction{};
+};
 struct Trait { std::size_t file; Identifier name; std::vector<TraitMethod> methods; bool isPublic; std::vector<Identifier> associated{}; Span span{}; };
 enum class ConstKind { None, Value, Function };
 struct Function {
@@ -145,6 +155,7 @@ struct Function {
     std::optional<Span> pendingExpansion{};
     Span header{};
     bool incompleteBody{};
+    std::optional<Identifier> traitOwner{};
 };
 
 struct FieldDefault { std::size_t function; bool emptyOption; };

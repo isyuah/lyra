@@ -45,7 +45,7 @@ struct Layouts {
     std::vector<std::vector<llvm::StructType*>> payloads;
     mutable std::map<Type, llvm::GlobalVariable*> typeTokens{};
     mutable std::set<Type> initializedTypeTokens{};
-    mutable std::map<std::vector<std::size_t>, llvm::Constant*> interfaceTables{};
+    mutable std::map<std::tuple<Type, Type, std::map<std::size_t, DynamicEntry>>, llvm::Constant*> interfaceTables{};
     mutable std::map<std::pair<Type, ValueOperation>, llvm::Function*> valueHelpers{};
     mutable std::map<Type, llvm::Function*> channelPackers{};
     mutable std::vector<llvm::CallInst*> recursionPolls{};
@@ -213,24 +213,31 @@ struct Layouts {
         return entry->second;
     }
 
-    llvm::Constant* interfaceTable(Builder& builder, const std::vector<std::size_t>& methods,
+    llvm::Constant* interfaceTable(Builder& builder, const DynamicCast& cast,
             std::span<llvm::Function* const> functions) const {
-        auto [entry, inserted] = interfaceTables.try_emplace(methods);
+        auto [entry, inserted] = interfaceTables.try_emplace({cast.from, cast.to, cast.entries});
         if (!inserted) return entry->second;
         auto& module = *builder.GetInsertBlock()->getModule();
-        std::vector<llvm::Constant*> addresses;
-        for (auto method : methods) {
-            auto* implementation = functions[method];
-            auto shape = implementation->getFunctionType()->params();
-            std::vector<llvm::Type*> parameters(shape.begin(), shape.end());
-            parameters[0] = builder.getPtrTy();
-            auto* signature = llvm::FunctionType::get(implementation->getReturnType(), parameters, false);
-            auto* bridge = llvm::Function::Create(signature, llvm::Function::InternalLinkage, implementation->getName() + ".interface", module);
+        auto* pointer = builder.getPtrTy();
+        std::vector<llvm::Constant*> addresses(cast.entries.size());
+        for (const auto& [index, plan] : cast.entries) {
+            const auto& method = program.dynamicMethods[index];
+            std::vector<llvm::Type*> parameters{pointer};
+            for (auto type : method.parameters) parameters.push_back(native(builder, type));
+            if (!method.asynchronous) parameters.push_back(pointer);
+            auto* signature = llvm::FunctionType::get(method.asynchronous ? pointer : native(builder, method.result), parameters, false);
+            auto* bridge = llvm::Function::Create(signature, llvm::Function::InternalLinkage, "lyra.interface.bridge", module);
             Builder thunk(llvm::BasicBlock::Create(builder.getContext(), "dispatch", bridge));
-            std::vector<Value> arguments{thunk.CreateLoad(shape[0], bridge->getArg(0))};
+            auto* receiver = thunk.CreateLoad(native(thunk, cast.from), bridge->getArg(0));
+            std::vector<Value> arguments{receiver};
             for (std::size_t slot = 1; slot < parameters.size(); ++slot) arguments.push_back(bridge->getArg(slot));
-            thunk.CreateRet(thunk.CreateCall(implementation, arguments));
-            addresses.push_back(bridge);
+            if (plan.kind == DynamicEntry::Source) {
+                arguments[0] = thunk.CreateExtractValue(receiver, 0);
+                auto* table = thunk.CreateExtractValue(receiver, 1);
+                auto* function = thunk.CreateLoad(pointer, thunk.CreateInBoundsGEP(pointer, table, thunk.getInt64(program.dynamicMethods[plan.target].slot)));
+                thunk.CreateRet(thunk.CreateCall(signature, function, arguments));
+            } else thunk.CreateRet(thunk.CreateCall(functions[plan.target], arguments));
+            addresses[method.slot] = bridge;
         }
         auto* type = llvm::ArrayType::get(builder.getPtrTy(), addresses.size());
         entry->second = new llvm::GlobalVariable(module, type, true, llvm::GlobalValue::PrivateLinkage,
@@ -1941,21 +1948,8 @@ struct Emitter {
         if (operation.op == TypeOperator::InterfaceCast) {
             auto from = fn.expressions[operation.value].type;
             if (from == target) return value;
-            const auto& methods = fn.expressions[id].interfaceMethods;
-            Value data, table;
-            if (from.kind == Type::Dyn) {
-                auto* pointer = builder.getPtrTy();
-                auto original = builder.CreateExtractValue(value, 1);
-                data = builder.CreateExtractValue(value, 0);
-                table = asyncCell(builder, llvm::ArrayType::get(pointer, methods.size()));
-                for (std::size_t slot = 0; slot < methods.size(); ++slot) {
-                    auto method = builder.CreateLoad(pointer, builder.CreateInBoundsGEP(pointer, original, builder.getInt64(methods[slot])));
-                    builder.CreateStore(method, builder.CreateInBoundsGEP(pointer, table, builder.getInt64(slot)));
-                }
-            } else {
-                data = NativeLists{builder}.box(value);
-                table = layouts.interfaceTable(builder, methods, functions);
-            }
+            auto* data = NativeLists{builder}.box(value);
+            auto* table = layouts.interfaceTable(builder, layouts.program.dynamicCasts[fn.expressions[id].target], functions);
             auto record = builder.CreateInsertValue(llvm::PoisonValue::get(layouts.native(builder, target)), data, 0);
             return builder.CreateInsertValue(record, table, 1);
         }

@@ -386,8 +386,18 @@ struct Linker {
         for (auto& trait : syntax.traits) {
             group(trait.name.text);
             for (auto& method : trait.methods) {
-                renameTypeIn(trait.file, method.result, trait.associated);
-                for (auto& parameter : method.parameters) renameTypeIn(trait.file, parameter.type, trait.associated);
+                auto parameters = trait.associated;
+                parameters.insert(parameters.end(), method.typeParameters.begin(), method.typeParameters.end());
+                renameTypeIn(trait.file, method.result, parameters);
+                for (auto& parameter : method.parameters) renameTypeIn(trait.file, parameter.type, parameters);
+                for (auto& bound : method.bounds) {
+                    renameTypeIn(trait.file, bound.trait);
+                    for (auto& binding : bound.bindings) renameTypeIn(trait.file, binding.type, parameters);
+                }
+                if (method.defaultFunction) {
+                    method.defaultFunction->text = spaces.at(sources[trait.file].moduleId).definitions.at(method.defaultFunction->text).name;
+                    if (needs) needs->insert(method.defaultFunction->text);
+                }
             }
         }
         for (auto& fn : syntax.functions) {
@@ -396,7 +406,16 @@ struct Linker {
                 if (auto found = definitions.find(name.text); found != definitions.end()) name.text = found->second.name;
             };
             auto renameType = [&](Identifier& name) {
-                renameTypeIn(fn.file, name, fn.typeParameters);
+                if (!fn.traitOwner) { renameTypeIn(fn.file, name, fn.typeParameters); return; }
+                auto owner = *fn.traitOwner;
+                rename(owner);
+                const auto& associated = std::ranges::find(syntax.traits, owner.text, [](const Trait& trait) { return trait.name.text; })->associated;
+                auto parameters = fn.typeParameters;
+                parameters.insert(parameters.end(), associated.begin(), associated.end());
+                renameTypeIn(fn.file, name, parameters);
+                name.text = mapTypeNames(typeForm(name.text), [&](const std::string& part) {
+                    return std::ranges::find(associated, part, &Identifier::text) == associated.end() ? part : "$assoc:" + part + "<$Self>";
+                });
             };
             if (fn.owner) rename(*fn.owner);
             if (fn.extensionGroup) rename(*fn.extensionGroup);
@@ -406,7 +425,10 @@ struct Linker {
                 if (auto found = moduleExtensions.find(sources[fn.file].moduleId); found != moduleExtensions.end())
                     needs->insert(found->second.begin(), found->second.end());
             }
-            renameBounds(fn, fn.bounds);
+            for (auto& bound : fn.bounds) {
+                renameTypeIn(fn.file, bound.trait);
+                for (auto& binding : bound.bindings) renameType(binding.type);
+            }
             if (!fn.result.text.empty()) renameType(fn.result);
             for (auto& type : fn.throwsTypes) renameType(type);
             for (auto& param : fn.parameters) renameType(param.type);

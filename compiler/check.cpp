@@ -293,7 +293,10 @@ bool traitUsesSelf(const Trait& trait) {
         return contains(contains, typeForm(annotation.text));
     };
     return std::ranges::any_of(trait.methods, [&](const auto& method) {
-        return usesSelf(method.result) || std::ranges::any_of(method.parameters, [&](const auto& parameter) { return usesSelf(parameter.type); });
+        return usesSelf(method.result) || std::ranges::any_of(method.parameters, [&](const auto& parameter) { return usesSelf(parameter.type); }) ||
+            std::ranges::any_of(method.bounds, [&](const Bound& bound) {
+                return std::ranges::any_of(bound.bindings, [&](const AssociatedBinding& binding) { return usesSelf(binding.type); });
+            });
     });
 }
 
@@ -311,6 +314,7 @@ struct Symbols {
     std::map<std::pair<Type, std::string>, std::size_t> builtinImplementations{};
     std::vector<DirectConversion> conversions{};
     StructuralContracts contracts{};
+    std::map<std::pair<std::string, std::string>, std::vector<Type>> methodVariables{};
     Names traitNames{};
     Names exceptionTypes{};
     Names enums{};
@@ -414,7 +418,7 @@ struct Symbols {
         Symbols& symbols;
         TypeTrial types{symbols};
         std::size_t functions = symbols.module.functions.size(), coverage = symbols.module.matchCoverage.size(),
-            constants = symbols.module.blockConstants.size(), warnings = symbols.module.warnings.size();
+            constants = symbols.module.blockConstants.size(), warnings = symbols.module.warnings.size(), casts = symbols.module.dynamicCasts.size();
 
         ~BodyTrial() {
             if (types.committed) return;
@@ -434,6 +438,7 @@ struct Symbols {
             module.matchCoverage.resize(coverage);
             module.blockConstants.resize(constants);
             module.warnings.resize(warnings);
+            module.dynamicCasts.resize(casts);
         }
     };
 
@@ -526,11 +531,13 @@ struct Symbols {
         return text + " @ " + declarationSite(syntax);
     }
 
-    std::optional<RequiredMethod> methodShape(Type receiver, const Callable& candidate, const Source& use) {
+    std::optional<RequiredMethod> methodShape(Type receiver, const Callable& candidate, const Source& use, std::span<const Type> methodTypes = {}) {
         const auto& arguments = instanceArguments(receiver);
         const auto& actual = declaration(candidate);
-        if ((!actual.isPublic && sources[actual.file].moduleId != use.moduleId) || actual.typeParameters.size() != arguments.size()) return {};
-        auto type = [&](const Identifier& annotation) { return resolve(actual, annotation, arguments); };
+        if ((!actual.isPublic && sources[actual.file].moduleId != use.moduleId) || actual.typeParameters.size() != arguments.size() + methodTypes.size()) return {};
+        std::vector<Type> types(arguments.begin(), arguments.end());
+        types.insert(types.end(), methodTypes.begin(), methodTypes.end());
+        auto type = [&](const Identifier& annotation) { return resolve(actual, annotation, types); };
         RequiredMethod result{{}, {}, type(resultAnnotation(candidate, use, actual.name.span)), actual.isAsync};
         for (std::size_t slot = 1; slot < actual.parameters.size(); ++slot) {
             const auto& parameter = actual.parameters[slot];
@@ -797,11 +804,13 @@ struct Symbols {
         return entry->second;
     }
 
-    RequiredMethod requiredShape(Type owner, const Trait& trait, const TraitMethod& method, const Source& use, Span site) {
+    RequiredMethod requiredShape(Type owner, const Trait& trait, const TraitMethod& method, const Source& use, Span site, std::span<const Type> methodTypes = {}) {
         auto types = trait.associated;
         types.push_back({"$Self", {}});
+        types.insert(types.end(), method.typeParameters.begin(), method.typeParameters.end());
         auto resolve = [&](const Identifier& annotation) {
             return resolveWith(typeForm(annotation.text), sources[trait.file], annotation.span, types, [&](std::size_t slot) {
+                if (slot > trait.associated.size()) return methodTypes[slot - trait.associated.size() - 1];
                 return slot == trait.associated.size() ? owner : projectionType(owner, trait.associated[slot].text, use, site);
             }).value();
         };
@@ -813,7 +822,112 @@ struct Symbols {
         return shape;
     }
 
-    struct BoundMethod { const Trait* trait; const TraitMethod* method; RequiredMethod shape; };
+    Function requirement(const Trait& trait, const TraitMethod& method) {
+        auto types = trait.associated;
+        types.push_back({"$Self", {}});
+        types.insert(types.end(), method.typeParameters.begin(), method.typeParameters.end());
+        auto bounds = method.bounds;
+        for (auto& bound : bounds) bound.parameter += trait.associated.size() + 1;
+        Function signature{trait.file, method.name, method.parameters, method.result, {}, 0, {}, trait.isPublic,
+            std::move(types), method.asynchronous, {}, false, std::move(bounds)};
+        signature.header = method.span;
+        return signature;
+    }
+
+    std::vector<Type> requirementTypes(Type owner, const Trait& trait, const Source& use, Span site, std::span<const Type> methodTypes = {}) {
+        std::vector<Type> types;
+        for (const auto& member : trait.associated) types.push_back(projectionType(owner, member.text, use, site));
+        types.push_back(owner);
+        types.insert(types.end(), methodTypes.begin(), methodTypes.end());
+        return types;
+    }
+
+    const std::vector<Type>& traitMethodVariables(const Trait& trait, const TraitMethod& method) const {
+        return methodVariables.at({trait.name.text, method.name.text});
+    }
+
+    bool supportsBounds(const Function& actual, std::size_t actualSkip, const Function& required, std::size_t requiredSkip,
+        std::span<const Type> actualTypes, std::span<const Type> requiredTypes) {
+        for (const auto& bound : actual.bounds) if (bound.parameter >= actualSkip) {
+            auto matches = [&](const Bound& promised) {
+                if (promised.parameter != bound.parameter - actualSkip + requiredSkip || bound.trait.text != promised.trait.text) return false;
+                for (const auto& binding : bound.bindings) {
+                    auto same = [&](const AssociatedBinding& other) {
+                        if (other.member.text != binding.member.text) return false;
+                        return resolve(actual, binding.type, actualTypes) == resolve(required, other.type, requiredTypes);
+                    };
+                    if (!std::ranges::any_of(promised.bindings, same)) return false;
+                }
+                return true;
+            };
+            if (!std::ranges::any_of(required.bounds, matches)) return false;
+        }
+        return true;
+    }
+
+    bool compatibleRequirements(Type owner, const Trait& provided, const TraitMethod& method, const Trait& required, const TraitMethod& want,
+        const Source& use, Span site) {
+        if (method.typeParameters.size() != want.typeParameters.size()) return false;
+        const auto& arguments = traitMethodVariables(required, want);
+        if (requiredShape(owner, provided, method, use, site, arguments) != requiredShape(owner, required, want, use, site, arguments)) return false;
+        auto actual = requirement(provided, method);
+        auto expected = requirement(required, want);
+        return supportsBounds(actual, provided.associated.size() + 1, expected, required.associated.size() + 1,
+            requirementTypes(owner, provided, use, site, arguments), requirementTypes(owner, required, use, site, arguments));
+    }
+
+    std::optional<std::size_t> matchingImplementation(Type owner, const Trait& trait, const TraitMethod& method, const Source& use, Span site) {
+        const auto& arguments = traitMethodVariables(trait, method);
+        auto required = requirement(trait, method);
+        auto shape = requiredShape(owner, trait, method, use, site, arguments);
+        if (owner.kind != Type::Record && owner.kind != Type::Enum) return {};
+        const auto& members = instanceMethods(owner);
+        auto found = members.find(method.name.text);
+        if (found == members.end()) return {};
+        auto types = instanceArguments(owner);
+        const auto enclosing = types.size();
+        types.insert(types.end(), arguments.begin(), arguments.end());
+        for (auto index : found->second) {
+            const auto& candidate = declaration(callables[index]);
+            if (auto actual = methodShape(owner, callables[index], use, arguments); actual && *actual == shape &&
+                supportsBounds(candidate, enclosing, required, trait.associated.size() + 1,
+                    types, requirementTypes(owner, trait, use, site, arguments))) return index;
+        }
+        return {};
+    }
+
+    const Trait& interfaceTrait(Type owner) const { return module.traits[module.dynamicTypes[owner.id].trait]; }
+
+    const TraitMethod* interfaceMethod(Type owner, const Trait& required, const TraitMethod& method, const Source& use, Span site) {
+        const auto& trait = interfaceTrait(owner);
+        auto match = std::ranges::find(trait.methods, method.name.text, [](const TraitMethod& item) { return item.name.text; });
+        if (match == trait.methods.end() || !compatibleRequirements(owner, trait, *match, required, method, use, site)) return nullptr;
+        return &*match;
+    }
+
+    std::optional<std::size_t> traitTarget(Type owner, const Trait& trait, const TraitMethod& method, std::span<const Type> arguments,
+        const Source& use, std::size_t file, Span site) {
+        if (arguments.empty()) if (auto builtin = builtinMember(owner, method.name.text)) {
+            if (builtin->shape == requiredShape(owner, trait, method, use, site))
+                return builtinImplementation(owner, method.name.text, *builtin, file, site);
+        }
+        auto selected = matchingImplementation(owner, trait, method, use, site);
+        if (!selected) return {};
+        const auto& candidate = callables[*selected];
+        if (!candidate.generic) return candidate.target;
+        auto types = instanceArguments(owner);
+        types.insert(types.end(), arguments.begin(), arguments.end());
+        return instantiate(*selected, types, use, site);
+    }
+
+    std::size_t traitDefault(Type owner, const TraitMethod& method, std::span<const Type> arguments, const Source& use, Span site) {
+        std::vector<Type> types{owner};
+        types.insert(types.end(), arguments.begin(), arguments.end());
+        auto target = functions.at(method.defaultFunction->text).front();
+        return instantiate(target, types, use, site);
+    }
+
+    struct BoundMethod { const Trait* trait; const TraitMethod* method; RequiredMethod shape; std::vector<std::string> alternatives{}; };
 
     std::optional<BoundMethod> boundMember(Type owner, const std::string& name, const Source& use, Span site) {
         std::optional<BoundMethod> result;
@@ -822,10 +936,12 @@ struct Symbols {
             const auto& trait = contracts.declaration(bound);
             auto method = std::ranges::find(trait.methods, name, [](const auto& entry) { return entry.name.text; });
             if (method == trait.methods.end()) continue;
-            auto shape = requiredShape(owner, trait, *method, use, site);
+            auto shape = requiredShape(owner, trait, *method, use, site, traitMethodVariables(trait, *method));
             if (!result) result = BoundMethod{&trait, &*method, std::move(shape)};
-            else if (result->shape != shape)
+            else if (!compatibleRequirements(owner, trait, *method, *result->trait, *result->method, use, site) ||
+                     !compatibleRequirements(owner, *result->trait, *result->method, trait, *method, use, site))
                 throw at(use, site, "LYG0006", "结构约束 " + result->trait->name.text + " 和 " + bound + " 为成员提供了冲突签名：" + name);
+            else result->alternatives.push_back(bound);
         }
         return result;
     }
@@ -858,28 +974,26 @@ struct Symbols {
             }
             for (const auto& method : trait.methods) {
                 const auto& name = method.name.text;
-                auto expected = requiredShape(actual, trait, method, definition, site);
+                auto expected = requiredShape(actual, trait, method, definition, site, traitMethodVariables(trait, method));
                 std::optional<RequiredMethod> found;
                 auto candidate = [&](const Trait& provided) {
                     auto member = std::ranges::find(provided.methods, name, [](const auto& entry) { return entry.name.text; });
                     if (member == provided.methods.end()) return false;
-                    auto shape = requiredShape(actual, provided, *member, definition, site);
-                    if (shape == expected) return true;
-                    found = std::move(shape);
-                    return false;
+                    return compatibleRequirements(actual, provided, *member, trait, method, definition, site);
                 };
                 if (actual.kind == Type::Variable) {
                     if (std::ranges::any_of(contracts.constraints(actual), [&](const auto& available) { return !valueConstraint(available) && candidate(contracts.declaration(available)); })) continue;
                 } else if (actual.kind == Type::Dyn) {
                     if (candidate(module.traits[module.dynamicTypes[actual.id].trait])) continue;
                 } else {
-                    if (auto builtin = builtinMember(actual, name)) {
+                    if (method.typeParameters.empty()) if (auto builtin = builtinMember(actual, name)) {
                         if (builtin->shape == expected) continue;
                         found = std::move(builtin->shape);
                     }
-                    if (shapedMethod(actual, name, definition, [&](const auto& shape) { return shape == expected; })) continue;
+                    if (matchingImplementation(actual, trait, method, definition, site)) continue;
                     if (auto available = shapedMethod(actual, name, definition, [](const auto&) { return true; })) found = std::move(available->second);
                 }
+                if (method.defaultFunction) continue;
                 auto reason = found ? "，实际为 " + describeRequirement(name, *found, nameOf) : "，缺少可见方法 " + name;
                 throw fail("需要 " + describeRequirement(name, expected, nameOf) + reason);
             }
@@ -1799,25 +1913,9 @@ struct Checker {
             }
             Bound bound{0, trait.name};
             symbols.requireBounds({&bound, 1}, fn.syntax.file, {&actual, 1}, source, operation.site);
-            if (materializing()) for (const auto& method : trait.methods) {
-                auto& implementations = fn.expressions[id].interfaceMethods;
-                if (actual.kind == Type::Dyn) {
-                    const auto& available = module.traits[module.dynamicTypes[actual.id].trait].methods;
-                    auto found = std::ranges::find(available, method.name.text, [](const TraitMethod& item) { return item.name.text; });
-                    implementations.push_back(found - available.begin());
-                } else {
-                    auto expected = symbols.requiredShape(target, trait, method, source, operation.site);
-                    if (auto builtin = symbols.builtinMember(actual, method.name.text)) {
-                        if (builtin->shape == expected) {
-                            implementations.push_back(symbols.builtinImplementation(actual, method.name.text, *builtin, fn.syntax.file, operation.site));
-                            continue;
-                        }
-                    }
-                    auto selected = symbols.shapedMethod(actual, method.name.text, source, [&](const auto& methodShape) { return methodShape == expected; }).value().first;
-                    const auto& entry = symbols.callables[selected];
-                    auto function = entry.generic ? symbols.instantiate(selected, symbols.instanceArguments(actual), source, operation.site) : entry.target;
-                    implementations.push_back(function);
-                }
+            if (materializing() && functionIndex) {
+                fn.expressions[id].target = module.dynamicCasts.size();
+                module.dynamicCasts.push_back({*functionIndex, id, actual, target, operation.site});
             }
             return target;
         }
@@ -2869,7 +2967,7 @@ struct Checker {
             if (qualifier) for (const auto& type : qualifier->arguments) arguments.push_back(symbols.resolve(fn.syntax, type, variables));
             overloads(symbols.staticMethods[record->second], arguments);
         } else if (key == "Task" || key == "CPtr" || key == "CCallback") {
-            if (key == "Task" && inAsync()) {
+            if (key == "Task") {
                 shape("cancelled", {{}, {}, Type::Bool, false});
                 shape("checkCancellation", {{}, {}, Type::Unit, false});
             }
@@ -2918,7 +3016,12 @@ struct Checker {
             if (!symbols.valueSupport(owner, ValueOperation::Equal).missing) shape("equals", {{"other"}, {owner}, Type::Bool, false});
             if (!symbols.valueSupport(owner, ValueOperation::Hash).missing) shape("hashCode", {{}, {}, Type::Int, false});
             auto traitMembers = [&](const Trait& trait) {
-                for (const auto& required : trait.methods) shape(required.name.text, symbols.requiredShape(owner, trait, required, source, site));
+                for (const auto& required : trait.methods) {
+                    auto signature = symbols.requirement(trait, required);
+                    auto known = symbols.requirementTypes(owner, trait, source, site);
+                    auto description = describeFunction(symbols.sources[trait.file], signature, required.name.text, {}, {}, known.size());
+                    add(required.name.text, EditorKind::Method, std::move(description.label), std::move(description.documentation));
+                }
             };
             if (owner.kind == Type::Dyn) traitMembers(module.traits[module.dynamicTypes[owner.id].trait]);
             for (const auto& bound : symbols.contracts.constraints(owner)) if (!valueConstraint(bound)) traitMembers(symbols.contracts.declaration(bound));
@@ -3238,6 +3341,50 @@ struct Checker {
         return declaredCall(selected, id, call, expected, types(selected));
     }
 
+    Type interfaceCall(ExprId id, const Call& call, Type owner, const Trait& trait, const TraitMethod& method, std::optional<Type> expected,
+                       std::span<const std::string> alternatives = {}) {
+        auto signature = symbols.requirement(trait, method);
+        auto ownerTypes = symbols.requirementTypes(owner, trait, source, call.name.span);
+        signature.parameters.insert(signature.parameters.begin(), Parameter{{"$this", {}}, {"$Self", {}}});
+        signature.hasReceiver = true;
+        if (auto cursor = editorArgument(call)) {
+            editorCallable(id, call, signature, ownerTypes, *cursor);
+            throw EditorProbeFinished{};
+        }
+        auto [types, exits] = bindGeneric(id, call, signature, expected, ownerTypes);
+        auto arguments = std::span<const Type>(types).subspan(ownerTypes.size());
+        auto& info = fn.expressions[id];
+        refer(call.name, trait.file, method.name.span);
+        auto result = symbols.resolve(signature, method.result, types);
+        if (owner.kind != Type::Variable && materializing()) {
+            auto useDynamic = [&](const TraitMethod& implementation) {
+                const auto& methods = symbols.interfaceTrait(owner).methods;
+                info.callee = Callee::Dynamic;
+                info.dynamicMethod = DynamicMethodKey{owner, static_cast<std::size_t>(&implementation - methods.data()), {arguments.begin(), arguments.end()}};
+                info.interfaceAsync = method.asynchronous;
+            };
+            if (owner.kind == Type::Dyn) {
+                if (const auto* implementation = symbols.interfaceMethod(owner, trait, method, source, call.name.span)) useDynamic(*implementation);
+            }
+            if (!info.dynamicMethod) {
+                auto implementation = symbols.traitTarget(owner, trait, method, arguments, source, fn.syntax.file, call.name.span);
+                const TraitMethod* fallback = method.defaultFunction ? &method : nullptr;
+                bool ambiguous = false;
+                for (const auto& constraint : alternatives) {
+                    const auto& alternate = symbols.contracts.declaration(constraint);
+                    const auto& member = *std::ranges::find(alternate.methods, method.name.text, [](const TraitMethod& item) { return item.name.text; });
+                    if (!implementation) implementation = symbols.traitTarget(owner, alternate, member, arguments, source, fn.syntax.file, call.name.span);
+                    if (member.defaultFunction) { ambiguous |= fallback != nullptr; fallback = &member; }
+                }
+                if (implementation) info.target = *implementation;
+                else if (ambiguous) throw at(source, call.name.span, "LYG0006", "调用有多个适用的 trait 默认实现：" + call.name.text);
+                else if (fallback) info.target = symbols.traitDefault(owner, *fallback, arguments, source, call.name.span);
+                else throw at(source, call.name.span, "LYG0005", "缺少满足约束的可见方法：" + call.name.text);
+            }
+        }
+        return exits ? Type{Type::Never} : method.asynchronous ? symbols.task(result) : result;
+    }
+
     Type infer(ExprId id, const Call& call, std::optional<Type> expected, bool) {
         if ((call.receiver || call.typeOwner) && atEditorProbe(call.name))
             editorMembers(call.receiver, call.typeOwner ? &*call.typeOwner : nullptr, call.name.span);
@@ -3332,6 +3479,11 @@ struct Checker {
             auto owner = visit(*call.receiver);
             if (owner == Type::Never) return owner;
             bool privateMember = false, staticMember = false;
+            if (call.boundTrait && owner.kind != Type::Variable && !valueConstraint(*call.boundTrait)) {
+                const auto& trait = symbols.contracts.declaration(*call.boundTrait);
+                const auto& method = *std::ranges::find(trait.methods, call.name.text, [](const auto& entry) { return entry.name.text; });
+                return interfaceCall(id, call, owner, trait, method, expected, call.alternateTraits);
+            }
             if (auto builtin = symbols.builtinMember(owner, call.name.text, true)) {
                 noTypeArgs();
                 if (builtin->context == Symbols::MemberContext::Unsafe) requireUnsafe(call.name.span);
@@ -3357,38 +3509,19 @@ struct Checker {
                 auto constraints = symbols.contracts.constraints(owner);
                 if (std::ranges::find(constraints, capability) != constraints.end()) return valueMember(valueConstraint(capability).value());
                 if (auto method = symbols.boundMember(owner, call.name.text, source, call.name.span)) {
-                    noTypeArgs();
                     info.boundTrait = method->trait->name.text;
-                    refer(call.name, method->trait->file, method->method->name.span);
-                    const auto& shape = method->shape;
-                    bool exits = arguments(id, call, shape.parameters.size(), [&](auto slot) -> std::string_view { return shape.labels[slot]; }, [&](auto slot) { return shape.parameters[slot]; });
-                    return exits ? Type{Type::Never} : shape.asynchronous ? symbols.task(shape.result) : shape.result;
+                    info.alternateTraits = std::move(method->alternatives);
+                    return interfaceCall(id, call, owner, *method->trait, *method->method, expected);
                 }
             }
             if (owner.kind == Type::Dyn) {
-                const auto& trait = module.traits[module.dynamicTypes[owner.id].trait];
+                const auto& trait = symbols.interfaceTrait(owner);
                 auto declaration = std::ranges::find(trait.methods, call.name.text, [](const TraitMethod& candidate) { return candidate.name.text; });
-                if (declaration != trait.methods.end()) {
-                    noTypeArgs();
-                    auto method = symbols.requiredShape(owner, trait, *declaration, source, call.name.span);
-                    refer(call.name, trait.file, declaration->name.span);
-                    info.callee = Callee::Dynamic;
-                    info.target = declaration - trait.methods.begin();
-                    info.interfaceAsync = method.asynchronous;
-                    bool exits = arguments(id, call, method.parameters.size(), [&](auto slot) -> std::string_view { return method.labels[slot]; }, [&](auto slot) { return method.parameters[slot]; });
-                    return exits ? Type{Type::Never} : method.asynchronous ? symbols.task(method.result) : method.result;
-                }
+                if (declaration != trait.methods.end()) return interfaceCall(id, call, owner, trait, *declaration, expected);
             }
             if (call.boundTrait) if (auto operation = valueConstraint(*call.boundTrait)) return valueMember(*operation);
             if (owner.kind == Type::Record || owner.kind == Type::Enum) {
                 ownerTypes = symbols.instanceArguments(owner);
-                if (call.boundTrait) {
-                    const auto& trait = symbols.contracts.declaration(*call.boundTrait);
-                    const auto& method = *std::ranges::find_if(trait.methods, [&](const auto& entry) { return entry.name.text == call.name.text; });
-                    auto required = symbols.requiredShape(owner, trait, method, source, call.name.span);
-                    auto chosen = symbols.shapedMethod(owner, call.name.text, source, [&](const auto& shape) { return shape == required; });
-                    return declaredCall(chosen.value().first, id, call, expected, ownerTypes);
-                }
                 if (owner.kind == Type::Record) {
                     const auto& decl = module.aggregates[owner.id];
                     const auto& fields = symbols.fields[decl.declaration];
@@ -4162,6 +4295,12 @@ static CheckedModule checkProgram(Module module, const std::vector<Source>& sour
         }
         return variables;
     };
+    for (const auto& trait : module.traits) for (const auto& method : trait.methods) {
+        auto signature = symbols.requirement(trait, method);
+        auto variables = typeVariables(signature);
+        variables.erase(variables.begin(), variables.begin() + trait.associated.size() + 1);
+        symbols.methodVariables.emplace(std::pair(trait.name.text, method.name.text), std::move(variables));
+    }
     for (const auto& alias : symbols.aliasDeclarations) {
         const auto& source = sources[alias.file];
         auto variables = typeVariables(alias);
@@ -4206,7 +4345,7 @@ static CheckedModule checkProgram(Module module, const std::vector<Source>& sour
             symbols.contracts.bind(owner, trait.name, source);
         }
         for (const auto& method : trait.methods) {
-            auto shape = symbols.requiredShape(owner, trait, method, source, method.name.span);
+            auto shape = symbols.requiredShape(owner, trait, method, source, method.name.span, symbols.traitMethodVariables(trait, method));
             symbols.indexBinding(trait.file, method.name, EditorKind::Method, shape.result, method.asynchronous ? AsyncFunction : 0u);
             for (std::size_t slot = 0; slot < method.parameters.size(); ++slot)
                 symbols.indexBinding(trait.file, method.parameters[slot].name, EditorKind::Parameter, shape.parameters[slot], Readonly);
@@ -4420,8 +4559,11 @@ static CheckedModule checkProgram(Module module, const std::vector<Source>& sour
         if (!callable.generic || (macro && callable.generic->pendingExpansion) || !checkedGenerics.insert(declaration).second) return;
         auto rememberContracts = [&](const CheckedFunction& fn) {
             for (ExprId id = 0; id < callable.generic->expressions.size(); ++id) {
-                if (const auto& bound = fn.expressions[id].boundTrait)
-                    std::get<Call>(callable.generic->expressions[id].node).boundTrait = bound;
+                if (const auto& bound = fn.expressions[id].boundTrait) {
+                    auto& call = std::get<Call>(callable.generic->expressions[id].node);
+                    call.boundTrait = bound;
+                    call.alternateTraits = fn.expressions[id].alternateTraits;
+                }
             }
         };
         for (std::size_t slot = 0; slot < callable.generic->parameters.size(); ++slot) if (callable.generic->parameters[slot].defaultValue) {
@@ -4478,7 +4620,65 @@ static CheckedModule checkProgram(Module module, const std::vector<Source>& sour
     if (macro) {
         auto entry = symbols.callables[symbols.functionCallables[macro->declaration]].target;
         evaluateMacro(checked, sources, *macro, entry, checkBody);
-    } else for (std::size_t index = 0; index < checked.functions.size(); ++index) checkBody(index);
+    } else {
+        std::map<DynamicMethodKey, std::size_t> slots;
+        std::map<Type, std::vector<std::size_t>> methodSlots, casts;
+        std::vector<std::pair<std::size_t, std::size_t>> pending;
+        auto demand = [&](DynamicMethodKey key, const Source& source, Span site) {
+            auto [index, inserted] = slots.try_emplace(key, checked.dynamicMethods.size());
+            if (inserted) {
+                if (slots.size() > 4096) throw at(source, site, "LYG0004", "动态接口的方法实例超过 4096 个");
+                const auto& trait = symbols.interfaceTrait(key.owner);
+                const auto& method = trait.methods[key.method];
+                auto shape = symbols.requiredShape(key.owner, trait, method, source, site, key.arguments);
+                auto& ownerSlots = methodSlots[key.owner];
+                checked.dynamicMethods.push_back({std::move(key), ownerSlots.size(), std::move(shape.parameters), shape.result, shape.asynchronous});
+                ownerSlots.push_back(index->second);
+                for (auto cast : casts[checked.dynamicMethods.back().key.owner]) pending.emplace_back(cast, index->second);
+            }
+            return index->second;
+        };
+        std::size_t nextFunction = 0, nextCast = 0, nextSlot = 0;
+        while (nextFunction < checked.functions.size() || nextSlot < pending.size()) {
+            if (nextFunction < checked.functions.size()) {
+                const auto index = nextFunction++;
+                checkBody(index);
+                if (diagnostics && !diagnostics->errors.empty()) continue;
+                auto& body = checked.functions[index];
+                for (ExprId id = 0; id < body.expressions.size(); ++id) if (const auto& key = body.expressions[id].dynamicMethod) {
+                    auto target = demand(*key, sources[body.syntax.file], body.syntax.expressions[id].span);
+                    body.expressions[id].target = checked.dynamicMethods[target].slot;
+                }
+                for (; nextCast < checked.dynamicCasts.size(); ++nextCast) {
+                    auto type = checked.dynamicCasts[nextCast].to;
+                    casts[type].push_back(nextCast);
+                    for (auto method : methodSlots[type]) pending.emplace_back(nextCast, method);
+                }
+                continue;
+            }
+            if (diagnostics && !diagnostics->errors.empty()) break;
+            auto [castIndex, methodIndex] = pending[nextSlot++];
+            auto& cast = checked.dynamicCasts[castIndex];
+            auto key = checked.dynamicMethods[methodIndex].key;
+            const auto& function = checked.functions[cast.function].syntax;
+            const auto& source = sources[function.file];
+            const auto& trait = symbols.interfaceTrait(cast.to);
+            const auto& method = trait.methods[key.method];
+            if (cast.from.kind == Type::Dyn) {
+                if (const auto* implementation = symbols.interfaceMethod(cast.from, trait, method, source, cast.site)) {
+                    const auto& methods = symbols.interfaceTrait(cast.from).methods;
+                    auto sourceMethod = demand({cast.from, static_cast<std::size_t>(implementation - methods.data()), key.arguments}, source, cast.site);
+                    cast.entries.emplace(methodIndex, DynamicEntry{DynamicEntry::Source, sourceMethod});
+                    continue;
+                }
+            }
+            auto implementation = symbols.traitTarget(cast.from, trait, method, key.arguments, source, function.file, cast.site);
+            if (!implementation && method.defaultFunction)
+                implementation = symbols.traitDefault(cast.from, method, key.arguments, source, cast.site);
+            if (!implementation) throw at(source, cast.site, "LYG0005", "缺少可分派的动态接口实现：" + method.name.text);
+            cast.entries.emplace(methodIndex, DynamicEntry{DynamicEntry::Concrete, *implementation});
+        }
+    }
     if (diagnostics) {
         diagnostics->warnings = checked.warnings;
         if (!diagnostics->errors.empty()) return checked;
