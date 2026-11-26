@@ -7,6 +7,7 @@
 #include <iostream>
 #include <optional>
 #include <ranges>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -20,6 +21,7 @@
 #endif
 
 import lyra.build;
+import lyra.build_cache;
 import lyra.c_import;
 import lyra.check;
 import lyra.format;
@@ -42,6 +44,7 @@ constexpr auto usage = "lyra --help | --version\n"
                        "lyra check|build|run|test <包目录> [--locked] [--offline] [--diagnostics=json]\n"
                        "lyra test <包目录> [--list] [--filter <片段>] [--case <ID>]... [--format=json] [--timeout-seconds <秒>]\n"
                        "lyra build <包目录> [-o <产物>] [--release] [--debug-info] [--link <C库>] | run <包目录> [--release] [--debug-info] [--link <C库>] [-- <程序实参>...]\n"
+                       "lyra build|run|test <包目录> [--rebuild]\n"
                        "lyra lock|fetch <目录> [--locked] [--offline] | lock <目录> --update\n"
                        "lyra pack <目录> [-o <源码包>|--registry <本地目录>]";
 
@@ -53,7 +56,7 @@ struct Options {
     NativeBuildOptions native{};
     std::vector<std::string_view> arguments{};
     std::vector<fs::path> libraries{};
-    bool listTests{}, testJson{};
+    bool listTests{}, testJson{}, rebuild{};
     std::optional<std::string_view> testFilter{};
     std::vector<std::string_view> testCases{};
     unsigned testTimeout{};
@@ -80,6 +83,7 @@ Options options(const std::vector<std::string_view>& args, const std::vector<std
         }
         else if (arg == "--release" && command != "check" && !result.native.release) result.native.release = true;
         else if (arg == "--debug-info" && command != "check" && !result.native.debugInfo) result.native.debugInfo = true;
+        else if (arg == "--rebuild" && command != "check" && !result.rebuild) result.rebuild = true;
         else if (arg == "-o" && command == "build" && !result.output && index + 1 < args.size() && !args[index + 1].starts_with('-')) result.output = fromUtf8(args[++index]);
         else if (arg == "--link" && command != "check" && index + 1 < args.size() && !args[index + 1].starts_with('-')) {
             auto path = fs::absolute(fromUtf8(args[++index]));
@@ -103,7 +107,7 @@ Options options(const std::vector<std::string_view>& args, const std::vector<std
     return result;
 }
 
-void compile(const Options& opts, Compilation program, bool library, const fs::path& output, std::vector<Diagnostic>& warnings,
+std::vector<NativeArtifact> compile(const Options& opts, Compilation program, bool library, const fs::path& output, std::vector<Diagnostic>& warnings,
     const PackageGraph* graph = nullptr, std::string_view entry = {}) {
     auto module = check(std::move(program.syntax), program.sources, !library);
     warnings.insert(warnings.end(), module.warnings.begin(), module.warnings.end());
@@ -114,7 +118,16 @@ void compile(const Options& opts, Compilation program, bool library, const fs::p
     auto native = graph ? buildNativePackages(*graph, entry, output, opts.native) : NativeLibraries{};
     auto libraries = opts.libraries;
     libraries.insert(libraries.end(), native.libraries.begin(), native.libraries.end());
-    build(module, program.sources, output, opts.native, libraries);
+    return build(module, program.sources, output, opts.native, libraries);
+}
+
+void compileCached(const Options& opts, const fs::path& directory, const PackageGraph* graph, std::string_view entry,
+    const fs::path& output, bool library, std::vector<Diagnostic>& warnings, auto&& load, const fs::path& test = {}) {
+    BuildCache cache(directory, graph, entry, output, opts.native, opts.libraries, test, opts.rebuild);
+    if (!opts.rebuild && cache.reuse(warnings)) return;
+    auto firstWarning = warnings.size();
+    auto artifacts = compile(opts, load(), library, output, warnings, graph, entry);
+    cache.store(artifacts, std::span(warnings).subspan(firstWarning));
 }
 
 struct TestEntry { std::string id, name, packageId; fs::path root, path; };
@@ -184,7 +197,8 @@ int runTests(const Options& opts, bool jsonDiagnostics, AnalysisDiagnostics& dia
                 diagnostics.add(std::move(error));
             };
             try {
-                compile(opts, loadProgram(graph, entry.packageId, entry.path), false, binary, diagnostics.warnings, &graph, entry.packageId);
+                compileCached(opts, entry.root, &graph, entry.packageId, binary, false, diagnostics.warnings,
+                    [&] { return loadProgram(graph, entry.packageId, entry.path); }, entry.path);
                 phase = "run";
                 int status;
                 if (opts.testJson) {
@@ -232,11 +246,13 @@ int project(const Options& opts, bool json, AnalysisDiagnostics& diagnostics) {
             analyze(false, [&](auto& current) { return loadLooseProgram(loadSources(opts.directory), current); });
             return !diagnostics.errors.empty();
         }
-        auto sources = loadSources(opts.directory);
-        auto module = parse(sources);
-        if (!module.imports.empty()) throw at(sources[module.imports.front().file], module.imports.front().path.front().span, "LYN0003", "使用 import 需要包清单 lyra.json5");
         auto output = binary(opts.directory);
-        compile(opts, {std::move(sources), std::move(module)}, false, output, diagnostics.warnings);
+        compileCached(opts, opts.directory, nullptr, {}, output, false, diagnostics.warnings, [&]() -> Compilation {
+            auto sources = loadSources(opts.directory);
+            auto module = parse(sources);
+            if (!module.imports.empty()) throw at(sources[module.imports.front().file], module.imports.front().path.front().span, "LYN0003", "使用 import 需要包清单 lyra.json5");
+            return {std::move(sources), std::move(module)};
+        });
         return opts.command == "build" ? 0 : execute(output, opts.arguments);
     }
     auto graph = resolvePackages(opts.directory, opts.packages);
@@ -255,7 +271,8 @@ int project(const Options& opts, bool json, AnalysisDiagnostics& diagnostics) {
             continue;
         }
         auto output = binary(package.root);
-        compile(opts, loadProgram(graph, id), package.library, output, diagnostics.warnings, &graph, id);
+        compileCached(opts, package.root, &graph, id, output, package.library, diagnostics.warnings,
+            [&] { return loadProgram(graph, id); });
         return opts.command == "build" ? 0 : execute(output, opts.arguments);
     }
     return !diagnostics.errors.empty();

@@ -61,6 +61,12 @@ class DebugInfoTest(unittest.TestCase):
             self.assertEqual(rebuilt.returncode, 0, rebuilt.stderr)
             self.assertEqual(list(cache.iterdir()), entries)
             self.assertEqual(entries[0].stat().st_mtime_ns, old_time)
+            if WINDOWS:
+                old_symbols = self.symbols_for(executable)
+                old_symbols.unlink()
+                rebuilt = subprocess.run([COMPILER, "build", package], capture_output=True, text=True, timeout=30)
+                self.assertEqual(rebuilt.returncode, 0, rebuilt.stderr)
+                self.assertNotEqual(self.symbols_for(executable), old_symbols)
             executed = subprocess.run([executable], capture_output=True, text=True, timeout=10)
             self.assertEqual((executed.returncode, executed.stdout), (0, "42\n"))
 

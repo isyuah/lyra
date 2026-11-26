@@ -1,5 +1,6 @@
 module;
 #include <filesystem>
+#include <fstream>
 #include <initializer_list>
 #include <algorithm>
 #include <llvm/ADT/SmallString.h>
@@ -10,6 +11,7 @@ module;
 #include <llvm/IR/Module.h>
 #include <llvm/MC/TargetRegistry.h>
 #include <llvm/Passes/PassBuilder.h>
+#include <llvm/Support/BLAKE3.h>
 #include <llvm/Support/SHA256.h>
 #include <llvm/Support/FileSystem.h>
 #include <llvm/Support/MemoryBuffer.h>
@@ -151,7 +153,7 @@ void storeObject(const fs::path& cache, llvm::StringRef key, llvm::StringRef obj
     }
 }
 
-void emitExecutable(llvm::Module& module, llvm::TargetMachine& machine, const fs::path& output, bool release, bool symbols,
+std::vector<NativeArtifact> emitExecutable(llvm::Module& module, llvm::TargetMachine& machine, const fs::path& output, bool release, bool symbols,
                     const std::vector<fs::path>& libraries) {
     auto sdk = sdkRoot();
     auto lib = sdk / "lib";
@@ -220,10 +222,12 @@ void emitExecutable(llvm::Module& module, llvm::TargetMachine& machine, const fs
     }
     linkNative(sdk, link, log);
     if (cacheMiss) storeObject(cacheObject, cacheKey, objectText);
+    std::vector<NativeArtifact> artifacts{{output, fileContentKey(executable)}};
     if constexpr (windows) {
         if (symbols) {
             if (!fs::is_regular_file(stagedSymbols)) throw Diagnostic{"LYB0002", "LLD 未生成预期的 CodeView 符号文件：" + pathText(stagedSymbols)};
             auto outputSymbols = output.parent_path() / stagedSymbols.filename();
+            artifacts.push_back({outputSymbols, fileContentKey(stagedSymbols)});
             publishExecutable(stagedSymbols, outputSymbols, false);
             try { publishExecutable(executable, output); }
             catch (...) {
@@ -231,15 +235,29 @@ void emitExecutable(llvm::Module& module, llvm::TargetMachine& machine, const fs
                 fs::remove(outputSymbols, ignored);
                 throw;
             }
-            return;
+            return artifacts;
         }
     }
     publishExecutable(executable, output);
+    return artifacts;
 }
 
 }
 
-void build(const CheckedModule& functions, const std::vector<Source>& sources, const fs::path& output,
+std::optional<std::string> fileContentKey(const fs::path& file) {
+    std::error_code error;
+    if (!fs::is_regular_file(file, error)) return {};
+    std::ifstream input(file, std::ios::binary);
+    if (!input) return {};
+    llvm::BLAKE3 digest;
+    char bytes[64 * 1024];
+    while (input.read(bytes, sizeof(bytes)) || input.gcount() != 0)
+        digest.update(llvm::StringRef(bytes, static_cast<std::size_t>(input.gcount())));
+    if (!input.eof() || input.bad()) return {};
+    return llvm::toHex(digest.final(), true);
+}
+
+std::vector<NativeArtifact> build(const CheckedModule& functions, const std::vector<Source>& sources, const fs::path& output,
         NativeBuildOptions options, const std::vector<fs::path>& libraries) {
     if (fs::exists(output)) {
         for (const auto& source : sources) {
@@ -253,7 +271,7 @@ void build(const CheckedModule& functions, const std::vector<Source>& sources, c
     auto module = lower(functions, sources, context, machine->createDataLayout(), options.release, symbols);
     llvm::ModuleAnalysisManager analyses;
     llvm::GlobalDCEPass{}.run(*module, analyses);
-    emitExecutable(*module, *machine, fs::absolute(output), options.release, symbols, libraries);
+    return emitExecutable(*module, *machine, fs::absolute(output).lexically_normal(), options.release, symbols, libraries);
 }
 
 int execute(const fs::path& executable, const std::vector<std::string_view>& arguments, const NativeOutput* output, unsigned timeoutSeconds) {

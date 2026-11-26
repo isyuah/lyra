@@ -46,7 +46,13 @@ lyra pack demo/config --registry ./center
 | `lyra fetch DIR --locked` | 缺锁或锁与当前清单不兼容时报错；允许下载指定制品。 |
 | `lyra fetch DIR --locked --offline` | 不尝试网络。只读本地路径、静态中心和已校验的缓存；缺制品时报告包名、确切版本与摘要。 |
 
-默认包缓存为 `<workspace>/.lyra/cache/`；可设置 `LYRA_CACHE` 指到专用目录。原生目标文件缓存使用 `LYRA_CACHE/compiler/objects/`；未设置时写入可执行文件输出目录下的 `.lyra-cache/objects/`，键包含精确 LLVM IR、目标三元组、CPU、LLVM 版本及代码生成选项。命中且内容校验通过时只跳过 IR 到目标文件的编译，前端检查与链接仍每次运行；缓存损坏或无法读写时照常构建。HTTP(S) 下载由 Lyra SDK 自带的静态注册中心传输程序完成，不依赖宿主 `curl`，不经 shell，且不跟随重定向；`--offline` 不执行下载。`LYRA_REGISTRY_CA_FILE` 可显式指定 HTTPS 注册中心的 PEM 信任链。锁要提交到源码管理，缓存和 `dist/` 不需要提交。
+默认包缓存为 `<workspace>/.lyra/cache/`；可设置 `LYRA_CACHE` 指到专用目录。HTTP(S) 下载由 Lyra SDK 自带的静态注册中心传输程序完成，不依赖宿主 `curl`，不经 shell，且不跟随重定向；`--offline` 不执行下载。`LYRA_REGISTRY_CA_FILE` 可显式指定 HTTPS 注册中心的 PEM 信任链。锁要提交到源码管理，缓存和 `dist/` 不需要提交。
+
+`build`、`run` 和 `test` 在包解析后校验源码、宏输入、SDK 与原生目标文件、静态库的内容指纹。现有可执行文件及其 PDB 也匹配时，直接复用构建结果和警告，跳过解析、类型检查、LLVM lowering 和链接。每次直接校验项目输入与产物内容；未变化的 SDK 文件用文件身份、大小和系统变更时间复用其摘要。构建记录使用 `LYRA_CACHE/compiler/builds/`，未设置时写入输出目录的 `.lyra-cache/builds/`。删除或修改产物、输入变化、损坏或缺失记录会触发构建；`--rebuild` 可跳过构建结果和 SDK 摘要的复用。
+
+含 C 源码的依赖、GNU linker script 和 thin archive 可引用额外文件。在能完整记录这些依赖前，涉及这些输入的构建不复用整个产物。
+
+原生目标文件缓存仍使用同一缓存根下的 `objects/`，键包含精确 LLVM IR、目标三元组、CPU、LLVM 版本及代码生成选项。前端重跑后若 LLVM IR 未变，仍可命中目标文件缓存。构建记录只用于同一输出路径，不把其他目录里的可执行文件或 PDB 恢复到这里。
 
 ## 随包分发 C 库
 

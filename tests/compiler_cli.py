@@ -204,7 +204,7 @@ class Native(PackageTest):
         cache = self.package / '对象 cache'
 
         def run(cache_path):
-            result = self.cli('run', '--release', env={**os.environ, 'LYRA_CACHE': str(cache_path)})
+            result = self.cli('run', '--release', '--rebuild', env={**os.environ, 'LYRA_CACHE': str(cache_path)})
             self.assertEqual((result.returncode, result.stdout, result.stderr), (0, '3\n', ''))
 
         run(self.main)
@@ -214,6 +214,47 @@ class Native(PackageTest):
         entry.write_bytes(truncated)
         run(cache)
         self.assertNotEqual(entry.read_bytes(), truncated)
+
+    def test_complete_build_cache_checks_content_and_preserves_diagnostics(self):
+        self.main.write_text('fn work(): Result<Int, String> { Ok(7) }\nfn main(): Unit { work(); print(7) }\n', encoding='utf-8')
+        output = executable(self.package / 'output')
+        cache = self.package / '内容 cache'
+        environment = {**os.environ, 'LYRA_CACHE': str(cache)}
+        def build(*flags):
+            result = self.cli('build', '--release', '--diagnostics=json', '-o', output, *flags, env=environment)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            return json.loads(result.stderr)
+
+        first = build()
+        self.assertEqual(first[0]['code'], 'LYW0001')
+        timestamp = 1_000_000_000
+        os.utime(output, ns=(timestamp, timestamp))
+        self.assertEqual(build(), first)
+        self.assertEqual(output.stat().st_mtime_ns, timestamp)
+        self.assertEqual(build('--rebuild'), first)
+        self.assertNotEqual(output.stat().st_mtime_ns, timestamp)
+
+        saved = self.main.stat().st_mtime_ns
+        content = self.main.read_bytes()
+        self.main.write_bytes(content.replace(b'print(7)', b'print(8)'))
+        os.utime(self.main, ns=(saved, saved))
+        build()
+        result = subprocess.run([output], capture_output=True, timeout=10)
+        self.assertEqual((result.returncode, result.stdout), (0, b'8\n'))
+
+        output.write_bytes(b'corrupt native artifact')
+        build()
+        result = subprocess.run([output], capture_output=True, timeout=10)
+        self.assertEqual((result.returncode, result.stdout), (0, b'8\n'))
+        if not WINDOWS:
+            output.chmod(0o644)
+            build()
+            self.assertTrue(os.access(output, os.X_OK))
+
+        entry, = (cache / 'compiler' / 'builds').glob('*.json')
+        entry.write_text('{corrupt}', encoding='utf-8')
+        build()
+        self.assertEqual(json.loads(entry.read_text(encoding='utf-8'))['format'], 1)
 
     def test_fixed_width_integers_floats_and_checked_conversions(self):
         self.main.write_text('''

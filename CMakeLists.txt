@@ -50,6 +50,7 @@ target_sources(lyra PRIVATE FILE_SET CXX_MODULES FILES compiler/traits.cppm comp
 target_sources(lyra PRIVATE FILE_SET CXX_MODULES FILES compiler/collections.cppm compiler/conversions.cppm compiler/exceptions.cppm compiler/closures.cppm)
 target_sources(lyra PRIVATE FILE_SET CXX_MODULES FILES compiler/ctfe.cppm compiler/macro_syntax.cppm compiler/format.cppm)
 target_sources(lyra PRIVATE FILE_SET CXX_MODULES FILES compiler/c_import.cppm compiler/native_packages.cppm)
+target_sources(lyra PRIVATE FILE_SET CXX_MODULES FILES compiler/build_cache.cppm)
 lyra_stage_standard_library()
 add_dependencies(lyra lyraRuntime)
 if(NOT WIN32)

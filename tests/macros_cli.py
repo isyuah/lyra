@@ -269,8 +269,8 @@ async fn main(): Unit { val pending = work(); print("cold"); print(await pending
         snapshot.write_text('5')
         self.manifest(macroInputs={'value': {'extra': 'extra.txt'}})
 
-        def run(expected):
-            result = self.cli('run', self.pkg)
+        def run(expected, *options):
+            result = self.cli('run', self.pkg, *options)
             self.assertEqual(result.returncode, 0, result.stderr.decode())
             self.assertEqual(result.stdout.decode().splitlines(), [str(expected)])
 
@@ -290,9 +290,11 @@ async fn main(): Unit { val pending = work(); print("cold"); print(await pending
         helper.write_text('fn combine(first: Int, second: Int): Int { first + second }')
 
         entry.write_bytes(b'incomplete expansion')
-        run(13)
+        run(13, '--rebuild')
         self.assertEqual(entry.read_bytes(), contents)
+        saved = snapshot.stat().st_mtime_ns
         snapshot.write_text('6')
+        os.utime(snapshot, ns=(saved, saved))
         run(14)
         main.write_text(source.replace('7', '8'))
         run(15)
