@@ -3,6 +3,7 @@
 #include "locks.h"
 #include "lists.h"
 #include "managed.h"
+#include "native_async.h"
 #include "strings.h"
 
 #include <algorithm>
@@ -75,6 +76,17 @@ struct Failure {
     Failure *next;
 };
 
+struct NativeCleanup { LyraTask *task; NativeCleanup *next; };
+
+struct LyraNativeAsync {
+    enum class State { Cold, Pending, Done };
+    LyraNativeSubmit submit;
+    LyraNativeCancel cancel;
+    void *data, *rejected;
+    LyraTask *task;
+    State state;
+};
+
 struct LyraTask {
     LyraTaskStep step;
     void *frame;
@@ -102,7 +114,9 @@ struct LyraTask {
     LyraTaskState pendingState;
     bool cancelRequested;
     BlockingRequest *blocking;
-    bool joining, resumeAfterChildren;
+    LyraNativeAsync *native;
+    NativeCleanup *nativeCleanups;
+    bool joining, resumeAfterChildren, nativeShielded;
 };
 
 struct DisconnectWatch {
@@ -645,7 +659,7 @@ void startTask(LyraDomain *domain, LyraTask *task) {
     if (task->state != LYRA_TASK_COLD) return;
     task->activeRoot = lyraGcRootCreate(task);
     task->domain = domain;
-    task->context = task->owner ? task->owner->context : nullptr;
+    task->context = task->owner && !task->nativeShielded ? task->owner->context : nullptr;
     ++domain->live;
     enqueue(task);
 }
@@ -659,7 +673,7 @@ void startChild(LyraTask *owner, LyraTask *child, bool reportToGroup, LyraDomain
     if (owner->lastChild) owner->lastChild->nextChild = child;
     else owner->firstChild = child;
     owner->lastChild = child;
-    if (owner->cancelRequested || owner->failures) child->cancelRequested = true;
+    if (!child->nativeShielded && (owner->cancelRequested || owner->failures)) child->cancelRequested = true;
     transferLease(owner->domain, domain, true);
     startTask(domain, child);
 }
@@ -784,6 +798,13 @@ void finish(TaskLock& lock, LyraTask *task, LyraTaskState state, void *outcome) 
 
 void publish(TaskLock& lock, LyraTask *task) {
     require(!task->firstChild, "task still has children to clean up");
+    if (auto *cleanup = task->nativeCleanups) {
+        task->nativeCleanups = cleanup->next;
+        task->joining = true;
+        task->state = LYRA_TASK_SUSPENDED;
+        startChild(task, cleanup->task, false, task->domain);
+        return;
+    }
     auto *primary = task->error;
     for (auto *cause = task->failures; cause; cause = cause->next) primary = lyraExceptionAddTaskFailure(primary, cause->cause);
     for (auto *cause = task->cancelledCleanups; cause; cause = cause->next) primary = lyraExceptionAddCleanupFailure(primary, cause->cause);
@@ -807,6 +828,7 @@ void publish(TaskLock& lock, LyraTask *task) {
     task->failures = task->cancelledCleanups = nullptr;
     task->frame = nullptr;
     task->step = nullptr;
+    task->native = nullptr;
     stopDeadline(task);
     task->context = nullptr;
     while (auto *watch = task->watches) {
@@ -846,11 +868,14 @@ void publish(TaskLock& lock, LyraTask *task) {
 void requestCancel(LyraTask *task) {
     auto *current = task;
     for (;;) {
-        if (!isTerminal(current) && !current->cancelRequested && !(current->wait && current->wait->winner)) {
+        if (!isTerminal(current) && !current->cancelRequested && !current->nativeShielded &&
+            !(current->wait && current->wait->winner) && !(current->native && current->native->state == LyraNativeAsync::State::Done)) {
             current->cancelRequested = true;
             if (current->joining && current->pendingState == LYRA_TASK_COMPLETED) current->pendingState = LYRA_TASK_CANCELLED;
             if (current->blocking) uv_cancel(reinterpret_cast<uv_req_t *>(&current->blocking->request));
-            if (current->state == LYRA_TASK_SUSPENDED && !current->joining && !current->blocking) {
+            if (current->native && current->native->state == LyraNativeAsync::State::Pending) {
+                if (auto cancel = current->native->cancel) cancel(current->native->data);
+            } else if (current->state == LYRA_TASK_SUSPENDED && !current->joining && !current->blocking) {
                 if (current->waitingOn) detachWaiter(current);
                 if (current->wait) detachChoices(*current->wait);
                 if (current->firstChild) current->resumeAfterChildren = true;
@@ -903,6 +928,45 @@ void blockingStep(LyraTask *self, void *storage) {
     else if (closure->error) lyraTaskFail(self, closure->error);
     else if (closure->submitted) lyraTaskComplete(self, closure->result);
     else { closure->submitted = true; lyraTaskBlock(self, runClosure, closure); }
+}
+
+void attachNativeCleanup(LyraTask *owner, LyraTask *cleanup) {
+    require(owner && cleanup->native && !cleanup->nativeShielded && cleanup->state == LYRA_TASK_COLD,
+        "invalid native cleanup task");
+    cleanup->nativeShielded = true;
+    owner->nativeCleanups = ::new (lyraGcAlloc(sizeof(NativeCleanup))) NativeCleanup{cleanup, owner->nativeCleanups};
+}
+
+void readyNative(LyraNativeAsync& operation, void *boxed) {
+    auto *task = operation.task;
+    require(operation.state == LyraNativeAsync::State::Pending && task->state == LYRA_TASK_SUSPENDED,
+        "native operation already completed");
+    operation.state = LyraNativeAsync::State::Done;
+    task->outcome = boxed;
+    auto& domain = *task->domain;
+    --domain.loopUsers;
+    if (!domain.pooled) --domain.executor->leases;
+    enqueue(task);
+}
+
+void nativeStep(LyraTask *self, void *storage) {
+    auto& operation = *static_cast<LyraNativeAsync *>(storage);
+    TaskLock lock;
+    if (cancelled(self)) { finish(lock, self, LYRA_TASK_CANCELLED, nullptr); return; }
+    if (operation.state == LyraNativeAsync::State::Done) {
+        finish(lock, self, LYRA_TASK_COMPLETED, self->outcome);
+        return;
+    }
+    require(operation.state == LyraNativeAsync::State::Cold, "native operation resumed before acknowledgement");
+    auto& domain = *self->domain;
+    ++domain.loopUsers;
+    if (!domain.pooled) {
+        ++domain.executor->leases;
+        notify(*domain.executor);
+    }
+    self->state = LYRA_TASK_SUSPENDED;
+    operation.state = LyraNativeAsync::State::Pending;
+    if (!operation.submit(&operation, operation.data)) readyNative(operation, operation.rejected);
 }
 
 struct LocalScope {
@@ -1004,6 +1068,32 @@ LyraTask *lyraTaskCreate(LyraTaskStep step, void *frame) {
     task->frame = frame;
     task->state = LYRA_TASK_COLD;
     return task;
+}
+
+LyraTask *lyraTaskNative(LyraNativeSubmit submit, LyraNativeCancel cancel, void *data, void *rejected) {
+    auto *operation = ::new (lyraGcAlloc(sizeof(LyraNativeAsync))) LyraNativeAsync{submit, cancel, data, rejected, nullptr, LyraNativeAsync::State::Cold};
+    auto *task = lyraTaskCreate(nativeStep, operation);
+    task->native = operation;
+    operation->task = task;
+    return task;
+}
+
+bool lyraNativeTryComplete(LyraNativeAsync *operation, void *boxed, LyraTask *cleanup) {
+    TaskLock lock;
+    if (cancelled(operation->task)) return false;
+    if (cleanup) attachNativeCleanup(operation->task->owner, cleanup);
+    readyNative(*operation, boxed);
+    return true;
+}
+
+void lyraNativeComplete(LyraNativeAsync *operation, void *boxed) {
+    TaskLock lock;
+    readyNative(*operation, boxed);
+}
+
+void lyraNativeKeepCleanup(LyraTask *cleanup) {
+    TaskLock lock;
+    attachNativeCleanup(currentTask, cleanup);
 }
 
 LyraChannel *lyraChannelCreate(int64_t capacity, const void *closedType, const LyraException **error) {
@@ -1205,7 +1295,8 @@ void lyraTaskSuspend(LyraTask *task) {
 
 void lyraTaskWake(LyraTask *task) {
     TaskLock lock;
-    if (task->state == LYRA_TASK_SUSPENDED && !task->waitingOn && !task->wait && !task->blocking && !task->joining && !task->resumeAfterChildren) enqueue(task);
+    if (task->state == LYRA_TASK_SUSPENDED && !task->waitingOn && !task->wait && !task->blocking && !task->native &&
+        !task->joining && !task->resumeAfterChildren) enqueue(task);
 }
 
 void lyraTaskBlock(LyraTask *task, LyraNativeWork work, void *nativeData) {
