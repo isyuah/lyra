@@ -28,6 +28,8 @@ lyra build examples/http-sqlite --locked --offline -o "$work/users-app"
 
 `Router.serve(listener, capacity)` 用固定数量的槽登记接收游标，达到容量时不会接受额外请求；每个请求收到完整消息后才分派给并发 handler。请求断开只取消所属 handler，原生响应和 SQLite 工作安全收尾后再关闭句柄。服务每个监听槽都在独立执行域推进，可在线程池只有一个阻塞 worker 时同时处理连接与查询。
 
+生产环境可传 `http.Shutdown()` 给 `serve`，信号到来后先停止接入，再等待在途请求完成；超过 `graceMs` 才取消尚未完成的 handler，并等待它们释放请求与 SQLite 资源。示例通过 `retryBusy` 对短暂的数据库锁冲突作有限退避，其他 `Busy` 或附带清理错误不会被重试。
+
 ## SQL 快照与取消
 
 `#userQuery` 在 `users` 包内展开为普通类型检查的参数化 SQLite 调用。`users/lyra.json5` 只授予查询宏读取 `users/inputs/schema.sql` 和 `users/inputs/userById.snapshot`。修改查询时同步更新宏调用的 SQL 字面量和 `users/tools/userById.sql`，再显式运行 `python examples/http-sqlite/users/tools/prepareQuery.py` 刷新；可加 `--check` 只校验不写入。正常构建不执行准备脚本或联网更新。

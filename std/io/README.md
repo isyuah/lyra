@@ -17,6 +17,7 @@
 - `file.read(maxBytes: Int = 65536)` 单次最多读 64 KiB；`Ok(Some(bytes))` 含非空片段，`Ok(None)` 为 EOF。`file.write(bytes)` 可多次调用；`file.flush()` 刷新缓冲，可处理失败。
 - `file.seek(offset: Int, origin: SeekOrigin = SeekOrigin.Start): Result<Int, IoError>` 用 64 位字节偏移定位并返回新位置。`Current` 和 `End` 分别从当前位置和末尾开始。追加模式即使定位，下一次写入也仍在末尾。
 - `file.close()` 是同步清理，可用 `defer file.close()`；别名共享关闭，闲置时重复关闭成功。并行操作占用同一文件时返回 `IoErrorKind.Busy`；此时 `close` 抛 `std.io.Busy` 而不关闭，其他关闭失败抛 `std.io.CloseError`。I/O 都是同步的，服务端可以通过 `blocking` 隔离等待。
+- `File.withRead(path) { file => ... }`、`File.withWrite(path) { file => ... }` 和 `File.withAppend(path) { file => ... }` 在回调退出时关闭句柄，包括返回 `Err` 或抛异常的路径；异步调用时把整个作用域放进一个 `blocking` 块。
 
 ```lyra
 import std.io.{File}

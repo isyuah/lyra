@@ -119,6 +119,10 @@ pub class File(val handle: CPtr) {
     pub static fn openWrite(path: String): Result<File, IoError> { openFile(path, 1, "openWrite") }
     pub static fn openAppend(path: String): Result<File, IoError> { openFile(path, 2, "openAppend") }
 
+    pub static fn withRead<T>(path: String, body: (File) -> Result<T, IoError>): Result<T, IoError> { openAndUse<T>(path, 0, "openRead", body) }
+    pub static fn withWrite<T>(path: String, body: (File) -> Result<T, IoError>): Result<T, IoError> { openAndUse<T>(path, 1, "openWrite", body) }
+    pub static fn withAppend<T>(path: String, body: (File) -> Result<T, IoError>): Result<T, IoError> { openAndUse<T>(path, 2, "openAppend", body) }
+
     pub fn read(maxBytes: Int = 65536): Result<Bytes?, IoError> {
         val result = lyraIoFileRead(handle, maxBytes)
         match lyraIoBytesStatus(result) {
@@ -147,6 +151,12 @@ pub class File(val handle: CPtr) {
             _ => throw CloseError(error.message()),
         }
     }
+}
+
+fn openAndUse<T>(path: String, mode: Int, operation: String, body: (File) -> Result<T, IoError>): Result<T, IoError> {
+    val file = openFile(path, mode, operation)?
+    defer file.close()
+    body(file)
 }
 
 fn openFile(path: String, mode: Int, operation: String): Result<File, IoError> {

@@ -168,3 +168,9 @@ fn connect(path: String, readOnly: Bool): Result<Connection, DbError> {
 
 pub fn open(path: String): Result<Connection, DbError> { connect(path, false) }
 pub fn openReadOnly(path: String): Result<Connection, DbError> { connect(path, true) }
+
+pub fn withConnection<T>(path: String, readOnly: Bool = false, body: (Connection) -> Result<T, DbError>): Result<T, DbError> {
+    val connection = connect(path, readOnly)?
+    defer connection.close()
+    body(connection)
+}

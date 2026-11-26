@@ -1,5 +1,5 @@
 import std.json.{JsonCodec}
-import std.sqlite.{Connection, DbError, Statement, open, openReadOnly}
+import std.sqlite.{Connection, DbError, Statement, withConnection}
 
 #derive(Json)
 pub struct User(pub val id: Int, pub val name: String)
@@ -23,24 +23,24 @@ fn prepareUserById(db: Connection, sql: String, id: Int): Result<Statement, DbEr
 }
 
 pub fn findUser(path: String, id: Int): Result<User?, DbError> {
-    val db = openReadOnly(path)?
-    defer db.close()
-    val query = #userQuery(db, "SELECT name FROM users WHERE id=?1", id)?
-    defer query.close()
-    if !query.next()? { return Ok(None) }
-    match query.readText(0)? {
-        Some(name) => Ok(Some(User(id, name))),
-        None => Err(DbError.typeMismatch("readText", "users.name must not be NULL")),
+    withConnection<User?>(path, readOnly: true) { db =>
+        val query = #userQuery(db, "SELECT name FROM users WHERE id=?1", id)?
+        defer query.close()
+        if !query.next()? { return Ok(None) }
+        match query.readText(0)? {
+            Some(name) => Ok(Some(User(id, name))),
+            None => Err(DbError.typeMismatch("readText", "users.name must not be NULL")),
+        }
     }
 }
 
 pub fn insertUser(path: String, input: NewUser): Result<User, DbError> {
-    val db = open(path)?
-    defer db.close()
-    db.transaction<User>() { tx =>
-        val insert = tx.prepare("INSERT INTO users(name) VALUES(?1)")?
-        insert.bindText(1, input.name)?
-        insert.next()?;
-        Ok(User(tx.lastInsertRowid()?, input.name))
+    withConnection<User>(path) { db =>
+        db.transaction<User>() { tx =>
+            val insert = tx.prepare("INSERT INTO users(name) VALUES(?1)")?
+            insert.bindText(1, input.name)?
+            insert.next()?;
+            Ok(User(tx.lastInsertRowid()?, input.name))
+        }
     }
 }

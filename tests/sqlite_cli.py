@@ -274,6 +274,54 @@ fn main(): Unit {
                     self.assertEqual(run.returncode, 0, run.stderr.decode())
                     self.assertEqual(run.stdout.decode().splitlines(), ['transaction ok'])
 
+    def test_connection_scope_closes_on_result_and_exception(self):
+        source = '''
+import std.sqlite.{Connection}
+import std.sqlite.{DbError}
+import std.sqlite.{DbErrorKind}
+import std.sqlite.{withConnection}
+
+fn main(): Unit {
+    var failedHandle: Connection? = None
+    val failed = withConnection<Unit>(":memory:") { db =>
+        failedHandle = Some(db)
+        db.exec("CREATE TABLE scoped(value INTEGER)")?
+        Err(DbError.typeMismatch("scope", "expected"))
+    }
+    #assert(match failed { Err(error) => error.operation == "scope", _ => false })
+    #assert(match failedHandle {
+        Some(db) => match db.exec("SELECT 1") { Err(error) => error.kind == DbErrorKind.Closed, _ => false },
+        None => false,
+    })
+
+    var thrownHandle: Connection? = None
+    var caught = false
+    try {
+        val _ = withConnection<Unit>(":memory:") { db =>
+            thrownHandle = Some(db)
+            throw Exception("expected")
+        }
+    } catch error: Exception { caught = error.message == "expected" }
+    #assert(caught)
+    #assert(match thrownHandle {
+        Some(db) => match db.exec("SELECT 1") { Err(error) => error.kind == DbErrorKind.Closed, _ => false },
+        None => false,
+    })
+}
+'''
+        with tempfile.TemporaryDirectory() as temporary:
+            package = Path(temporary)
+            (package / 'src').mkdir()
+            (package / 'lyra.json5').write_text("{name:'test/sqlite-scope',version:'1.0.0'}", encoding='utf-8')
+            (package / 'src/main.ly').write_text(source, encoding='utf-8')
+            for flags in ([], ['--release']):
+                with self.subTest(release=bool(flags)):
+                    app = executable(package / 'scope')
+                    built = subprocess.run([COMPILER, 'build', package, '-o', app, *flags], capture_output=True, timeout=30)
+                    self.assertEqual(built.returncode, 0, built.stderr.decode())
+                    result = subprocess.run([app], cwd=package, capture_output=True, timeout=10)
+                    self.assertEqual((result.returncode, result.stdout, result.stderr), (0, b'', b''))
+
 
 if __name__ == "__main__":
     unittest.main()

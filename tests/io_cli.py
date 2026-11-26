@@ -94,6 +94,46 @@ fn main(): Unit {
 }
 ''', invoke)
 
+    def test_scoped_file_helpers_close_on_result_and_exception(self):
+        self.example('''
+import std.io.{File}
+import std.io.{IoError}
+import std.io.{IoErrorKind}
+import std.io.{readBytes}
+
+fn main(): Unit {
+    var failedHandle: File? = None
+    val failed = File.withWrite<Unit>("scoped.bin") { file =>
+        failedHandle = Some(file)
+        file.write(b"discarded")?
+        Err(IoError(IoErrorKind.Invalid, "expected"))
+    }
+    #assert(match failed { Err(error) => error.kind == IoErrorKind.Invalid, _ => false })
+    #assert(match failedHandle {
+        Some(file) => match file.flush() { Err(error) => error.kind == IoErrorKind.Closed, _ => false },
+        None => false,
+    })
+
+    var thrownHandle: File? = None
+    var caught = false
+    try {
+        val _ = File.withAppend<Unit>("scoped.bin") { file =>
+            thrownHandle = Some(file)
+            throw Exception("expected")
+        }
+    } catch error: Exception { caught = error.message == "expected" }
+    #assert(caught)
+    #assert(match thrownHandle {
+        Some(file) => match file.flush() { Err(error) => error.kind == IoErrorKind.Closed, _ => false },
+        None => false,
+    })
+
+    val _ = File.withWrite<Unit>("scoped.bin") { file => file.write(b"closed") }
+    val _ = File.withAppend<Unit>("scoped.bin") { file => file.write(b" and appended") }
+    #assert(match readBytes("scoped.bin") { Ok(bytes) => bytes == b"closed and appended", _ => false })
+}
+''', lambda app: self.assertEqual(subprocess.run([app], cwd=self.package, capture_output=True, timeout=5).returncode, 0))
+
     def test_run_preserves_forwarded_argument_boundaries(self):
         self.source.write_text(IO_HELPERS + 'fn main(): Unit { val values = require(args()); print(values.size); print(values[0]); print(values[1]) }')
         value = '中文 "quoted" \\'

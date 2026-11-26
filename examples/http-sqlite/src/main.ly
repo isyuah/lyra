@@ -13,10 +13,27 @@ import std.text.{StringOps}
 fn text(code: Int, body: String): http.Response { http.Response.text(code, body) }
 
 fn databaseFailure(logger: log.Logger, route: String, error: sqlite.DbError): http.Response {
+    if error.kind == sqlite.DbErrorKind.Busy && error.cleanupError == None {
+        return text(503, "database busy").withHeader("Retry-After", "1")
+    }
     val fields = json.jsonObject().put("route", json.jsonString(route))
         .put("operation", json.jsonString(error.operation)).put("code", json.jsonInt(error.code)).build()
     val _ = logger.error("database error", fields: fields)
     text(500, "database error")
+}
+
+async fn retryBusy<T>(action: () -> Result<T, sqlite.DbError>): Result<T, sqlite.DbError> {
+    var delay = 10
+    var result = await blocking { action() }
+    for attempt in 0..<3 {
+        if let Err(error) = result {
+            if error.kind != sqlite.DbErrorKind.Busy || error.cleanupError != None { break }
+        } else { break }
+        await sleepMs(delay)
+        result = await blocking { action() }
+        delay *= 2
+    }
+    result
 }
 
 async fn getUser(request: http.Request, path: String, logger: log.Logger): http.Response {
@@ -24,7 +41,7 @@ async fn getUser(request: http.Request, path: String, logger: log.Logger): http.
         Ok(Some(value)) => value,
         _ => return text(400, "invalid id"),
     }
-    val result = await blocking { users.findUser(path, id) }
+    val result = await retryBusy<users.User?>(() => { users.findUser(path, id) })
     match result {
         Ok(Some(user)) => http.Response.json(user, users.userCodec()),
         Ok(None) => text(404, "not found"),
@@ -37,7 +54,7 @@ async fn postUser(request: http.Request, path: String, logger: log.Logger): http
         Ok(value) => value,
         Err(error) => return text(400, error.message()),
     }
-    val result = await blocking { users.insertUser(path, input) }
+    val result = await retryBusy<users.User>(() => { users.insertUser(path, input) })
     match result {
         Ok(user) => http.Response.json(user, users.userCodec(), code: 201),
         Err(error) => databaseFailure(logger, "POST /users", error),

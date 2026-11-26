@@ -19,7 +19,7 @@ async fn main(): Unit {
 }
 ```
 
-`listen(port, host: "127.0.0.1")` 返回 `Result<Listener, HttpError>`。`host` 使用数值 IPv4 或 IPv6 地址；如需对外监听，显式用 `0.0.0.0` 或 `::`，分别开放对应协议。传 `0` 让系统分配端口，`port()` 读取实际值。`Router.serve(listener, capacity)` 接管监听器，用固定接收槽并发处理路由，容量必须在 1..64。
+`listen(port, host: "127.0.0.1")` 返回 `Result<Listener, HttpError>`。`host` 使用数值 IPv4 或 IPv6 地址；如需对外监听，显式用 `0.0.0.0` 或 `::`，分别开放对应协议。传 `0` 让系统分配端口，`port()` 读取实际值。`Router.serve(listener, capacity, shutdown, graceMs)` 接管监听器，用固定接收槽并发处理路由，容量必须在 1..64。`shutdown` 默认为 `None`，`graceMs` 默认为 5000。
 
 不用 Router 时，同步代码用 `listener.accept(timeoutMs): Result<Request, HttpError>`，成功后自行关闭请求。异步代码用 `await listener.withAccepted<T>(timeoutMs, handler)`，其中 `handler` 的类型为 `(Request) -> Task<T>`：
 
@@ -46,7 +46,17 @@ val handled = await server.withAccepted<Unit>(5000, async (request: Request) => 
 
 ## 关闭与断线
 
-同一监听器可并行接受多个连接。手动关闭前，应停止并等待该监听器的 `accept` 操作结束；占用中的 `close()` 抛出 `std.http.Busy`，不会关闭仍在使用的句柄。要停止 `Router.serve`，取消服务任务并等待它收尾，由服务关闭监听器。请求同样会在响应写入与其他原生操作冲突时返回 `HttpErrorKind.Busy`，关闭与写入冲突时抛出 `Busy`。在关闭完成后再次 `close()` 无副作用。
+同一监听器可并行接受多个连接。传入 `Shutdown()` 后，可从信号处理任务调用 `request()`：服务停止接收新连接、关闭监听器，并等待已接收请求最多 `graceMs` 毫秒；到期后取消仍在运行的 handler，等待其清理和原生工作收尾，再返回。随后服务拥有并关闭监听器。没有传 shutdown 时，可取消服务任务并等待它收尾。手动关闭前，应停止并等待该监听器的 `accept` 操作结束；占用中的 `close()` 抛出 `std.http.Busy`，不会关闭仍在使用的句柄。请求同样会在响应写入与其他原生操作冲突时返回 `HttpErrorKind.Busy`，关闭与写入冲突时抛出 `Busy`。在关闭完成后再次 `close()` 无副作用。
+
+```lyra
+val shutdown = Shutdown()
+val serving = spawn router.serve(listener, capacity: 4, shutdown: Some(shutdown), graceMs: 5000)
+await waitForTerminationSignal()
+shutdown.request()
+await serving
+```
+
+`Shutdown.request()` 可重复调用；该对象用于在异步任务间传递停机信号，不代表操作系统信号处理器。
 
 在异步 handler 中，`request.watchDisconnect()` 把当前请求登记到**当前 Task**：注册成功返回 `true`，随后对端断开会取消这个 Task 及它的子任务。本地 `close()` 或响应完成不会取消 Task。在同步 `main` 或阻塞池线程内无法登记。`disconnected()` 查询当前连接状态；`waitDisconnect(timeoutMs)` 同步等待，在 `blocking` 中会响应任务取消，不必等到超时。当前实现把对端关闭写方向也视为断线，客户端应在读取响应后再关闭连接。
 

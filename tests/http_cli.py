@@ -83,6 +83,19 @@ class HTTP(unittest.TestCase):
                     connection.execute("INSERT INTO users VALUES(7,?)", (name,))
                     connection.execute("INSERT INTO users VALUES(9,?)", ("x" * (2 * 1024 * 1024),))
                 with server(app, database) as (port, process, output):
+                    lock = sqlite3.connect(database, timeout=0)
+                    lock.execute("BEGIN IMMEDIATE")
+                    try:
+                        busy = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+                        busy.request("POST", "/users", body=json.dumps({"name": "queued"}), headers={"Content-Type": "application/json"})
+                        response = busy.getresponse()
+                        self.assertEqual((response.status, response.read(), response.getheader("Retry-After")), (503, b"database busy", "1"))
+                        busy.close()
+                    finally:
+                        lock.rollback()
+                        lock.close()
+                    created_status, created_type, created_body = exchange(port, "POST", "/users", json.dumps({"name": "queued"}).encode())
+                    self.assertEqual((created_status, created_type, json.loads(created_body)), (201, "application/json", {"id": 10, "name": "queued"}))
                     with socket.socket() as drop:
                         drop.settimeout(5)
                         drop.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
@@ -244,6 +257,125 @@ async fn main(): Unit {
                 self.assertEqual(exchange(port, "GET", "/fail")[0], 500)
                 self.assertEqual(output.line().strip(), b"handler cleanup")
                 self.assertEqual(exchange(port, "GET", "/ready"), (200, "text/plain", b"ready"))
+
+    def test_router_shutdown_drains_active_requests_before_stopping(self):
+        package = self.root / "shutdown"
+        (package / "src").mkdir(parents=True)
+        (package / "lyra.json5").write_text("{name:'test/http-shutdown',version:'1.0.0'}")
+        (package / "src/main.ly").write_text(HTTP_HELPERS + '''
+import std.http.{Request}
+import std.http.{Router}
+import std.http.{Shutdown}
+import std.io.{readLine}
+
+async fn main(): Unit {
+    val listener = requireHttp(listen(0))
+    val router = Router()
+    router.get("/delayed", async (request: Request) => {
+        print("handler-started")
+        defer print("handler-cleanup")
+        await sleepMs(80)
+        Response.text(200, "done")
+    })
+    val shutdown = Shutdown()
+    val service = spawn router.serve(listener, 1, Some(shutdown), 1000)
+    print(listener.port())
+    await parallel { #assert(match readLine() { Ok(Some(line)) => line == "stop", _ => false }) }
+    shutdown.request()
+    await service
+    print("server-stopped")
+}
+''', encoding="utf-8")
+        for profile, app in self.profiles(package):
+            with self.subTest(profile=profile), server(app) as (port, process, output):
+                connection = socket.create_connection(("127.0.0.1", port), timeout=5)
+                self.addCleanup(connection.close)
+                connection.sendall(b"GET /delayed HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                try:
+                    started = output.line()
+                except TimeoutError:
+                    status = process.poll()
+                    if status is None:
+                        process.terminate()
+                        status = process.wait(timeout=5)
+                    self.fail(f"handler did not start (exit {status}): {process.stderr.read().decode(errors='replace')}")
+                self.assertEqual(started, b"handler-started\n")
+                process.stdin.write(b"stop\n")
+                process.stdin.flush()
+                response = http.client.HTTPResponse(connection)
+                response.begin()
+                self.assertEqual((response.status, response.read()), (200, b"done"))
+                self.assertEqual(process.wait(timeout=5), 0, process.stderr.read())
+                self.assertEqual(output.remaining(), b"handler-cleanup\nserver-stopped\n")
+
+    def test_router_shutdown_waits_for_scoped_sqlite_write(self):
+        package = self.root / "shutdown-sqlite"
+        (package / "src").mkdir(parents=True)
+        (package / "lyra.json5").write_text("{name:'test/http-shutdown-sqlite',version:'1.0.0'}")
+        (package / "src/main.ly").write_text(HTTP_HELPERS + '''
+import std.http.{Request}
+import std.http.{Router}
+import std.http.{Shutdown}
+import std.io.{readLine}
+import std.os.{args}
+import std.sqlite.{DbError}
+import std.sqlite.{withConnection}
+
+extern fn uv_sleep(milliseconds: Int32): Unit;
+
+async fn writeDatabase(path: String): Result<Unit, DbError> {
+    await blocking {
+        withConnection<Unit>(path) { db =>
+            db.transaction<Unit>() { tx =>
+                tx.exec("CREATE TABLE IF NOT EXISTS writes(value INTEGER)")?
+                tx.exec("INSERT INTO writes VALUES(1)")?
+                uv_sleep(250)
+                Ok({})
+            }
+        }
+    }
+}
+
+async fn main(): Unit {
+    val arguments = match args() { Ok(value) => value, Err(error) => throw Exception(error.message()) }
+    val listener = requireHttp(listen(0))
+    val router = Router()
+    router.get("/write", async (request: Request) => {
+        print("write-started")
+        defer print("handler-cleanup")
+        match await writeDatabase(arguments[0]) {
+            Ok(_) => Response.text(200, "committed"),
+            Err(error) => Response.text(500, error.message()),
+        }
+    })
+    val shutdown = Shutdown()
+    val service = spawn router.serve(listener, 1, Some(shutdown), 2000)
+    print(listener.port())
+    await parallel { #assert(match readLine() { Ok(Some(line)) => line == "stop", _ => false }) }
+    shutdown.request()
+    await service
+    print("server-stopped")
+}
+''', encoding="utf-8")
+        for profile, app in self.profiles(package):
+            database_path = self.root / (profile + ".sqlite")
+            with self.subTest(profile=profile), server(app, database_path) as (port, process, output):
+                connection = socket.create_connection(("127.0.0.1", port), timeout=5)
+                try:
+                    connection.sendall(b"GET /write HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                    self.assertEqual(output.line(), b"write-started\n")
+                    process.stdin.write(b"stop\n")
+                    process.stdin.flush()
+                    response = http.client.HTTPResponse(connection)
+                    response.begin()
+                    self.assertEqual((response.status, response.read()), (200, b"committed"))
+                finally:
+                    connection.close()
+                self.assertEqual(output.line(), b"handler-cleanup\n")
+                self.assertEqual(process.wait(timeout=5), 0, process.stderr.read())
+                self.assertEqual(output.remaining(), b"server-stopped\n")
+                with contextlib.closing(sqlite3.connect(database_path)) as database:
+                    self.assertEqual(database.execute("SELECT value FROM writes").fetchall(), [(1,)])
 
     def test_bind_methods_head_and_allow(self):
         package = self.root / "methods"
@@ -417,7 +549,7 @@ async fn main(): Unit {
                                   capture_output=True, timeout=20)
         mismatch = check()
         self.assertNotEqual(mismatch.returncode, 0)
-        diagnostic, = json.loads(mismatch.stderr)
+        diagnostic = next(item for item in json.loads(mismatch.stderr) if item['code'] == 'LYM0002')
         self.assertEqual(diagnostic['code'], 'LYM0002', diagnostic)
         source = library / 'src/users.ly'
         self.assertEqual(Path(diagnostic['file']).resolve(), source.resolve())

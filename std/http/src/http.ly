@@ -1,11 +1,14 @@
 import std.io.{writeError}
 import std.json.{JsonCodec}
+import std.task.{withTimeout}
+import std.time.{Clock}
 
 extern fn lyraHttpListen(host: String, port: Int): CPtr;
 extern fn lyraHttpStatus(server: CPtr): Int;
 extern fn lyraHttpStatusDetail(server: CPtr): String;
 extern fn lyraHttpErrorKind(status: Int): Int;
 extern fn lyraHttpPort(server: CPtr): Int;
+extern fn lyraHttpBeginDrain(server: CPtr): Unit;
 extern fn lyraHttpStop(server: CPtr): Int;
 extern fn lyraHttpAccept(server: CPtr, timeoutMs: Int): CPtr;
 extern fn lyraHttpRequestStatus(request: CPtr): Int;
@@ -222,6 +225,12 @@ pub fn listen(port: Int, host: String = "127.0.0.1"): Result<Listener, HttpError
 
 struct Route(val method: String, val pattern: CPtr, val handler: (Request) -> Task<Response>)
 
+pub class Shutdown {
+    val signal: Channel<Unit> = Channel<Unit>(1)
+    pub fn request(): Unit { signal.close() }
+    async fn wait(): Unit { val _ = await signal.receive() }
+}
+
 pub class Router {
     val routes: List<Route> = []
 
@@ -240,13 +249,31 @@ pub class Router {
         routes.add(Route(method, compiled, handler))
     }
 
-    pub async fn serve(listener: Listener, capacity: Int = 4): Unit {
+    pub async fn serve(listener: Listener, capacity: Int = 4, shutdown: Shutdown? = None, graceMs: Int = 5000): Unit {
         if capacity < 1 || capacity > 64 { throw Exception("HTTP capacity must be in 1..64") }
+        if graceMs < 0 { throw Exception("HTTP graceMs must be nonnegative") }
         defer listener.close()
         val snapshot: List<Route> = []
         for route in routes { snapshot.add(route) }
         taskGroup {
-            for slot in 0..<capacity { spawn serveSlot(listener, snapshot); }
+            val slots: List<Task<Unit>> = []
+            for slot in 0..<capacity { slots.add(spawn serveSlot(listener, snapshot)) }
+            if let Some(stop) = shutdown {
+                await stop.wait()
+                val started = Clock.monotonicMs()
+                lyraHttpBeginDrain(listener.handle)
+                var status = lyraHttpStop(listener.handle)
+                while lyraHttpErrorKind(status) == 10 {
+                    await sleepMs(1)
+                    status = lyraHttpStop(listener.handle)
+                }
+                closeHandle(status, "listener.close")
+                val elapsed = Clock.monotonicMs() - started
+                val remaining = if elapsed >= graceMs { 0 } else { graceMs - elapsed }
+                if let Cancelled(_) = awaitOutcome(withTimeout(remaining, joinSlots(slots))) {
+                    for slot in slots { slot.cancel() }
+                }
+            }
         }
     }
 }
@@ -306,7 +333,9 @@ async fn acceptScoped<T>(cursor: CPtr, handleRequest: (Request) -> Task<T>): Res
         status = await parallel { lyraHttpAcceptAdvance(cursor) }
     }
     if status < 0 { return Err(httpError("accept", -status)) }
-    val request = Request(lyraHttpAcceptTake(cursor))
+    val handle = lyraHttpAcceptTake(cursor)
+    if handle.isNull() { return Err(HttpError(HttpErrorKind.Closed, "accept")) }
+    val request = Request(handle)
     defer request.close()
     Ok(await handleRequest(request))
 }
@@ -318,6 +347,13 @@ async fn serveSlot(listener: Listener, routes: List<Route>): Unit {
         val accepted = await acceptScoped<Unit>(cursor, async (request: Request) => {
             taskGroup { spawn respond(request, routes); };
         })
-        if let Err(error) = accepted { throw Exception(error.message()) }
+        if let Err(error) = accepted {
+            if error.kind == HttpErrorKind.Closed { return }
+            throw Exception(error.message())
+        }
     }
+}
+
+async fn joinSlots(slots: List<Task<Unit>>): Unit {
+    for slot in slots { await slot }
 }

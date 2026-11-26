@@ -93,6 +93,7 @@ struct Endpoint {
     const http::Transport* transport{};
     void* listener{};
     int64_t handshakeTimeoutMs{};
+    std::atomic<bool> draining{};
     SocketAccess access{};
 };
 struct Field { const void* name; const void* value; };
@@ -483,7 +484,12 @@ int handshake(Request* request, int64_t sliceEnd) {
 
 net::Socket accept(const Endpoint* server, int64_t deadline, int& error) {
     for (;;) {
-        if ((error = waitFor(server->descriptor, POLLIN, deadline))) return net::invalidSocket;
+        if (server->draining.load(std::memory_order_acquire)) { error = EBADF; return net::invalidSocket; }
+        auto until = std::min(deadline, now() + acceptInterval);
+        error = waitFor(server->descriptor, POLLIN, until);
+        if (error == ETIMEDOUT && until < deadline) continue;
+        if (error) return net::invalidSocket;
+        if (server->draining.load(std::memory_order_acquire)) { error = EBADF; return net::invalidSocket; }
         auto descriptor = net::accept(server->descriptor);
         if (descriptor != net::invalidSocket) return descriptor;
         error = net::error();
@@ -578,6 +584,7 @@ extern "C" int64_t lyraHttpStatus(const Endpoint* server) { return server->statu
 extern "C" const void* lyraHttpStatusDetail(const Endpoint* server) {
     return server->detail ? server->detail : lyraStringFromBytes(nullptr, 0);
 }
+extern "C" void lyraHttpBeginDrain(Endpoint* server) { server->draining.store(true, std::memory_order_release); }
 extern "C" int64_t lyraHttpStop(Endpoint* server) {
     SocketLease lease(server->access);
     if (lease.status == EBADF) return 0;
@@ -635,6 +642,7 @@ extern "C" AcceptCursor* lyraHttpAcceptCursor(const Endpoint* server, int64_t ti
 }
 
 extern "C" int64_t lyraHttpAcceptAdvance(AcceptCursor* cursor) {
+    if (cursor->listener->draining.load(std::memory_order_acquire)) return -EBADF;
     SocketLease lease(cursor->listener->access, true);
     if (lease.status) return -lease.status;
     const bool single = cursor->deadline != INT64_MAX;
@@ -673,6 +681,12 @@ extern "C" int64_t lyraHttpAcceptAdvance(AcceptCursor* cursor) {
 }
 
 extern "C" Request* lyraHttpAcceptTake(AcceptCursor* cursor) {
+    if (cursor->listener->draining.load(std::memory_order_acquire)) {
+        auto request = cursor->request;
+        cursor->request = nullptr;
+        if (request) stop(request);
+        return nullptr;
+    }
     auto request = cursor->request;
     cursor->request = nullptr;
     return request;

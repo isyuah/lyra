@@ -31,6 +31,8 @@ fn main(): Unit {
 
 `close(): Unit` 是同步清理，先关 statement，再关连接。已有操作占用句柄、存在未关的 statement 或另一关闭尚未完成时，`close` 抛 `std.sqlite.Busy`，待操作结束可重试；其他关闭失败抛 `std.sqlite.CloseError`。一次关闭对全部别名生效，之后重复关闭幂等。已由 `next()` 返回的执行错误不会在 statement 释放后再被重复抛出。异步应用把整段查询与清理放进 `blocking`。
 
+`withConnection(path) { db => ... }` 与 `withConnection(path, readOnly: true) { db => ... }` 在回调结束时关闭连接，包括返回 `Err` 或抛异常的路径。异步应用应把连接作用域和全部 SQL 操作放在同一个 `blocking` 块中，避免取消时把仍被原生工作使用的连接交给调用方。
+
 ## 写入与事务
 
 `db.exec(sql)` 与 `tx.exec(sql)` 用于一次执行一条不带绑定参数、也不返回列的命令，例如 `CREATE TABLE`。`SELECT`、`RETURNING` 和参数化语句用 `prepare`。可用 `lastInsertRowid()` 读取连接最近一次成功插入的 SQLite rowid；即使这次插入随后回滚，SQLite 也不会重置该值。若要原子地关联插入和取 rowid，两步都在同一个事务回调里执行。
