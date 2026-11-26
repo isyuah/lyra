@@ -1,18 +1,18 @@
 extern fn lyraProcessArgs(count: Int): CPtr;
 extern fn lyraProcessArg(args: CPtr, index: Int, value: String): Unit;
-extern fn lyraProcessRun(args: CPtr, count: Int, cwd: String, timeoutMs: Int, maxBytes: Int): CPtr;
+extern fn lyraProcessRun(args: CPtr, count: Int, cwd: String, timeoutMs: Int, maxBytes: Int, input: Bytes): CPtr;
 extern fn lyraProcessStatus(result: CPtr): Int;
 extern fn lyraProcessExitCode(result: CPtr): Int;
 extern fn lyraProcessSignal(result: CPtr): Int;
 extern fn lyraProcessStdout(result: CPtr): Bytes;
 extern fn lyraProcessStderr(result: CPtr): Bytes;
 
-pub struct ProcessOptions(pub val timeoutMs: Int = 30000, pub val maxOutputBytes: Int = 1048576, pub val cwd: String? = None)
+pub struct ProcessOptions(pub val timeoutMs: Int = 30000, pub val maxOutputBytes: Int = 1048576, pub val cwd: String? = None, pub val stdin: Bytes = b"")
 pub struct ProcessResult(pub val exitCode: Int, pub val signal: Int?, pub val stdout: Bytes, pub val stderr: Bytes)
 pub enum ProcessError { Invalid, Timeout, OutputLimit, System(Int) }
 
 async fn collectProcess(arguments: CPtr, count: Int, options: ProcessOptions): Result<ProcessResult, ProcessError> {
-    val result = await blocking { lyraProcessRun(arguments, count, options.cwd ?? "", options.timeoutMs, options.maxOutputBytes) }
+    val result = await blocking { lyraProcessRun(arguments, count, options.cwd ?? "", options.timeoutMs, options.maxOutputBytes, options.stdin) }
     match lyraProcessStatus(result) {
         0 => {
             val signal = lyraProcessSignal(result)

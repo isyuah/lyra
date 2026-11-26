@@ -1,6 +1,7 @@
 import ctypes
 import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
 import tempfile
@@ -126,6 +127,83 @@ async fn main(): Unit {
         cwd.mkdir()
         done = subprocess.run([app, sys.executable, child, cwd], capture_output=True, timeout=12)
         self.assertEqual((done.returncode, done.stdout), (0, b''), done.stderr.decode())
+
+    def test_process_drains_output_while_writing_input_and_handles_early_close(self):
+        child = self.root / 'pipe.py'
+        child.write_text(r'''import sys
+if sys.argv[1] == 'closed':
+    sys.stdin.close()
+    sys.exit(17)
+sys.stdout.buffer.write(b'x' * 80000)
+sys.stdout.flush()
+sys.stderr.buffer.write(b'y' * 90000)
+sys.stderr.flush()
+assert sys.stdin.buffer.read() == '中\0🙂'.encode() * 32768
+sys.stdout.buffer.write(b'OK')
+''', encoding='utf-8')
+        app = self.build(r'''
+import std.os.{ProcessOptions, args, runProcess}
+
+async fn main(): Unit {
+    val params = match args() { Ok(value) => value, Err(problem) => throw Exception(problem.message()) }
+    var input = "中\0🙂"
+    for _ in 0..<15 { input += input }
+    val options = ProcessOptions(stdin: input.toBytes())
+    match await runProcess([params[0], params[1], "data"], options) {
+        Ok(child) => {
+            #assert(child.stdout.size == 80002 && child.stdout[80000] == 79 && child.stderr.size == 90000)
+            #assert(child.exitCode == 0)
+        },
+        Err(_) => throw Exception("subprocess pipes did not complete"),
+    }
+    #assert(match await runProcess([params[0], params[1], "closed"], options) { Ok(child) => child.exitCode == 17, _ => false })
+}
+''')
+        result = subprocess.run([app, sys.executable, child], capture_output=True, timeout=12)
+        self.assertEqual((result.returncode, result.stdout), (0, b''), result.stderr.decode())
+
+    def test_platform_and_cancelled_signal_subscription(self):
+        platform = 'Windows' if WINDOWS else 'Linux'
+        unsupported = 'Terminate' if WINDOWS else 'Break'
+        app = self.build(f'''
+import std.os.{{Platform, Signal, SignalError, architecture, platform, waitSignal}}
+
+async fn main(): Unit {{
+    #assert(platform() == Platform.{platform} && architecture == "x86_64")
+    #assert(match await waitSignal(Signal.{unsupported}) {{ Err(SignalError.Unsupported) => true, _ => false }})
+    val pending = spawn waitSignal(Signal.Interrupt)
+    await sleepMs(10)
+    pending.cancel()
+    #assert(match awaitOutcome(pending) {{ Cancelled(errors) => errors.size == 0, _ => false }})
+}}
+''')
+        result = subprocess.run([app], capture_output=True, timeout=8)
+        self.assertEqual((result.returncode, result.stdout), (0, b''), result.stderr.decode())
+
+    @unittest.skipIf(WINDOWS, 'SIGTERM is a Unix process signal')
+    def test_wait_signal_observes_sigterm(self):
+        app = self.build('''
+import std.os.{Signal, waitSignal}
+
+async fn main(): Unit {
+    match await waitSignal(Signal.Terminate) {
+        Ok(_) => print("stopping"),
+        Err(_) => throw Exception("signal subscription failed"),
+    }
+}
+''')
+        with running([app]) as (process, output):
+            status = Path(f'/proc/{process.pid}/status')
+            deadline = time.monotonic() + 5
+            while True:
+                mask = next(line.split()[1] for line in status.read_text().splitlines() if line.startswith('SigCgt:'))
+                if int(mask, 16) & (1 << (signal.SIGTERM - 1)):
+                    break
+                self.assertLess(time.monotonic(), deadline, 'SIGTERM watcher did not start')
+                time.sleep(0.005)
+            process.send_signal(signal.SIGTERM)
+            self.assertEqual(output.line(timeout=5), b'stopping\n')
+            self.assertEqual(process.wait(timeout=5), 0)
 
     def test_cancel_reaps_child_before_task_finishes(self):
         child = self.root / 'pending.py'

@@ -5,3 +5,5 @@
 `AtomicInt(value)` 创建顺序一致的 64 位原子整数，默认值为零。`load()` 读取、`store(value)` 写入、`fetchAdd(amount)` 加法返回旧值（溢出按二补码回绕）、`compareExchange(expected, replacement)` 返回是否替换成功。
 
 Class 字段、捕获绑定及 List 的单次访问不会因跨域读写而读出撕裂的引用。复合操作不是原子的；多个域共同操作 Map/Set 时，用同一把锁保护查找、更新与遍历。
+
+`Locked<T>(initial)` 把共享状态和锁放在一起。`counter.update { it + 1 }` 在锁内读取、计算和替换一次，`counter.snapshot()` 同步读取当前值。如果 `T` 是 Class，快照仍是同一对象引用；对象内部的可变状态不会自动被保护或深拷贝。

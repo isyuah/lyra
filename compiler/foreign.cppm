@@ -50,24 +50,25 @@ llvm::Attribute::AttrKind extension(Type type) {
 
 void validateForeign(const CheckedFunction& fn, const CheckedModule& program, const Source& source) {
     const auto& symbol = *fn.syntax.foreignSymbol;
-    struct SdkBinding { std::string_view symbol; std::vector<Type> parameters; Type result; bool task; };
+    struct SdkBinding { std::string_view module, symbol; std::vector<Type> parameters; Type result; bool task; };
     static const std::vector<SdkBinding> bindings{
-        {"lyraHttpAcceptAsync", {Type::CPtr, Type::Int, Type::Bool, Type::Bool}, Type::CPtr, true},
-        {"lyraHttpRespondAsync", {Type::CPtr, Type::Int, Type::String, Type::Bytes, Type::CPtr}, Type::Int, true},
-        {"lyraHttpWaitDisconnectAsync", {Type::CPtr, Type::Int}, Type::Int, true},
-        {"lyraHttpRequestCloseAsync", {Type::CPtr}, Type::Unit, true},
-        {"lyraHttpListenerCloseAsync", {Type::CPtr}, Type::Unit, true},
-        {"lyraHttpListenerScopeAsync", {Type::CPtr}, Type::Unit, true},
-        {"lyraHttpKeepListener", {Type::CPtr}, Type::Unit, false},
+        {"$std/http", "lyraHttpAcceptAsync", {Type::CPtr, Type::Int, Type::Bool, Type::Bool}, Type::CPtr, true},
+        {"$std/http", "lyraHttpRespondAsync", {Type::CPtr, Type::Int, Type::String, Type::Bytes, Type::CPtr}, Type::Int, true},
+        {"$std/http", "lyraHttpWaitDisconnectAsync", {Type::CPtr, Type::Int}, Type::Int, true},
+        {"$std/http", "lyraHttpRequestCloseAsync", {Type::CPtr}, Type::Unit, true},
+        {"$std/http", "lyraHttpListenerCloseAsync", {Type::CPtr}, Type::Unit, true},
+        {"$std/http", "lyraHttpListenerScopeAsync", {Type::CPtr}, Type::Unit, true},
+        {"$std/http", "lyraHttpKeepListener", {Type::CPtr}, Type::Unit, false},
+        {"$std/os", "lyraOsWaitSignal", {Type::Int}, Type::Int, true},
     };
     if (auto binding = std::ranges::find(bindings, symbol.text, &SdkBinding::symbol); binding != bindings.end()) {
         bool result = binding->task ? fn.result.kind == Type::Task && program.taskResults[fn.result.id] == binding->result
                                     : fn.result == binding->result;
-        if (source.moduleId != "$std/http" || !result || fn.syntax.parameters.size() != binding->parameters.size())
-            throw at(source, symbol.span, "LYF0001", "此符号仅供内置 HTTP 异步运行时使用：" + symbol.text);
+        if (source.moduleId != binding->module || !result || fn.syntax.parameters.size() != binding->parameters.size())
+            throw at(source, symbol.span, "LYF0001", "此符号仅供内置运行时使用：" + symbol.text);
         for (std::size_t slot = 0; slot < binding->parameters.size(); ++slot)
             if (fn.locals[slot].type != binding->parameters[slot])
-                throw at(source, fn.syntax.parameters[slot].type.span, "LYF0001", "内置 HTTP 异步运行时签名不匹配");
+                throw at(source, fn.syntax.parameters[slot].type.span, "LYF0001", "内置运行时签名不匹配");
         return;
     }
     if (symbol.text == "main" || symbol.text == "wmain" || symbol.text.starts_with("llvm.")) throw at(source, symbol.span, "LYF0001", "不能绑定此保留 C 符号：" + symbol.text);

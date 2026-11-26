@@ -111,11 +111,51 @@ fn main(): Unit {
                 (('--input=one', '--input=two'), '--input was supplied more than once\n'),
                 (('--unknown',), 'unknown option --unknown\n'),
                 (('--input=one', '--', '--help'), '[one]\nabsent\nfalse\n--help\n'),
-                (('--help',), 'Usage: stats [options] [--] [args...]\n\nOptions:\n  --input <value> (required)\n  --limit <value>\n  --verbose\n  --help\n\n'),
+                (('--help',), 'Usage: stats [options] [--] [args...]\n\nOptions:\n  --input <value> (required)\n  --limit <value>\n  --verbose\n  -h, --help\n\n'),
             ):
                 with self.subTest(arguments=arguments):
                     result = self.run_app(app, *arguments)
                     self.assertEqual((result.stdout.decode(), result.stderr), (output, b''))
+
+    def test_cli_resolves_short_clusters_and_nested_command_scopes(self):
+        for _, app in self.programs('''
+import std.cli.{Command, parseArgs}
+
+fn main(): Unit {
+    val large = Command("large").option("--number", required: true, short: "-n").flag("--quiet", short: "-q")
+    val report = Command("report").subcommand(large)
+    val cli = Command("data").option("--input", required: true, short: "-i").flag("--verbose", short: "-v").subcommand(report)
+    match parseArgs(cli) {
+        Ok(Run(root)) => {
+            val nested = root.subcommand ?? throw Exception("expected report")
+            val chosen = nested.subcommand ?? throw Exception("expected large")
+            print("${root.name}/${nested.name}/${chosen.name}")
+            print(root.value("--input") ?? "missing")
+            print(chosen.value("--number") ?? "missing")
+            print(root.flag("--verbose"))
+            print(chosen.flag("--quiet"))
+            for item in chosen.positionals { print(item) }
+        },
+        Ok(Help(text)) => print(text),
+        Err(problem) => print(problem.message()),
+    }
+}
+'''):
+            cases = (
+                (('-vi中', 'report', 'large', '-qn=-7', '--', '-q'), 'data/report/large\n中\n-7\ntrue\ntrue\n-q\n'),
+                (('-i', 'one', 'report', 'large', '-n', '-4'), 'data/report/large\none\n-4\nfalse\nfalse\n'),
+                (('-vi', 'value', '--verbose', 'report', 'large', '-n3'), '--verbose was supplied more than once\n'),
+                (('-v=1',), '-v does not take a value\n'),
+                (('-i', '-v'), '-i requires a value\n'),
+                (('missing',), 'unknown command missing\n'),
+                (('report', 'large', '-n3'), 'missing required option --input\n'),
+            )
+            for argv, expected in cases:
+                with self.subTest(argv=argv):
+                    self.assertEqual(self.run_app(app, *argv).stdout.decode(), expected)
+            help_text = self.run_app(app, 'report', 'large', '-h').stdout.decode()
+            self.assertIn('Usage: data report large', help_text)
+            self.assertIn('-n, --number <value> (required)', help_text)
 
     def test_config_precedence_and_source_without_secret(self):
         for package, app in self.programs('''

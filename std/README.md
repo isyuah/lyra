@@ -5,10 +5,11 @@
 | 场景 | 标准库入口 |
 |---|---|
 | 文本、排序、去重 | [`std.text`](text/README.md) 的 `StringOps`；[`std.collections`](collections/README.md) 的 `ListOps`、`sortedBy`、`distinct`、`HashMap` |
-| 标准流、文件和目录 | [`std.io`](io/README.md) 的 `LineReader`、`File`；[`std.fs`](fs/README.md) 的 `pathJoin`、`listDir`、`mkdirAll`、`atomicWrite` |
+| 标准流、文件和目录 | [`std.io`](io/README.md) 的 `LineReader`、`File`；[`std.fs`](fs/README.md) 的 `stat`、`rename`、`copy`、`listDir`、`atomicWrite` |
 | 程序参数、环境与子进程 | [`std.os`](os/README.md) 的 `args`、`env`、`runProcess`；入口函数可用 `Int` 返回退出状态 |
 | 选项与部署配置 | [`std.cli`](cli/README.md) 的 `Command`、`parseArgs`；[`std.config`](config/README.md) 的 `Config`、类型化配置键 |
 | 日期、延时与日志 | [`std.time`](time/README.md) 的 `Clock`、`Date`、`DateTime`；内置 `await sleepMs(...)`；[`std.log`](log/README.md) 的 `Logger` |
+| 并发、上下文与同步 | 内置 `Channel<T>`、`select`、`for await`、`awaitOutcome` 和 `FrozenList<T>`；[`std.task`](task/README.md) 的 `TaskLocal` 用法；[`std.sync`](sync/README.md) 的 `Locked<T>` 和原子操作 |
 | JSON、JSONL 和 TOML | [`std.json`](json/README.md) 的构造器和 codec；[`std.jsonl`](jsonl/README.md) 的 `jsonlReader`；[`std.toml`](toml/README.md) 的 TOML 值和 codec |
 | SQLite 查询与写入 | [`std.sqlite`](sqlite/README.md) 的预编译语句、事务、`DbError` |
 | HTTP 与 TLS | [`std.http`](http/README.md) 的 `Router` 和 `listen`；[`std.httpTls`](httpTls/README.md) 的 `listenTls`；[`std.httpClient`](httpClient/README.md) 的 `httpRequest` 和 `httpGet` |

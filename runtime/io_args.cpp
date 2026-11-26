@@ -74,3 +74,11 @@ extern "C" LyraIoText* lyraOsEnv(const void* key) {
     if (!status) return lyraIoDecode(buffer.data(), size, 0);
     return lyraIoDecode(nullptr, 0, status == UV_ENOENT ? -1 : status == UV_EINVAL ? -4 : -status);
 }
+
+extern "C" uint8_t lyraOsWindows() {
+#ifdef _WIN32
+    return 1;
+#else
+    return 0;
+#endif
+}

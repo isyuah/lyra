@@ -1,4 +1,5 @@
 #include "managed.h"
+#include "sigpipe.h"
 #include "strings.h"
 #include "tasks.h"
 
@@ -9,6 +10,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <gc/gc.h>
 #include <uv.h>
 #include <vector>
 
@@ -36,11 +38,15 @@ struct Process {
     uv_loop_t loop{};
     uv_timer_t timer{};
     uv_process_t child{};
+    uv_pipe_t input{};
+    uv_write_t inputWrite{};
     Capture output, errors;
     ProcessResult result;
     std::size_t bytesLeft;
+    const char* inputBytes{};
+    std::size_t inputLength{}, inputOffset{};
     std::uint64_t deadline{};
-    bool running{}, timerOpen{};
+    bool running{}, timerOpen{}, inputOpen{};
 };
 
 template <class Handle>
@@ -50,6 +56,12 @@ void closeCapture(Capture& capture) {
     if (!capture.opened) return;
     capture.opened = false;
     close(capture.pipe);
+}
+
+void closeInput(Process& process) {
+    if (!process.inputOpen) return;
+    process.inputOpen = false;
+    close(process.input);
 }
 
 void finishWhenDrained(Process& process) {
@@ -62,6 +74,7 @@ void finishWhenDrained(Process& process) {
 void fail(Process& process, int status) {
     if (process.result.status) return;
     process.result.status = status;
+    closeInput(process);
     closeCapture(process.output);
     closeCapture(process.errors);
     if (process.running) {
@@ -104,6 +117,23 @@ int startCapture(Capture& capture) {
     }, drain);
 }
 
+void writeInput(Process& process) {
+    if (!process.inputOpen) return;
+    if (process.inputOffset == process.inputLength) { closeInput(process); return; }
+    const auto count = static_cast<unsigned>(std::min<std::size_t>(65536, process.inputLength - process.inputOffset));
+    auto buffer = uv_buf_init(const_cast<char*>(process.inputBytes + process.inputOffset), count);
+    auto complete = [](uv_write_t* request, int status) {
+        auto& process = *static_cast<Process*>(request->data);
+        if (!process.inputOpen) return;
+        if (status == UV_EPIPE || status == UV_ECONNRESET) closeInput(process);
+        else if (status < 0) fail(process, -status);
+        else writeInput(process);
+    };
+    auto status = uv_write(&process.inputWrite, reinterpret_cast<uv_stream_t*>(&process.input), &buffer, 1, complete);
+    if (status < 0) complete(&process.inputWrite, status);
+    else process.inputOffset += count;
+}
+
 void tick(uv_timer_t* timer) {
     auto& process = *static_cast<Process*>(timer->data);
     if (lyraBlockingCancelled()) fail(process, cancelled);
@@ -115,6 +145,7 @@ void childExited(uv_process_t* child, std::int64_t code, int signal) {
     process.running = false;
     process.result.exitCode = code;
     process.result.signal = signal;
+    closeInput(process);
     close(*child);
     finishWhenDrained(process);
 }
@@ -125,6 +156,11 @@ void run(Process& process, char** argv, const char* cwd, std::uint64_t timeout) 
     process.deadline = uv_now(&process.loop) + timeout;
     status = openCapture(process.output, process);
     if (!status) status = openCapture(process.errors, process);
+    if (!status && process.inputLength) {
+        status = uv_pipe_init(&process.loop, &process.input, 0);
+        process.inputOpen = status == 0;
+        process.inputWrite.data = &process;
+    }
     if (!status) {
         status = uv_timer_init(&process.loop, &process.timer);
         process.timerOpen = status == 0;
@@ -132,6 +168,10 @@ void run(Process& process, char** argv, const char* cwd, std::uint64_t timeout) 
     }
     if (!status) {
         uv_stdio_container_t streams[3]{};
+        if (process.inputOpen) {
+            streams[0].flags = static_cast<uv_stdio_flags>(UV_CREATE_PIPE | UV_READABLE_PIPE);
+            streams[0].data.stream = reinterpret_cast<uv_stream_t*>(&process.input);
+        }
         streams[1].flags = streams[2].flags = static_cast<uv_stdio_flags>(UV_CREATE_PIPE | UV_WRITABLE_PIPE);
         streams[1].data.stream = reinterpret_cast<uv_stream_t*>(&process.output.pipe);
         streams[2].data.stream = reinterpret_cast<uv_stream_t*>(&process.errors.pipe);
@@ -160,6 +200,8 @@ void run(Process& process, char** argv, const char* cwd, std::uint64_t timeout) 
         status = uv_timer_start(&process.timer, tick, std::min<std::uint64_t>(remaining, 20), 20);
     }
     if (status) fail(process, -status);
+    [[maybe_unused]] lyraRuntime::SuppressSigpipe signal;
+    if (!status) writeInput(process);
     uv_run(&process.loop, UV_RUN_DEFAULT);
     if (uv_loop_close(&process.loop) != 0) std::abort();
 }
@@ -179,7 +221,7 @@ extern "C" const void** lyraProcessArgs(std::int64_t count) {
 extern "C" void lyraProcessArg(const void** args, std::int64_t index, const void* value) { args[index] = value; }
 
 extern "C" const ProcessResult* lyraProcessRun(const void* const* args, std::int64_t count, const void* cwdValue,
-                                                 std::int64_t timeout, std::int64_t maxBytes) {
+                                                 std::int64_t timeout, std::int64_t maxBytes, const void* input) {
     if (lyraBlockingCancelled()) return save({cancelled});
     std::vector<std::string> strings;
     strings.reserve(count);
@@ -196,7 +238,10 @@ extern "C" const ProcessResult* lyraProcessRun(const void* const* args, std::int
     argv.push_back(nullptr);
     Process process{};
     process.bytesLeft = maxBytes;
+    process.inputBytes = lyraStringBytes(input);
+    process.inputLength = lyraStringLength(input);
     run(process, argv.data(), cwd.empty() ? nullptr : cwd.c_str(), timeout);
+    GC_reachable_here(input);
     if (process.result.status == 0) {
         process.result.output = lyraStringFromBytes(process.output.bytes.data(), process.output.bytes.size());
         process.result.errors = lyraStringFromBytes(process.errors.bytes.data(), process.errors.bytes.size());

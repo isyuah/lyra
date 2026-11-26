@@ -1032,6 +1032,8 @@ bool lyraNativeTryComplete(LyraNativeAsync *operation, void *boxed, LyraTask *cl
     return true;
 }
 
+uv_loop_t* lyraNativeLoop(LyraNativeAsync *operation) { return &operation->task->domain->executor->loop; }
+
 void lyraNativeComplete(LyraNativeAsync *operation, void *boxed) {
     TaskLock lock;
     readyNative(*operation, boxed);
