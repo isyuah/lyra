@@ -1,30 +1,35 @@
-#include "managed.h"
+#include "native_async.h"
+#include "sigpipe.h"
 #include "strings.h"
-#include "tasks.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <deque>
 #include <limits>
 #include <memory>
+#include <mutex>
+#include <new>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 #include <curl/curl.h>
+#include <uv.h>
 
 namespace {
 
 using std::chrono::milliseconds;
 using Clock = std::chrono::steady_clock;
 using Url = std::unique_ptr<CURLU, decltype(&curl_url_cleanup)>;
-using Multi = std::unique_ptr<CURLM, decltype(&curl_multi_cleanup)>;
 using Easy = std::unique_ptr<CURL, decltype(&curl_easy_cleanup)>;
 using Headers = std::unique_ptr<curl_slist, decltype(&curl_slist_free_all)>;
 
-enum class Status : int64_t { Ok, InvalidRequest, TimedOut, TooLarge, TooManyRedirects, RedirectRejected, Tls, Network, Cancelled };
+enum class Status : int64_t { Ok, InvalidRequest, TimedOut, TooLarge, TooManyRedirects, RedirectRejected, Tls, Network, Cancelled, Busy };
 
 struct Failure {
     Status status = Status::Ok;
@@ -59,7 +64,7 @@ struct Response {
 };
 
 struct Transfer {
-    size_t& remaining;
+    size_t remaining;
     std::vector<std::pair<std::string, std::string>> headers;
     std::string body;
     bool readingHeaders = false;
@@ -196,8 +201,6 @@ size_t bodyCallback(char* bytes, size_t width, size_t items, void* context) {
     return count;
 }
 
-int progressCallback(void*, curl_off_t, curl_off_t, curl_off_t, curl_off_t) { return lyraBlockingCancelled(); }
-
 Failure curlFailure(CURLcode code) {
     switch (code) {
         case CURLE_OK: return {};
@@ -214,24 +217,6 @@ Failure curlFailure(CURLcode code) {
     }
 }
 
-Failure pump(CURLM* multi, const Transfer& transfer) {
-    for (;;) {
-        if (lyraBlockingCancelled()) return {Status::Cancelled};
-        int running;
-        if (auto code = curl_multi_perform(multi, &running); code != CURLM_OK) return {Status::Network, code};
-        if (lyraBlockingCancelled()) return {Status::Cancelled};
-        int queued;
-        while (auto* event = curl_multi_info_read(multi, &queued)) {
-            if (event->msg == CURLMSG_DONE) {
-                if (transfer.overBudget) return {Status::TooLarge};
-                return curlFailure(event->data.result);
-            }
-        }
-        if (!running) return {Status::Network};
-        if (auto code = curl_multi_poll(multi, nullptr, 0, 25, nullptr); code != CURLM_OK) return {Status::Network, code};
-    }
-}
-
 struct Configurator {
     CURL* easy;
     CURLcode status = CURLE_OK;
@@ -241,11 +226,9 @@ struct Configurator {
     }
 };
 
-Failure perform(CURLM* multi, CURLU* url, const Request& request, const std::string& method, const std::string& proxy,
-                const Headers& headers, int64_t timeout, Transfer& transfer, long& responseStatus) {
-    Easy easy(curl_easy_init(), curl_easy_cleanup);
-    if (!easy) return {Status::Network, CURLE_FAILED_INIT};
-    Configurator settings{easy.get()};
+Failure configure(CURL* easy, CURLU* url, const Request& request, const std::string& method, const std::string& proxy,
+                  const Headers& headers, int64_t timeout, Transfer& transfer) {
+    Configurator settings{easy};
     settings.set(CURLOPT_CURLU, url);
     settings.set(CURLOPT_PROTOCOLS_STR, "http,https");
     settings.set(CURLOPT_CUSTOMREQUEST, method.c_str());
@@ -258,8 +241,6 @@ Failure perform(CURLM* multi, CURLU* url, const Request& request, const std::str
     settings.set(CURLOPT_HEADERDATA, &transfer);
     settings.set(CURLOPT_WRITEFUNCTION, bodyCallback);
     settings.set(CURLOPT_WRITEDATA, &transfer);
-    settings.set(CURLOPT_XFERINFOFUNCTION, progressCallback);
-    settings.set(CURLOPT_NOPROGRESS, 0L);
     settings.set(CURLOPT_PROXY, proxy.c_str());
     settings.set(CURLOPT_NOPROXY, "");
     settings.set(CURLOPT_SSL_VERIFYPEER, 1L);
@@ -269,7 +250,7 @@ Failure perform(CURLM* multi, CURLU* url, const Request& request, const std::str
         settings.set(CURLOPT_PROXY_SSL_VERIFYHOST, 2L);
     }
     if (request.hasCa) {
-        curl_blob ca{const_cast<char*>(lyraStringBytes(request.caPem)), lyraStringLength(request.caPem), CURL_BLOB_NOCOPY};
+        curl_blob ca{const_cast<char*>(lyraStringBytes(request.caPem)), lyraStringLength(request.caPem), CURL_BLOB_COPY};
         settings.set(CURLOPT_CAINFO, static_cast<const char*>(nullptr));
         settings.set(CURLOPT_CAPATH, static_cast<const char*>(nullptr));
         settings.set(CURLOPT_CAINFO_BLOB, &ca);
@@ -291,13 +272,7 @@ Failure perform(CURLM* multi, CURLU* url, const Request& request, const std::str
         settings.set(CURLOPT_POSTFIELDSIZE_LARGE, static_cast<curl_off_t>(body.size()));
         settings.set(CURLOPT_POSTFIELDS, body.empty() ? "" : body.data());
     }
-    if (settings.status != CURLE_OK) return curlFailure(settings.status);
-    if (auto code = curl_multi_add_handle(multi, easy.get()); code != CURLM_OK) return {Status::Network, code};
-    auto failure = pump(multi, transfer);
-    curl_multi_remove_handle(multi, easy.get());
-    if (failure.status != Status::Ok) return failure;
-    if (auto code = curl_easy_getinfo(easy.get(), CURLINFO_RESPONSE_CODE, &responseStatus); code != CURLE_OK) return curlFailure(code);
-    return responseStatus >= 100 ? Failure{} : Failure{Status::Network};
+    return curlFailure(settings.status);
 }
 
 bool redirect(long status) {
@@ -321,57 +296,340 @@ const Response* received(long status, const Transfer& transfer) {
     return output;
 }
 
-const Response* send(const Request& request) {
-    if (lyraBlockingCancelled()) return failed({Status::Cancelled});
-    if (request.connectTimeoutMs <= 0 || request.connectTimeoutMs > INT32_MAX || request.maxResponseBytes <= 0 ||
-        request.maxRedirects < 0 || request.maxRedirects > 20 || (request.hasCa && bytes(request.caPem).empty())) return failed({Status::InvalidRequest});
-    static const auto initialized = curl_global_init(CURL_GLOBAL_DEFAULT);
-    if (initialized != CURLE_OK) return failed(curlFailure(initialized));
-    const auto method = std::string(bytes(request.method));
-    const auto url = std::string(bytes(request.url));
-    const auto proxy = std::string(bytes(request.proxy));
-    const auto readOnly = method == "GET" || method == "HEAD";
-    if (!token(method) || sameAscii(method, "CONNECT") || (readOnly && request.hasBody) || control(url) || control(proxy)) {
-        return failed({Status::InvalidRequest});
+struct Job {
+    const Request* request;
+    const Response* result{};
+    LyraNativeAsync* task{};
+    Clock::time_point deadline{};
+    CURL* active{};
+};
+
+struct Active {
+    Job& job;
+    LyraGcRoot* root;
+    std::string method, proxy;
+    Url url{curl_url(), curl_url_cleanup};
+    Easy easy{curl_easy_init(), curl_easy_cleanup};
+    Headers headers{nullptr, curl_slist_free_all};
+    std::optional<Origin> firstOrigin;
+    Transfer transfer;
+    int64_t followed{};
+
+    explicit Active(Job& job) : job(job), root(lyraGcRootCreate(&job)), method(bytes(job.request->method)), proxy(bytes(job.request->proxy)),
+        transfer{static_cast<size_t>(job.request->maxResponseBytes), {}, {}} {}
+
+    ~Active() { lyraGcRootDrop(root); }
+
+    Failure prepare() {
+        const auto& request = *job.request;
+        const auto address = std::string(bytes(request.url));
+        const auto readOnly = method == "GET" || method == "HEAD";
+        if (!token(method) || sameAscii(method, "CONNECT") || (readOnly && request.hasBody) || control(address) || control(proxy))
+            return {Status::InvalidRequest};
+        if (!url || !easy) return {Status::Network, CURLE_OUT_OF_MEMORY};
+        if (curl_url_set(url.get(), CURLUPART_URL, address.c_str(), CURLU_DISALLOW_USER) != CURLUE_OK) return {Status::InvalidRequest};
+        firstOrigin = origin(url.get());
+        if (!firstOrigin) return {Status::InvalidRequest};
+        if (request.hasProxy) {
+            Url parsed(curl_url(), curl_url_cleanup);
+            if (!parsed) return {Status::Network, CURLE_OUT_OF_MEMORY};
+            if (curl_url_set(parsed.get(), CURLUPART_URL, proxy.c_str(), 0) != CURLUE_OK || !origin(parsed.get())) return {Status::InvalidRequest};
+        }
+        return requestHeaders(request, headers, request.hasBody || method == "POST");
     }
-    Url current(curl_url(), curl_url_cleanup);
-    if (!current) return failed({Status::Network, CURLE_OUT_OF_MEMORY});
-    if (curl_url_set(current.get(), CURLUPART_URL, url.c_str(), CURLU_DISALLOW_USER) != CURLUE_OK) return failed({Status::InvalidRequest});
-    const auto firstOrigin = origin(current.get());
-    if (!firstOrigin) return failed({Status::InvalidRequest});
-    if (request.hasProxy) {
-        Url parsed(curl_url(), curl_url_cleanup);
-        if (!parsed) return failed({Status::Network, CURLE_OUT_OF_MEMORY});
-        if (curl_url_set(parsed.get(), CURLUPART_URL, proxy.c_str(), 0) != CURLUE_OK || !origin(parsed.get())) return failed({Status::InvalidRequest});
-    }
-    Headers headers(nullptr, curl_slist_free_all);
-    if (auto failure = requestHeaders(request, headers, request.hasBody || method == "POST"); failure.status != Status::Ok) return failed(failure);
-    Multi multi(curl_multi_init(), curl_multi_cleanup);
-    if (!multi) return failed({Status::Network, CURLE_FAILED_INIT});
-    size_t remaining = static_cast<size_t>(request.maxResponseBytes);
-    const auto deadline = Clock::now() + milliseconds(request.timeoutMs);
-    for (int64_t followed = 0;; ++followed) {
-        auto timeout = std::chrono::ceil<milliseconds>(deadline - Clock::now()).count();
-        if (timeout <= 0) return failed({Status::TimedOut});
-        Transfer transfer{remaining, {}, {}};
-        long status;
-        auto outcome = perform(multi.get(), current.get(), request, method, proxy, headers, timeout, transfer, status);
-        if (outcome.status != Status::Ok) return failed(outcome);
-        if (!readOnly || request.maxRedirects == 0 || !redirect(status)) return received(status, transfer);
+
+    Failure next(long status, bool& again) {
+        if ((method != "GET" && method != "HEAD") || job.request->maxRedirects == 0 || !redirect(status)) return {};
         const std::string* location = nullptr;
         for (const auto& [name, value] : transfer.headers) {
             if (!sameAscii(name, "Location")) continue;
-            if (location) return failed({Status::RedirectRejected});
+            if (location) return {Status::RedirectRejected};
             location = &value;
         }
-        if (!location) return received(status, transfer);
-        if (followed == request.maxRedirects) return failed({Status::TooManyRedirects});
-        if (location->empty() || control(*location) || curl_url_set(current.get(), CURLUPART_URL, location->c_str(), CURLU_DISALLOW_USER) != CURLUE_OK) {
-            return failed({Status::RedirectRejected});
-        }
-        const auto target = origin(current.get());
-        if (!target || !sameOrigin(*firstOrigin, *target)) return failed({Status::RedirectRejected});
+        if (!location) return {};
+        if (followed == job.request->maxRedirects) return {Status::TooManyRedirects};
+        if (location->empty() || control(*location) || curl_url_set(url.get(), CURLUPART_URL, location->c_str(), CURLU_DISALLOW_USER) != CURLUE_OK)
+            return {Status::RedirectRejected};
+        const auto target = origin(url.get());
+        if (!target || !sameOrigin(*firstOrigin, *target)) return {Status::RedirectRejected};
+        ++followed;
+        again = true;
+        return {};
     }
+};
+
+class ClientLoop {
+    static constexpr std::size_t maxJobs = 128, batchSize = 32;
+    static constexpr long maxConnections = 64, maxPerHost = 16;
+
+    struct Command { Job* job; LyraGcRoot* root; bool cancel; };
+    struct Watch { uv_poll_t poll{}; ClientLoop* client; curl_socket_t socket; };
+
+    std::mutex mutex;
+    std::once_flag once;
+    Failure startup{};
+    std::deque<Command> inbox;
+    std::size_t outstanding{};
+    uv_loop_t loop{};
+    uv_async_t wake{};
+    uv_timer_t timer{};
+    uv_thread_t thread{};
+    CURLM* multi{};
+    bool running{}, stopping{};
+    std::unordered_map<CURL*, std::unique_ptr<Active>> transfers;
+    std::unordered_map<curl_socket_t, Watch*> sockets;
+
+    void notify() { if (uv_async_send(&wake) != 0) std::abort(); }
+
+    void removeSocket(curl_socket_t socket) {
+        auto watch = sockets.extract(socket);
+        if (watch.empty()) return;
+        auto* value = watch.mapped();
+        uv_poll_stop(&value->poll);
+        uv_close(reinterpret_cast<uv_handle_t*>(&value->poll), [](uv_handle_t* handle) { delete static_cast<Watch*>(handle->data); });
+    }
+
+    int watchSocket(curl_socket_t socket, int action) {
+        if (action == CURL_POLL_REMOVE) { removeSocket(socket); return 0; }
+        if (action == CURL_POLL_NONE) {
+            if (auto found = sockets.find(socket); found != sockets.end()) uv_poll_stop(&found->second->poll);
+            return 0;
+        }
+        auto found = sockets.find(socket);
+        if (found == sockets.end()) {
+            auto entry = std::make_unique<Watch>(Watch{{}, this, socket});
+            if (uv_poll_init_socket(&loop, &entry->poll, socket) != 0) return -1;
+            entry->poll.data = entry.get();
+            found = sockets.emplace(socket, entry.release()).first;
+        }
+        int events = 0;
+        if (action & CURL_POLL_IN) events |= UV_READABLE;
+        if (action & CURL_POLL_OUT) events |= UV_WRITABLE;
+        return uv_poll_start(&found->second->poll, events, [](uv_poll_t* handle, int status, int ready) {
+            const auto& active = *static_cast<Watch*>(handle->data);
+            int events = status < 0 ? CURL_CSELECT_ERR : 0;
+            if (ready & UV_READABLE) events |= CURL_CSELECT_IN;
+            if (ready & UV_WRITABLE) events |= CURL_CSELECT_OUT;
+            active.client->advance(active.socket, events);
+        }) == 0 ? 0 : -1;
+    }
+
+    int setTimer(long delay) {
+        if (delay < 0) return uv_timer_stop(&timer) == 0 ? 0 : -1;
+        uv_update_time(&loop);
+        return uv_timer_start(&timer, [](uv_timer_t* timer) {
+            static_cast<ClientLoop*>(timer->data)->advance(CURL_SOCKET_TIMEOUT, 0);
+        }, static_cast<uint64_t>(delay), 0) == 0 ? 0 : -1;
+    }
+
+    Failure open() {
+        if (auto code = curl_global_init(CURL_GLOBAL_DEFAULT); code != CURLE_OK) return curlFailure(code);
+        multi = curl_multi_init();
+        auto startedLoop = uv_loop_init(&loop);
+        if (startedLoop != 0) {
+            if (multi) curl_multi_cleanup(multi);
+            curl_global_cleanup();
+            return {Status::Network, startedLoop};
+        }
+        if (!multi) { uv_loop_close(&loop); curl_global_cleanup(); return {Status::Network, CURLE_OUT_OF_MEMORY}; }
+        auto opened = uv_async_init(&loop, &wake, [](auto* handle) { static_cast<ClientLoop*>(handle->data)->dispatch(); });
+        bool wakeOpen = opened == 0;
+        if (!opened) opened = uv_timer_init(&loop, &timer);
+        bool timerOpen = opened == 0;
+        if (timerOpen) {
+            wake.data = this;
+            timer.data = this;
+            auto set = [&](CURLMoption option, auto value) { if (!opened) opened = curl_multi_setopt(multi, option, value); };
+            set(CURLMOPT_SOCKETFUNCTION, +[](CURL*, curl_socket_t socket, int action, void* data, void*) {
+                return static_cast<ClientLoop*>(data)->watchSocket(socket, action);
+            });
+            set(CURLMOPT_SOCKETDATA, this);
+            set(CURLMOPT_TIMERFUNCTION, +[](CURLM*, long delay, void* data) { return static_cast<ClientLoop*>(data)->setTimer(delay); });
+            set(CURLMOPT_TIMERDATA, this);
+            set(CURLMOPT_MAX_TOTAL_CONNECTIONS, maxConnections);
+            set(CURLMOPT_MAX_HOST_CONNECTIONS, maxPerHost);
+            set(CURLMOPT_MAXCONNECTS, maxConnections);
+        }
+        if (!opened) opened = uv_thread_create(&thread, [](void* argument) {
+            auto& owner = *static_cast<ClientLoop*>(argument);
+            const auto registration = lyraGcEnterWorker();
+            [[maybe_unused]] lyraRuntime::SuppressSigpipe ignoreSigpipe;
+            uv_run(&owner.loop, UV_RUN_DEFAULT);
+            if (uv_loop_close(&owner.loop) != 0) std::abort();
+            lyraGcLeaveWorker(registration);
+        }, this);
+        if (opened) {
+            curl_multi_cleanup(multi);
+            if (timerOpen) uv_close(reinterpret_cast<uv_handle_t*>(&timer), nullptr);
+            if (wakeOpen) uv_close(reinterpret_cast<uv_handle_t*>(&wake), nullptr);
+            uv_run(&loop, UV_RUN_DEFAULT);
+            uv_loop_close(&loop);
+            curl_global_cleanup();
+            return {Status::Network, opened};
+        }
+        running = true;
+        return {};
+    }
+
+    void dispatch() {
+        std::array<Command, batchSize> commands;
+        std::size_t count = 0;
+        bool shutdown;
+        {
+            std::lock_guard lock(mutex);
+            for (; count < commands.size() && !inbox.empty(); ++count) {
+                commands[count] = inbox.front();
+                inbox.pop_front();
+            }
+            shutdown = stopping && inbox.empty();
+            if (!inbox.empty()) notify();
+        }
+        for (std::size_t index = 0; index < count; ++index) {
+            auto& command = commands[index];
+            if (command.cancel) cancel(*command.job);
+            else start(*command.job);
+            lyraGcRootDrop(command.root);
+        }
+        if (shutdown) {
+            if (!transfers.empty()) std::abort();
+            curl_multi_cleanup(multi);
+            while (!sockets.empty()) removeSocket(sockets.begin()->first);
+            uv_close(reinterpret_cast<uv_handle_t*>(&timer), nullptr);
+            uv_close(reinterpret_cast<uv_handle_t*>(&wake), nullptr);
+        }
+    }
+
+    void finish(Job& job, const Response* response) {
+        auto* task = std::exchange(job.task, nullptr);
+        job.result = response;
+        {
+            std::lock_guard lock(mutex);
+            --outstanding;
+        }
+        lyraNativeComplete(task, &job.result);
+    }
+
+    std::unique_ptr<Active> take(CURL* handle) {
+        auto entry = transfers.extract(handle);
+        if (entry.empty()) std::abort();
+        auto active = std::move(entry.mapped());
+        active->job.active = nullptr;
+        if (curl_multi_remove_handle(multi, handle) != CURLM_OK) std::abort();
+        return active;
+    }
+
+    void cancel(Job& job) {
+        if (!job.task) return;
+        take(job.active).reset();
+        finish(job, failed({Status::Cancelled}));
+    }
+
+    Failure attach(std::unique_ptr<Active>& active) {
+        auto& job = active->job;
+        auto timeout = std::chrono::ceil<milliseconds>(job.deadline - Clock::now()).count();
+        if (timeout <= 0) return {Status::TimedOut};
+        auto& transfer = active->transfer;
+        transfer.headers.clear();
+        transfer.body.clear();
+        transfer.readingHeaders = transfer.overBudget = false;
+        auto* easy = active->easy.get();
+        curl_easy_reset(easy);
+        auto error = configure(easy, active->url.get(), *job.request, active->method, active->proxy, active->headers, timeout, transfer);
+        if (error.status != Status::Ok) return error;
+        if (auto code = curl_multi_add_handle(multi, easy); code != CURLM_OK) return {Status::Network, code};
+        job.active = easy;
+        transfers.emplace(easy, std::move(active));
+        return {};
+    }
+
+    void start(Job& job) {
+        const auto& request = *job.request;
+        if (request.connectTimeoutMs <= 0 || request.connectTimeoutMs > INT32_MAX || request.maxResponseBytes <= 0 ||
+            request.maxRedirects < 0 || request.maxRedirects > 20 || (request.hasCa && bytes(request.caPem).empty())) {
+            finish(job, failed({Status::InvalidRequest}));
+            return;
+        }
+        auto active = std::make_unique<Active>(job);
+        auto failure = active->prepare();
+        if (failure.status == Status::Ok) failure = attach(active);
+        if (failure.status != Status::Ok) { active.reset(); finish(job, failed(failure)); }
+    }
+
+    void completed(CURL* handle, CURLcode result) {
+        long status = 0;
+        if (result == CURLE_OK) result = curl_easy_getinfo(handle, CURLINFO_RESPONSE_CODE, &status);
+        auto active = take(handle);
+        auto& job = active->job;
+        auto failure = active->transfer.overBudget ? Failure{Status::TooLarge} : curlFailure(result);
+        if (failure.status == Status::Ok && status < 100) failure = {Status::Network};
+        bool again = false;
+        if (failure.status == Status::Ok) failure = active->next(status, again);
+        if (failure.status == Status::Ok && again) {
+            failure = attach(active);
+            if (failure.status == Status::Ok) return;
+        }
+        auto* response = failure.status == Status::Ok ? received(status, active->transfer) : failed(failure);
+        active.reset();
+        finish(job, response);
+    }
+
+    void advance(curl_socket_t socket, int events) {
+        int pending = 0;
+        if (auto code = curl_multi_socket_action(multi, socket, events, &pending); code != CURLM_OK) {
+            while (!transfers.empty()) {
+                auto active = take(transfers.begin()->first);
+                auto& job = active->job;
+                active.reset();
+                finish(job, failed({Status::Network, code}));
+            }
+            return;
+        }
+        int messages = 0;
+        while (auto* message = curl_multi_info_read(multi, &messages)) {
+            if (message->msg == CURLMSG_DONE) completed(message->easy_handle, message->data.result);
+        }
+    }
+
+public:
+    ~ClientLoop() {
+        if (!running) return;
+        {
+            std::lock_guard lock(mutex);
+            stopping = true;
+            notify();
+        }
+        uv_thread_join(&thread);
+        curl_global_cleanup();
+    }
+
+    bool submit(LyraNativeAsync* task, Job& job) {
+        job.deadline = Clock::now() + milliseconds(job.request->timeoutMs);
+        std::call_once(once, [&] { startup = open(); });
+        if (startup.status != Status::Ok) { job.result = failed(startup); return false; }
+        {
+            std::lock_guard lock(mutex);
+            if (outstanding < maxJobs) {
+                ++outstanding;
+                job.task = task;
+                inbox.push_back({&job, lyraGcRootCreate(&job), false});
+                notify();
+                return true;
+            }
+        }
+        job.result = failed({Status::Busy});
+        return false;
+    }
+
+    void requestCancel(Job& job) {
+        std::lock_guard lock(mutex);
+        inbox.push_back({&job, lyraGcRootCreate(&job), true});
+        notify();
+    }
+};
+
+ClientLoop& clientLoop() {
+    static ClientLoop loop;
+    return loop;
 }
 
 }
@@ -390,7 +648,11 @@ extern "C" void lyraHttpClientSetHeader(Request* request, int64_t index, const v
     request->headers[index] = {name, value};
 }
 
-extern "C" const Response* lyraHttpClientSend(const Request* request) { return send(*request); }
+extern "C" LyraTask* lyraHttpClientSendAsync(const Request* request) {
+    auto* job = ::new (lyraGcAlloc(sizeof(Job))) Job{request};
+    return lyraTaskNative([](LyraNativeAsync* task, void* data) { return clientLoop().submit(task, *static_cast<Job*>(data)); },
+        [](void* data) { clientLoop().requestCancel(*static_cast<Job*>(data)); }, job, &job->result);
+}
 extern "C" int64_t lyraHttpClientErrorKind(const Response* response) { return static_cast<int64_t>(response->failure.status); }
 extern "C" int64_t lyraHttpClientErrorCode(const Response* response) { return response->failure.code; }
 extern "C" int64_t lyraHttpClientStatus(const Response* response) { return response->status; }

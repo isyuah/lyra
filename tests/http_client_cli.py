@@ -20,6 +20,12 @@ OPENSSL = os.environ.get('LYRA_TEST_OPENSSL') or shutil.which('openssl')
 class FixtureHandler(http.server.BaseHTTPRequestHandler):
     protocol_version = 'HTTP/1.1'
 
+    def setup(self):
+        super().setup()
+        with self.server.lock:
+            self.server.connections += 1
+            self.connection_id = self.server.connections
+
     def log_message(self, *arguments):
         pass
 
@@ -70,6 +76,8 @@ class FixtureHandler(http.server.BaseHTTPRequestHandler):
             self.reply(200, b'too late')
         elif self.path == '/ok':
             self.reply(200, b'ok')
+        elif self.path == '/reuse':
+            self.reply(200, str(self.connection_id).encode('ascii'))
         elif self.path == 'http://proxy-target.invalid/through':
             self.reply(200, b'explicit proxy')
         else:
@@ -87,6 +95,8 @@ def server(tls=None):
             fixture.socket = tls.wrap_socket(fixture.socket, server_side=True)
         fixture.arrived = threading.Event()
         fixture.release = threading.Event()
+        fixture.lock = threading.Lock()
+        fixture.connections = 0
         thread = threading.Thread(target=fixture.serve_forever, kwargs={'poll_interval': 0.05}, daemon=True)
         thread.start()
         try:
@@ -271,7 +281,7 @@ async fn main(): Unit {
                     self.assertEqual(process.wait(timeout=4), 0)
                     self.assertEqual(process.stderr.read(), b'')
 
-    def test_total_timeout_includes_waiting_for_a_native_worker(self):
+    def test_transfers_reuse_connections_while_native_workers_are_occupied(self):
         for app in self.programs('''
 import std.httpClient.{HttpClientErrorKind}
 import std.httpClient.{HttpClientOptions}
@@ -288,20 +298,56 @@ async fn main(): Unit {
     }
     while entered.load() == 0 { await sleepMs(1) }
     val url = match args() { Ok(values) => values[0], Err(error) => throw Exception(error.message()) }
-    val result = await httpGet(url, HttpClientOptions(timeoutMs: 100))
+    val first = match await httpGet(url) { Ok(value) => value, Err(error) => throw Exception(error.message()) }
+    val second = match await httpGet(url) { Ok(value) => value, Err(error) => throw Exception(error.message()) }
+    #assert(first.body == second.body)
+    val result = await httpGet(url + "/../slow", HttpClientOptions(timeoutMs: 150))
     #assert(match result { Err(error) => error.kind == HttpClientErrorKind.TimedOut, _ => false })
-    print("timed out while queued")
+    print("reused and timed out")
     await parked
 }
 '''):
             with self.subTest(mode=app.stem), server() as fixture:
-                with running([app, f'http://127.0.0.1:{fixture.server_port}/slow'],
+                with running([app, f'http://127.0.0.1:{fixture.server_port}/reuse'],
                              env={**os.environ, 'UV_THREADPOOL_SIZE': '1'}) as (process, output):
-                    self.assertEqual(output.line(timeout=5), b'timed out while queued\n')
+                    self.assertEqual(output.line(timeout=5), b'reused and timed out\n')
+                    self.assertTrue(fixture.arrived.is_set())
+                    self.assertEqual(fixture.connections, 1)
                     process.stdin.write(b'release\n')
                     process.stdin.flush()
                     self.assertEqual(process.wait(timeout=5), 0, process.stderr.read().decode())
-                    self.assertFalse(fixture.arrived.is_set())
+
+    def test_request_capacity_is_bounded_and_cancellation_releases_it(self):
+        for app in self.programs('''
+import std.httpClient.{HttpClientError, HttpClientErrorKind, HttpClientOptions, ClientResponse, httpGet}
+import std.io.{readLine}
+import std.os.{args}
+
+async fn main(): Unit {
+    val base = match args() { Ok(values) => values[0], Err(error) => throw Exception(error.message()) }
+    val jobs: List<Task<Result<ClientResponse, HttpClientError>>> = []
+    for index in 0..<129 { jobs.add(spawn httpGet(base + "/slow", HttpClientOptions(timeoutMs: 25000))) }
+    #assert(match await jobs[128] { Err(error) => error.kind == HttpClientErrorKind.Busy, _ => false })
+    print("capacity reached")
+    val _ = await blocking { readLine() }
+    for job in jobs { job.cancel() }
+    for job in jobs { val _ = awaitOutcome(job) }
+    match await httpGet(base + "/ok") {
+        Ok(response) => print(response.text() ?? "invalid"),
+        Err(error) => throw Exception(error.message()),
+    }
+}
+'''):
+            with self.subTest(mode=app.stem), server() as fixture:
+                with running([app, f'http://127.0.0.1:{fixture.server_port}']) as (process, output):
+                    self.assertEqual(output.line(timeout=8), b'capacity reached\n')
+                    self.assertTrue(fixture.arrived.wait(timeout=5))
+                    with fixture.lock:
+                        self.assertLessEqual(fixture.connections, 16)
+                    process.stdin.write(b'cancel\n')
+                    process.stdin.flush()
+                    self.assertEqual(output.line(timeout=5), b'ok\n')
+                    self.assertEqual(process.wait(timeout=5), 0, process.stderr.read().decode())
 
 
 if __name__ == '__main__':

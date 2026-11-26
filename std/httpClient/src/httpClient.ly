@@ -2,7 +2,7 @@ extern fn lyraHttpClientPrepare(method: String, url: String, body: Bytes, proxy:
     connectTimeoutMs: Int, timeoutMs: Int, maxResponseBytes: Int, maxRedirects: Int,
     hasBody: Bool, hasProxy: Bool, hasCa: Bool, count: Int): CPtr;
 extern fn lyraHttpClientSetHeader(request: CPtr, index: Int, name: String, value: String): Unit;
-extern fn lyraHttpClientSend(request: CPtr): CPtr;
+extern fn lyraHttpClientSendAsync(request: CPtr): Task<CPtr>;
 extern fn lyraHttpClientErrorKind(response: CPtr): Int;
 extern fn lyraHttpClientErrorCode(response: CPtr): Int;
 extern fn lyraHttpClientStatus(response: CPtr): Int;
@@ -13,7 +13,7 @@ extern fn lyraHttpClientBody(response: CPtr): Bytes;
 extern fn lyraHttpClientHeaderMatches(first: String, second: String): Bool;
 
 pub enum HttpClientErrorKind {
-    InvalidRequest, TimedOut, TooLarge, TooManyRedirects, RedirectRejected, Tls, Network, Cancelled,
+    InvalidRequest, TimedOut, TooLarge, TooManyRedirects, RedirectRejected, Tls, Network, Cancelled, Busy,
 }
 
 pub struct HttpClientError(pub val kind: HttpClientErrorKind, pub val code: Int) {
@@ -27,6 +27,7 @@ pub struct HttpClientError(pub val kind: HttpClientErrorKind, pub val code: Int)
             Tls => "HTTP TLS connection or certificate verification failed",
             Network => "HTTP transfer failed (native code ${code})",
             Cancelled => "HTTP request cancelled",
+            Busy => "HTTP client request capacity reached",
         }
     }
 }
@@ -80,6 +81,7 @@ fn unpack(response: CPtr): Result<ClientResponse, HttpClientError> {
         6 => HttpClientErrorKind.Tls,
         7 => HttpClientErrorKind.Network,
         8 => HttpClientErrorKind.Cancelled,
+        9 => HttpClientErrorKind.Busy,
         _ => throw Exception("unexpected native HTTP client status"),
     }
     Err(HttpClientError(kind, lyraHttpClientErrorCode(response)))
@@ -100,19 +102,7 @@ pub async fn httpRequest(method: String, url: String, headers: List<HttpHeader> 
         val header = snapshot[index]
         lyraHttpClientSetHeader(request, index, header.name, header.value)
     }
-    val results = Channel<Result<ClientResponse, HttpClientError>>(1)
-    val worker = spawn async {
-        val response = await blocking { unpack(lyraHttpClientSend(request)) }
-        await results.send(response)
-    }
-    await select {
-        val received = results.receive() => received ?? throw Exception("HTTP response channel closed unexpectedly"),
-        sleepMs(options.timeoutMs) => {
-            worker.cancel()
-            val _ = awaitOutcome(worker)
-            Err(HttpClientError(HttpClientErrorKind.TimedOut, 0))
-        },
-    }
+    unpack(await lyraHttpClientSendAsync(request))
 }
 
 pub fn httpGet(url: String, options: HttpClientOptions = HttpClientOptions()): Task<Result<ClientResponse, HttpClientError>> {

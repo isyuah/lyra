@@ -59,6 +59,7 @@ void validateForeign(const CheckedFunction& fn, const CheckedModule& program, co
         {"$std/http", "lyraHttpListenerCloseAsync", {Type::CPtr}, Type::Unit, true},
         {"$std/http", "lyraHttpListenerScopeAsync", {Type::CPtr}, Type::Unit, true},
         {"$std/http", "lyraHttpKeepListener", {Type::CPtr}, Type::Unit, false},
+        {"$std/httpClient", "lyraHttpClientSendAsync", {Type::CPtr}, Type::CPtr, true},
         {"$std/os", "lyraOsWaitSignal", {Type::Int}, Type::Int, true},
     };
     if (auto binding = std::ranges::find(bindings, symbol.text, &SdkBinding::symbol); binding != bindings.end()) {
