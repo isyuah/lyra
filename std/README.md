@@ -13,6 +13,7 @@
 | JSON、JSONL 和 TOML | [`std.json`](json/README.md) 的构造器和 codec；[`std.jsonl`](jsonl/README.md) 的 `jsonlReader`；[`std.toml`](toml/README.md) 的 TOML 值和 codec |
 | SQLite 查询与写入 | [`std.sqlite`](sqlite/README.md) 的预编译语句、事务、`DbError` |
 | HTTP 与 TLS | [`std.http`](http/README.md) 的 `Router` 和 `listen`；[`std.httpTls`](httpTls/README.md) 的 `listenTls`；[`std.httpClient`](httpClient/README.md) 的 `httpRequest` 和 `httpGet` |
+| 流式上传与压缩 | [`std.httpMultipart`](httpMultipart/README.md) 的 `MultipartReader`；[`std.compression`](compression/README.md) 的 `GzipEncoder` 和 `GzipDecoder`；[`std.httpCompression`](httpCompression/README.md) 的 `gzipResponse` 和 `GzipRequestReader` |
 | 测试断言 | 内置 `#assert(condition, message)`，失败位置指向调用处 |
 
 JSON 与 TOML 都使用显式 `#derive(Json)` / `#derive(Toml)` 生成静态编解码实现；格式不能表示的多层空值、对象身份图等仍需显式映射，不会静默丢信息。

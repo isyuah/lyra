@@ -60,7 +60,7 @@ examples/compiler-smoke/pass/build/release/app
 
 `check .../fail` 预期非零退出，在 `;` 处报告 `LYT0001`；最后一条命令应打印 `3` 并正常退出。要构建优化版编译器，把三个 preset 命令中的 `dev` 换成 `release`。用 `cmake --install build/dev --prefix <目录>` 安装工具链，搬迁时整体复制前缀，包含 `bin/`、`lib/`、`libexec/`、`share/` 和给 C 适配器使用的 `include/`。
 
-源码构建需要 `libgc-dev`、`libuv1-dev`、`libsqlite3-dev`、`libjansson-dev` 和 `libssl-dev`（OpenSSL 3），完整 HTTPS 测试另用 `openssl` 命令。CMake 下载并校验固定版本的 llhttp、tomlc17、curl 与 c-ares。离线配置可分别传 `-DLYRA_LLHTTP_SOURCE_DIR=...`、`-DFETCHCONTENT_SOURCE_DIR_LYRA_TOMLC17=...`、`-DFETCHCONTENT_SOURCE_DIR_LYRA_CURL=...` 和 `-DFETCHCONTENT_SOURCE_DIR_LYRA_CARES=...`，指向已准备的源码。部署**编译好的应用**不用带工具链或这些开发库。
+源码构建需要 `libgc-dev`、`libuv1-dev`、`libsqlite3-dev`、`libjansson-dev`、`zlib1g-dev` 和 `libssl-dev`（OpenSSL 3），完整 HTTPS 测试另用 `openssl` 命令。CMake 下载并校验固定版本的 llhttp、tomlc17、curl 与 c-ares。离线配置可分别传 `-DLYRA_LLHTTP_SOURCE_DIR=...`、`-DFETCHCONTENT_SOURCE_DIR_LYRA_TOMLC17=...`、`-DFETCHCONTENT_SOURCE_DIR_LYRA_CURL=...` 和 `-DFETCHCONTENT_SOURCE_DIR_LYRA_CARES=...`，指向已准备的源码。部署**编译好的应用**不用带工具链或这些开发库。
 
 维护者可用 `python tools/package_sdk.py build/windows-release` 或 `python3 tools/package_sdk.py build/release` 打包已构建的 SDK。脚本安装到新的临时前缀，校验文件清单，在 `build/dist/` 生成带目标和 Git 版本的制品，并附文件 SHA-256 清单；同名制品已存在时不会覆盖。Linux 的 Ubuntu 22.04 发行包应在 Ubuntu 22.04 环境构建。
 

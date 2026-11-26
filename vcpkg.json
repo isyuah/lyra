@@ -7,6 +7,7 @@
     { "name": "curl", "default-features": false, "features": ["c-ares", "openssl"] },
     "jansson",
     "libuv",
-    "sqlite3"
+    "sqlite3",
+    "zlib"
   ]
 }

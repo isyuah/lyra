@@ -205,11 +205,15 @@ std::vector<NativeArtifact> emitExecutable(llvm::Module& module, llvm::TargetMac
     };
     auto client = uses("lyraHttpClient");
     auto serverTls = uses("lyraHttpTls");
+    auto compression = uses("lyraGzip");
     auto tls = client || serverTls;
+    if (compression) append(lib, {"liblyraCompression.a"});
     if (client) {
         append(lib, {"liblyraHttpClient.a", "libcurl.a", "libcares.a"});
-        if constexpr (windows) append(lib, {"libzs.a"});
     }
+    if constexpr (windows) {
+        if (client || compression) append(lib, {"libzs.a"});
+    } else if (compression) append(lib, {"libz.a"});
     if (serverTls) append(lib, {"liblyraHttpTls.a"});
     if (tls) append(lib, {"libssl.a", "libcrypto.a"});
     if constexpr (windows) {

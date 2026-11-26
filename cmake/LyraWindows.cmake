@@ -47,7 +47,7 @@ function(lyra_stage_windows_sdk)
             "-DFETCHCONTENT_FULLY_DISCONNECTED=${FETCHCONTENT_FULLY_DISCONNECTED}" "-DCMAKE_INSTALL_PREFIX=<INSTALL_DIR>"
         BUILD_ALWAYS TRUE)
     foreach(archive IN ITEMS liblyraRuntime.a libllhttp.a libgc.a libuv.a libjansson.a libsqlite3.a
-            liblyraHttpClient.a liblyraHttpTls.a libcurl.a libcares.a libssl.a libcrypto.a libzs.a)
+            liblyraHttpClient.a liblyraHttpTls.a liblyraCompression.a libcurl.a libcares.a libssl.a libcrypto.a libzs.a)
         install(FILES "${CMAKE_BINARY_DIR}/lib/${archive}" DESTINATION lib)
     endforeach()
     install(PROGRAMS "${CMAKE_BINARY_DIR}/libexec/lyra/lyra-registry-download.exe" DESTINATION libexec/lyra)

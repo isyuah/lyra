@@ -149,13 +149,19 @@ pub class Listener {
 pub struct Header(pub val name: String, pub val value: String)
 
 pub class ResponseWriter {
-    val handle: CPtr
-    init(handle: CPtr) { this.handle = handle }
+    val sink: (Bytes) -> Task<Result<Unit, HttpError>>
+    init(sink: (Bytes) -> Task<Result<Unit, HttpError>>) { this.sink = sink }
 
-    pub async fn write(content: Bytes): Result<Unit, HttpError> {
-        val status = await lyraHttpWriteStreamAsync(handle, content, false)
-        if status == 0 { Ok({}) } else { Err(httpError("response.write", status)) }
+    pub static fn fromSink(sink: (Bytes) -> Task<Result<Unit, HttpError>>): ResponseWriter {
+        ResponseWriter(sink)
     }
+
+    pub async fn write(content: Bytes): Result<Unit, HttpError> { await sink(content) }
+}
+
+async fn writeResponseChunk(handle: CPtr, content: Bytes): Result<Unit, HttpError> {
+    val status = await lyraHttpWriteStreamAsync(handle, content, false)
+    if status == 0 { Ok({}) } else { Err(httpError("response.write", status)) }
 }
 
 pub enum ResponseBody {
@@ -274,7 +280,10 @@ pub class Request {
             Streaming(produce) => {
                 val started = await lyraHttpStartStreamAsync(handle, response.code, response.contentType, headers)
                 if started != 0 { return Err(httpError("respond", started)) }
-                if method() != "HEAD" { (await produce(ResponseWriter(handle)))? }
+                if method() != "HEAD" {
+                    val writer = ResponseWriter.fromSink((content: Bytes) => { writeResponseChunk(handle, content) })
+                    (await produce(writer))?
+                }
                 await lyraHttpWriteStreamAsync(handle, "".toBytes(), true)
             },
         }
