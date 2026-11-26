@@ -2,6 +2,7 @@
 #include "strings.h"
 
 #include <algorithm>
+#include <array>
 #include <memory>
 #include <new>
 #include <openssl/err.h>
@@ -99,7 +100,26 @@ void releaseConnection(void* state) {
 
 void releaseListener(void* state) { SSL_CTX_free(static_cast<SSL_CTX*>(state)); }
 
-constexpr http::Transport transport{open, feed, flush, endInput, handshake, read, write, shutdown, releaseConnection, releaseListener};
+bool http2(void* state) {
+    const unsigned char* selected = nullptr;
+    unsigned length = 0;
+    SSL_get0_alpn_selected(static_cast<Connection*>(state)->ssl, &selected, &length);
+    return length == 2 && selected[0] == 'h' && selected[1] == '2';
+}
+
+constexpr http::Transport transport{open, feed, flush, endInput, handshake, read, write, shutdown, releaseConnection, releaseListener, http2};
+
+constexpr std::array<unsigned char, 12> protocols{2, 'h', '2', 8, 'h', 't', 't', 'p', '/', '1', '.', '1'};
+
+int negotiateProtocol(SSL*, const unsigned char** output, unsigned char* length, const unsigned char* input, unsigned size, void* first) {
+    const auto* supported = static_cast<const unsigned char*>(first);
+    auto remaining = static_cast<unsigned>(protocols.data() + protocols.size() - supported);
+    unsigned char* selected = nullptr;
+    if (SSL_select_next_proto(&selected, length, supported, remaining, input, size) != OPENSSL_NPN_NEGOTIATED)
+        return SSL_TLSEXT_ERR_ALERT_FATAL;
+    *output = selected;
+    return SSL_TLSEXT_ERR_OK;
+}
 
 bool trim(std::string_view& pem) {
     auto begin = pem.find_first_not_of(" \t\r\n");
@@ -154,7 +174,9 @@ extern "C" void* lyraHttpTlsListen(const void* host, std::int64_t port, const vo
     auto context = std::unique_ptr<SSL_CTX, decltype(&SSL_CTX_free)>(SSL_CTX_new(TLS_server_method()), SSL_CTX_free);
     if (!context || SSL_CTX_set_min_proto_version(context.get(), TLS1_2_VERSION) != 1 ||
         SSL_CTX_set_max_proto_version(context.get(), TLS1_3_VERSION) != 1) return configurationError("cannot configure TLS 1.2/1.3");
-    SSL_CTX_set_options(context.get(), SSL_OP_NO_COMPRESSION | SSL_OP_NO_RENEGOTIATION);
+    SSL_CTX_set_options(context.get(), SSL_OP_NO_COMPRESSION | SSL_OP_NO_RENEGOTIATION | SSL_OP_CIPHER_SERVER_PREFERENCE);
+    if (SSL_CTX_set_cipher_list(context.get(), "ECDHE+AESGCM:ECDHE+CHACHA20") != 1) return configurationError("cannot configure TLS ciphers");
+    SSL_CTX_set_alpn_select_cb(context.get(), negotiateProtocol, const_cast<unsigned char*>(protocols.data() + (options->enableHttp2 ? 0 : 3)));
     if (!loadChain(context.get(), {lyraStringBytes(chain), chainSize})) return configurationError("invalid PEM certificate chain");
     if (!loadKey(context.get(), {lyraStringBytes(key), keySize})) return configurationError("invalid or mismatched PEM private key");
     return lyraHttpListenWithTransport(host, port, options, &transport, context.release());

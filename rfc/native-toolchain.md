@@ -110,7 +110,7 @@ Windows 的解包验收可加 `--deployment-bundle build/dist/windows-apps`，�
 
    ```sh
    sudo apt update
-   sudo apt install build-essential clang-18 clang-tools-18 llvm-18-dev libclang-18-dev lld-18 cmake ninja-build python3 libgc-dev libuv1-dev libsqlite3-dev libjansson-dev libssl-dev openssl curl
+   sudo apt install build-essential clang-18 clang-tools-18 llvm-18-dev libclang-18-dev lld-18 cmake ninja-build python3 libgc-dev libuv1-dev libsqlite3-dev libjansson-dev zlib1g-dev libssl-dev openssl curl
    ```
 
 3. 在同一 Ubuntu 终端做一次冒烟检查。`LLVMConfig.cmake` 应可读；IR 编译链接出的程序应返回 `42`：

@@ -4,7 +4,7 @@ import std.sync.{Locked}
 import std.task.{withTimeout}
 
 extern fn lyraHttpListen(host: String, port: Int, options: CPtr): CPtr;
-extern fn lyraHttpOptions(capacity: Int, requestTimeoutMs: Int, idleReadTimeoutMs: Int, writeTimeoutMs: Int, handshakeTimeoutMs: Int, graceMs: Int, claimTimeoutMs: Int, maxBodyBytes: Int, maxRequestBytes: Int, keepAliveTimeoutMs: Int, maxRequestsPerConnection: Int, streamRequestBody: Bool): CPtr;
+extern fn lyraHttpOptions(capacity: Int, requestTimeoutMs: Int, idleReadTimeoutMs: Int, writeTimeoutMs: Int, handshakeTimeoutMs: Int, graceMs: Int, claimTimeoutMs: Int, maxBodyBytes: Int, maxRequestBytes: Int, keepAliveTimeoutMs: Int, maxRequestsPerConnection: Int, streamRequestBody: Bool, enableHttp2: Bool): CPtr;
 extern fn lyraHttpStatus(server: CPtr): Int;
 extern fn lyraHttpStatusDetail(server: CPtr): String;
 extern fn lyraHttpErrorKind(status: Int): Int;
@@ -115,6 +115,7 @@ pub struct HttpServerOptions(
     pub val keepAliveTimeoutMs: Int = 5000,
     pub val maxRequestsPerConnection: Int = 1000,
     pub val streamRequestBody: Bool = false,
+    pub val enableHttp2: Bool = true,
 )
 
 fn serverOptions(options: HttpServerOptions): CPtr {
@@ -122,7 +123,7 @@ fn serverOptions(options: HttpServerOptions): CPtr {
         None => -1,
         Some(milliseconds) => if milliseconds < 1 { 0 } else { milliseconds },
     }
-    lyraHttpOptions(options.capacity, options.requestTimeoutMs, idle, options.writeTimeoutMs, options.handshakeTimeoutMs, options.graceMs, options.claimTimeoutMs, options.maxBodyBytes, options.maxRequestBytes, options.keepAliveTimeoutMs, options.maxRequestsPerConnection, options.streamRequestBody)
+    lyraHttpOptions(options.capacity, options.requestTimeoutMs, idle, options.writeTimeoutMs, options.handshakeTimeoutMs, options.graceMs, options.claimTimeoutMs, options.maxBodyBytes, options.maxRequestBytes, options.keepAliveTimeoutMs, options.maxRequestsPerConnection, options.streamRequestBody, options.enableHttp2)
 }
 
 fn acceptResult(request: CPtr): Result<Request, HttpError> {
@@ -353,7 +354,7 @@ pub class Router {
         lyraHttpKeepListener(listener.handle)
         val snapshot = routes.snapshot()
         taskGroup {
-            spawn lyraHttpListenerScopeAsync(listener.handle);
+            val listening = spawn lyraHttpListenerScopeAsync(listener.handle)
             val slots: List<Task<Unit>> = []
             for slot in 0..<lyraHttpCapacity(listener.handle) { slots.add(spawn serveSlot(listener, snapshot)) }
             if let Some(stop) = shutdown {
@@ -361,6 +362,7 @@ pub class Router {
                 await joinSlots(slots)
                 stopping.cancel()
             } else { await joinSlots(slots) }
+            await listening
         };
     }
 }
@@ -452,6 +454,7 @@ async fn drainOnShutdown(listener: Listener, stop: Shutdown, slots: List<Task<Un
     await stop.wait()
     lyraHttpBeginDrain(listener.handle)
     if let Cancelled(_) = awaitOutcome(withTimeout(lyraHttpGraceMs(listener.handle), joinSlots(slots))) {
+        lyraHttpStop(listener.handle)
         for slot in slots { slot.cancel() }
     }
 }

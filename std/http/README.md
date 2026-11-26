@@ -1,4 +1,4 @@
-# std.http：有界并发 HTTP/1 服务端
+# std.http 有界并发 HTTP 服务端
 
 ```lyra
 import std.http.{listen}
@@ -46,7 +46,11 @@ val handled = await server.withAccepted<Unit>(5000, async (request: Request) => 
 
 HTTP/1.1 默认支持 keep-alive，HTTP/1.0 通过 `Connection: keep-alive` 开启。`request.respond(response)` 返回 `Result<Unit, HttpError>`，成功写完后释放当前请求并复用连接，客户端要求关闭、服务停机或达到单连接请求上限时关闭连接。每条请求独立保留自己的正文、首部与路由，完成后的旧 Request 无法关闭或响应下一条请求。
 
+HTTPS 默认通过 ALPN 优先协商 HTTP/2，客户端也可使用 HTTP/1.1。`HttpServerOptions(enableHttp2: false)` 只协商 HTTP/1.1。HTTP/2 同一连接可并发处理多个请求，继续复用 Router、Request 和响应 API。每条连接最多有 `capacity` 个活跃流，整个 listener 最多有 `2 × capacity` 个活跃 HTTP/2 请求，实际运行的 handler 仍受 `capacity` 限制。超过流容量时返回 `REFUSED_STREAM`，客户端可另行重试。
+
 `HttpServerOptions` 的 `maxBodyBytes` 默认 8 MiB，`maxRequestBytes` 默认 16 MiB，分别限制解码后正文和整条请求的传输字节。目标最多 8 KiB，头部最多 100 项且字段名和值合计最多 32 KiB。`keepAliveTimeoutMs` 默认 5000，控制两条请求之间的空闲时间，设为 0 关闭复用。`maxRequestsPerConnection` 默认 1000。同一连接顺序处理请求，管线输入只保留有界读取窗口。
+
+HTTP/2 的大小与截止时间限制分别计入每个流，`maxRequestBytes` 包括该请求的 HEADERS、CONTINUATION 和 DATA 帧。解压后的首部另有 32 KiB 限制，每项计入协议要求的额外 32 字节。达到单连接请求上限或关闭复用时发送 GOAWAY，已接受的请求继续完成。流式上传每流最多缓冲 65535 字节，应用读取后才补回流窗口；暂停某一上传时，其他流仍能推进。
 
 超限回 `413`，格式或头部文本非法回 `400`。HTTP/1.1 必须有且只有一个有效的 `Host`，携带 `Expect` 的请求在读完首部后回 `417`。响应在写前验证失败可改正后重试。TLS 复用同一套请求和生命周期语义，见 [`std.httpTls`](../httpTls/README.md)。
 
@@ -58,6 +62,8 @@ HTTP/1.1 默认支持 keep-alive，HTTP/1.0 通过 `Connection: keep-alive` 开�
 - `maxBodyBytes` 和 `maxRequestBytes` 依然累计限制整条请求。总请求预算包含应用暂停读取的时间，空闲预算只在等待网络时计时。解码协议错误或超限时库会发错误响应并终止本次传输。
 - 读完后可以复用连接。未读完就响应时，本次响应后关闭连接，并在写端关闭后限时排空剩余输入；正在读时尝试发送响应返回 `Busy`。
 - `bodyStreaming()` 可查询监听器使用的模式。`body()`、`text()`、`json(codec)` 与宏 `[body]` 使用默认缓冲模式；开启流式上传时由 handler 按需读取和解码。
+
+HTTP/2 中，取消读取或 handler 只重置所属流。未读完就响应时先完整写出响应，再用 `RST_STREAM(NO_ERROR)` 停止剩余上传；同一连接的其他请求继续运行。
 
 ### 流式响应
 
@@ -71,6 +77,8 @@ router.get("/events", async (request: Request) => {
 ```
 
 从 `std.http` 导入 `ResponseWriter`。库验证并写完响应头后才调用生产函数。顺序 `await writer.write(bytes)`，每次只借用一个 `Bytes` 分块，等网络传输接收这次写入再继续；空块不写到线上，并发写入返回 `Busy`。HTTP/1.1 用分块编码，可以在末尾复用连接；HTTP/1.0 用关连接标记正文结束。`HEAD` 不执行生产函数。生产函数中途失败或被取消会停止传输并关闭连接，不再补成功结束标记。生产函数退出后，旧 writer 不能再写入。`Response.body` 以 `ResponseBody.Buffered` 或 `ResponseBody.Streaming` 区分两种正文。
+
+HTTP/2 用 DATA 帧发送正文并受每流和连接窗口约束。窗口不足时只暂停相应写入，应用的 `write()` 等对应密文的原生写回调完成后返回。生产失败、断线或取消重置所属流；正常结束发送 END_STREAM。
 
 ## 关闭与断线
 

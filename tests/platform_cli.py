@@ -38,7 +38,7 @@ def assert_linkage(test, program, *linux_libraries):
         libraries = {name.lower() for name in re.findall(r'^\s*Name:\s+(\S+\.dll)\s*$', output, re.I | re.M)}
         system_libraries = {
             'advapi32.dll', 'bcrypt.dll', 'crypt32.dll', 'dbghelp.dll', 'gdi32.dll', 'iphlpapi.dll', 'kernel32.dll',
-            'ntdll.dll', 'ole32.dll', 'psapi.dll', 'shell32.dll', 'user32.dll', 'userenv.dll', 'ws2_32.dll',
+            'ntdll.dll', 'ole32.dll', 'psapi.dll', 'secur32.dll', 'shell32.dll', 'user32.dll', 'userenv.dll', 'ws2_32.dll',
         }
         test.assertIn('kernel32.dll', libraries)
         test.assertEqual({name for name in libraries - system_libraries if not name.startswith('api-ms-win-crt-')}, set())

@@ -26,6 +26,7 @@ std::size_t writeBody(char* bytes, std::size_t width, std::size_t count, void* o
 }
 
 int download(const char* url, const std::filesystem::path& caPath) {
+    if (curl_global_sslset(CURLSSLBACKEND_OPENSSL, nullptr, nullptr) != CURLSSLSET_OK) return 1;
     if (curl_global_init(CURL_GLOBAL_DEFAULT) != CURLE_OK) return 1;
     struct Global { ~Global() { curl_global_cleanup(); } } initialized;
     std::unique_ptr<CURL, decltype(&curl_easy_cleanup)> easy(curl_easy_init(), curl_easy_cleanup);

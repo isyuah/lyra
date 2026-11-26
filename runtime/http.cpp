@@ -243,6 +243,34 @@ namespace lyraRuntime::http {
 
 std::string_view text(const void* value) { return {lyraStringBytes(value), lyraStringLength(value)}; }
 
+int populateRequest(Request& request, std::string_view method, std::string_view target, std::span<const Field> fields) {
+    if (fields.size() > maxHeaderFields || target.size() > maxTarget) return EMSGSIZE;
+    if (!validFieldName(method) || !target.starts_with('/') || !lyraUtf8Valid(target.data(), target.size()) ||
+        !parseTarget(&request, target)) return EPROTO;
+    auto* headers = static_cast<Field*>(lyraGcAlloc(fields.size() * sizeof(Field)));
+    bool host = false, expect = false;
+    for (std::size_t index = 0; index < fields.size(); ++index) {
+        const auto& field = fields[index];
+        auto name = text(field.name), value = trimField(text(field.value));
+        if (!validFieldName(name) || !validFieldValue(value)) return EPROTO;
+        if (!lyraUtf8Valid(value.data(), value.size())) return EILSEQ;
+        if (fieldEqual(name, "Host")) {
+            if (host || !validHost(value)) return EPROTO;
+            host = true;
+        }
+        expect |= fieldEqual(name, "Expect");
+        headers[index] = {field.name, lyraStringFromBytes(value.data(), value.size())};
+    }
+    if (!host) return EPROTO;
+    if (expect) return unsupportedExpectation;
+    request.method = lyraStringFromBytes(method.data(), method.size());
+    request.target = lyraStringFromBytes(target.data(), target.size());
+    request.headers = headers;
+    request.headerCount = fields.size();
+    request.keepAlive = true;
+    return 0;
+}
+
 RequestParser::RequestParser(Request& message, std::size_t maxBodyBytes, std::size_t maxWireBytes)
     : request(message), maxBodyBytes(maxBodyBytes), maxWireBytes(maxWireBytes) {
     llhttp_init(&parser, HTTP_REQUEST, &parserSettings);

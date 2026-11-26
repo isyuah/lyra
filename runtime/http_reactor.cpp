@@ -1,4 +1,5 @@
 #include "http_protocol.h"
+#include "http2.h"
 #include "http_transport.h"
 #include "native_async.h"
 #include "strings.h"
@@ -13,6 +14,7 @@
 #include <deque>
 #include <functional>
 #include <list>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <new>
@@ -26,13 +28,14 @@ namespace {
 
 constexpr int64_t forever = INT64_MAX;
 constexpr std::size_t readChunk = 8192, writeChunk = 16 * 1024;
+constexpr std::size_t http2DrainLimit = 64 * 1024;
 constexpr std::size_t ingressBatch = 32, commandBatch = 64, maxSubmissions = 4096;
-constexpr int64_t rejectionTimeoutMs = 1000;
+constexpr int64_t rejectionTimeoutMs = 1000, tcpDrainTimeoutMs = 1000;
 constexpr std::string_view overloadResponse = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nRetry-After: 1\r\nConnection: close\r\n\r\n";
 
 enum class Stop { Open, Drain, Close };
 enum class OperationKind { Accept, ReadBody, Respond, StartStream, WriteStream, Observe, CloseRequest, CloseListener, ListenerScope };
-enum class Phase { Handshake, Idle, Reading, ReadingBody, Ready, StreamReady, Writing, EndingTls, EndingTcp, RejectDrain, Closing };
+enum class Phase { Handshake, Idle, Reading, ReadingBody, Ready, StreamReady, Writing, Http2, EndingTls, EndingTcp, DrainingTcp, Closing };
 
 void require(bool condition, const char* message) {
     if (condition) return;
@@ -127,6 +130,7 @@ struct Endpoint {
     void* tlsContext{};
     std::atomic<Stop> requested{Stop::Open};
     std::atomic<bool> stopped{};
+    std::atomic<std::size_t> http2Streams{};
     int port{}, status{};
     const void* detail{};
 };
@@ -183,7 +187,8 @@ struct Server {
     bool polling{}, listenerClosed{}, finishing{}, rejecting{};
     std::size_t ordinary{}, issued{};
     int64_t retryAt{forever}, retryMs{};
-    std::unordered_map<Session*, Slot> connections;
+    std::unordered_map<Session*, LyraGcRoot*> connections;
+    std::unordered_map<Request*, Slot> requests;
     std::list<Request*> ready;
     std::list<Operation*> accepts, closeWaiters;
 
@@ -192,6 +197,7 @@ struct Server {
     int pollForAccept();
     void acceptReady();
     void offer(Request& request);
+    bool removeRequest(Request& request);
     void released(Request& request);
     void closed(Session& session);
     void dispatch();
@@ -273,6 +279,16 @@ void closeRequest(Request& request, bool includeClaimed);
 }
 
 struct Connection {
+    struct Http2Stream {
+        Request* request;
+        LyraGcRoot* root;
+        Operation* reader{};
+        Operation* writer{};
+        std::list<Operation*> observers, closes;
+        int64_t requestDue, idleDue, writeDue{forever}, claimDue{forever};
+        bool ready{}, changed{}, closed{}, peer{};
+        int status{};
+    };
     Session& session;
     Request* request;
     Reactor& reactor;
@@ -285,14 +301,18 @@ struct Connection {
     Phase phase{Phase::Reading};
     unsigned closingHandles{};
     int closeStatus{}, ingressError{};
-    int64_t phaseDue{forever}, idleDue{forever}, claimDue{forever};
+    int64_t phaseDue{forever}, idleDue{forever}, claimDue{forever}, wireDue{forever};
     bool tcpEof{}, readActive{}, writePending{}, pumpQueued{}, bioInputEnded{}, tlsReadEnded{}, tlsShutdownDone{}, tlsWriteRetry{};
-    bool discardBody{};
+    bool discardBody{}, peerClosed{};
     std::size_t inputOffset{}, inputSize{}, completedRequests{}, discarded{};
     std::array<char, readChunk> input;
     struct TlsBuffers { std::array<char, writeChunk> ciphertext; std::array<char, readChunk> plaintext; };
     std::unique_ptr<TlsBuffers> tlsBuffers;
     std::unique_ptr<RequestParser> parser;
+    std::unique_ptr<h2::Session> http2;
+    std::map<int32_t, Http2Stream> streams;
+    std::size_t http2WriteBytes{};
+    bool processingHttp2{};
     std::string responseHead, pendingInput;
     std::string_view outgoingHead, outgoingBody, outgoingTail;
     Operation* response{};
@@ -323,6 +343,15 @@ struct Connection {
     std::string_view nextChunk();
     void consumeChunk(std::size_t count);
     void observe(Operation& operation);
+    void openHttp2();
+    void processHttp2();
+    void readHttp2(Operation& operation);
+    void respondHttp2(Operation& operation);
+    void writeHttp2(Operation& operation);
+    void finishHttp2(Http2Stream& stream, int status, bool peer);
+    void closeMessage(Request& request, int status);
+    void drain();
+    void setClaimDeadline(Request& request);
     void refreshTimer();
     void expire();
     void beginClose(int status = 0, bool peer = false);
@@ -335,7 +364,7 @@ void closeRequest(Request& request, bool includeClaimed) {
     auto delivery = request.delivery.load();
     while (delivery < Delivery::Closing && (includeClaimed || delivery != Delivery::Claimed))
         if (request.delivery.compare_exchange_weak(delivery, Delivery::Closing)) {
-            request.session->reactor->post<[](Request& request) { if (auto* connection = request.connection) connection->beginClose(EBADF); }>(request);
+            request.session->reactor->post<[](Request& request) { if (auto* connection = request.connection) connection->closeMessage(request, EBADF); }>(request);
             return;
         }
 }
@@ -399,7 +428,8 @@ void Connection::open() {
 
 void Connection::readFromSocket() {
     if (readActive || tcpEof || phase == Phase::Closing || !pendingInput.empty() || (tls && inputOffset != inputSize)) return;
-    if ((phase == Phase::ReadingBody && !bodyReader) || (discardBody && phase != Phase::RejectDrain)) return;
+    if (phase == Phase::Http2 && !http2->wantsRead()) return;
+    if ((phase == Phase::ReadingBody && !bodyReader) || (discardBody && phase != Phase::DrainingTcp)) return;
     auto status = uv_read_start(reinterpret_cast<uv_stream_t*>(&tcp), [](uv_handle_t* handle, std::size_t, uv_buf_t* buffer) {
         auto& connection = *static_cast<Connection*>(handle->data);
         *buffer = uv_buf_init(connection.input.data(), static_cast<unsigned>(connection.input.size()));
@@ -418,11 +448,12 @@ void Connection::pauseRead() {
 
 void Connection::readResult(std::ptrdiff_t count) {
     if (!count || phase == Phase::Closing) return;
-    if (phase == Phase::RejectDrain) {
+    if (phase == Phase::DrainingTcp) {
         if (count < 0) beginClose();
         else {
             discarded += static_cast<std::size_t>(count);
-            if (discarded > static_cast<std::size_t>(session.endpoint->options.maxRequestBytes)) beginClose();
+            const auto limit = http2 ? http2DrainLimit : static_cast<std::size_t>(session.endpoint->options.maxRequestBytes);
+            if (discarded >= limit) beginClose();
         }
         return;
     }
@@ -450,6 +481,171 @@ void Connection::beginMessage() {
     refreshTimer();
 }
 
+void Connection::openHttp2() {
+    phase = Phase::Http2;
+    phaseDue = deadline(session.endpoint->options.requestTimeoutMs);
+    idleDue = claimDue = forever;
+    http2 = std::make_unique<h2::Session>(session.endpoint->options, h2::Hooks{
+        [](void* data, int32_t id) -> Request* {
+            auto& connection = *static_cast<Connection*>(data);
+            auto& endpoint = *connection.session.endpoint;
+            auto count = endpoint.http2Streams.fetch_add(1, std::memory_order_relaxed);
+            if (count >= static_cast<std::size_t>(2 * endpoint.options.capacity) || endpoint.requested.load() != Stop::Open) {
+                endpoint.http2Streams.fetch_sub(1, std::memory_order_relaxed);
+                return nullptr;
+            }
+            auto* request = ::new (lyraGcAlloc(sizeof(Request))) Request{
+                .session = &connection.session, .connection = &connection, .streamId = id,
+            };
+            auto time = now();
+            connection.streams.emplace(id, Http2Stream{request, lyraGcRootCreate(request), nullptr, nullptr, {}, {},
+                deadline(endpoint.options.requestTimeoutMs, time), deadline(endpoint.options.idleReadTimeoutMs, time)});
+            connection.phaseDue = connection.idleDue = forever;
+            return request;
+        },
+        [](void* data, Request& request) { static_cast<Connection*>(data)->streams.at(request.streamId).ready = true; },
+        [](void* data, Request& request) { static_cast<Connection*>(data)->streams.at(request.streamId).changed = true; },
+        [](void* data, Request& request, int status, bool peer) {
+            auto& stream = static_cast<Connection*>(data)->streams.at(request.streamId);
+            stream.closed = true;
+            stream.status = status;
+            stream.peer = peer;
+        },
+    }, this);
+    if (session.overload) http2->drain();
+    processHttp2();
+}
+
+void Connection::finishHttp2(Http2Stream& stream, int status, bool peer) {
+    auto& message = *stream.request;
+    message.connection = nullptr;
+    if (peer) message.peerLost.store(true);
+    if (!message.bodyError && status) message.bodyError = status;
+    message.delivery.store(Delivery::Closed);
+    session.endpoint->reactor->post<[](Request& message) { message.session->endpoint->server->released(message); }>(message);
+    if (stream.reader) finish(*stream.reader, message.bodyError);
+    if (stream.writer) finish(*stream.writer, status);
+    for (auto* observer : stream.observers) finish(*observer, message.peerLost.load());
+    for (auto* close : stream.closes) finish(*close);
+    session.endpoint->http2Streams.fetch_sub(1, std::memory_order_relaxed);
+    lyraGcRootDrop(stream.root);
+}
+
+void Connection::processHttp2() {
+    if (processingHttp2 || phase != Phase::Http2) return;
+    processingHttp2 = true;
+    for (auto iterator = streams.begin(); iterator != streams.end();) {
+        auto& stream = iterator->second;
+        if (stream.closed) {
+            finishHttp2(stream, stream.status, stream.peer);
+            iterator = streams.erase(iterator);
+            continue;
+        }
+        auto& message = *stream.request;
+        if (stream.changed) stream.idleDue = stream.reader || !message.streamingBody ? deadline(session.endpoint->options.idleReadTimeoutMs) : forever;
+        if (http2->inputComplete(message)) stream.requestDue = stream.idleDue = forever;
+        if (stream.ready) {
+            stream.ready = false;
+            if (session.endpoint->requested.load() == Stop::Open)
+                session.endpoint->reactor->post<[](Request& message) { message.session->endpoint->server->offer(message); }>(message);
+            else http2->reset(message, EBADF);
+        }
+        stream.changed = false;
+        if (stream.reader) {
+            auto result = http2->read(message);
+            if (result.state != h2::ReadState::Pending) {
+                auto* operation = std::exchange(stream.reader, nullptr);
+                stream.idleDue = forever;
+                if (lyraNativeTryComplete(operation->task, box(box(BodyRead{result.status, result.bytes})))) operation->task = nullptr;
+                else { finish(*operation, ECANCELED); http2->reset(message, ECANCELED); }
+            }
+        }
+        if (stream.writer) if (auto status = http2->takeWriteCompletion(message)) {
+            auto* operation = std::exchange(stream.writer, nullptr);
+            stream.writeDue = forever;
+            if (!*status && operation->kind == OperationKind::StartStream) {
+                if (lyraNativeTryComplete(operation->task, box<int64_t>(0), requestCloseTask(message))) operation->task = nullptr;
+                else { finish(*operation, ECANCELED); http2->reset(message, ECANCELED); }
+            } else finish(*operation, *status);
+        }
+        ++iterator;
+    }
+    processingHttp2 = false;
+    if (auto status = http2->status()) { beginClose(status, true); return; }
+    if (http2->finished()) {
+        phase = Phase::EndingTls;
+        phaseDue = deadline(session.endpoint->options.writeTimeoutMs);
+        idleDue = forever;
+    } else if (streams.empty() && phaseDue == forever && idleDue == forever)
+        idleDue = deadline(session.endpoint->options.keepAliveTimeoutMs);
+    refreshTimer();
+}
+
+void Connection::readHttp2(Operation& operation) {
+    auto& message = *operation.request;
+    auto& stream = streams.at(message.streamId);
+    if (!message.streamingBody) { finish(operation, EINVAL); return; }
+    if (message.bodyError) { finish(operation, message.bodyError); return; }
+    if (message.delivery.load() >= Delivery::Closing) { finish(operation, EBADF); return; }
+    if (stream.reader) { finish(operation, EBUSY); return; }
+    if (auto status = claim(message)) { finish(operation, status); return; }
+    stream.reader = &operation;
+    stream.idleDue = deadline(session.endpoint->options.idleReadTimeoutMs);
+    processHttp2();
+    pump();
+}
+
+void Connection::respondHttp2(Operation& operation) {
+    auto& message = *operation.request;
+    auto& stream = streams.at(message.streamId);
+    if (message.delivery.load() >= Delivery::Closing) { finish(operation, EBADF); return; }
+    if (stream.writer || stream.reader) { finish(operation, EBUSY); return; }
+    if (auto status = claim(message)) { finish(operation, status); return; }
+    auto status = http2->respond(message, operation.argument, operation.mediaType, operation.body, *operation.headers,
+        operation.kind == OperationKind::StartStream);
+    if (status) { finish(operation, status); return; }
+    stream.writer = &operation;
+    stream.writeDue = deadline(session.endpoint->options.writeTimeoutMs);
+    processHttp2();
+    pump();
+}
+
+void Connection::writeHttp2(Operation& operation) {
+    auto& message = *operation.request;
+    auto& stream = streams.at(message.streamId);
+    if (message.delivery.load() >= Delivery::Closing) { finish(operation, EBADF); return; }
+    if (stream.writer) { finish(operation, EBUSY); return; }
+    auto status = http2->write(message, operation.body, operation.argument != 0);
+    if (status) { finish(operation, status); return; }
+    stream.writer = &operation;
+    stream.writeDue = deadline(session.endpoint->options.writeTimeoutMs);
+    processHttp2();
+    pump();
+}
+
+void Connection::closeMessage(Request& message, int status) {
+    if (!http2) { beginClose(status); return; }
+    http2->reset(message, status);
+    processHttp2();
+    pump();
+}
+
+void Connection::setClaimDeadline(Request& message) {
+    if (http2) streams.at(message.streamId).claimDue = message.offerExpires;
+    else claimDue = message.offerExpires;
+}
+
+void Connection::drain() {
+    if (session.endpoint->requested.load() == Stop::Close) { beginClose(EBADF); return; }
+    if (http2) {
+        http2->drain();
+        for (auto& [id, stream] : streams)
+            if (stream.request->delivery.load() != Delivery::Claimed) http2->reset(*stream.request, EBADF);
+        processHttp2();
+        pump();
+    } else if (request->delivery.load() != Delivery::Claimed) beginClose(EBADF);
+}
+
 void Connection::holdInput(std::string_view bytes) {
     require(pendingInput.size() + bytes.size() <= readChunk, "HTTP input exceeded its read window");
     pendingInput.append(bytes);
@@ -461,6 +657,12 @@ void Connection::offerRequest() {
 }
 
 void Connection::messageBytes(std::string_view bytes) {
+    if (http2) {
+        if (auto status = http2->feed(bytes)) { beginClose(status, true); return; }
+        processHttp2();
+        if (phase == Phase::Http2 && !http2->wantsRead()) pauseRead();
+        return;
+    }
     if (phase == Phase::Idle) beginMessage();
     const auto readingBody = phase == Phase::ReadingBody;
     if (phase != Phase::Reading && !readingBody) {
@@ -507,6 +709,7 @@ void Connection::messageBytes(std::string_view bytes) {
 }
 
 void Connection::readBody(Operation& operation) {
+    if (http2) { readHttp2(operation); return; }
     if (!request->streamingBody) { finish(operation, EINVAL); return; }
     if (request->bodyError) { finish(operation, request->bodyError); return; }
     if (request->delivery.load() >= Delivery::Closing) { finish(operation, EBADF); return; }
@@ -534,6 +737,7 @@ void Connection::completeBodyRead(int status, const void* chunk) {
 }
 
 void Connection::startResponse(Operation& operation) {
+    if (http2) { respondHttp2(operation); return; }
     if (response && phase != Phase::Closing) { finish(operation, EBUSY); return; }
     if (bodyReader) { finish(operation, EBUSY); return; }
     auto unread = phase == Phase::ReadingBody;
@@ -566,6 +770,7 @@ void Connection::startResponse(Operation& operation) {
 }
 
 void Connection::writeStream(Operation& operation) {
+    if (http2) { writeHttp2(operation); return; }
     if (request->delivery.load() >= Delivery::Closing) { finish(operation, EBADF); return; }
     if (phase != Phase::StreamReady) {
         finish(operation, phase == Phase::Writing && response && response->kind != OperationKind::Respond ? EBUSY : EBADF);
@@ -626,9 +831,14 @@ void Connection::consumeChunk(std::size_t count) {
 void Connection::queueWrite(std::string_view bytes) {
     auto buffer = uv_buf_init(const_cast<char*>(bytes.data()), static_cast<unsigned>(bytes.size()));
     writePending = true;
+    if (phase == Phase::Http2) {
+        wireDue = deadline(session.endpoint->options.writeTimeoutMs);
+        refreshTimer();
+    }
     auto status = uv_write(&write, reinterpret_cast<uv_stream_t*>(&tcp), &buffer, 1, [](uv_write_t* write, int status) {
         auto& connection = *static_cast<Connection*>(write->data);
         connection.writePending = false;
+        connection.wireDue = forever;
         if (connection.phase == Phase::Closing) return;
         if (status) connection.beginClose(statusCode(status), true);
         else connection.pump();
@@ -640,9 +850,9 @@ void Connection::finishTcp() {
     phase = Phase::EndingTcp;
     auto status = uv_shutdown(&shutdown, reinterpret_cast<uv_stream_t*>(&tcp), [](uv_shutdown_t* shutdown, int status) {
         auto& connection = *static_cast<Connection*>(shutdown->data);
-        if (!status && (connection.ingressError || connection.discardBody) && !connection.tcpEof) {
-            connection.phase = Phase::RejectDrain;
-            connection.phaseDue = deadline(rejectionTimeoutMs);
+        if (!status && (connection.http2 || connection.ingressError || connection.discardBody) && !connection.tcpEof) {
+            connection.phase = Phase::DrainingTcp;
+            connection.phaseDue = deadline(tcpDrainTimeoutMs);
             connection.idleDue = forever;
             connection.inputOffset = connection.inputSize = 0;
             connection.refreshTimer();
@@ -697,8 +907,8 @@ void Connection::completeWrite() {
 }
 
 void Connection::pump() {
-    if (phase == Phase::Closing || phase == Phase::EndingTcp || phase == Phase::RejectDrain) return;
-    if (request->delivery.load() == Delivery::Closing) { beginClose(EBADF); return; }
+    if (phase == Phase::Closing || phase == Phase::EndingTcp || phase == Phase::DrainingTcp) return;
+    if (!http2 && request->delivery.load() == Delivery::Closing) { beginClose(EBADF); return; }
     if (tls) { pumpTls(); return; }
     if (writePending || phase != Phase::Writing) return;
     auto bytes = nextChunk();
@@ -719,7 +929,7 @@ void Connection::pumpTls() {
         if (step.progress == TlsProgress::Done) messageBytes({buffer.data(), step.bytes});
         if (step.progress == TlsProgress::End) {
             tlsReadEnded = true;
-            if (phase == Phase::Reading || phase == Phase::ReadingBody || phase == Phase::Idle) beginClose(ECONNRESET, true);
+            if (phase == Phase::Reading || phase == Phase::ReadingBody || phase == Phase::Idle || phase == Phase::Http2) beginClose(ECONNRESET, true);
         }
         return step.progress;
     };
@@ -736,15 +946,35 @@ void Connection::pumpTls() {
             bioInputEnded = true;
         }
         if (writePending || flush()) return;
+        if (http2WriteBytes) {
+            http2->consumeOutput(std::exchange(http2WriteBytes, 0));
+            processHttp2();
+            if (phase == Phase::Closing) return;
+        }
         TlsProgress progress;
         if (phase == Phase::Handshake) {
             progress = transport->handshake(tls).progress;
-            if (progress == TlsProgress::Done) beginMessage();
+            if (progress == TlsProgress::Done) {
+                if (transport->http2 && transport->http2(tls)) openHttp2();
+                else beginMessage();
+            }
             else if (progress == TlsProgress::Failed || progress == TlsProgress::End) {
                 ingressError = handshakeFailed;
                 beginClose(ingressError, true);
                 return;
             }
+        } else if (phase == Phase::Http2) {
+            auto bytes = http2->output();
+            processHttp2();
+            if (phase != Phase::Http2) continue;
+            if (!bytes.empty()) {
+                auto step = transport->write(tls, bytes.data(), bytes.size());
+                progress = step.progress;
+                tlsWriteRetry = progress == TlsProgress::WantInput || progress == TlsProgress::WantOutput;
+                if (progress == TlsProgress::Done) http2WriteBytes = step.bytes;
+                if (progress == TlsProgress::End) { beginClose(ECONNRESET, true); return; }
+            } else if (!tlsReadEnded && http2->wantsRead()) progress = receive();
+            else return;
         } else if (phase == Phase::Idle || phase == Phase::Reading || phase == Phase::ReadingBody || phase == Phase::Ready || phase == Phase::StreamReady) {
             if (tlsReadEnded || !pendingInput.empty() || (phase == Phase::ReadingBody && !bodyReader)) return;
             progress = receive();
@@ -786,6 +1016,14 @@ void Connection::pumpTls() {
 
 void Connection::observe(Operation& operation) {
     if (!validWait(operation.argument)) { finish(operation, -EINVAL); return; }
+    if (http2) {
+        auto& stream = streams.at(operation.request->streamId);
+        if (stream.observers.size() >= 64) { finish(operation, -EBUSY); return; }
+        if (operation.expires <= now()) { finish(operation, operation.request->peerLost.load()); return; }
+        stream.observers.push_back(&operation);
+        refreshTimer();
+        return;
+    }
     if (observers.size() >= 64) { finish(operation, -EBUSY); return; }
     if (operation.expires <= now()) { finish(operation, request->peerLost.load()); return; }
     observers.push_back(&operation);
@@ -794,13 +1032,41 @@ void Connection::observe(Operation& operation) {
 
 void Connection::refreshTimer() {
     if (phase == Phase::Closing) return;
-    auto due = std::min({phaseDue, idleDue, claimDue});
+    auto due = std::min({phaseDue, idleDue, claimDue, wireDue});
     for (auto* operation : observers) due = std::min(due, operation->expires);
+    for (const auto& [id, stream] : streams) {
+        due = std::min({due, stream.requestDue, stream.idleDue, stream.writeDue, stream.claimDue});
+        for (auto* observer : stream.observers) due = std::min(due, observer->expires);
+    }
     arm(timer, [](uv_timer_t* timer) { static_cast<Connection*>(timer->data)->expire(); }, due);
 }
 
 void Connection::expire() {
     auto time = now();
+    if (wireDue <= time) { beginClose(ETIMEDOUT); return; }
+    if (http2 && phase == Phase::Http2) {
+        for (auto& [id, stream] : streams) {
+            auto& message = *stream.request;
+            for (auto iterator = stream.observers.begin(); iterator != stream.observers.end();) {
+                auto& operation = **iterator;
+                if (operation.expires > time) { ++iterator; continue; }
+                iterator = stream.observers.erase(iterator);
+                finish(operation, message.peerLost.load());
+            }
+            if (stream.claimDue <= time) {
+                stream.claimDue = forever;
+                auto offered = Delivery::Offered;
+                if (message.delivery.compare_exchange_strong(offered, Delivery::Closing)) http2->reset(message, ETIMEDOUT);
+            }
+            if (std::min({stream.requestDue, stream.idleDue, stream.writeDue}) <= time) {
+                stream.requestDue = stream.idleDue = stream.writeDue = forever;
+                http2->reset(message, ETIMEDOUT);
+            }
+        }
+        processHttp2();
+        pump();
+        if (phase == Phase::Closing) return;
+    }
     for (auto iterator = observers.begin(); iterator != observers.end();) {
         auto& operation = **iterator;
         if (operation.expires > time) { ++iterator; continue; }
@@ -833,6 +1099,7 @@ void Connection::beginClose(int status, bool peer) {
     if ((phase == Phase::ReadingBody || bodyReader) && !request->bodyError) request->bodyError = status ? status : EBADF;
     phase = Phase::Closing;
     closeStatus = status;
+    peerClosed = peer;
     parser.reset();
     if (readActive) uv_read_stop(reinterpret_cast<uv_stream_t*>(&tcp));
     uv_timer_stop(&timer);
@@ -847,6 +1114,11 @@ void Connection::beginClose(int status, bool peer) {
 
 void Connection::finalize() {
     require(!writePending, "closing TCP stream still owns a write buffer");
+    if (http2) {
+        http2->abort(closeStatus ? closeStatus : EBADF);
+        for (auto& [id, stream] : streams) finishHttp2(stream, stream.status, stream.peer || peerClosed);
+        streams.clear();
+    }
     if (tls) transport->releaseConnection(tls);
     auto* closed = &session;
     auto* root = lyraGcRootCreate(closed);
@@ -1068,7 +1340,7 @@ void Server::acceptReady() {
             .endpoint = &endpoint, .reactor = &reactor, .socket = accepted, .overload = overload, .acceptedAt = now(),
         };
         session->request = ::new (lyraGcAlloc(sizeof(Request))) Request{.session = session};
-        connections.emplace(session, Slot{lyraGcRootCreate(session), ready.end()});
+        connections.emplace(session, lyraGcRootCreate(session));
         if (overload) rejecting = true;
         else ++ordinary;
         reactor.post<[](Session& session) { (new Connection(session))->open(); }>(*session);
@@ -1079,28 +1351,36 @@ void Server::acceptReady() {
 
 void Server::offer(Request& request) {
     if (stopping != Stop::Open || request.delivery.load() != Delivery::Pending) return;
-    connections.at(request.session).ready = ready.insert(ready.end(), &request);
+    auto position = ready.insert(ready.end(), &request);
+    require(requests.emplace(&request, Slot{lyraGcRootCreate(&request), position}).second, "request was offered twice");
     dispatch();
 }
 
-void Server::released(Request& request) {
-    auto& slot = connections.at(request.session);
+bool Server::removeRequest(Request& request) {
+    auto entry = requests.find(&request);
+    if (entry == requests.end()) return false;
+    auto& slot = entry->second;
+    auto delivered = slot.issued;
     if (slot.ready != ready.end()) ready.erase(slot.ready);
-    slot.ready = ready.end();
-    if (slot.issued) --issued;
-    slot.issued = false;
+    if (delivered) --issued;
+    lyraGcRootDrop(slot.root);
+    requests.erase(entry);
+    return delivered;
+}
+
+void Server::released(Request& request) {
+    removeRequest(request);
     dispatch();
 }
 
 void Server::closed(Session& session) {
     auto entry = connections.find(&session);
-    auto delivered = entry->second.issued;
-    released(*session.request);
+    auto delivered = removeRequest(*session.request);
     session.request = nullptr;
     if (session.overload) rejecting = false;
     else --ordinary;
     endpoint.reactor->pool->release(*session.reactor);
-    lyraGcRootDrop(entry->second.root);
+    lyraGcRootDrop(entry->second);
     connections.erase(entry);
     if (stopping != Stop::Open) { maybeFinish(); return; }
     if (endpoint.requested.load() != Stop::Open) { applyStop(endpoint); return; }
@@ -1114,7 +1394,7 @@ void Server::dispatch() {
     expire(now());
     while (!accepts.empty() && !ready.empty() && issued < static_cast<std::size_t>(endpoint.options.capacity)) {
         auto& request = *ready.front();
-        auto& slot = connections.at(request.session);
+        auto& slot = requests.at(&request);
         auto& operation = *accepts.front();
         const auto delivery = operation.scoped ? Delivery::Claimed : Delivery::Offered;
         auto pending = Delivery::Pending;
@@ -1141,7 +1421,7 @@ void Server::dispatch() {
             request.session->reactor->post<[](Request& request) {
                 auto* connection = request.connection;
                 if (connection && request.delivery.load() == Delivery::Offered) {
-                    connection->claimDue = request.offerExpires;
+                    connection->setClaimDeadline(request);
                     connection->refreshTimer();
                 }
             }>(request);
@@ -1214,11 +1494,7 @@ void Server::stop(Stop mode, int error) {
     stopping = mode;
     for (const auto& entry : connections) {
         entry.first->reactor->post<[](Session& session) {
-            if (auto* connection = session.connection) {
-                auto delivery = connection->request->delivery.load();
-                if (session.endpoint->requested.load() == Stop::Close || delivery != Delivery::Claimed)
-                    connection->beginClose(EBADF);
-            }
+            if (auto* connection = session.connection) connection->drain();
         }>(*entry.first);
     }
     maybeFinish();
@@ -1268,8 +1544,9 @@ void Operation::start() {
             break;
         case OperationKind::CloseRequest:
             if (auto* connection = request->connection) {
-                connection->closeWaiters.push_back(this);
-                connection->beginClose(EBADF);
+                if (connection->http2) connection->streams.at(request->streamId).closes.push_back(this);
+                else connection->closeWaiters.push_back(this);
+                connection->closeMessage(*request, EBADF);
             } else finish(*this);
             break;
         case OperationKind::CloseListener:
@@ -1293,12 +1570,13 @@ void Operation::cancel() {
             break;
         }
         case OperationKind::ReadBody: case OperationKind::Respond: case OperationKind::StartStream: case OperationKind::WriteStream:
-            request->connection->beginClose(ECANCELED);
+            request->connection->closeMessage(*request, ECANCELED);
             break;
         case OperationKind::Observe: {
             auto& connection = *request->connection;
             if (connection.phase == Phase::Closing) break;
-            connection.observers.remove(this);
+            if (connection.http2) connection.streams.at(request->streamId).observers.remove(this);
+            else connection.observers.remove(this);
             connection.refreshTimer();
             finish(*this, -ECANCELED);
             break;
@@ -1326,10 +1604,10 @@ namespace net = lyraRuntime::net;
 
 extern "C" const ServerOptions* lyraHttpOptions(int64_t capacity, int64_t requestTimeoutMs, int64_t idleReadTimeoutMs,
     int64_t writeTimeoutMs, int64_t handshakeTimeoutMs, int64_t graceMs, int64_t claimTimeoutMs,
-    int64_t maxBodyBytes, int64_t maxRequestBytes, int64_t keepAliveTimeoutMs, int64_t maxRequestsPerConnection, uint8_t streamRequestBody) {
+    int64_t maxBodyBytes, int64_t maxRequestBytes, int64_t keepAliveTimeoutMs, int64_t maxRequestsPerConnection, uint8_t streamRequestBody, uint8_t enableHttp2) {
     return ::new (lyraGcAllocAtomic(sizeof(ServerOptions))) ServerOptions{
         capacity, requestTimeoutMs, idleReadTimeoutMs, writeTimeoutMs, handshakeTimeoutMs, graceMs, claimTimeoutMs,
-        maxBodyBytes, maxRequestBytes, keepAliveTimeoutMs, maxRequestsPerConnection, streamRequestBody != 0,
+        maxBodyBytes, maxRequestBytes, keepAliveTimeoutMs, maxRequestsPerConnection, streamRequestBody != 0, enableHttp2 != 0,
     };
 }
 

@@ -20,6 +20,7 @@ async fn main(): Unit {
 - 默认不跟随重定向。将 `maxRedirects` 设置为 `1`–`20` 可跟随同源 `GET`/`HEAD` 跳转；跨协议、主机或端口的目标会被拒绝。
 - `proxy` 可显式指定 HTTP/HTTPS 代理；不自动读取代理环境变量。HTTPS 始终验证主机名与证书；默认用系统信任根，也可用 `caPem: Some(bytes)` 指定专用 PEM 信任根。错误信息不打印目标或代理地址。
 - 调用返回冷 Task，激活后由独立 libuv 事件循环驱动 libcurl Multi socket API。连接池跨请求复用，最多同时处理 128 个请求、建立 64 条连接，每个目标最多 16 条连接。超过请求容量返回 `HttpClientErrorKind.Busy`，应用可以据此实施背压。
+- HTTPS 通过 ALPN 优先使用 HTTP/2，并按服务端协商结果使用 HTTP/1.1。同一 HTTP/2 连接允许最多 64 个并发流，同时受服务端公布的流容量限制。静态 libcurl、nghttp2、zlib 和 OpenSSL 随 SDK 分发，连接池支持多路复用。
 - 取消通过事件循环移除传输，等本次原生操作退出后完成 Task。HTTP 请求不占用文件 I/O 的阻塞池。`httpRequest` 和 `httpGet` 完整读取正文后返回快照。
 
 ## 流式响应

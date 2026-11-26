@@ -1,6 +1,6 @@
 # Lyra RFC：HTTP 入站网络运行时
 
-**状态：已接受。** 本文定义 `std.http` 与 `std.httpTls` 的 HTTP/1 入站网络、背压与生命周期，不改变出站 HTTP 客户端。
+**状态：已接受。** 本文定义 `std.http` 与 `std.httpTls` 的 HTTP/1、HTTP/2 入站网络、背压与生命周期。出站 HTTP 客户端复用相同的静态协议依赖。
 
 ## 平台与线程归属
 
@@ -27,6 +27,7 @@
 | `keepAliveTimeoutMs` | 5000 | 两条请求之间等待首字节的预算，0 关闭连接复用 |
 | `maxRequestsPerConnection` | 1000 | 单条连接最多处理的请求数 |
 | `streamRequestBody` | `false` | 首部就绪即派发，handler 按需读取正文 |
+| `enableHttp2` | `true` | TLS 通过 ALPN 优先协商 HTTP/2 |
 
 这些是库的可覆盖策略，不是语言规则。请求、写入、握手和认领预算为 `1..2147483647` 毫秒；空闲预算为 `None` 或同一范围。连接超时用单调钟定时器处理，不靠固定时间片重试 socket 操作。
 
@@ -49,8 +50,24 @@ llhttp 增量解析请求行、首部和正文，检查 UTF-8、`Host` 和 `Expe
 - TLS 1.2/1.3 用双向有界的 OpenSSL memory BIO pair 与同一个 `uv_tcp_t` 交换密文。握手、解密和加密只在有输入、写完成或有明确进展时推进；输出阻塞时保留至多一份待写的密文分块。连接复用共享已完成的 TLS 握手，关闭连接时发送 `close_notify`。明文程序不链接 TLS。
 - `close()` 同步、幂等地请求关闭；`closeAndWait()` 等待原生资源回收。`Router.serve(listener, shutdown: …)` 使用 listener 的容量和宽限期。收到 `Shutdown.request()`，先停止接入、关闭未认领连接，再等已认领的 handler；到期取消剩余任务，仍等 SQLite 等原生工作安全返回。直接取消服务跳过宽限期。监听器关闭确认还包括连接及 TLS context 释放。
 
+## HTTP/2
+
+TLS ALPN 默认依次提供 `h2`、`http/1.1`，禁用 `enableHttp2` 时只提供后者。未发送 ALPN 的连接使用 HTTP/1。HTTP/2 协议、HPACK、帧合法性和流状态由静态 nghttp2 1.70.0 管理，明文入口保持 HTTP/1。TLS 1.2 使用 ECDHE 与 AEAD 密码套件，TLS 1.3 使用 OpenSSL 默认套件。
+
+- 每个流拥有独立 Request、GC roots、读写等待、断线观察、认领和请求截止时间。请求就绪与 handler 容量由监听器统一派发。每条连接最多 `capacity` 个活跃流，整个 listener 最多 `2 × capacity` 个活跃 HTTP/2 请求；超限流以 `REFUSED_STREAM` 拒绝。
+- 请求方法、目标和可见字段使用与 HTTP/1 相同的校验；`:authority` 映射为 `Host`，同时提供时必须一致。禁止逐跳连接字段，保留重复普通字段的顺序。`maxBodyBytes` 限制 DATA 正文，`maxRequestBytes` 累计请求的 HEADERS、CONTINUATION、DATA 帧及其帧头。解压字段另受 32 KiB 与 100 项限制，字段空间计入每项 32 字节开销。HPACK 动态表固定上限 4096 字节，ACK、SETTINGS、CONTINUATION 与流重置另有队列和速率限制。
+- 流式请求的接收窗口为每流 65535 字节。每次 `readBody()` 最多返回 8 KiB，应用取走后补回该流的窗口。连接窗口随 DATA 接收补回，应用暂停一个流时其他流仍可接收。默认缓冲模式在完整正文后派发，累计大小仍受配置限制。
+- 输出每次最多暴露 16 KiB，等待该分块对应的 TLS 密文 `uv_write` 回调完成后才确认消费。每流同时只允许一个挂起写入；完成信号取走后才接受下一块。传输背压、连接窗口和流窗口共同约束输出。
+- 请求截止时间在对端 END_STREAM 后停止，尚未消费的已接收正文仍可读取。网络空闲计时只在等待读取时生效，写入和认领分别计时。新连接等待首个请求使用请求预算，流之间的空闲使用 `keepAliveTimeoutMs`。流超时重置所属流；物理传输写入超时关闭连接并收尾所有流。
+- 取消 handler、请求或 writer 发送所属流的 RST_STREAM，完成该流的原生等待后再释放 roots。提前响应完整发送后用 `RST_STREAM(NO_ERROR)` 停止剩余上传。旧 Request 无法操作其他流。物理连接关闭时先终止所有流并完成原生等待，再释放 TLS 和连接句柄。
+- 优雅停机发送带最后已接受流 ID 的 GOAWAY，停止接受新流，取消未认领流，让已认领流在宽限期内完成。收到对端 GOAWAY 同样收尾。达到 `maxRequestsPerConnection` 或 `keepAliveTimeoutMs == 0` 时发送 GOAWAY，后者每连接只接受第一个请求。
+- 正常结束先确认 GOAWAY 和应用响应已写入传输，再发送 TLS `close_notify` 并关闭 TCP 写侧。读侧继续在 Reactor 上排空最后到达的控制帧密文，直到 EOF、1 秒或收到 64 KiB，避免因未读入站数据导致 TCP reset 丢失已发尾帧。强制关闭和宽限期到期不等待这段自然收尾。
+
+协议引擎只由所属 Reactor 调用。创建回调在 nghttp2 调用栈中分配 Request 与所属状态；返回空指针表示拒绝该流。其他回调在 nghttp2 返回后登记就绪、进度或关闭事件，随后由 Reactor 完成 Task。关闭事件优先于同批进度事件，引擎在关闭通知后释放自身 Request root。每次输出视图在确认消费前保持有效，确认后才可继续生成输出。
+
 ## 验收
 
 - Windows／Linux Debug 和 Release 检查请求分片、FIN 与 reset、大响应背压、慢客户端、过载、认领超时、竞争、GC 与有界停机；`UV_THREADPOOL_SIZE=1` 时，忙碌的 SQLite 或其他阻塞工作不挡住健康响应。
 - 本地临时 CA 验证 TLS 1.2/1.3、证书失败、握手超时、截断和关闭，不依赖公网。用原生门闩在两个 Reactor 上确认连接实际由不同 OS 线程推进，且释放最后一条连接前不释放它所用的 TLS context。
+- HTTP/2 用本地 CA 验证 ALPN、真实 SDK 客户端 HPACK 解码、并发流、双向流控、RST 隔离、未读完就响应、GOAWAY 与 HTTP/1 回退；零窗口流暂停期间健康流仍成功，关闭复用后首条流完整结束。
 - 同一负载对比旧 `poll/WSAPoll` 路径与单／多分片 Reactor，记录吞吐、延迟分位和进程 CPU。该测量用于观察回归，不把特定机器的默认分片数当作性能保证。

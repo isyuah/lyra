@@ -4,9 +4,10 @@
   "builtin-baseline": "9eec002df1cd109f8f104cd966a763daf9751489",
   "dependencies": [
     "bdwgc",
-    { "name": "curl", "default-features": false, "features": ["c-ares", "openssl"] },
+    { "name": "curl", "default-features": false, "features": ["c-ares", "http2", "openssl"] },
     "jansson",
     "libuv",
+    "nghttp2",
     "sqlite3",
     "zlib"
   ]

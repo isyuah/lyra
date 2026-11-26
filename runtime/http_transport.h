@@ -12,6 +12,7 @@ struct ServerOptions {
     int64_t capacity, requestTimeoutMs, idleReadTimeoutMs, writeTimeoutMs, handshakeTimeoutMs, graceMs, claimTimeoutMs;
     int64_t maxBodyBytes, maxRequestBytes, keepAliveTimeoutMs, maxRequestsPerConnection;
     bool streamRequestBody{};
+    bool enableHttp2{true};
 };
 
 enum class TlsProgress { Done, WantInput, WantOutput, End, Failed };
@@ -28,6 +29,7 @@ struct Transport {
     TlsStep (*shutdown)(void* connection);
     void (*releaseConnection)(void* connection);
     void (*releaseListener)(void* listener);
+    bool (*http2)(void* connection){};
 };
 
 }

@@ -4,6 +4,7 @@
 #include <atomic>
 #include <cstdint>
 #include <llhttp.h>
+#include <span>
 #include <string>
 #include <string_view>
 
@@ -53,6 +54,7 @@ struct Request {
     std::atomic<const RoutePattern*> route{};
     Field* headers{};
     std::size_t headerCount{};
+    int32_t streamId{};
 };
 
 inline constexpr std::size_t maxHeaderFields = 100;
@@ -75,6 +77,7 @@ struct RequestParser {
 };
 
 std::string_view text(const void* value);
+int populateRequest(Request&, std::string_view method, std::string_view target, std::span<const Field> fields);
 int formatResponse(std::string& wire, int64_t status, const void* type, const void* body, const ResponseFields& headers,
     bool keepAlive, bool chunked, bool streaming = false);
 

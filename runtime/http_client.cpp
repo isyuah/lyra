@@ -290,6 +290,8 @@ Failure configure(CURL* easy, CURLU* url, const Request& request, const std::str
     Configurator settings{easy};
     settings.set(CURLOPT_CURLU, url);
     settings.set(CURLOPT_PROTOCOLS_STR, "http,https");
+    settings.set(CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_2TLS);
+    settings.set(CURLOPT_PIPEWAIT, 1L);
     settings.set(CURLOPT_CUSTOMREQUEST, method.c_str());
     settings.set(CURLOPT_HTTPHEADER, headers.get());
     settings.set(CURLOPT_HEADEROPT, CURLHEADER_SEPARATE);
@@ -475,6 +477,7 @@ class ClientLoop {
     }
 
     Failure open() {
+        if (curl_global_sslset(CURLSSLBACKEND_OPENSSL, nullptr, nullptr) != CURLSSLSET_OK) return {Status::Tls};
         if (auto code = curl_global_init(CURL_GLOBAL_DEFAULT); code != CURLE_OK) return curlFailure(code);
         multi = curl_multi_init();
         auto startedLoop = uv_loop_init(&loop);
@@ -501,6 +504,8 @@ class ClientLoop {
             set(CURLMOPT_MAX_TOTAL_CONNECTIONS, maxConnections);
             set(CURLMOPT_MAX_HOST_CONNECTIONS, maxPerHost);
             set(CURLMOPT_MAXCONNECTS, maxConnections);
+            set(CURLMOPT_PIPELINING, CURLPIPE_MULTIPLEX);
+            set(CURLMOPT_MAX_CONCURRENT_STREAMS, 64L);
         }
         if (!opened) opened = uv_thread_create(&thread, [](void* argument) {
             auto& owner = *static_cast<ClientLoop*>(argument);

@@ -35,6 +35,10 @@ class ApplicationStd(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr.decode())
         return result
 
+    def assert_utc_timestamp(self, value):
+        self.assertRegex(value, r'\A[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,9})?Z\Z')
+        datetime.strptime(value[:19], '%Y-%m-%dT%H:%M:%S')
+
     def test_jsonl_streams_stdin_and_file_with_recoverable_line_errors(self):
         for package, app in self.programs('''
 import std.io.{File}
@@ -237,14 +241,11 @@ async fn main(): Unit {
             self.assertEqual(result.stdout, b'')
             structured, text = result.stderr.decode().splitlines()
             event = json.loads(structured)
-            timestamp = event.pop('time')
-            self.assertTrue(timestamp.endswith('Z'))
-            datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+            self.assert_utc_timestamp(event.pop('time'))
             self.assertEqual(event, {'level': 'INFO', 'logger': '统计🙂', 'message': 'first\nsecond',
                                      'trace': 'req-中', 'fields': {'delta': 9007199254740993}})
             text_time, message = text.split(' ', 1)
-            self.assertTrue(text_time.endswith('Z'))
-            datetime.fromisoformat(text_time.replace('Z', '+00:00'))
+            self.assert_utc_timestamp(text_time)
             self.assertEqual(message, r'WARN "text" "first\nsecond"')
 
     @unittest.skipUnless(sys.platform.startswith('linux'), 'POSIX SIGPIPE and FIFO')

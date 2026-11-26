@@ -211,13 +211,14 @@ std::vector<NativeArtifact> emitExecutable(llvm::Module& module, llvm::TargetMac
     if (client) {
         append(lib, {"liblyraHttpClient.a", "libcurl.a", "libcares.a"});
     }
+    append(lib, {"libnghttp2.a"});
     if constexpr (windows) {
         if (client || compression) append(lib, {"libzs.a"});
-    } else if (compression) append(lib, {"libz.a"});
+    } else if (client || compression) append(lib, {"libz.a"});
     if (serverTls) append(lib, {"liblyraHttpTls.a"});
     if (tls) append(lib, {"libssl.a", "libcrypto.a"});
     if constexpr (windows) {
-        if (tls) append(target, {"libbcrypt.a", "libcrypt32.a", "libgdi32.a"});
+        if (tls) append(target, {"libbcrypt.a", "libcrypt32.a", "libgdi32.a", "libsecur32.a"});
         append(target, {"libc++.a", "libunwind.a", "libmingw32.a", "libmingwex.a", "libmoldname.a", "libmsvcrt.a",
             "libclang_rt.builtins.a", "libws2_32.a", "libiphlpapi.a", "libuserenv.a", "libpsapi.a", "libadvapi32.a",
             "libuser32.a", "libdbghelp.a", "libole32.a", "libshell32.a", "libkernel32.a", "crtend.o"});
