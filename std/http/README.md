@@ -32,7 +32,7 @@ val handled = await server.withAccepted<Unit>(5000, async (request: Request) => 
 })
 ```
 
-`withAccepted` 在回调成功、抛异常或取消后，等待原生连接释放再结束。`await listener.accept(timeoutMs)` 是低层版本：返回裸请求后，若不立即响应，调用 `request.claim()` 认领，并自行关闭。请求默认在发放 5000ms 后仍未被认领就关闭。两种接收的 `timeoutMs` 控制等待已解析请求，`-1` 无期限，`0` 只取当前就绪项；已登记的手动接收也可能得到客户端解析或握手错误。请求接入后的独立计时见 [`HttpServerOptions`](../../rfc/http-reactor.md#接入超时与背压)。
+`withAccepted` 在回调及其子任务退出后，等待当前请求释放再结束。成功响应可复用连接，异常、取消或未响应时关闭连接。`await listener.accept(timeoutMs)` 返回裸请求，若不立即响应，调用 `request.claim()` 认领，并自行关闭。请求默认在发放 5000ms 后仍未被认领就关闭。两种接收的 `timeoutMs` 控制等待已解析请求，`-1` 无期限，`0` 只取当前就绪项，已登记的手动接收也可能得到客户端解析或握手错误。请求接入后的独立计时见 [`HttpServerOptions`](../../rfc/http-reactor.md#接入超时与背压)。
 
 ## 请求、路由、响应
 
@@ -44,7 +44,11 @@ val handled = await server.withAccepted<Unit>(5000, async (request: Request) => 
 - `[path]` 支持 `Int`/`String`；`[query("tag")]` 的 `String` 要求恰好一次，`List<String>` 保留所有值；`[body]` 使用同模块可见的 `jsonCodec<Type>()`，也可写 `[body("codecFactory")]` 指定零参数工厂。参数不符或 JSON 解码失败回 `400`，不调用业务函数。
 - 相同方法、相同路径形状是冲突，参数改名不影响形状。两个宏路由冲突时，编译诊断定位到两个声明。与手写注册冲突时，`Router.mount` 报告两条路由，并且整批都不提交；已经启动的 `serve` 继续用其启动时的路由快照。
 
-一条连接一个 HTTP 请求。请求线、头部和传输体总计最多 256 KiB，目标最多 8 KiB，头部最多 100 项且字段名和值合计最多 32 KiB，解码后正文最多 128 KiB。超限回 `413`，格式或头部文本非法回 `400`。HTTP/1.1 必须有且只有一个有效的 `Host`；携带 `Expect` 的请求在读完首部后直接回 `417`，不等待正文。`request.respond(response)` 写出响应后关闭连接，返回 `Result<Unit, HttpError>`；响应在写前验证失败可改正后重试。TLS 见 [`std.httpTls`](../httpTls/README.md)，暂不支持 HTTP/2 和长连接。
+HTTP/1.1 默认支持 keep-alive，HTTP/1.0 通过 `Connection: keep-alive` 开启。`request.respond(response)` 返回 `Result<Unit, HttpError>`，成功写完后释放当前请求并复用连接，客户端要求关闭、服务停机或达到单连接请求上限时关闭连接。每条请求独立保留自己的正文、首部与路由，完成后的旧 Request 无法关闭或响应下一条请求。
+
+`HttpServerOptions` 的 `maxBodyBytes` 默认 8 MiB，`maxRequestBytes` 默认 16 MiB，分别限制解码后正文和整条请求的传输字节。目标最多 8 KiB，头部最多 100 项且字段名和值合计最多 32 KiB。`keepAliveTimeoutMs` 默认 5000，控制两条请求之间的空闲时间，设为 0 关闭复用。`maxRequestsPerConnection` 默认 1000。同一连接顺序处理请求，管线输入只保留有界读取窗口。
+
+超限回 `413`，格式或头部文本非法回 `400`。HTTP/1.1 必须有且只有一个有效的 `Host`，携带 `Expect` 的请求在读完首部后回 `417`。响应在写前验证失败可改正后重试。TLS 复用同一套请求和生命周期语义，见 [`std.httpTls`](../httpTls/README.md)。
 
 ## 关闭与断线
 
@@ -60,7 +64,7 @@ await serving
 
 `Shutdown.request()` 可重复调用；该对象用于在异步任务间传递停机信号，不代表操作系统信号处理器。
 
-`await request.waitDisconnect(timeoutMs)` 在对端断线时返回 `true`，超时或本地关闭返回 `false`；`disconnected()` 读取已经观测到的断线状态。完整请求后的 TCP 半关闭仍可响应。Router 自动取消对端已断线的 handler 及其子任务；手写接收循环可以用一个子任务等待断线并取消 handler。
+`await request.waitDisconnect(timeoutMs)` 在对端断线时返回 `true`，超时、本地关闭或当前响应完成返回 `false`。`disconnected()` 读取已经观测到的断线状态。完整请求后的 TCP 半关闭仍可响应。Router 自动取消对端已断线的 handler 及其子任务，手写接收循环可以用一个子任务等待断线并取消 handler。
 
 连接读写、TLS 握手和断线由独立 Reactor 推进，直接 `await`，无需 `parallel` 或 `blocking`。SQLite 等同步工作仍用 `blocking`；完整的 [SQLite 服务](../../examples/http-sqlite/README.md) 演示了这条路径。
 

@@ -84,7 +84,7 @@ net::Socket connectTo(int64_t port) {
 
 int main() {
     auto* host = lyraStringFromBytes("127.0.0.1", 9);
-    const http::ServerOptions options{2, 5000, -1, 5000, 15000, 0, 5000};
+    const http::ServerOptions options{2, 5000, -1, 5000, 15000, 0, 5000, 8388608, 16777216, 5000, 1000};
     check(uv_os_setenv("LYRA_HTTP_REACTORS", "65") == 0, "cannot configure reactor count");
     auto* invalid = static_cast<http::Endpoint*>(lyraHttpListenWithTransport(host, 0, &options, nullptr, nullptr));
     check(lyraHttpStatus(invalid) != 0, "listen accepted an invalid reactor count");

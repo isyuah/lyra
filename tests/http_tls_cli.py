@@ -39,7 +39,7 @@ def fragmented_exchange(port, trust):
                         incoming.write_eof()
 
         run(client.do_handshake)
-        for fragment in (b'POST /echo HTTP/1.1\r\nHost: local', b'host\r\nContent-Length: 4\r\n\r\n\x00', b'\xffAB'):
+        for fragment in (b'POST /echo HTTP/1.1\r\nHost: local', b'host\r\nConnection: close\r\nContent-Length: 4\r\n\r\n\x00', b'\xffAB'):
             run(lambda: client.write(fragment))
         clear = bytearray()
         while chunk := run(lambda: client.read(16384)):
@@ -133,8 +133,14 @@ async fn main(): Int {
                         self.assertEqual(content, b'\x00\xffAB')
                         with contextlib.closing(http.client.HTTPSConnection('localhost', port, context=trusted, timeout=5)) as stream:
                             stream.request('GET', '/large')
+                            connection = stream.sock
                             response = stream.getresponse()
                             self.assertEqual((response.status, response.read()), (200, expected_payload))
+                            for _ in range(3):
+                                stream.request('GET', '/health')
+                                response = stream.getresponse()
+                                self.assertEqual((response.status, response.read()), (200, b'ok'))
+                                self.assertIs(stream.sock, connection)
 
                         with self.assertRaises(ssl.SSLCertVerificationError), contextlib.closing(
                                 http.client.HTTPSConnection('localhost', port, context=ssl.create_default_context(), timeout=5)) as untrusted:

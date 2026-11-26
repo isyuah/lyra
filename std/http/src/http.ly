@@ -4,7 +4,7 @@ import std.sync.{Locked}
 import std.task.{withTimeout}
 
 extern fn lyraHttpListen(host: String, port: Int, options: CPtr): CPtr;
-extern fn lyraHttpOptions(capacity: Int, requestTimeoutMs: Int, idleReadTimeoutMs: Int, writeTimeoutMs: Int, handshakeTimeoutMs: Int, graceMs: Int, claimTimeoutMs: Int): CPtr;
+extern fn lyraHttpOptions(capacity: Int, requestTimeoutMs: Int, idleReadTimeoutMs: Int, writeTimeoutMs: Int, handshakeTimeoutMs: Int, graceMs: Int, claimTimeoutMs: Int, maxBodyBytes: Int, maxRequestBytes: Int, keepAliveTimeoutMs: Int, maxRequestsPerConnection: Int): CPtr;
 extern fn lyraHttpStatus(server: CPtr): Int;
 extern fn lyraHttpStatusDetail(server: CPtr): String;
 extern fn lyraHttpErrorKind(status: Int): Int;
@@ -103,6 +103,10 @@ pub struct HttpServerOptions(
     pub val handshakeTimeoutMs: Int = 5000,
     pub val graceMs: Int = 5000,
     pub val claimTimeoutMs: Int = 5000,
+    pub val maxBodyBytes: Int = 8388608,
+    pub val maxRequestBytes: Int = 16777216,
+    pub val keepAliveTimeoutMs: Int = 5000,
+    pub val maxRequestsPerConnection: Int = 1000,
 )
 
 fn serverOptions(options: HttpServerOptions): CPtr {
@@ -110,7 +114,7 @@ fn serverOptions(options: HttpServerOptions): CPtr {
         None => -1,
         Some(milliseconds) => if milliseconds < 1 { 0 } else { milliseconds },
     }
-    lyraHttpOptions(options.capacity, options.requestTimeoutMs, idle, options.writeTimeoutMs, options.handshakeTimeoutMs, options.graceMs, options.claimTimeoutMs)
+    lyraHttpOptions(options.capacity, options.requestTimeoutMs, idle, options.writeTimeoutMs, options.handshakeTimeoutMs, options.graceMs, options.claimTimeoutMs, options.maxBodyBytes, options.maxRequestBytes, options.keepAliveTimeoutMs, options.maxRequestsPerConnection)
 }
 
 fn acceptResult(request: CPtr): Result<Request, HttpError> {

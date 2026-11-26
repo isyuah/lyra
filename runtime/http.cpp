@@ -24,7 +24,6 @@ using lyra::httpRoute::split;
 namespace {
 
 struct PathInteger { int64_t value; bool valid; };
-constexpr std::size_t maxBody = 128 * 1024;
 constexpr std::size_t maxHeaderBytes = 32 * 1024;
 
 int append(RequestParser& parsed, std::string& storage, std::size_t limit, const char* data, std::size_t size) {
@@ -52,7 +51,7 @@ constexpr auto parserSettings = [] {
     };
     config.on_body = [](llhttp_t* parser, const char* bytes, std::size_t count) {
         auto& parsed = *static_cast<RequestParser*>(parser->data);
-        return append(parsed, parsed.body, maxBody, bytes, count);
+        return append(parsed, parsed.body, parsed.maxBodyBytes, bytes, count);
     };
     config.on_header_field = [](llhttp_t* parser, const char* bytes, std::size_t count) { return appendHeader(parser, bytes, count, true); };
     config.on_header_value = [](llhttp_t* parser, const char* bytes, std::size_t count) { return appendHeader(parser, bytes, count, false); };
@@ -172,6 +171,7 @@ bool validHost(std::string_view authority) {
 
 int parseHeaders(const llhttp_t& parser, const RequestParser& parsed) {
     if (parser.http_major != 1 || parser.http_minor > 1) return EPROTO;
+    if ((parser.flags & F_CONTENT_LENGTH) && parser.content_length > parsed.maxBodyBytes) return EMSGSIZE;
     auto& request = parsed.request;
     if (parsed.headerCount) request.headers = static_cast<Field*>(lyraGcAlloc(parsed.headerCount * sizeof(Field)));
     bool host = false, expect = false;
@@ -216,15 +216,17 @@ namespace lyraRuntime::http {
 
 std::string_view text(const void* value) { return {lyraStringBytes(value), lyraStringLength(value)}; }
 
-RequestParser::RequestParser(Request& message) : request(message) {
+RequestParser::RequestParser(Request& message, std::size_t maxBodyBytes, std::size_t maxWireBytes)
+    : request(message), maxBodyBytes(maxBodyBytes), maxWireBytes(maxWireBytes) {
     llhttp_init(&parser, HTTP_REQUEST, &parserSettings);
     parser.data = this;
 }
 
 int RequestParser::feed(std::string_view bytes) {
-    total += bytes.size();
-    if (total > maxWire) return EMSGSIZE;
     auto code = llhttp_execute(&parser, bytes.data(), bytes.size());
+    consumed = code == HPE_PAUSED && complete ? static_cast<std::size_t>(llhttp_get_error_pos(&parser) - bytes.data()) : bytes.size();
+    total += consumed;
+    if (total > maxWireBytes) return EMSGSIZE;
     if (code != HPE_OK && !(code == HPE_PAUSED && complete)) return error ? error : EPROTO;
     if (!complete) return 0;
     if (!target.starts_with('/') || !lyraUtf8Valid(target.data(), target.size()) || !parseTarget(&request, target)) return EPROTO;
@@ -232,6 +234,7 @@ int RequestParser::feed(std::string_view bytes) {
     request.method = lyraStringFromBytes(method, std::strlen(method));
     request.target = lyraStringFromBytes(target.data(), target.size());
     request.body = lyraStringFromBytes(body.data(), body.size());
+    request.keepAlive = llhttp_should_keep_alive(&parser);
     return 0;
 }
 
@@ -358,15 +361,15 @@ extern "C" int64_t lyraHttpResponseHeaderSet(ResponseFields* headers, int64_t in
     return 0;
 }
 
-int lyraRuntime::http::formatResponse(std::string& wire, int64_t status, const void* mediaType, const void* body, const ResponseFields& headers) {
+int lyraRuntime::http::formatResponse(std::string& wire, int64_t status, const void* mediaType, const void* body, const ResponseFields& headers, bool keepAlive) {
     auto type = text(mediaType);
     auto length = lyraStringLength(body);
     auto noBody = status == 204 || status == 304;
     if (status < 200 || status > 599 || type.empty() || type.size() > 200 || ((noBody || status == 205) && length) ||
         !std::ranges::all_of(type, [](unsigned char byte) { return byte >= 0x20 && byte <= 0x7e; })) return EINVAL;
     char basic[512];
-    auto count = std::snprintf(basic, sizeof(basic), "HTTP/1.1 %lld %s\r\nContent-Type: %.*s\r\nConnection: close\r\n",
-        static_cast<long long>(status), reason(status), static_cast<int>(type.size()), type.data());
+    auto count = std::snprintf(basic, sizeof(basic), "HTTP/1.1 %lld %s\r\nContent-Type: %.*s\r\nConnection: %s\r\n",
+        static_cast<long long>(status), reason(status), static_cast<int>(type.size()), type.data(), keepAlive ? "keep-alive" : "close");
     wire.assign(basic, count);
     wire.reserve(wire.size() + 40 + headers.wireSize);
     if (!noBody) {

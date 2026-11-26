@@ -18,6 +18,7 @@
 #include <new>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 
 namespace lyraRuntime::http {
 
@@ -31,7 +32,7 @@ constexpr std::string_view overloadResponse = "HTTP/1.1 503 Service Unavailable\
 
 enum class Stop { Open, Drain, Close };
 enum class OperationKind { Accept, Respond, Observe, CloseRequest, CloseListener, ListenerScope };
-enum class Phase { Handshake, Reading, Ready, Writing, EndingTls, EndingTcp, Closing };
+enum class Phase { Handshake, Idle, Reading, Ready, Writing, EndingTls, EndingTcp, RejectDrain, Closing };
 
 void require(bool condition, const char* message) {
     if (condition) return;
@@ -182,7 +183,7 @@ struct Server {
     bool polling{}, listenerClosed{}, finishing{}, rejecting{};
     std::size_t ordinary{}, issued{};
     int64_t retryAt{forever}, retryMs{};
-    std::unordered_map<Request*, Slot> connections;
+    std::unordered_map<Session*, Slot> connections;
     std::list<Request*> ready;
     std::list<Operation*> accepts, closeWaiters;
 
@@ -191,7 +192,8 @@ struct Server {
     int pollForAccept();
     void acceptReady();
     void offer(Request& request);
-    void closed(Request& request);
+    void released(Request& request);
+    void closed(Session& session);
     void dispatch();
     void registerAccept(Operation& operation);
     void expire(int64_t time);
@@ -246,7 +248,7 @@ LyraTask* nativeTask(Operation input) {
 }
 
 LyraTask* requestCloseTask(Request& request) {
-    return nativeTask({OperationKind::CloseRequest, request.reactor, request.endpoint, &request});
+    return nativeTask({OperationKind::CloseRequest, request.session->reactor, request.session->endpoint, &request});
 }
 
 void applyStop(Endpoint& endpoint) {
@@ -266,7 +268,8 @@ void closeRequest(Request& request, bool includeClaimed);
 }
 
 struct Connection {
-    Request& request;
+    Session& session;
+    Request* request;
     Reactor& reactor;
     const Transport* transport;
     void* tls{};
@@ -279,21 +282,22 @@ struct Connection {
     int closeStatus{}, ingressError{};
     int64_t phaseDue{forever}, idleDue{forever};
     bool tcpEof{}, readActive{}, writePending{}, pumpQueued{}, bioInputEnded{}, tlsReadEnded{}, tlsShutdownDone{}, tlsWriteRetry{};
-    std::size_t inputOffset{}, inputSize{}, discarded{};
+    std::size_t inputOffset{}, inputSize{}, completedRequests{}, discarded{};
     std::array<char, readChunk> input;
     struct TlsBuffers { std::array<char, writeChunk> ciphertext; std::array<char, readChunk> plaintext; };
     std::unique_ptr<TlsBuffers> tlsBuffers;
     std::unique_ptr<RequestParser> parser;
-    std::string responseHead;
+    std::string responseHead, pendingInput;
     std::string_view outgoingHead, outgoingBody;
     Operation* response{};
     std::list<Operation*> observers, closeWaiters;
 
-    explicit Connection(Request& request) : request(request), reactor(*request.reactor), transport(request.endpoint->transport) {}
+    explicit Connection(Session& session) : session(session), request(session.request), reactor(*session.reactor), transport(session.endpoint->transport) {}
     void open();
     void readFromSocket();
     void readResult(std::ptrdiff_t count);
     void beginMessage();
+    void finishResponse();
     void messageBytes(std::string_view bytes);
     void startResponse(Operation& operation);
     void sendRejection(std::string_view wire, int status);
@@ -316,7 +320,7 @@ void closeRequest(Request& request, bool includeClaimed) {
     auto delivery = request.delivery.load();
     while (delivery < Delivery::Closing && (includeClaimed || delivery != Delivery::Claimed))
         if (request.delivery.compare_exchange_weak(delivery, Delivery::Closing)) {
-            request.reactor->post<[](Request& request) { if (auto* connection = request.connection) connection->beginClose(EBADF); }>(request);
+            request.session->reactor->post<[](Request& request) { if (auto* connection = request.connection) connection->beginClose(EBADF); }>(request);
             return;
         }
 }
@@ -327,9 +331,9 @@ int claim(Request& request) {
     return EBADF;
 }
 
-void notifyClosed(Request& request) {
-    request.delivery.store(Delivery::Closed);
-    request.endpoint->reactor->post<[](Request& request) { request.endpoint->server->closed(request); }>(request);
+void notifyClosed(Session& session) {
+    session.request->delivery.store(Delivery::Closed);
+    session.endpoint->reactor->post<[](Session& session) { session.endpoint->server->closed(session); }>(session);
 }
 
 std::string_view rejection(int status) {
@@ -345,14 +349,14 @@ std::string_view rejection(int status) {
 }
 
 void Connection::open() {
-    auto socket = request.socket;
-    if (request.delivery.load() >= Delivery::Closing) {
+    auto socket = session.socket;
+    if (session.endpoint->requested.load() != Stop::Open) {
         net::close(socket);
-        notifyClosed(request);
+        notifyClosed(session);
         delete this;
         return;
     }
-    request.connection = this;
+    session.connection = request->connection = this;
     require(uv_tcp_init(&reactor.loop, &tcp) == 0 && uv_timer_init(&reactor.loop, &timer) == 0, "cannot initialize TCP handles");
     tcp.data = timer.data = write.data = shutdown.data = this;
     if (auto status = uv_tcp_open(&tcp, socket)) {
@@ -364,14 +368,14 @@ void Connection::open() {
     uv_tcp_nodelay(&tcp, 1);
     if (transport) {
         phase = Phase::Handshake;
-        if (!(tls = transport->open(request.endpoint->tlsContext))) {
+        if (!(tls = transport->open(session.endpoint->tlsContext))) {
             ingressError = handshakeFailed;
             beginClose(ingressError);
             return;
         }
         tlsBuffers = std::make_unique_for_overwrite<TlsBuffers>();
-        auto timeout = request.endpoint->options.handshakeTimeoutMs;
-        phaseDue = deadline(request.overload ? std::min(timeout, rejectionTimeoutMs) : timeout, request.acceptedAt);
+        auto timeout = session.endpoint->options.handshakeTimeoutMs;
+        phaseDue = deadline(session.overload ? std::min(timeout, rejectionTimeoutMs) : timeout, session.acceptedAt);
     } else beginMessage();
     readFromSocket();
     pump();
@@ -379,7 +383,7 @@ void Connection::open() {
 }
 
 void Connection::readFromSocket() {
-    if (readActive || tcpEof || phase == Phase::Closing || (tls && inputOffset != inputSize)) return;
+    if (readActive || tcpEof || phase == Phase::Closing || !pendingInput.empty() || (tls && inputOffset != inputSize)) return;
     auto status = uv_read_start(reinterpret_cast<uv_stream_t*>(&tcp), [](uv_handle_t* handle, std::size_t, uv_buf_t* buffer) {
         auto& connection = *static_cast<Connection*>(handle->data);
         *buffer = uv_buf_init(connection.input.data(), static_cast<unsigned>(connection.input.size()));
@@ -392,11 +396,19 @@ void Connection::readFromSocket() {
 
 void Connection::readResult(std::ptrdiff_t count) {
     if (!count || phase == Phase::Closing) return;
+    if (phase == Phase::RejectDrain) {
+        if (count < 0) beginClose();
+        else {
+            discarded += static_cast<std::size_t>(count);
+            if (discarded > static_cast<std::size_t>(session.endpoint->options.maxRequestBytes)) beginClose();
+        }
+        return;
+    }
     if (count < 0) {
         readActive = false;
         if (count != UV_EOF) { beginClose(statusCode(static_cast<int>(count)), true); return; }
         tcpEof = true;
-        if (!tls && phase == Phase::Reading) { beginClose(ECONNRESET, true); return; }
+        if (!tls && (phase == Phase::Reading || phase == Phase::Idle)) { beginClose(ECONNRESET, true); return; }
     } else if (tls) {
         inputOffset = 0;
         inputSize = static_cast<std::size_t>(count);
@@ -405,49 +417,64 @@ void Connection::readResult(std::ptrdiff_t count) {
 }
 
 void Connection::beginMessage() {
-    if (request.overload) { sendRejection(overloadResponse, 0); return; }
+    if (session.overload) { sendRejection(overloadResponse, 0); return; }
     phase = Phase::Reading;
-    parser = std::make_unique<RequestParser>(request);
-    auto time = tls ? now() : request.acceptedAt;
-    phaseDue = deadline(request.endpoint->options.requestTimeoutMs, time);
-    idleDue = deadline(request.endpoint->options.idleReadTimeoutMs, time);
+    const auto& options = session.endpoint->options;
+    parser = std::make_unique<RequestParser>(*request, options.maxBodyBytes, options.maxRequestBytes);
+    auto time = tls || completedRequests ? now() : session.acceptedAt;
+    phaseDue = deadline(options.requestTimeoutMs, time);
+    idleDue = deadline(options.idleReadTimeoutMs, time);
     refreshTimer();
 }
 
 void Connection::messageBytes(std::string_view bytes) {
+    if (phase == Phase::Idle) beginMessage();
     if (phase != Phase::Reading) {
-        discarded += bytes.size();
-        if (discarded > maxWire) beginClose(EMSGSIZE, true);
+        if (ingressError || session.overload) {
+            discarded += bytes.size();
+            if (discarded > static_cast<std::size_t>(session.endpoint->options.maxRequestBytes)) beginClose();
+            return;
+        }
+        if (phase == Phase::Ready || phase == Phase::Writing) {
+            require(pendingInput.size() + bytes.size() <= readChunk, "pipelined input exceeded its read window");
+            pendingInput.append(bytes);
+            if (readActive) { uv_read_stop(reinterpret_cast<uv_stream_t*>(&tcp)); readActive = false; }
+        }
         return;
     }
     if (auto status = parser->feed(bytes)) { sendRejection(rejection(status), status); return; }
     if (!parser->complete) {
-        if (auto idle = request.endpoint->options.idleReadTimeoutMs; idle >= 0) {
+        if (auto idle = session.endpoint->options.idleReadTimeoutMs; idle >= 0) {
             idleDue = deadline(idle);
             refreshTimer();
         }
         return;
     }
+    bytes.remove_prefix(parser->consumed);
     parser.reset();
     phase = Phase::Ready;
     phaseDue = idleDue = forever;
     refreshTimer();
-    request.endpoint->reactor->post<[](Request& request) { request.endpoint->server->offer(request); }>(request);
+    request->session->endpoint->reactor->post<[](Request& request) { request.session->endpoint->server->offer(request); }>(*request);
+    if (!bytes.empty()) messageBytes(bytes);
 }
 
 void Connection::startResponse(Operation& operation) {
     if (response && phase != Phase::Closing) { finish(operation, EBUSY); return; }
-    if (phase != Phase::Ready || request.delivery.load() >= Delivery::Closing) { finish(operation, EBADF); return; }
-    if (auto status = formatResponse(responseHead, operation.argument, operation.mediaType, operation.body, *operation.headers)) {
+    if (phase != Phase::Ready || request->delivery.load() >= Delivery::Closing) { finish(operation, EBADF); return; }
+    request->keepAlive = request->keepAlive && session.endpoint->options.keepAliveTimeoutMs != 0 &&
+        completedRequests + 1 < static_cast<std::size_t>(session.endpoint->options.maxRequestsPerConnection) &&
+        session.endpoint->requested.load() == Stop::Open && !tcpEof;
+    if (auto status = formatResponse(responseHead, operation.argument, operation.mediaType, operation.body, *operation.headers, request->keepAlive)) {
         finish(operation, status);
         return;
     }
-    if (auto status = claim(request)) { finish(operation, status); return; }
+    if (auto status = claim(*request)) { finish(operation, status); return; }
     response = &operation;
     outgoingHead = responseHead;
-    if (text(request.method) != "HEAD") outgoingBody = text(operation.body);
+    if (text(request->method) != "HEAD") outgoingBody = text(operation.body);
     phase = Phase::Writing;
-    phaseDue = deadline(request.endpoint->options.writeTimeoutMs);
+    phaseDue = deadline(session.endpoint->options.writeTimeoutMs);
     refreshTimer();
     pump();
 }
@@ -458,7 +485,7 @@ void Connection::sendRejection(std::string_view wire, int status) {
     if (wire.empty()) { beginClose(status); return; }
     phase = Phase::Writing;
     outgoingHead = wire;
-    phaseDue = deadline(std::min(request.endpoint->options.writeTimeoutMs, rejectionTimeoutMs));
+    phaseDue = deadline(std::min(session.endpoint->options.writeTimeoutMs, rejectionTimeoutMs));
     idleDue = forever;
     refreshTimer();
 }
@@ -487,18 +514,52 @@ void Connection::queueWrite(std::string_view bytes) {
 void Connection::finishTcp() {
     phase = Phase::EndingTcp;
     auto status = uv_shutdown(&shutdown, reinterpret_cast<uv_stream_t*>(&tcp), [](uv_shutdown_t* shutdown, int status) {
-        static_cast<Connection*>(shutdown->data)->beginClose(statusCode(status), status != 0);
+        auto& connection = *static_cast<Connection*>(shutdown->data);
+        if (!status && connection.ingressError && !connection.tcpEof) {
+            connection.phase = Phase::RejectDrain;
+            connection.phaseDue = deadline(rejectionTimeoutMs);
+            connection.idleDue = forever;
+            connection.inputOffset = connection.inputSize = 0;
+            connection.refreshTimer();
+            connection.readFromSocket();
+        } else connection.beginClose(statusCode(status), status != 0);
     });
     if (status) beginClose(statusCode(status), true);
 }
 
+void Connection::finishResponse() {
+    if (!response || !request->keepAlive || tcpEof || tlsReadEnded || session.endpoint->requested.load() != Stop::Open) {
+        if (tls) phase = Phase::EndingTls;
+        else finishTcp();
+        return;
+    }
+    auto* completed = request;
+    auto* operation = std::exchange(response, nullptr);
+    completed->connection = nullptr;
+    completed->delivery.store(Delivery::Closed);
+    completed->session->endpoint->reactor->post<[](Request& request) { request.session->endpoint->server->released(request); }>(*completed);
+    auto pendingObservers = std::move(observers);
+    for (auto* observer : pendingObservers) finish(*observer);
+    ++completedRequests;
+    request = session.request = ::new (lyraGcAlloc(sizeof(Request))) Request{.session = &session, .connection = this};
+    phase = Phase::Idle;
+    phaseDue = deadline(session.endpoint->options.keepAliveTimeoutMs);
+    idleDue = forever;
+    auto buffered = std::move(pendingInput);
+    pendingInput.clear();
+    finish(*operation);
+    refreshTimer();
+    if (!buffered.empty()) messageBytes(buffered);
+    readFromSocket();
+}
+
 void Connection::pump() {
-    if (phase == Phase::Closing || phase == Phase::EndingTcp) return;
-    if (request.delivery.load() == Delivery::Closing) { beginClose(EBADF); return; }
+    if (phase == Phase::Closing || phase == Phase::EndingTcp || phase == Phase::RejectDrain) return;
+    if (request->delivery.load() == Delivery::Closing) { beginClose(EBADF); return; }
     if (tls) { pumpTls(); return; }
     if (writePending || phase != Phase::Writing) return;
     auto bytes = nextChunk();
-    if (bytes.empty()) finishTcp();
+    if (bytes.empty()) finishResponse();
     else { consumeChunk(bytes.size()); queueWrite(bytes); }
 }
 
@@ -515,7 +576,7 @@ void Connection::pumpTls() {
         if (step.progress == TlsProgress::Done) messageBytes({buffer.data(), step.bytes});
         if (step.progress == TlsProgress::End) {
             tlsReadEnded = true;
-            if (phase == Phase::Reading) beginClose(ECONNRESET, true);
+            if (phase == Phase::Reading || phase == Phase::Idle) beginClose(ECONNRESET, true);
         }
         return step.progress;
     };
@@ -541,13 +602,13 @@ void Connection::pumpTls() {
                 beginClose(ingressError, true);
                 return;
             }
-        } else if (phase == Phase::Reading || phase == Phase::Ready) {
-            if (tlsReadEnded) return;
+        } else if (phase == Phase::Idle || phase == Phase::Reading || phase == Phase::Ready) {
+            if (tlsReadEnded || !pendingInput.empty()) return;
             progress = receive();
         } else if (bioInputEnded && !tlsReadEnded && !tlsWriteRetry) progress = receive();
         else if (phase == Phase::Writing) {
             auto bytes = nextChunk();
-            if (bytes.empty()) { phase = Phase::EndingTls; continue; }
+            if (bytes.empty()) { finishResponse(); continue; }
             auto step = transport->write(tls, bytes.data(), bytes.size());
             progress = step.progress;
             tlsWriteRetry = progress == TlsProgress::WantInput || progress == TlsProgress::WantOutput;
@@ -574,16 +635,16 @@ void Connection::pumpTls() {
     }
     if (!pumpQueued) {
         pumpQueued = true;
-        reactor.post<[](Request& request) {
-            if (auto* connection = request.connection) { connection->pumpQueued = false; connection->pump(); }
-        }>(request);
+        reactor.post<[](Session& session) {
+            if (auto* connection = session.connection) { connection->pumpQueued = false; connection->pump(); }
+        }>(session);
     }
 }
 
 void Connection::observe(Operation& operation) {
     if (!validWait(operation.argument)) { finish(operation, -EINVAL); return; }
     if (observers.size() >= 64) { finish(operation, -EBUSY); return; }
-    if (operation.expires <= now()) { finish(operation, request.peerLost.load()); return; }
+    if (operation.expires <= now()) { finish(operation, request->peerLost.load()); return; }
     observers.push_back(&operation);
     refreshTimer();
 }
@@ -601,15 +662,16 @@ void Connection::expire() {
         auto& operation = **iterator;
         if (operation.expires > time) { ++iterator; continue; }
         iterator = observers.erase(iterator);
-        finish(operation, request.peerLost.load());
+        finish(operation, request->peerLost.load());
     }
     if (phaseDue <= time || idleDue <= time) {
         switch (phase) {
             case Phase::Handshake: ingressError = handshakeTimeout; beginClose(ingressError); return;
+            case Phase::Idle: beginClose(); return;
             case Phase::Reading: sendRejection(rejection(ETIMEDOUT), ETIMEDOUT); pump(); return;
             case Phase::Ready: {
                 auto pending = Delivery::Offered;
-                if (request.delivery.compare_exchange_strong(pending, Delivery::Closing)) { beginClose(ETIMEDOUT); return; }
+                if (request->delivery.compare_exchange_strong(pending, Delivery::Closing)) { beginClose(ETIMEDOUT); return; }
                 phaseDue = forever;
                 break;
             }
@@ -621,9 +683,9 @@ void Connection::expire() {
 
 void Connection::beginClose(int status, bool peer) {
     if (phase == Phase::Closing) return;
-    auto previous = request.delivery.exchange(Delivery::Closing);
+    auto previous = request->delivery.exchange(Delivery::Closing);
     if (previous == Delivery::Closing && peer) status = EBADF;
-    else if (peer) request.peerLost.store(true);
+    else if (peer) request->peerLost.store(true);
     if (peer && !ingressError && (phase == Phase::Reading || phase == Phase::Handshake))
         ingressError = phase == Phase::Handshake ? handshakeFailed : status;
     phase = Phase::Closing;
@@ -643,13 +705,13 @@ void Connection::beginClose(int status, bool peer) {
 void Connection::finalize() {
     require(!writePending, "closing TCP stream still owns a write buffer");
     if (tls) transport->releaseConnection(tls);
-    auto* closed = &request;
+    auto* closed = &session;
     auto* root = lyraGcRootCreate(closed);
     auto pendingObservers = std::move(observers), pendingCloses = std::move(closeWaiters);
     auto* pendingResponse = response;
     auto status = closeStatus;
-    auto lost = closed->peerLost.load();
-    closed->connection = nullptr;
+    auto lost = request->peerLost.load();
+    closed->connection = request->connection = nullptr;
     closed->ingressError = ingressError;
     delete this;
     notifyClosed(*closed);
@@ -856,13 +918,14 @@ void Server::acceptReady() {
         }
         retryMs = 0;
         auto& reactor = pool.place();
-        auto* request = ::new (lyraGcAlloc(sizeof(Request))) Request{
+        auto* session = ::new (lyraGcAlloc(sizeof(Session))) Session{
             .endpoint = &endpoint, .reactor = &reactor, .socket = accepted, .overload = overload, .acceptedAt = now(),
         };
-        connections.emplace(request, Slot{lyraGcRootCreate(request), ready.end()});
+        session->request = ::new (lyraGcAlloc(sizeof(Request))) Request{.session = session};
+        connections.emplace(session, Slot{lyraGcRootCreate(session), ready.end()});
         if (overload) rejecting = true;
         else ++ordinary;
-        reactor.post<[](Request& request) { (new Connection(request))->open(); }>(*request);
+        reactor.post<[](Session& session) { (new Connection(session))->open(); }>(*session);
     }
     if (endpoint.requested.load() != Stop::Open) applyStop(endpoint);
     else if (auto status = pollForAccept()) stop(Stop::Close, status);
@@ -870,23 +933,30 @@ void Server::acceptReady() {
 
 void Server::offer(Request& request) {
     if (stopping != Stop::Open || request.delivery.load() != Delivery::Pending) return;
-    connections.at(&request).ready = ready.insert(ready.end(), &request);
+    connections.at(request.session).ready = ready.insert(ready.end(), &request);
     dispatch();
 }
 
-void Server::closed(Request& request) {
-    auto entry = connections.find(&request);
-    auto& slot = entry->second;
+void Server::released(Request& request) {
+    auto& slot = connections.at(request.session);
     if (slot.ready != ready.end()) ready.erase(slot.ready);
+    slot.ready = ready.end();
     if (slot.issued) --issued;
-    if (request.overload) rejecting = false;
+    slot.issued = false;
+    dispatch();
+}
+
+void Server::closed(Session& session) {
+    released(*session.request);
+    auto entry = connections.find(&session);
+    if (session.overload) rejecting = false;
     else --ordinary;
-    endpoint.reactor->pool->release(*request.reactor);
-    lyraGcRootDrop(slot.root);
+    endpoint.reactor->pool->release(*session.reactor);
+    lyraGcRootDrop(entry->second.root);
     connections.erase(entry);
     if (stopping != Stop::Open) { maybeFinish(); return; }
     if (endpoint.requested.load() != Stop::Open) { applyStop(endpoint); return; }
-    if (!request.overload && request.ingressError) reportRejected(request.ingressError);
+    if (!session.overload && session.ingressError) reportRejected(session.ingressError);
     dispatch();
     if (auto status = pollForAccept()) stop(Stop::Close, status);
 }
@@ -896,7 +966,7 @@ void Server::dispatch() {
     expire(now());
     while (!accepts.empty() && !ready.empty() && issued < static_cast<std::size_t>(endpoint.options.capacity)) {
         auto& request = *ready.front();
-        auto& slot = connections.at(&request);
+        auto& slot = connections.at(request.session);
         auto& operation = *accepts.front();
         const auto delivery = operation.scoped ? Delivery::Claimed : Delivery::Offered;
         auto pending = Delivery::Pending;
@@ -920,7 +990,7 @@ void Server::dispatch() {
         ++issued;
         if (!operation.scoped) {
             request.offerExpires = deadline(endpoint.options.claimTimeoutMs);
-            request.reactor->post<[](Request& request) {
+            request.session->reactor->post<[](Request& request) {
                 auto* connection = request.connection;
                 if (connection && connection->phase == Phase::Ready && request.delivery.load() == Delivery::Offered) {
                     connection->phaseDue = request.offerExpires;
@@ -994,7 +1064,15 @@ void Server::stop(Stop mode, int error) {
         accepts.clear();
     }
     stopping = mode;
-    for (const auto& entry : connections) closeRequest(*entry.first, mode == Stop::Close);
+    for (const auto& entry : connections) {
+        entry.first->reactor->post<[](Session& session) {
+            if (auto* connection = session.connection) {
+                auto delivery = connection->request->delivery.load();
+                if (session.endpoint->requested.load() == Stop::Close || delivery != Delivery::Claimed)
+                    connection->beginClose(EBADF);
+            }
+        }>(*entry.first);
+    }
     maybeFinish();
 }
 
@@ -1076,7 +1154,9 @@ bool validOptions(const ServerOptions& options) {
     auto positive = [](int64_t value) { return value >= 1 && value <= INT_MAX; };
     return options.capacity >= 1 && options.capacity <= 64 && positive(options.requestTimeoutMs) &&
         (options.idleReadTimeoutMs == -1 || positive(options.idleReadTimeoutMs)) && positive(options.writeTimeoutMs) &&
-        positive(options.handshakeTimeoutMs) && options.graceMs >= 0 && options.graceMs <= INT_MAX && positive(options.claimTimeoutMs);
+        positive(options.handshakeTimeoutMs) && options.graceMs >= 0 && options.graceMs <= INT_MAX && positive(options.claimTimeoutMs) &&
+        positive(options.maxBodyBytes) && positive(options.maxRequestBytes) && options.maxRequestBytes >= options.maxBodyBytes &&
+        options.keepAliveTimeoutMs >= 0 && options.keepAliveTimeoutMs <= INT_MAX && positive(options.maxRequestsPerConnection);
 }
 
 }
@@ -1087,9 +1167,11 @@ using namespace lyraRuntime::http;
 namespace net = lyraRuntime::net;
 
 extern "C" const ServerOptions* lyraHttpOptions(int64_t capacity, int64_t requestTimeoutMs, int64_t idleReadTimeoutMs,
-    int64_t writeTimeoutMs, int64_t handshakeTimeoutMs, int64_t graceMs, int64_t claimTimeoutMs) {
+    int64_t writeTimeoutMs, int64_t handshakeTimeoutMs, int64_t graceMs, int64_t claimTimeoutMs,
+    int64_t maxBodyBytes, int64_t maxRequestBytes, int64_t keepAliveTimeoutMs, int64_t maxRequestsPerConnection) {
     return ::new (lyraGcAllocAtomic(sizeof(ServerOptions))) ServerOptions{
         capacity, requestTimeoutMs, idleReadTimeoutMs, writeTimeoutMs, handshakeTimeoutMs, graceMs, claimTimeoutMs,
+        maxBodyBytes, maxRequestBytes, keepAliveTimeoutMs, maxRequestsPerConnection,
     };
 }
 
@@ -1177,11 +1259,11 @@ extern "C" LyraTask* lyraHttpAcceptAsync(Endpoint* endpoint, int64_t timeoutMs, 
 }
 
 extern "C" LyraTask* lyraHttpRespondAsync(Request* request, int64_t code, const void* mediaType, const void* body, const ResponseFields* headers) {
-    return nativeTask({OperationKind::Respond, request->reactor, request->endpoint, request, code, mediaType, body, headers});
+    return nativeTask({OperationKind::Respond, request->session->reactor, request->session->endpoint, request, code, mediaType, body, headers});
 }
 
 extern "C" LyraTask* lyraHttpWaitDisconnectAsync(Request* request, int64_t timeoutMs) {
-    return nativeTask({OperationKind::Observe, request->reactor, request->endpoint, request, timeoutMs});
+    return nativeTask({OperationKind::Observe, request->session->reactor, request->session->endpoint, request, timeoutMs});
 }
 
 extern "C" LyraTask* lyraHttpRequestCloseAsync(Request* request) { return requestCloseTask(*request); }

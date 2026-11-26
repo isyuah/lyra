@@ -337,6 +337,80 @@ async fn main(): Unit {
                 self.assertEqual(exchange(port, "GET", "/claimed"), (200, "text/plain", b"claimed"))
                 self.assertEqual(process.wait(timeout=5), 0, process.stderr.read())
 
+    def test_keep_alive_pipeline_request_identity_and_idle_expiration(self):
+        package = self.root / 'keep-alive'
+        (package / 'src').mkdir(parents=True)
+        (package / 'lyra.json5').write_text("{name:'test/keep-alive',version:'1.0.0'}")
+        (package / 'src/main.ly').write_text(HTTP_HELPERS + '''
+async fn main(): Unit {
+    val listener = requireHttp(listen(0, options: HttpServerOptions(capacity: 1, maxBodyBytes: 1048576,
+        maxRequestBytes: 2097152, keepAliveTimeoutMs: 200, maxRequestsPerConnection: 3)))
+    print(listener.port())
+    val first = requireHttp(await listener.accept(5000))
+    #assert(first.target() == "/first" && first.body().size == 200000)
+    requireHttp(await first.respond(Response.bytes(200, "application/octet-stream", first.body())))
+    for index in 2..3 {
+        val next = requireHttp(await listener.accept(5000))
+        first.close()
+        await first.closeAndWait()
+        #assert(first.target() == "/first" && first.body().size == 200000)
+        #assert(failed(await first.respond(Response.text(200, "stale")), HttpErrorKind.Closed))
+        #assert(next.target() == "/${index}")
+        requireHttp(await next.respond(Response.text(200, "${index}")))
+    }
+    for index in 0..<4 {
+        val request = requireHttp(await listener.accept(5000))
+        requireHttp(await request.respond(Response.text(200, request.target())))
+    }
+    #assert(failed(await listener.accept(5000), HttpErrorKind.TooLarge))
+    await listener.closeAndWait()
+}
+''', encoding='utf-8')
+
+        def read_response(stream):
+            status = int(stream.readline().split()[1])
+            headers = {}
+            while line := stream.readline().rstrip(b'\r\n'):
+                name, value = line.split(b':', 1)
+                headers[name.lower()] = value.strip()
+            body = stream.read(int(headers.get(b'content-length', b'0')))
+            return status, headers, body
+
+        for profile, app in self.profiles(package):
+            with self.subTest(profile=profile), server(app) as (port, process, _):
+                with socket.create_connection(('127.0.0.1', port), timeout=5) as connection, connection.makefile('rb') as stream:
+                    body = bytes(range(250)) * 800
+                    connection.sendall(b'POST /first HTTP/1.1\r\nHost: localhost\r\nContent-Length: 200000\r\n\r\n' + body)
+                    status, headers, received = read_response(stream)
+                    self.assertEqual((status, headers[b'connection'], received), (200, b'keep-alive', body))
+                    connection.sendall(b'GET /2 HTTP/1.1\r\nHost: localhost\r\n\r\nGET /3 HTTP/1.1\r\nHost: localhost\r\n\r\n')
+                    status, headers, received = read_response(stream)
+                    self.assertEqual((status, headers[b'connection'], received), (200, b'keep-alive', b'2'))
+                    status, headers, received = read_response(stream)
+                    self.assertEqual((status, headers[b'connection'], received), (200, b'close', b'3'))
+                    self.assertEqual(stream.read(1), b'')
+                with socket.create_connection(('127.0.0.1', port), timeout=5) as connection, connection.makefile('rb') as stream:
+                    connection.sendall(b'GET /old HTTP/1.0\r\n\r\n')
+                    status, headers, received = read_response(stream)
+                    self.assertEqual((status, headers[b'connection'], received), (200, b'close', b'/old'))
+                    self.assertEqual(stream.read(1), b'')
+                with socket.create_connection(('127.0.0.1', port), timeout=5) as connection, connection.makefile('rb') as stream:
+                    connection.sendall(b'GET /old-persistent HTTP/1.0\r\nConnection: keep-alive\r\n\r\n')
+                    status, headers, received = read_response(stream)
+                    self.assertEqual((status, headers[b'connection'], received), (200, b'keep-alive', b'/old-persistent'))
+                    connection.sendall(b'GET /close HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n')
+                    status, headers, received = read_response(stream)
+                    self.assertEqual((status, headers[b'connection'], received), (200, b'close', b'/close'))
+                    self.assertEqual(stream.read(1), b'')
+                with socket.create_connection(('127.0.0.1', port), timeout=5) as connection, connection.makefile('rb') as stream:
+                    connection.sendall(b'GET /idle HTTP/1.1\r\nHost: localhost\r\n\r\n')
+                    self.assertEqual(read_response(stream)[2], b'/idle')
+                    self.assertEqual(stream.read(1), b'')
+                with socket.create_connection(('127.0.0.1', port), timeout=5) as connection, connection.makefile('rb') as stream:
+                    connection.sendall(b'POST /large HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1048577\r\n\r\n')
+                    self.assertEqual(read_response(stream)[0], 413)
+                self.assertEqual(process.wait(timeout=5), 0, process.stderr.read())
+
     def test_handler_bounds_failure_does_not_stop_the_server(self):
         package = self.root / "handler-error"
         (package / "src").mkdir(parents=True)
@@ -797,7 +871,7 @@ async fn main(): Unit {
         for profile, app in self.profiles(package):
             with self.subTest(profile=profile), server(app) as (port, process, output):
                 with socket.create_connection(("127.0.0.1", port), timeout=5) as connection:
-                    connection.sendall(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                    connection.sendall(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
                     self.assertEqual(output.line(), b"waiting\n")
                     process.stdin.write(b"cancel\n")
                     process.stdin.flush()

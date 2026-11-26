@@ -16,25 +16,33 @@
 | 选项 | 默认值 | 作用 |
 | --- | ---: | --- |
 | `capacity` | 4 | 同时发放的请求，范围 `1..64` |
-| `requestTimeoutMs` | 30000 | 从接入（TLS 为握手完成）到收到完整请求 |
+| `requestTimeoutMs` | 30000 | 首次接入（TLS 为握手完成）或复用连接收到首个字节后，到收到完整请求 |
 | `idleReadTimeoutMs` | `None` | 读取请求期间距上次接收 HTTP 字节的上限 |
 | `writeTimeoutMs` | 5000 | 从开始写响应到传输结束的预算 |
 | `handshakeTimeoutMs` | 5000 | TLS 握手预算，独立于请求读取 |
 | `graceMs` | 5000 | 优雅停机等待 handler 的预算，可为 0 |
 | `claimTimeoutMs` | 5000 | 裸 `accept` 结果等候认领的预算 |
+| `maxBodyBytes` | 8388608 | 解码传输分块后的请求正文上限 |
+| `maxRequestBytes` | 16777216 | 单条请求的请求线、首部、传输分块与正文总上限 |
+| `keepAliveTimeoutMs` | 5000 | 两条请求之间等待首字节的预算，0 关闭连接复用 |
+| `maxRequestsPerConnection` | 1000 | 单条连接最多处理的请求数 |
 
 这些是库的可覆盖策略，不是语言规则。请求、写入、握手和认领预算为 `1..2147483647` 毫秒；空闲预算为 `None` 或同一范围。连接超时用单调钟定时器处理，不靠固定时间片重试 socket 操作。
 
 每个 listener 最多同时持有 `2 × capacity` 条普通连接，计入握手、解析、待派发、已发放和关闭中的连接；关闭完成才释放名额。完整请求按 Reactor 收到就绪通知的顺序派发，不被较早到达的半条请求挡住。额外只有一个限时拒绝槽，尽力回 `503` 与 `Retry-After: 1`（TLS 先握手再加密回复）。拒绝槽也满时暂停接入，等待内核 backlog 与名额释放；没有无限排队或每连接线程。
 
-llhttp 增量解析请求行、首部和正文，保持既有大小、UTF-8、`Host` 和 `Expect` 规则。一条连接只处理一条请求。读取超时可回 `408`；非法请求可回 `400`、`413` 或 `417`。已登记的手动接收可以观察单连接错误；Router 不因单条连接失败而关闭服务。
+llhttp 增量解析请求行、首部和正文，检查 UTF-8、`Host` 和 `Expect`。HTTP/1.1 默认复用连接，HTTP/1.0 需要显式 `Connection: keep-alive`。同一连接的请求按顺序执行，最多额外缓存一个 8 KiB 读取窗口的管线数据，其余通过暂停 socket 读取产生背压。达到请求次数上限、客户端要求关闭、半关闭或服务进入停机时，当前响应后关闭连接。空闲连接仍占普通连接名额，到期直接回收。
+
+每条请求都有独立的 `Request` 对象，物理连接由独立的 Session 管理。完成响应后，旧 Request 的正文、首部与路由绑定仍可读取，旧对象的关闭和写入无法操作下一条请求。声明超过正文限制的 `Content-Length` 在首部完成后即拒绝。拒绝时先写出错误并关闭写侧，再限时消费剩余输入，减少未读上传数据导致的 TCP reset。
+
+读取超时可回 `408`，非法请求可回 `400`、`413` 或 `417`。已登记的手动接收可以观察单连接错误，Router 继续处理其他请求。
 
 ## Task、连接与停机
 
-- `accept`、`respond`、`waitDisconnect` 和 `closeAndWait` 都创建冷 Task。`accept` 的 `timeoutMs` 控制等待已解析请求，`-1` 无期限、`0` 只取当前就绪项；只取消这个等待不会取消别的接收。裸结果是有期限的发放，调用 `claim()` 或开始写有效响应后认领。`withAccepted` 在发布请求前登记作用域清理，直到回调及其子任务退出、连接原生关闭完成才结束。
-- 完整请求后的明文 TCP FIN 只代表读侧结束，仍允许响应。不完整请求 EOF、reset 和没有 `close_notify` 的 TLS 截断是对端断线。`waitDisconnect` 观察同一连接的事件，超时或本地关闭返回 `false`；取消观察不关闭连接。Router 用独立子 Task 观察断线，取消所属请求及其子任务，不影响其他请求。
+- `accept`、`respond`、`waitDisconnect` 和 `closeAndWait` 都创建冷 Task。`accept` 的 `timeoutMs` 控制等待已解析请求，`-1` 无期限、`0` 只取当前就绪项；只取消这个等待不会取消别的接收。裸结果是有期限的发放，调用 `claim()` 或开始写有效响应后认领。`withAccepted` 在发布请求前登记作用域清理，回调及子任务退出后，等当前请求释放再结束。响应成功后可复用连接，未响应或失败时关闭物理连接。
+- 完整请求后的明文 TCP FIN 只代表读侧结束，仍允许响应。不完整请求 EOF、reset 和没有 `close_notify` 的 TLS 截断是对端断线。`waitDisconnect` 观察当前请求的连接事件，超时、本地关闭或当前响应完成返回 `false`；取消观察不关闭连接。Router 用独立子 Task 观察断线，取消所属请求及其子任务，不影响其他请求。
 - 每条连接最多一个挂起的 `uv_write`；大响应分块，正文直接借用保活的 `Bytes`。写入竞争只有一个胜者。取消写入或显式关闭会停止读写并关闭句柄，等 write callback 和 close callback 回收缓冲、TLS 状态及 roots 后才完成相关 Task。SDK 私有桥接在投递前登记等待和执行器保活；普通 `extern` 仍不接受 `Task`。
-- TLS 1.2/1.3 用双向有界的 OpenSSL memory BIO pair 与同一个 `uv_tcp_t` 交换密文。握手、解密和加密只在有输入、写完成或有明确进展时推进；输出阻塞时保留至多一份待写的密文分块。响应结束发送 `close_notify`，不会无期限等待对端关闭。明文程序不链接 TLS。
+- TLS 1.2/1.3 用双向有界的 OpenSSL memory BIO pair 与同一个 `uv_tcp_t` 交换密文。握手、解密和加密只在有输入、写完成或有明确进展时推进；输出阻塞时保留至多一份待写的密文分块。连接复用共享已完成的 TLS 握手，关闭连接时发送 `close_notify`。明文程序不链接 TLS。
 - `close()` 同步、幂等地请求关闭；`closeAndWait()` 等待原生资源回收。`Router.serve(listener, shutdown: …)` 使用 listener 的容量和宽限期。收到 `Shutdown.request()`，先停止接入、关闭未认领连接，再等已认领的 handler；到期取消剩余任务，仍等 SQLite 等原生工作安全返回。直接取消服务跳过宽限期。监听器关闭确认还包括连接及 TLS context 释放。
 
 ## 验收

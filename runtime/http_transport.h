@@ -10,6 +10,7 @@ inline constexpr int handshakeTimeout = 1000003;
 
 struct ServerOptions {
     int64_t capacity, requestTimeoutMs, idleReadTimeoutMs, writeTimeoutMs, handshakeTimeoutMs, graceMs, claimTimeoutMs;
+    int64_t maxBodyBytes, maxRequestBytes, keepAliveTimeoutMs, maxRequestsPerConnection;
 };
 
 enum class TlsProgress { Done, WantInput, WantOutput, End, Failed };
