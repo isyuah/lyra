@@ -12,6 +12,7 @@
 | 泛型与接口 | [generics-and-interfaces.md](generics-and-interfaces.md) | 首版泛型函数、编译期结构约束、静态成员解析、泛型语义与代码生成分离 |
 | 错误与资源 | [errors-and-resources.md](errors-and-resources.md) | `Result`、`?` 复用普通 `implicit`、异常与取消、资源别名、关闭后的错误和同步 `defer` |
 | 异步执行 | [async-execution.md](async-execution.md) | 冷 Task 重复等待、任务组收尾、同域串行、显式跨域共享、竞争与内存安全 |
+| HTTP 网络运行时 | [http-reactor.md](http-reactor.md) | libuv TCP Reactor、任务取消交接、TLS memory BIO、有界背压与停机的实现契约 |
 | 模块、包与构建 | [modules-packages.md](modules-packages.md) | 文件与模块映射、可见性、re-export、包身份、锁文件、源码发布与显式脚本授权 |
 | 原生工具链与 FFI | [native-toolchain.md](native-toolchain.md) | Windows 与 Linux 原生构建和 AOT 交付、GC 演进路线、SQLite 句柄与取消验收 |
 | 编译器与运行时验收 | [compiler-acceptance.md](compiler-acceptance.md) | H 委托设计：先交付源码诊断与最小 AOT 正反例，再验证 GC、异步、FFI 与服务 |
