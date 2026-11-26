@@ -62,6 +62,8 @@ examples/compiler-smoke/pass/build/release/app
 
 源码构建需要 `libgc-dev`、`libuv1-dev`、`libsqlite3-dev`、`libjansson-dev` 和 `libssl-dev`（OpenSSL 3），完整 HTTPS 测试另用 `openssl` 命令。CMake 下载并校验固定版本的 llhttp、tomlc17、curl 与 c-ares。离线配置可分别传 `-DLYRA_LLHTTP_SOURCE_DIR=...`、`-DFETCHCONTENT_SOURCE_DIR_LYRA_TOMLC17=...`、`-DFETCHCONTENT_SOURCE_DIR_LYRA_CURL=...` 和 `-DFETCHCONTENT_SOURCE_DIR_LYRA_CARES=...`，指向已准备的源码。部署**编译好的应用**不用带工具链或这些开发库。
 
+维护者可用 `python tools/package_sdk.py build/windows-release` 或 `python3 tools/package_sdk.py build/release` 打包已构建的 SDK。脚本安装到新的临时前缀，校验文件清单，在 `build/dist/` 生成带目标和 Git 版本的制品，并附文件 SHA-256 清单；同名制品已存在时不会覆盖。Linux 的 Ubuntu 22.04 发行包应在 Ubuntu 22.04 环境构建。
+
 ### 试跑一个完整项目
 
 从仓库根目录执行。下面先原生编译并运行库的 Lyra 测试，再运行依赖它的 CLI；不需要启动包中心。
@@ -114,7 +116,7 @@ lyra fmt [--check] <文件.ly>...
 - `const` 可调用纯同步函数并预计算复合值，`pub const` 可跨包导入。编译期求值范围与预算见[元编程 RFC](rfc/metaprogramming-data.md#编译期常量)。[std.reflect](std/reflect/README.md) 可显式读取 `Any` 的类型名及公开 Struct/Class 字段；它与静态 JSON/TOML 派生相互独立。
 - 形参和字段可带 `[path]`、`[query("tag")]` 等编译期标记；声明宏据此生成包装函数。表达式宏 `#name(...)` 可以校验显式授予的快照，再把调用者实参拼进普通的类型检查；无需运行时反射或联网。
 - [JSON Lines 统计 CLI](examples/jsonlines/README.md) 是可直接运行的双包项目：公开库解码，命令行逐行统计，错误带行号。验收会实际发布库、移走源码和中心，再从锁和缓存重新原生编译。
-- `check` 不生成原生产物。`build` 由 LLVM 直接生成目标文件，再用 SDK 内的 LLD 链接。默认输出 `<包目录>/build/debug/app`（`-O0`，含源码级调试信息），`--release` 输出 `build/release/app`（`-O2`），`--release --debug-info` 保留优化版符号。Windows 的程序名为 `app.exe`，有符号时另生成同名 `.pdb`。目标文件按 LLVM IR、后端版本和发射选项缓存；每次仍进行类型检查与链接。缓存默认位于 `.lyra-cache/objects`，`LYRA_CACHE` 可指定共享缓存根。`-o` 指定完整目标路径；类型错误或链接失败不会覆盖已有产物。
+- `check` 不生成原生产物。`build` 由 LLVM 直接生成目标文件，再用 SDK 内的 LLD 链接。默认输出 `<包目录>/build/debug/app`（`-O0`，含源码级调试信息），`--release` 输出 `build/release/app`（`-O2`），`--release --debug-info` 保留优化版符号。Windows 的 `app.exe` 记录了配套 `.pdb` 的文件名，两者放在同一目录即可调试。目标文件按 LLVM IR、后端版本和发射选项缓存；每次仍进行类型检查与链接。缓存默认位于 `.lyra-cache/objects`，`LYRA_CACHE` 可指定共享缓存根。`-o` 指定完整目标路径；类型错误或链接失败不会覆盖已有产物。
 - 设置 `LYRA_NATIVE_BACKTRACE=1` 会在未捕获异常的 Lyra 源码链后显示原生帧。见[调试原生程序](rfc/native-toolchain.md#调试原生程序)。
 - `lyra check` 和 `lyra lsp --stdio` 共用诊断恢复，可一次报告独立函数中的多个错误。VS Code 支持导入和分号 Quick Fix、语义高亮、大纲、工作区符号搜索、定义和类型定义，以及未保存的 `lyra.json5` 补全与校验。完整功能和更新方法见[扩展说明](editors/vscode/README.md)；服务端不会下载包或执行准备脚本。LSP 行列使用 UTF-16，CLI 诊断保留 UTF-8 字节范围。
 - `lyra fmt` 整理显式传入的 `.ly` 文件，`--check` 只检查不写入。首版整理缩进和 token 之外的行尾空白，不重排语句或改动字面量、注释内容和原有换行；无需解析包或展开宏。

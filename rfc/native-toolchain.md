@@ -52,7 +52,7 @@ for pid in "${pids[@]}"; do cat "/proc/$pid/smaps_rollup"; done |
 
 ### 调试原生程序
 
-默认 Debug 产物内含 DWARF（Linux）或配套的 CodeView/PDB（Windows）。函数、参数、局部变量、源码行和复合类型字段按 LLVM 目标布局记录；Windows 部署调试产物时将同名 `.pdb` 放在 `.exe` 旁。`lyra build <包目录> --release --debug-info` 可保留优化版符号；优化器删除或合并的局部值仍可能无法查看。
+默认 Debug 产物内含 DWARF（Linux）或配套的 CodeView/PDB（Windows）。函数、参数、局部变量、源码行和复合类型字段按 LLVM 目标布局记录。Windows 每次链接写入唯一命名的 PDB，部署调试产物时将 EXE 的 CodeView 记录所指的 `.pdb` 放在同一目录。新 EXE 安装成功前不会改变旧 EXE 引用的 PDB；不再使用的旧符号文件可手动清理。`lyra build <包目录> --release --debug-info` 可保留优化版符号；优化器删除或合并的局部值仍可能无法查看。
 
 `LYRA_NATIVE_BACKTRACE=1` 在异常首次抛出时捕获至多 32 帧。未捕获异常先打印 Lyra 的源码、任务与原因链，再输出原生帧；原样重抛不会用新的回溯覆盖抛点。Windows 运行时从本机 PDB 查符号，Linux 打印模块名和相对偏移，例如可用 `llvm-symbolizer-18 --obj ./app 0x1234` 查具体位置。合成宏代码的语义诊断仍指回手写调用处。原生调试信息、回溯和可搬迁符号由[命令行用例](../tests/debug_info_cli.py)验证。
 
@@ -83,21 +83,19 @@ for pid in "${pids[@]}"; do cat "/proc/$pid/smaps_rollup"; done |
 
 ### 打包与复验 SDK
 
-在 Windows x64 构建机上用已通过测试的 `windows-release` 安装树打包：
+在 Windows x64 构建机上用已通过测试的 `windows-release` 打包：
 
 ```powershell
-$name = 'lyra-0.1.0-alpha.1-windows-x64'
-cmake --install build/windows-release --prefix "build/dist/staging/$name"
-tar -a -cf "build/dist/$name.zip" -C build/dist/staging $name
+python tools/package_sdk.py build/windows-release
 ```
 
 在 Ubuntu 22.04 x86-64 构建机上用 `release` 安装树打包：
 
 ```sh
-name=lyra-0.1.0-alpha.1-ubuntu22.04-x86_64
-cmake --install build/release --prefix "build/dist/staging/$name"
-tar -czf "build/dist/$name.tar.gz" -C build/dist/staging "$name"
+python3 tools/package_sdk.py build/release
 ```
+
+脚本安装到临时空目录，校验 CMake 安装清单和标准库，写入 SHA-256 文件清单。制品名包含 SDK 版本、平台和当前 Git 提交；同名制品不会被覆盖。历史安装和打包目录不作为输入。
 
 解包后在对应平台从仓库根目录运行 `python tests/installed_cli.py --sdk <解包后的SDK目录>`。该验收用开发机预编译 C 适配器，然后清空 `PATH` 和 SDK/库搜索环境，从搬迁后的 SDK 构建、测试并运行依赖包与两个双包应用。Windows 的 Developer PowerShell 仅用于编译测试用的 C 适配器。Ubuntu 裸系统的构建和独立运行分别走[容器验收](../tests/jammy.Dockerfile)的两个阶段。VSIX 打包与联调见[扩展说明](../editors/vscode/README.md#真实编辑器验收)。
 

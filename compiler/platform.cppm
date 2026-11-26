@@ -71,7 +71,7 @@ std::filesystem::path cacheOverride() {
 #endif
 }
 
-void publishExecutable(const std::filesystem::path& staged, const std::filesystem::path& output) {
+void publishExecutable(const std::filesystem::path& staged, const std::filesystem::path& output, [[maybe_unused]] bool replace = true) {
 #ifdef _WIN32
     auto name = output;
     name.make_preferred();
@@ -80,7 +80,7 @@ void publishExecutable(const std::filesystem::path& staged, const std::filesyste
     auto buffer = std::make_unique<std::byte[]>(size);
     auto* rename = ::new (buffer.get()) FILE_RENAME_INFO{};
     constexpr DWORD replaceExisting = 0x1, posixSemantics = 0x2;
-    rename->Flags = replaceExisting | posixSemantics;
+    rename->Flags = replace ? replaceExisting | posixSemantics : 0;
     rename->FileNameLength = bytes;
     std::memcpy(buffer.get() + offsetof(FILE_RENAME_INFO, FileName), name.c_str(), bytes);
     auto handle = CreateFileW(staged.c_str(), DELETE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,

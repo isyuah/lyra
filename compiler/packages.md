@@ -46,7 +46,7 @@ lyra pack demo/config --registry ./center
 | `lyra fetch DIR --locked` | 缺锁或锁与当前清单不兼容时报错；允许下载指定制品。 |
 | `lyra fetch DIR --locked --offline` | 不尝试网络。只读本地路径、静态中心和已校验的缓存；缺制品时报告包名、确切版本与摘要。 |
 
-默认包缓存为 `<workspace>/.lyra/cache/`；可设置 `LYRA_CACHE` 指到专用目录。原生目标文件缓存使用 `LYRA_CACHE/compiler/objects/`；未设置时写入可执行文件输出目录下的 `.lyra-cache/objects/`，键包含精确 LLVM IR、目标、Clang 路径与版本及编译选项。命中且内容校验通过时只跳过 IR 到目标文件的编译，前端检查与链接仍每次运行；缓存损坏或无法读写时照常构建。HTTP(S) 下载由 Lyra SDK 自带的静态注册中心传输程序完成，不依赖宿主 `curl`，不经 shell，且不跟随重定向；`--offline` 不执行下载。`LYRA_REGISTRY_CA_FILE` 可显式指定 HTTPS 注册中心的 PEM 信任链。锁要提交到源码管理，缓存和 `dist/` 不需要提交。
+默认包缓存为 `<workspace>/.lyra/cache/`；可设置 `LYRA_CACHE` 指到专用目录。原生目标文件缓存使用 `LYRA_CACHE/compiler/objects/`；未设置时写入可执行文件输出目录下的 `.lyra-cache/objects/`，键包含精确 LLVM IR、目标三元组、CPU、LLVM 版本及代码生成选项。命中且内容校验通过时只跳过 IR 到目标文件的编译，前端检查与链接仍每次运行；缓存损坏或无法读写时照常构建。HTTP(S) 下载由 Lyra SDK 自带的静态注册中心传输程序完成，不依赖宿主 `curl`，不经 shell，且不跟随重定向；`--offline` 不执行下载。`LYRA_REGISTRY_CA_FILE` 可显式指定 HTTPS 注册中心的 PEM 信任链。锁要提交到源码管理，缓存和 `dist/` 不需要提交。
 
 ## 静态中心和脚本边界
 

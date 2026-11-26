@@ -14,9 +14,16 @@ WINDOWS = COMPILER.suffix.lower() == ".exe"
 
 
 class DebugInfoTest(unittest.TestCase):
+    def symbols_for(self, executable):
+        codeview = executable.read_bytes().split(b"RSDS", 1)[1]
+        name = codeview[20:].split(b"\x00", 1)[0].decode("utf-8")
+        self.assertEqual(name, Path(name).name)
+        self.assertRegex(name, re.escape(executable.stem) + r"\.[0-9a-fA-F]{16}\.pdb$")
+        return executable.parent / name
+
     def inspect(self, executable, *, types=False):
         if WINDOWS:
-            symbols = executable.with_suffix(".pdb")
+            symbols = self.symbols_for(executable)
             self.assertTrue(symbols.is_file())
             command = [DEBUG_TOOL, "dump", "-l", "--files", "--symbols"]
             if types:
@@ -110,13 +117,39 @@ class DebugInfoTest(unittest.TestCase):
                     for fragment in ("DebugNode", "DebugEnvelope", "DebugLoad", "nodeCount", "nextNode", "prefixByte", "payloadNode", "packet", "hasValue", "isOk"):
                         self.assertTrue(fragment in symbols, f"{fragment} missing from {profile} symbols")
                     if WINDOWS:
-                        codeview = executable.read_bytes().split(b"RSDS", 1)[1]
-                        self.assertEqual(codeview[20:].split(b"\x00", 1)[0], b"custom name.pdb")
                         field = next(line for line in symbols.splitlines() if "LF_MEMBER" in line and "`payloadNode`" in line)
                         self.assertRegex(field, r"offset = 8\b")
                     else:
                         field = symbols.split('("payloadNode")', 1)[1].split("DW_TAG_", 1)[0]
                         self.assertRegex(field, r'DW_AT_data_member_location\s+\(0x08\)')
+
+    @unittest.skipUnless(WINDOWS, "Windows file sharing")
+    def test_running_image_keeps_its_original_symbols(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            package = Path(temporary)
+            source = package / "src" / "main.ly"
+            source.parent.mkdir()
+            source.write_text('extern fn getchar(): Int32;\nfn main(): Unit { val _ = getchar() }\n', encoding="utf-8")
+            executable = package / "locked.exe"
+            command = [COMPILER, "build", package, "-o", executable]
+            built = subprocess.run(command, capture_output=True, timeout=40)
+            self.assertEqual(built.returncode, 0, built.stderr)
+            original = executable.read_bytes()
+            symbols = self.symbols_for(executable)
+            original_symbols = symbols.read_bytes()
+            with subprocess.Popen([executable], stdin=subprocess.PIPE, creationflags=subprocess.CREATE_NO_WINDOW) as running:
+                try:
+                    source.write_text('fn main(): Unit { print(43) }\n', encoding="utf-8")
+                    replacement = subprocess.run(command, capture_output=True, timeout=40)
+                    self.assertNotEqual(replacement.returncode, 0, replacement.stderr)
+                    self.assertEqual(executable.read_bytes(), original)
+                    self.assertEqual(symbols.read_bytes(), original_symbols)
+                finally:
+                    running.communicate(b"\n", timeout=10)
+            replacement = subprocess.run(command, capture_output=True, timeout=40)
+            self.assertEqual(replacement.returncode, 0, replacement.stderr)
+            self.assertNotEqual(self.symbols_for(executable), symbols)
+            self.assertEqual(symbols.read_bytes(), original_symbols)
 
     def test_async_step_symbols_keep_source_and_local_variables(self):
         with tempfile.TemporaryDirectory() as temporary:

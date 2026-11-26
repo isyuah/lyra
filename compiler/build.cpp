@@ -2,6 +2,7 @@ module;
 #include <filesystem>
 #include <initializer_list>
 #include <algorithm>
+#include <llvm/ADT/SmallString.h>
 #include <llvm/ADT/StringExtras.h>
 #include <llvm/Config/llvm-config.h>
 #include <llvm/IR/LegacyPassManager.h>
@@ -176,12 +177,16 @@ void emitExecutable(llvm::Module& module, llvm::TargetMachine& machine, const fs
             link.push_back(pathText(input));
         }
     };
-    auto stagedSymbols = executable;
-    stagedSymbols.replace_extension(".pdb");
+    fs::path stagedSymbols;
     if constexpr (windows) {
         link = {"/lldmingw", "/lldignoreenv", "/machine:x64", "/subsystem:console", "/entry:mainCRTStartup",
             "/nodefaultlib", "/alternatename:__chkstk=___chkstk_ms", "/out:" + pathText(executable)};
-        if (symbols) link.insert(link.end(), {"/debug", "/pdb:" + pathText(stagedSymbols), "/pdbaltpath:%_PDB%"});
+        if (symbols) {
+            llvm::SmallString<128> name;
+            llvm::sys::fs::createUniquePath(pathText(executable.stem()) + ".%%%%%%%%%%%%%%%%.pdb", name, false);
+            stagedSymbols = executable.parent_path() / fromUtf8(name.str().str());
+            link.insert(link.end(), {"/debug", "/pdb:" + pathText(stagedSymbols), "/pdbaltpath:%_PDB%"});
+        }
         append(target, {"crt2u.o", "crtbegin.o"});
     } else {
         link = {"-m", "elf_x86_64", "-pie", "--eh-frame-hdr", "--build-id", "-z", "relro", "--hash-style=gnu",
@@ -217,10 +222,16 @@ void emitExecutable(llvm::Module& module, llvm::TargetMachine& machine, const fs
     if (cacheMiss) storeObject(cacheObject, cacheKey, objectText);
     if constexpr (windows) {
         if (symbols) {
-            auto outputSymbols = output;
-            outputSymbols.replace_extension(".pdb");
             if (!fs::is_regular_file(stagedSymbols)) throw Diagnostic{"LYB0002", "LLD 未生成预期的 CodeView 符号文件：" + pathText(stagedSymbols)};
-            publishExecutable(stagedSymbols, outputSymbols);
+            auto outputSymbols = output.parent_path() / stagedSymbols.filename();
+            publishExecutable(stagedSymbols, outputSymbols, false);
+            try { publishExecutable(executable, output); }
+            catch (...) {
+                std::error_code ignored;
+                fs::remove(outputSymbols, ignored);
+                throw;
+            }
+            return;
         }
     }
     publishExecutable(executable, output);
