@@ -4,6 +4,7 @@ module;
 #include <llvm/Support/FileSystem.h>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #ifdef _WIN32
 #include <cstddef>
@@ -20,10 +21,14 @@ export namespace lyra {
 #ifdef _WIN32
 inline constexpr bool windows = true;
 inline constexpr auto nativeTriple = "x86_64-pc-windows-msvc";
+inline constexpr auto nativeCTarget = "--target=x86_64-w64-windows-gnu";
+inline constexpr auto nativePackageTarget = "windows-x64";
 inline constexpr auto nativeEntry = "wmain";
 #else
 inline constexpr bool windows = false;
 inline constexpr auto nativeTriple = "x86_64-pc-linux-gnu";
+inline constexpr auto nativeCTarget = "--target=x86_64-pc-linux-gnu";
+inline constexpr auto nativePackageTarget = "linux-x64";
 inline constexpr auto nativeEntry = "main";
 #endif
 inline constexpr std::string_view linuxLoader = "/lib64/ld-linux-x86-64.so.2";
@@ -47,6 +52,15 @@ const std::filesystem::path& sdkRoot() {
         return std::filesystem::canonical(executable).parent_path().parent_path();
     }();
     return root;
+}
+
+std::vector<std::string> nativeCFlags() {
+    const auto& sdk = sdkRoot();
+    auto targetHeaders = sdk / "lib/lyra/target/include";
+    std::vector<std::string> flags{"-x", "c", "-std=c17", nativeCTarget, "-nostdinc", "-isystem", pathText(sdk / "libexec/lyra/clang/include")};
+    if constexpr (!windows) flags.insert(flags.end(), {"-isystem", pathText(targetHeaders / "x86_64-linux-gnu")});
+    flags.insert(flags.end(), {"-isystem", pathText(targetHeaders), "-isystem", pathText(sdk / "include")});
+    return flags;
 }
 
 std::filesystem::path executablePath(std::filesystem::path path) {

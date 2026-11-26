@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.28)
 
 file(GET_RUNTIME_DEPENDENCIES
-    EXECUTABLES "${LINKER}"
+    EXECUTABLES "${LINKER}" "${CLANG_TOOLS}/clang" "${CLANG_TOOLS}/llvm-ar"
     LIBRARIES "${LLVM}"
     RESOLVED_DEPENDENCIES_VAR dependencies
     UNRESOLVED_DEPENDENCIES_VAR missing

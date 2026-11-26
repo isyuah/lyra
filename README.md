@@ -111,6 +111,7 @@ lyra fmt [--check] <文件.ly>...
 - 普通异常写 `throw Exception("reason")`，用 `try { ... } catch e: Exception { ... }` 或 `catch { ... }` 捕获。`defer` 在退出当前块时倒序清理；取消独立于异常。使用 [std.task](std/task/README.md) 给一棵任务树设置 trace 或 deadline，不需要逐层传 `context`。
 - `extern fn` 通过 C ABI 调用原生函数。`--link` 接受 Linux 的 `.o`、`.a`、`.so`，或 Windows x64 COFF 的 `.obj`、`.lib`、`.a`。Windows C 适配器推荐用 LLVM-MinGW UCRT 构建；依赖私有 MSVC CRT 符号的库通过 DLL 的 C 接口调用。`<lyra/string.h>` 可按字节读取 `String`。[std.io](std/io/README.md) 可读参数、标准流和文件；[std.sqlite](std/sqlite/README.md) 提供预编译语句，两端均按需静态链接 SQLite。
 - `lyra import-c api.h -I include -o src/bindings.ly` 用 SDK 自带的 Clang 解析 C 头文件并生成 `extern` 声明。`unsafe` 块支持定宽指针读写和同步闭包回调；[FFI RFC](rfc/native-toolchain.md#原生指针与闭包回调)列出生命周期和 ABI 契约。
+- [清单的 `native` 节](compiler/packages.md#随包分发-c-库)可随包分发 C 源码和目标静态库。SDK 自动编译并链接传递依赖，不要求在开发机额外安装 C 编译器。
 - [std.json](std/json/README.md) 支持显式 `#derive(Json)`，派生器本身是 [Lyra 宏](std/meta/README.md)。用 [std.http](std/http/README.md) 可以运行[真实 HTTP/SQLite 查询服务](examples/http-sqlite/README.md)，无需 VM 或外部 Web 服务器。
 - [std.toml](std/toml/README.md) 同样用显式 `#derive(Toml)` 生成 TOML 编解码器，严格拒绝未知字段，可用显式入口放宽；别名、默认值、嵌套表和数组表均有端到端验收。日期时间目前解析为 TOML 专用值，业务类型需要手写映射。
 - `const` 可调用纯同步函数并预计算复合值，`pub const` 可跨包导入。编译期求值范围与预算见[元编程 RFC](rfc/metaprogramming-data.md#编译期常量)。[std.reflect](std/reflect/README.md) 可显式读取 `Any` 的类型名及公开 Struct/Class 字段；它与静态 JSON/TOML 派生相互独立。

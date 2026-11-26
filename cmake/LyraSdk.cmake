@@ -88,7 +88,7 @@ function(lyra_stage_linux_sdk)
         message(FATAL_ERROR "The Linux SDK needs a shared LLVM 18 installation alongside LLD.")
     endif()
     set(hostDependencies "${CMAKE_BINARY_DIR}/lyra-host-dependencies.cmake")
-    execute_process(COMMAND "${CMAKE_COMMAND}" "-DLINKER=${LYRA_LLD}" "-DLLVM=${llvm}" "-DOUTPUT=${hostDependencies}"
+    execute_process(COMMAND "${CMAKE_COMMAND}" "-DLINKER=${LYRA_LLD}" "-DLLVM=${llvm}" "-DCLANG_TOOLS=${LLVM_TOOLS_BINARY_DIR}" "-DOUTPUT=${hostDependencies}"
         -P "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/LyraLinuxHost.cmake" COMMAND_ERROR_IS_FATAL ANY)
     include("${hostDependencies}")
     foreach(dependency IN LISTS dependencies)

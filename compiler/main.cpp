@@ -25,6 +25,7 @@ import lyra.check;
 import lyra.format;
 import lyra.lsp;
 import lyra.modules;
+import lyra.native_packages;
 import lyra.packages;
 import lyra.platform;
 
@@ -36,7 +37,7 @@ namespace {
 constexpr auto usage = "lyra --help | --version\n"
                        "lyra lsp --stdio\n"
                        "lyra fmt [--check] <文件.ly>...\n"
-                       "lyra import-c <头文件> [-I <包含目录>] [-D <宏[=值]>] [-o <新文件.ly>]\n"
+                       "lyra import-c <头文件> [-I <包含目录>] [-D <宏[=值]>] [-o <新文件.ly> [--adapter <新文件.c> [--varargs <调用形状>]...]]\n"
                        "lyra new <目录> [--name <包名>] [--lib]\n"
                        "lyra check|build|run|test <包目录> [--locked] [--offline] [--diagnostics=json]\n"
                        "lyra test <包目录> [--list] [--filter <片段>] [--case <ID>]... [--format=json] [--timeout-seconds <秒>]\n"
@@ -102,14 +103,18 @@ Options options(const std::vector<std::string_view>& args, const std::vector<std
     return result;
 }
 
-void compile(const Options& opts, Compilation program, bool library, const fs::path& output, std::vector<Diagnostic>& warnings) {
+void compile(const Options& opts, Compilation program, bool library, const fs::path& output, std::vector<Diagnostic>& warnings,
+    const PackageGraph* graph = nullptr, std::string_view entry = {}) {
     auto module = check(std::move(program.syntax), program.sources, !library);
     warnings.insert(warnings.end(), module.warnings.begin(), module.warnings.end());
     if (library) throw Diagnostic{"LYC0002", "库没有可执行入口；使用 lyra check 或 lyra test 检查库"};
     if (fs::exists(output)) for (const auto& input : program.macroInputs) {
         if (fs::equivalent(input, output)) throw Diagnostic{"LYI0001", "输出路径不能覆盖宏或其只读输入：" + pathText(output)};
     }
-    build(module, program.sources, output, opts.native, opts.libraries);
+    auto native = graph ? buildNativePackages(*graph, entry, output, opts.native) : NativeLibraries{};
+    auto libraries = opts.libraries;
+    libraries.insert(libraries.end(), native.libraries.begin(), native.libraries.end());
+    build(module, program.sources, output, opts.native, libraries);
 }
 
 struct TestEntry { std::string id, name, packageId; fs::path root, path; };
@@ -179,7 +184,7 @@ int runTests(const Options& opts, bool jsonDiagnostics, AnalysisDiagnostics& dia
                 diagnostics.add(std::move(error));
             };
             try {
-                compile(opts, loadProgram(graph, entry.packageId, entry.path), false, binary, diagnostics.warnings);
+                compile(opts, loadProgram(graph, entry.packageId, entry.path), false, binary, diagnostics.warnings, &graph, entry.packageId);
                 phase = "run";
                 int status;
                 if (opts.testJson) {
@@ -250,7 +255,7 @@ int project(const Options& opts, bool json, AnalysisDiagnostics& diagnostics) {
             continue;
         }
         auto output = binary(package.root);
-        compile(opts, loadProgram(graph, id), package.library, output, diagnostics.warnings);
+        compile(opts, loadProgram(graph, id), package.library, output, diagnostics.warnings, &graph, id);
         return opts.command == "build" ? 0 : execute(output, opts.arguments);
     }
     return !diagnostics.errors.empty();

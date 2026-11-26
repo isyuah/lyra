@@ -11,7 +11,7 @@
 - Windows 开发机可直接构建 Windows x64 程序。给 Linux 服务器构建时仍用 Linux 或 WSL；当前不做跨目标链接和 sysroot 管理。
 - Linux x86-64 以 Ubuntu 22.04/glibc 2.35 为发布基线。[部署验收](../tests/jammy-smoke.sh)检查 ELF 的动态依赖：整数、对象、标准 I/O 和 JSONL 样例只需系统 `libc.so.6`；SQLite 与 HTTP/SQLite 样例静态链接 SQLite，另用系统 `libm.so.6`。入站 HTTPS 只在使用 `std.httpTls` 时链接静态 OpenSSL，出站 HTTP(S) 额外链接静态 libcurl；部署不需要 TLS 动态库。
 - Windows 使用 x64 C ABI，通过 LLVM-MinGW 的开放启动代码和导入库链接系统 UCRT。GC、libuv、Jansson、llhttp、tomlc17 和 SQLite 静态链接进使用它们的应用。PE 默认只导入系统 DLL；通过外部导入库引入的 DLL 由应用另行部署。
-- 预编译 SDK 本身包含编译器、私有 LLD、链接库、注册中心传输程序和标准库。`new`、`check`、`test`、`build` 和 `run` 不需要另外安装 Clang、LLVM、VS Build Tools、VC Redistributable 或 C 开发库，也不会在首次构建时联网安装工具。仅 `import-c` 显式加载 SDK 自带的 Clang 前端。未缓存的远程包经 SDK 自带下载程序获取；本地或冻结离线构建不访问网络。
+- 预编译 SDK 自带编译器、私有 LLD、链接库、注册中心传输程序和标准库。`new`、`check`、`test`、`build` 和 `run` 不需要另外安装 Clang、LLVM、VS Build Tools、VC Redistributable 或 C 开发库。`import-c` 加载 SDK 私有 Clang 前端；带 `native.sources` 的包用 SDK 自带 Clang、C 头文件和归档器编译，其他包不启动 C 编译器。未缓存的远程包经 SDK 自带下载程序获取；本地或冻结离线构建不访问网络。
 - 类 Go `scratch` 的零基础镜像/全静态交付是后续优化目标，不是首期门槛。不得以支持 scratch 为由让第一版构建链无法运行。
 
 程序包大小与常驻内存分别看待。目标是内置 Runtime/GC 但不用虚拟机、单程序易分发且能够在服务器上多进程运行；目前不设与 Go 对比的硬 MB 上限。建立可执行服务后，再以等价负载与 Go 对照报告多进程总内存、二进制大小、启动时间、吞吐和尾延迟。
@@ -79,7 +79,7 @@ for pid in "${pids[@]}"; do cat "/proc/$pid/smaps_rollup"; done |
    cmake --install build/windows-release --prefix build/sdk-windows
    ```
 
-   调试版改用 `windows-dev`。CMake 从 Developer PowerShell 的 `VCToolsRedistDir` 取应用本地运行库；自定义位置可传 `-DLYRA_WINDOWS_REDIST=<x64 CRT DLL 目录>`。SDK 不打包 Visual Studio/Windows SDK 的开发 `.lib`，也不打包 `clang` 命令；只为 `import-c` 携带 `libclang` 及其内建头文件。Windows C 静态库推荐用同一 LLVM-MinGW UCRT 目标构建；依赖 MSVC 私有 CRT 的库通过预编译 DLL 的 C 接口接入。
+   调试版改用 `windows-dev`。CMake 从 Developer PowerShell 的 `VCToolsRedistDir` 取应用本地运行库；自定义位置可传 `-DLYRA_WINDOWS_REDIST=<x64 CRT DLL 目录>`。SDK 不打包 Visual Studio/Windows SDK 的开发 `.lib`；C 编译用 `libexec/lyra/` 下的私有 Clang 和 LLVM-MinGW UCRT 头文件，不往全局 `PATH` 安装 `clang`。Windows C 静态库推荐用同一 LLVM-MinGW UCRT 目标构建；依赖 MSVC 私有 CRT 的库通过预编译 DLL 的 C 接口接入。
 
 ### 打包与复验 SDK
 
@@ -205,9 +205,17 @@ lyra import-c include/api.h -I include -D API_VERSION=2 -o src/bindings.ly
 lyra build . --link /path/to/libapi.a
 ```
 
-命令使用 SDK 内的 Clang 按应用目标解析 C17 头文件。`-I` 和 `-D` 可重复；内建头文件提供 `stdint.h`、`stddef.h` 等，第三方头文件和完整系统头文件由调用方通过包含目录提供。导入只为所选头文件中的外部函数生成 `pub extern fn`，不会为间接包含的头文件生成绑定。整数位宽按目标确定，例如 Windows 的 `long` 是 32 位、Linux 是 64 位；C 指针（包括函数指针）映射为 `CPtr`，`_Bool` 映射为 `Bool`。不生成 C 实现，不链接 C 库，也不在普通构建中自动运行。
+命令使用 SDK 内的 Clang 按应用目标解析 C17 头文件。`-I` 和 `-D` 可重复；内建头文件和随 SDK 分发的目标 C 头文件直接可用，第三方头文件由调用方通过包含目录提供。导入只为所选头文件中的外部函数生成 `pub extern fn`，不会为间接包含的头文件生成绑定。整数位宽按目标确定，例如 Windows 的 `long` 是 32 位、Linux 是 64 位；C 指针（包括函数指针）映射为 `CPtr`，`_Bool` 映射为 `Bool`。不链接 C 库，也不在普通构建中自动运行。库可用 `--link` 手动接入，或[在包清单声明](../compiler/packages.md#随包分发-c-库)后自动链接。
 
-按值聚合类型、C 全局变量、C++、可变参数、非默认调用约定与 inline 函数不在首版映射范围内。无法映射的声明报带头文件位置的 `LYF0004` 警告，仍输出其余绑定；C 解析错误报 `LYF0003` 并停止生成。可通过 `--diagnostics=json` 获取诊断。省略 `-o` 输出到 stdout，`-o` 只创建新文件；可从生成的普通 Lyra 源码继续手写 `extern` 或包装 API。
+需要按值 Struct、全局变量、`static inline` 或可变参数时，显式生成 C 适配文件并将它声明为包的原生源码。
+
+```sh
+lyra import-c native/api.h -o src/bindings.ly --adapter native/bridge.c --varargs 'sum=sumValues(Int16,Float32)'
+```
+
+适配器为仅含标量和指针字段的 POD Struct 生成 `CRecord类型名` 值类型，使用目标 Clang 完成字段布局、按值参数和返回值的 ABI 处理。全局变量生成同名读取函数，可写变量另有一个接收新值的重载。有定义的 `static inline` 在 C 适配单元内调用。每个 `--varargs` 指定一个明确的额外参数列表，由 Clang 执行整数和浮点的默认参数提升，可为同一 C 函数指定多个 Lyra 名称。生成的私有 C 符号使用内容摘要前缀，也可用 `--prefix` 明确指定。
+
+嵌套 Record、Union、数组和位域的按值映射、C++、非默认调用约定仍需手写适配。无法映射的声明报带头文件位置的 `LYF0004` 警告，仍输出其余绑定；C 解析错误报 `LYF0003` 并停止生成。可通过 `--diagnostics=json` 获取诊断。省略 `-o` 输出到 stdout，`-o` 和 `--adapter` 只创建新文件；可从生成的普通 Lyra 源码继续手写 `extern` 或包装 API。
 
 ## 标准库与诊断
 

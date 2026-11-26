@@ -32,12 +32,17 @@ export namespace lyra {
 
 struct PackageOptions { bool locked = false, offline = false, update = false, readOnly = false; };
 struct PackageError { std::string code, message; std::optional<Span> span{}; };
+struct NativePackage {
+    std::vector<std::filesystem::path> sources, headers, includeDirs;
+    std::map<std::string, std::vector<std::filesystem::path>> archives;
+};
 struct ResolvedPackage {
     std::string id, name, version;
     std::filesystem::path root;
     std::map<std::string, std::string> dependencies;
     bool library{};
     std::map<std::string, std::map<std::string, std::filesystem::path>> macroInputs{};
+    NativePackage native{};
 };
 struct PackageGraph {
     std::filesystem::path workspace;
@@ -56,6 +61,7 @@ LocalPackageLayout localEntryPackages(const std::filesystem::path& directory);
 std::vector<ManifestCompletion> completeManifest(const Source& source, std::size_t offset);
 std::optional<Diagnostic> validateManifest(const Source& source);
 int packageCommand(const std::vector<std::string_view>& args);
+std::string readNativePackageFile(const std::filesystem::path& root, const std::filesystem::path& relative);
 
 }
 
@@ -143,7 +149,7 @@ void validateHash(const string& hash) {
 
 string render(const json::Value& value) { return llvm::formatv("{0:2}\n", value).str(); }
 
-enum class ManifestScope { Root, Workspace, Dependencies, Dependency, Scripts, Script, Macros, Inputs, Kind, Other };
+enum class ManifestScope { Root, Workspace, Dependencies, Dependency, Scripts, Script, Macros, Inputs, Native, Archives, Kind, Other };
 struct ManifestField { string_view name, detail, initial; ManifestScope scope = ManifestScope::Other; };
 constexpr std::array<string_view, 2> packageKinds{"app", "lib"};
 
@@ -153,6 +159,7 @@ std::span<const ManifestField> manifestFields(ManifestScope scope) {
         {"name", "包名；可使用组织名/包名", "\"\""}, {"version", "SemVer 版本", "\"0.1.0\""},
         {"kind", "app 可执行包（默认）；lib 库", "\"app\"", Kind}, {"dependencies", "按简称组织的依赖", "{}", Dependencies},
         {"scripts", "显式运行的本地脚本和产物声明", "{}", Scripts}, {"macroInputs", "按宏名授权的包内只读输入", "{}", Macros},
+        {"native", "随包编译的 C 源码或按目标选择的静态库", "{}", Native},
         {"workspace", "由多个本地包组成的工作区", "{ members: [] }", Workspace},
     };
     static constexpr ManifestField workspace[] = {{"members", "工作区内的包目录", "[]"}};
@@ -161,11 +168,18 @@ std::span<const ManifestField> manifestFields(ManifestScope scope) {
         {"path", "本地依赖目录；与 registry 二选一", "\"\""}, {"registry", "依赖的注册中心；与 path 二选一", "\"\""},
     };
     static constexpr ManifestField script[] = {{"command", "显式执行的本地命令", "\"\""}, {"outputs", "包内产物路径列表", "[]"}};
+    static constexpr ManifestField native[] = {
+        {"sources", "native/ 下的 C 源文件", "[]"}, {"headers", "随包分发的 C 头文件", "[]"},
+        {"includeDirs", "native/ 内的附加头文件目录", "[]"}, {"archives", "按目标选择的静态库", "{}", Archives},
+    };
+    static constexpr ManifestField archives[] = {{"windows-x64", "x64 COFF 静态库", "[]"}, {"linux-x64", "x86-64 ELF 静态库", "[]"}};
     switch (scope) {
         case Root: return root;
         case Workspace: return workspace;
         case Dependency: return dependency;
         case Script: return script;
+        case Native: return native;
+        case Archives: return archives;
         default: return {};
     }
 }
@@ -477,7 +491,21 @@ struct Manifest {
     std::vector<Script> scripts;
     bool library{};
     std::map<string, std::map<string, fs::path>> macroInputs{};
+    NativePackage native{};
 };
+
+std::set<fs::path> nativeFilePaths(const NativePackage& native) {
+    std::set<fs::path> result(native.sources.begin(), native.sources.end());
+    result.insert(native.headers.begin(), native.headers.end());
+    for (const auto& [target, archives] : native.archives) result.insert(archives.begin(), archives.end());
+    return result;
+}
+
+void validateNativeFile(const fs::path& root, const fs::path& relative) {
+    for (auto path = relative; !path.empty(); path = path.parent_path())
+        if (fs::is_symlink(fs::symlink_status(root / path))) invalid("原生输入不能沿符号链接读取：" + pathText(root / path));
+    if (!fs::is_regular_file(root / relative)) io("找不到已声明的原生输入：" + pathText(root / relative));
+}
 
 Manifest manifestFromObject(const json::Object& obj, const string& where, const ManifestSites* sites = nullptr) {
     auto name = validateField(sites, {"name"}, [&] { auto value = required(obj, "name", where); packageName(value); return value; });
@@ -546,6 +574,41 @@ Manifest manifestFromObject(const json::Object& obj, const string& where, const 
             }
         }
     }
+    if (auto value = obj.get("native")) {
+        const auto& native = validateField(sites, {"native"}, [&]() -> const json::Object& { return asObject(*value, where + ": native"); });
+        auto paths = [&](const json::Object& section, string_view key, std::vector<fs::path>& output, auto accept, std::initializer_list<string_view> site) {
+            if (!section.get(key)) return;
+            validateField(sites, site, [&] {
+                std::set<fs::path> unique;
+                for (const auto& name : stringList(section, key, where)) {
+                    auto directory = key == "includeDirs";
+                    if (!safeRelative(name) || (!name.starts_with("native/") && !(directory && name == "native")))
+                        invalid(where + "：原生输入必须是 native/ 下的包内路径：" + name);
+                    auto path = fromUtf8(name);
+                    if (!accept(path) || !unique.insert(path).second) invalid(where + "：无效或重复的原生输入：" + name);
+                    output.push_back(std::move(path));
+                }
+            });
+        };
+        const auto nativeFields = manifestFields(ManifestScope::Native);
+        for (const auto& [key, field] : native) if (std::ranges::find(nativeFields, key.str(), &ManifestField::name) == nativeFields.end())
+            validateField(sites, {"native", key.str()}, [&] { invalid(where + "：未知的原生清单字段：" + key.str()); });
+        auto any = [](const fs::path&) { return true; };
+        paths(native, "sources", manifest.native.sources, [](const auto& path) { return path.extension() == ".c"; }, {"native", "sources"});
+        paths(native, "headers", manifest.native.headers, any, {"native", "headers"});
+        paths(native, "includeDirs", manifest.native.includeDirs, any, {"native", "includeDirs"});
+        if (auto archives = native.get("archives")) {
+            const auto& targets = validateField(sites, {"native", "archives"}, [&]() -> const json::Object& { return asObject(*archives, where + ": native.archives"); });
+            for (const auto& [key, field] : targets) {
+                auto target = key.str();
+                if (target != "windows-x64" && target != "linux-x64")
+                    validateField(sites, {"native", "archives", target}, [&] { invalid(where + "：未知的静态库目标：" + target); });
+                paths(targets, target, manifest.native.archives[target], [&](const auto& path) {
+                    return path.extension() == ".a" || (target == "windows-x64" && path.extension() == ".lib");
+                }, {"native", "archives", target});
+            }
+        }
+    }
     return manifest;
 }
 
@@ -577,6 +640,7 @@ Files collect(const fs::path& root) {
         for (auto parent = path.parent_path(); !parent.empty(); parent = parent.parent_path()) if (fs::is_symlink(root / parent)) invalid("宏输入目录不能是符号链接：" + pathText(parent));
         include(root / path);
     }
+    for (const auto& path : nativeFilePaths(manifest.native)) { validateNativeFile(root, path); include(root / path); }
     return files;
 }
 
@@ -602,7 +666,7 @@ Files unpack(string_view bytes, const string& where) {
     while (!bytes.empty()) {
         auto pathSize = size(); auto dataSize = size();
         string path(take(pathSize));
-        if (!safeRelative(path) || (path != manifestFile && !path.starts_with("src/") && !path.starts_with("inputs/"))) invalid(where + "：无效归档路径 " + path);
+        if (!safeRelative(path) || (path != manifestFile && !path.starts_with("src/") && !path.starts_with("inputs/") && !path.starts_with("native/"))) invalid(where + "：无效归档路径 " + path);
         if (files.size() >= maxFiles || (!files.empty() && path <= files.rbegin()->first)) invalid(where + "：过多、重复或未排序的源码条目");
         files.emplace(std::move(path), string(take(dataSize)));
     }
@@ -614,8 +678,14 @@ Files unpack(string_view bytes, const string& where) {
         if (!files.contains(name)) invalid(where + "：归档缺少声明的宏输入：" + name);
         grants.insert(std::move(name));
     }
+    for (const auto& path : nativeFilePaths(manifest.native)) {
+        auto name = pathText(path);
+        if (!files.contains(name)) invalid(where + "：归档缺少声明的原生输入：" + name);
+        grants.insert(std::move(name));
+    }
     for (const auto& [name, body] : files) {
         if (name.starts_with("inputs/") && !grants.contains(name)) invalid(where + "：归档包含未声明的宏输入：" + name);
+        if (name.starts_with("native/") && !grants.contains(name)) invalid(where + "：归档包含未声明的原生输入：" + name);
         for (auto prefix = fromUtf8(name).parent_path(); !prefix.empty(); prefix = prefix.parent_path()) if (files.contains(pathText(prefix))) invalid(where + "：文件与目录重名：" + pathText(prefix));
     }
     return files;
@@ -939,7 +1009,7 @@ PackageGraph resolvePackages(const fs::path& directory, PackageOptions options) 
     std::map<string, ResolvedPackage> packages;
     for (const auto& [id, node] : state.chosen) {
         const auto& manifest = node->manifest;
-        ResolvedPackage package{id, manifest.name, manifest.version, node->root, {}, manifest.library, manifest.macroInputs};
+        ResolvedPackage package{id, manifest.name, manifest.version, node->root, {}, manifest.library, manifest.macroInputs, manifest.native};
         for (const auto& [alias, dep] : manifest.dependencies) {
             auto req = store.dependency(*node, dep);
             package.dependencies.emplace(alias, identity(req.source, req.name));
@@ -988,7 +1058,7 @@ PackageGraph indexPackages(const fs::path& directory) {
         const auto& manifest = node.manifest;
         auto id = identity(node.source, manifest.name);
         auto [entry, fresh] = packages.try_emplace(id, ResolvedPackage{id, manifest.name, manifest.version,
-            node.root, {}, manifest.library, manifest.macroInputs});
+            node.root, {}, manifest.library, manifest.macroInputs, manifest.native});
         if (!fresh) return;
         for (const auto& [alias, dependency] : manifest.dependencies) {
             auto& target = entry->second.dependencies[alias];
@@ -1036,6 +1106,11 @@ std::vector<fs::path> indexLocalPackageRoots(const fs::path& directory) {
     catch (const fs::filesystem_error&) {}
     visit(visit, directory);
     return {seen.begin(), seen.end()};
+}
+
+std::string readNativePackageFile(const fs::path& root, const fs::path& relative) {
+    validateNativeFile(root, relative);
+    return readFile(root / relative);
 }
 
 std::vector<ManifestCompletion> completeManifest(const Source& source, std::size_t offset) {

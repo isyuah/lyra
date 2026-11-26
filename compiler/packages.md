@@ -35,7 +35,7 @@ lyra pack demo/config -o config.lypkg
 lyra pack demo/config --registry ./center
 ```
 
-第一条输出可按 SHA-256 校验的确定性归档，包含清单、`src/` 下的普通文件（包括 `.macros/`、`.typedMacros/`、`.decorators/`、`.expressions/` 中的实现），以及 `inputs/` 下由 `macroInputs` 明确声明的[只读宏输入](../std/meta/README.md)。宏目录是源码包的一部分，但其中的实现不当作应用的普通运行时代码加载。打包不跟随符号链接，不包含 `build/`、workspace 锁或包根的私有配置。第二条将同样的字节和索引写入本地静态中心。同一包名和版本不允许二次发布。库依赖的 `path` 或指向作者磁盘的 `registry` 也不允许发布。发布包依赖同一个中心的另一包时可写 `registry: 'self'`；跨中心依赖写明确的 HTTP(S) 基地址。
+第一条输出可按 SHA-256 校验的确定性归档，包含清单、`src/` 下的普通文件（包括 `.macros/`、`.typedMacros/`、`.decorators/`、`.expressions/` 中的实现）、`inputs/` 下由 `macroInputs` 明确声明的[只读宏输入](../std/meta/README.md)，以及 `native/` 下明确声明的 C 源码、头文件和静态库。宏目录是源码包的一部分，但其中的实现不当作应用的普通运行时代码加载。打包不跟随符号链接，不包含 `build/`、workspace 锁或包根的私有配置。第二条将同样的字节和索引写入本地静态中心。同一包名和版本不允许二次发布。库依赖的 `path` 或指向作者磁盘的 `registry` 也不允许发布。发布包依赖同一个中心的另一包时可写 `registry: 'self'`；跨中心依赖写明确的 HTTP(S) 基地址。
 
 在上例把 `cfg` 的 `path` 换成 `registry: '../../center'`，运行 `lyra lock demo` 即可从本地中心消费发布包，源代码中仍使用 `cfg`。把中心的同一目录树交给静态 HTTP(S) 服务，把 `registry` 改成服务基地址，也能使用同一份包；客户端只发 GET，不接收服务器指定的下载地址或脚本。
 
@@ -48,8 +48,29 @@ lyra pack demo/config --registry ./center
 
 默认包缓存为 `<workspace>/.lyra/cache/`；可设置 `LYRA_CACHE` 指到专用目录。原生目标文件缓存使用 `LYRA_CACHE/compiler/objects/`；未设置时写入可执行文件输出目录下的 `.lyra-cache/objects/`，键包含精确 LLVM IR、目标三元组、CPU、LLVM 版本及代码生成选项。命中且内容校验通过时只跳过 IR 到目标文件的编译，前端检查与链接仍每次运行；缓存损坏或无法读写时照常构建。HTTP(S) 下载由 Lyra SDK 自带的静态注册中心传输程序完成，不依赖宿主 `curl`，不经 shell，且不跟随重定向；`--offline` 不执行下载。`LYRA_REGISTRY_CA_FILE` 可显式指定 HTTPS 注册中心的 PEM 信任链。锁要提交到源码管理，缓存和 `dist/` 不需要提交。
 
+## 随包分发 C 库
+
+```json5
+{
+  name: 'acme/image', version: '0.1.0', kind: 'lib',
+  native: {
+    sources: ['native/resize.c'],
+    headers: ['native/include/resize.h'],
+    includeDirs: ['native/include'],
+    archives: {
+      'linux-x64': ['native/linux/libcodec.a'],
+      'windows-x64': ['native/windows/codec.lib'],
+    },
+  },
+}
+```
+
+四项都可省略；只用 C 源码时无需 `archives`。一旦声明目标静态库，构建只选择当前目标对应的列表，不会拿另一平台的库凑用。Linux 归档须包含 x86-64 ELF 目标文件，Windows 须包含 x64 COFF 目标文件；不接受依赖归档外文件的 thin archive、导入库和 LLVM bitcode。
+
+`build`、`run`、`test` 使用 SDK 内置 Clang、C 头文件和归档器编译声明的 `.c`，自动链接传递依赖的原生库。编译器默认搜索包自己的 `native/` 和显式声明的头目录。C 代码及静态库是受信任的原生依赖；它们不享有 Lyra 安全代码的内存检查。构建不运行包提供的脚本，不读取宿主 Clang 配置。`--link` 仍可用来接入包外已经构建好的库。
+
 ## 静态中心和脚本边界
 
 - `index/<完整包名>.json` 中 `versions` 各项含 `version`、`sha256`、`yanked`，制品在 `artifacts/<sha256>.lypkg`。中心维护者可将普通撤回版本的 `yanked` 置为 `true`：新解析跳过，已有锁的摘要一致时沿用并告警；摘要变更即失败。离线所见的撤回状态以最后获取的元数据为准。服务端不需要运行 Lyra。
 - 可选脚本声明示例：`scripts: { prepare: { command: 'generate-inputs', outputs: ['src/generated.ly'] } }`。解析结果列出包名、版本、来源、命令和缺失产物；普通命令不执行。当前不提供脚本授权或沙箱执行命令，也不在构建时偷偷补跑。
-- 目前分发的是源码，不承诺跨编译器的二进制 ABI、发布签名、凭据管理、被封禁的恶意包或静态网站之外的服务端发布接口。清单、锁和归档格式是这个编译器版本的格式，语言约束见[模块与包 RFC](../rfc/modules-packages.md)。
+- `.lypkg` 可以携带按目标选择的静态库，但不承诺跨编译器的二进制 ABI。目前未提供发布签名、凭据管理、恶意包封禁或静态网站之外的服务端发布接口。清单、锁和归档格式是这个编译器版本的格式，语言约束见[模块与包 RFC](../rfc/modules-packages.md)。

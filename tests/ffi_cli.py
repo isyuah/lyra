@@ -215,7 +215,7 @@ fn main(): Unit {
     def test_relocated_sdk_imports_and_links_header_without_host_tools(self):
         sdk = self.root / 'SDK 搬迁'
         staged = self.root / 'staged'
-        installed = subprocess.run([CMAKE, '--install', COMPILER.parent.parent, '--prefix', staged], capture_output=True, text=True, encoding='utf-8', timeout=60)
+        installed = subprocess.run([CMAKE, '--install', COMPILER.parent.parent, '--prefix', staged], capture_output=True, text=True, encoding='utf-8', timeout=120)
         self.assertEqual(installed.returncode, 0, installed.stderr)
         shutil.move(staged, sdk)
         compiler = executable(sdk / 'bin/lyra')
@@ -269,6 +269,64 @@ size_t measure(const int32_t *values, size_t count) { return values ? count : 0;
         ran = self.command('run', self.root, '--release', '--link', archive, compiler=compiler)
         self.assertEqual(ran.stdout.splitlines(), ['5' if WINDOWS else '9', '-3', 'true', 'false', '7'])
 
+        registry = self.root / 'registry'
+        def package(directory, name, code, **manifest):
+            root = self.root / directory
+            (root / 'src').mkdir(parents=True)
+            (root / 'src/main.ly').write_text(code, encoding='utf-8')
+            (root / 'lyra.json5').write_text(json.dumps(dict(name=name, version='1.0.0', **manifest)), encoding='utf-8')
+            return root
+
+        leaf = package('C 原生层', 'native/leaf', 'pub fn marker(): Int { 1 }', kind='lib', native={
+            'sources': ['native/count.c'], 'headers': ['native/include/helper.h'], 'includeDirs': ['native/include'],
+        })
+        (leaf / 'native/include').mkdir(parents=True)
+        (leaf / 'native/include/helper.h').write_text('#define ADDEND 5\n', encoding='utf-8')
+        (leaf / 'native/count.c').write_text('''#include <helper.h>
+#include <stdlib.h>
+#include <stdint.h>
+int32_t nativeCount(int32_t amount) { return abs(amount) + ADDEND; }
+''', encoding='utf-8')
+        first, second = self.root / 'first.lypkg', self.root / 'second.lypkg'
+        self.command('pack', leaf, '-o', first, compiler=compiler, environment=environment)
+        (leaf / 'native/unused.c').write_text('#error unused native input\n')
+        self.command('pack', leaf, '-o', second, compiler=compiler, environment=environment)
+        self.assertEqual(first.read_bytes(), second.read_bytes())
+        self.command('pack', leaf, '--registry', registry, compiler=compiler, environment=environment)
+        bridge = package('bridge', 'native/bridge', 'extern fn nativeCount(value: Int32): Int32;\n'
+                         'pub fn count(value: Int32): Int32 { nativeCount(value) }', kind='lib', dependencies={
+                             'leaf': {'name': 'native/leaf', 'version': '1.0.0', 'registry': 'self'},
+                         })
+        self.command('pack', bridge, '--registry', registry, compiler=compiler, environment=environment)
+        app = package('测试 应用', 'native/app', 'import bridge.{count}\nfn main(): Unit { print(count(-7)) }', dependencies={
+            'bridge': {'name': 'native/bridge', 'version': '1.0.0', 'registry': str(registry)},
+        })
+        ran = self.command('run', app, '--offline', '--release', compiler=compiler, environment=environment)
+        self.assertEqual(ran.stdout.splitlines(), ['12'])
+
+    def test_native_archive_requires_a_valid_archive_for_this_target(self):
+        current = 'windows-x64' if WINDOWS else 'linux-x64'
+        other = 'linux-x64' if WINDOWS else 'windows-x64'
+        native = self.root / 'native'
+        native.mkdir()
+        archive = self.archive('int fixture(void) { return 31; }')
+        shutil.copyfile(archive, native / 'fixture.a')
+        (native / 'invalid.a').write_bytes(b'not an archive')
+        self.main.write_text('extern fn fixture(): Int32;\nfn main(): Unit { print(fixture()) }', encoding='utf-8')
+        manifest = self.root / 'lyra.json5'
+
+        def configure(archives):
+            manifest.write_text(json.dumps(dict(name='fixture', version='1.0.0', native={'archives': archives})))
+
+        configure({other: ['native/invalid.a'], current: ['native/fixture.a']})
+        self.assertEqual(self.command('run', self.root).stdout.splitlines(), ['31'])
+        configure({other: ['native/fixture.a']})
+        missing = self.command('build', self.root, '--diagnostics=json', success=False)
+        self.assertEqual(json.loads(missing.stderr)[0]['code'], 'LYB0004')
+        configure({current: ['native/invalid.a']})
+        invalid = self.command('build', self.root, '--diagnostics=json', success=False)
+        self.assertEqual(json.loads(invalid.stderr)[0]['code'], 'LYB0004')
+
     def test_import_keeps_supported_bindings_and_diagnoses_unmapped_declarations(self):
         header = self.root / 'case.h'
         header.write_text('''struct Data { int value; };
@@ -290,6 +348,56 @@ int supported(struct Data *opaque);
         diagnostic, = json.loads(imported.stderr)
         self.assertEqual(imported.stdout, '')
         self.assertEqual((diagnostic['code'], diagnostic['range']['start']['line']), ('LYF0003', 1))
+
+    def test_import_adapter_uses_c_abi_for_records_inline_globals_and_variadic_promotions(self):
+        native = self.root / 'native'
+        native.mkdir()
+        header = native / 'header.h'
+        header.write_text('''#include <stdint.h>
+typedef struct { int32_t x; double y; } Point;
+struct Mix { Point *pointer; int16_t offset; };
+extern int32_t counter;
+extern const int32_t base;
+Point addPoint(Point first, Point second);
+static inline int32_t builtIn(int32_t value) { return value + EXTRA; }
+double sum(int32_t count, ...);
+''', encoding='utf-8')
+        (native / 'fixture.c').write_text('''#define EXTRA 7
+#include "header.h"
+#include <stdarg.h>
+int32_t counter = 5;
+const int32_t base = 11;
+Point addPoint(Point first, Point second) { return (Point){ first.x + second.x, first.y + second.y }; }
+double sum(int32_t count, ...) {
+    va_list args;
+    va_start(args, count);
+    int integer = va_arg(args, int);
+    double real = va_arg(args, double);
+    va_end(args);
+    return count + integer + real;
+}
+''', encoding='utf-8')
+        bindings, adapter = self.src / 'binding.ly', native / 'bridge.c'
+        inputs = ('import-c', header, '-DEXTRA=7', '--adapter', adapter, '--diagnostics=json')
+        request = self.command(*inputs, '-o', bindings, '--varargs', 'sum=sumValues(Int16,Float32)')
+        self.assertEqual(json.loads(request.stderr), [])
+        self.command(*inputs, '-o', self.src / 'second.ly', success=False)
+        self.assertFalse((self.src / 'second.ly').exists())
+        (self.root / 'lyra.json5').write_text(json.dumps(dict(name='bridge', version='1.0.0', native={
+            'sources': ['native/bridge.c', 'native/fixture.c'], 'headers': ['native/header.h'],
+        })))
+        self.main.write_text('''fn main(): Unit {
+    val point = addPoint(CRecordPoint(12, 1.5), CRecordPoint(-2, 0.75))
+    print(point.x); print(point.y)
+    print(counter()); counter(9); print(counter()); print(base())
+    print(builtIn(35)); print(sumValues(2, -3, 2.5))
+}''', encoding='utf-8')
+        environment = {'PATH': ''}
+        if WINDOWS:
+            environment['SystemRoot'] = os.environ['SystemRoot']
+        for mode in ([], ['--release']):
+            result = self.command('run', self.root, *mode, environment=environment)
+            self.assertEqual(result.stdout.splitlines(), ['10', '2.25', '5', '9', '11', '42', '1.5'])
 
 
 if __name__ == '__main__':
