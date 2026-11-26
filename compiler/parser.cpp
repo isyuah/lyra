@@ -19,7 +19,7 @@ namespace lyra {
 namespace {
 
 enum class Kind { Name, Keyword, Escaped, Number, String, Bytes, Char, TextHead, TextMiddle, TextTail, Symbol, Bad, Hole, End };
-constexpr std::string_view keywords[] = {"fn", "val", "var", "const", "if", "else", "while", "for", "in", "return", "break", "continue", "true", "false", "struct", "class", "enum", "trait", "pub", "import", "as", "is", "async", "await", "spawn", "extern", "match", "null", "implicit", "defer", "throw", "try", "catch", "this", "static"};
+constexpr std::string_view keywords[] = {"fn", "val", "var", "const", "if", "else", "while", "for", "in", "ref", "return", "break", "continue", "true", "false", "struct", "class", "enum", "trait", "pub", "import", "as", "is", "async", "await", "spawn", "extern", "match", "null", "implicit", "defer", "throw", "try", "catch", "this", "static"};
 
 struct Token {
     Kind kind;
@@ -354,8 +354,8 @@ private:
                 auto prefix = consume().span;
                 if (is("fn") && !token.newlineBefore) {
                     auto fn = function({}, pub);
-                    if (fn.name.text == "main" || fn.result.text.empty() || std::ranges::any_of(fn.parameters, [](const auto& param) { return param.variadic; }))
-                        throw at(source, prefix, "LYCT0001", "const fn 需要显式返回类型，且不能是入口函数或变长函数");
+                    if (fn.name.text == "main" || fn.result.text.empty() || std::ranges::any_of(fn.parameters, [](const auto& param) { return param.variadic || param.passing != Passing::Value; }))
+                        throw at(source, prefix, "LYCT0001", "const fn 需要显式返回类型，且不能是入口函数、变长函数或引用传参函数");
                     fn.constant = ConstKind::Function;
                     fn.header.begin = prefix.begin;
                     module.functions.push_back(std::move(fn));
@@ -603,6 +603,11 @@ private:
 
     std::string_view text(Token item) const { return item.kind == Kind::Hole ? std::string_view{} : std::string_view(source.text).substr(item.span.begin, item.span.end - item.span.begin); }
     bool is(std::string_view word) const { return text(token) == word; }
+
+    Passing passing() {
+        if (!is("in") && !is("ref")) return Passing::Value;
+        return text(consume()) == "in" ? Passing::In : Passing::Ref;
+    }
     Token require(std::string_view word) {
         if (!is(word)) throw at(source, token.span, "LYP0001", "此处需要 " + std::string(word));
         return consume();
@@ -1107,16 +1112,23 @@ private:
             if (!parameters.empty() && parameters.back().variadic) throw at(source, token.span, "LYP0001", "变长形参 " + parameters.back().name.text + " 必须放在最后");
             if (is("...")) throw at(source, token.span, "LYP0001", "变长形参写在类型之后，例如 values: Int...");
             auto marks = attributes();
+            auto modeSite = token.span;
+            auto mode = passing();
+            if (mode != Passing::Value && (isAsync || foreign || conversion || initializer || (!owner && !extension && name.text == "main")))
+                throw at(source, modeSite, "LYT0022", "in/ref 只用于普通同步函数或方法");
             auto parameter = identifier();
             require(":");
             Parameter item{std::move(parameter), type()};
             item.attributes = std::move(marks);
+            item.passing = mode;
             if (is("...")) { consume(); item.variadic = true; }
             if (is("=")) {
                 if (item.variadic) throw at(source, token.span, "LYP0001", "变长形参不能设置默认值");
                 consume(); item.defaultValue = expression(true);
             }
             if (foreign && (item.variadic || item.defaultValue)) throw at(source, item.name.span, "LYF0001", "extern 形参不支持变长或默认值");
+            if (mode != Passing::Value && (item.variadic || item.defaultValue))
+                throw at(source, modeSite, "LYT0022", "in/ref 形参不能变长或有默认值");
             parameters.push_back(std::move(item));
             if (!is(",")) break;
             consume();
@@ -1631,9 +1643,11 @@ private:
             completeAt(CompletionPlace::Expression);
             std::optional<Identifier> label;
             if (text(next) == ":") { label = identifier(); consume(); }
+            auto mode = passing();
             std::optional<Span> spread;
             if (is("...")) spread = consume().span;
-            node.arguments.push_back({std::move(label), expression(true), spread});
+            if (spread && mode != Passing::Value) throw at(source, *spread, "LYT0022", "in/ref 实参不能展开");
+            node.arguments.push_back({std::move(label), expression(true), spread, {}, mode});
             if (!is(",")) break;
             consume();
         }
@@ -2196,6 +2210,7 @@ EditorSignature describeFunction(const Source& source, const Function& function,
         auto name = parameter.name.text.empty() ? std::string{} : editorSpelling(source, parameter.name);
         auto type = parameterTypes.empty() ? trimmed(excerpt(source, parameter.type.span)) : std::string_view(parameterTypes[slot]);
         std::string rendered = name.empty() ? std::string(type) : name + ": " + std::string(type);
+        if (parameter.passing != Passing::Value) rendered = std::string(passingName(parameter.passing)) + ' ' + rendered;
         if (parameter.variadic) rendered += "...";
         if (parameter.defaultValue) rendered += " = …";
         if (!signature.parameters.empty()) signature.label += ", ";

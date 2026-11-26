@@ -743,7 +743,8 @@ struct Emitter {
     Value read(std::size_t slot) {
         auto* type = layouts.native(builder, fn.locals[slot].type);
         auto address = cell(slot);
-        return fn.locals[slot].captured && layouts.workers ? sharedRead(builder, type, address) : builder.CreateLoad(type, address);
+        return layouts.workers && (fn.locals[slot].captured || fn.locals[slot].passing != Passing::Value) ?
+            sharedRead(builder, type, address) : builder.CreateLoad(type, address);
     }
 
     llvm::FunctionType* signature(const FunctionShape& shape) {
@@ -781,7 +782,8 @@ struct Emitter {
         for (std::size_t slot = 0; slot < fn.locals.size(); ++slot) {
             const auto& local = fn.locals[slot];
             if (local.worker == worker && !local.constant) {
-                locals[slot] = builder.CreateAlloca(local.captured ? builder.getPtrTy() : layouts.native(builder, local.type));
+                locals[slot] = local.passing != Passing::Value ? static_cast<Value>(native->getArg(slot)) :
+                    builder.CreateAlloca(local.captured ? builder.getPtrTy() : layouts.native(builder, local.type));
                 if (debug && local.declaration && !local.name.empty()) declareDebugLocal(slot, local);
             }
         }
@@ -799,7 +801,7 @@ struct Emitter {
                 auto slot = fn.expressions[*worker].captures[arg.getArgNo()];
                 locals[slot] = builder.CreateAlloca(builder.getPtrTy());
                 builder.CreateStore(&arg, locals[slot]);
-            } else initialize(arg.getArgNo(), &arg);
+            } else if (fn.locals[arg.getArgNo()].passing == Passing::Value) initialize(arg.getArgNo(), &arg);
         }
         if (initializer()) initialize(fn.syntax.parameters.size(), asyncCell(builder, layouts.objects[fn.result.id]));
         auto tail = emit(bodyId());
@@ -1416,11 +1418,15 @@ struct Emitter {
         Type element{};
         Span site{};
         std::vector<unsigned> path{};
+        bool shared{};
     };
 
     Place address(ExprId id) {
         const auto& node = fn.syntax.expressions[id].node;
-        if (std::holds_alternative<Identifier>(node) || std::holds_alternative<This>(node)) return {cell(fn.expressions[id].target)};
+        if (std::holds_alternative<Identifier>(node) || std::holds_alternative<This>(node)) {
+            auto slot = fn.expressions[id].target;
+            return {.pointer = cell(slot), .shared = fn.locals[slot].captured || fn.locals[slot].passing != Passing::Value};
+        }
         if (auto indexed = std::get_if<Index>(&node)) {
             auto list = emit(indexed->receiver);
             if (!live()) return {};
@@ -1430,12 +1436,21 @@ struct Emitter {
         }
         const auto& member = std::get<Member>(node);
         auto owner = fn.expressions[member.receiver].type;
-        auto place = layouts.reference(owner) ? Place{emit(member.receiver)} : address(member.receiver);
+        auto place = layouts.reference(owner) ? Place{.pointer = emit(member.receiver), .shared = true} : address(member.receiver);
         if (!live()) return {};
         auto slot = static_cast<unsigned>(fn.expressions[id].target);
         place.pointer = builder.CreateStructGEP(layouts.objects[owner.id], place.pointer, slot);
         if (place.list) place.path.push_back(slot);
         return place;
+    }
+
+    bool directlyAddressable(ExprId id) const {
+        const auto& info = fn.expressions[id];
+        if (info.sourceType || info.narrowed || info.constantRef || info.callableType || info.callee != Callee::Function) return false;
+        const auto& node = fn.syntax.expressions[id].node;
+        if (std::holds_alternative<Identifier>(node) || std::holds_alternative<This>(node)) return true;
+        const auto* member = std::get_if<Member>(&node);
+        return member && fn.expressions[member->receiver].type.kind == Type::Record && directlyAddressable(member->receiver);
     }
 
     Value emitNode(ExprId id, const QualifiedMember&) { return makeVariant(id); }
@@ -1448,6 +1463,11 @@ struct Emitter {
 
     Value emitNode(ExprId id, const Member& member) {
         if (fn.expressions[id].callee == Callee::Variant) return makeVariant(id);
+        if (directlyAddressable(id)) {
+            auto place = address(id);
+            auto* type = layouts.native(builder, rawType(id));
+            return layouts.workers && place.shared ? sharedRead(builder, type, place.pointer) : builder.CreateLoad(type, place.pointer);
+        }
         auto object = emit(member.receiver);
         if (!live()) return unit();
         if (fn.expressions[id].callee == Callee::BoundMethod) {
@@ -1572,7 +1592,8 @@ struct Emitter {
         if (variadic) args.back() = lists.create();
         for (std::size_t index = 0; index < call.arguments.size(); ++index) {
             auto slot = info.argumentSlots[index] + skip;
-            auto value = emit(call.arguments[index].value);
+            const auto& argument = call.arguments[index];
+            auto value = argument.passing == Passing::Value ? emit(argument.value) : address(argument.value).pointer;
             if (!live()) return unit();
             if (variadic && slot == args.size() - 1) {
                 if (fn.expressions[call.arguments[index].value].boxedSpread) {
@@ -1926,7 +1947,7 @@ struct Emitter {
             auto place = address(binary.left);
             if (!live()) return unit();
             auto type = fn.expressions[binary.left].type;
-            auto shared = !place.list && layouts.workers && (!std::holds_alternative<Identifier>(fn.syntax.expressions[binary.left].node) || fn.locals[fn.expressions[binary.left].target].captured);
+            auto shared = layouts.workers && place.shared;
             auto left = op == Op::Set ? nullptr : shared ? sharedRead(builder, layouts.native(builder, type), place.pointer) : builder.CreateLoad(layouts.native(builder, type), place.pointer);
             auto right = emit(binary.right);
             if (!live()) return unit();
@@ -2219,7 +2240,8 @@ std::unique_ptr<llvm::Module> lower(const CheckedModule& program, const std::vec
     for (const auto& fn : program.functions) {
         if (fn.syntax.constant == ConstKind::Value) { functions.push_back(nullptr); continue; }
         std::vector<llvm::Type*> params;
-        for (std::size_t index = 0; index < fn.syntax.parameters.size(); ++index) params.push_back(layouts.native(builder, fn.locals[index].type));
+        for (std::size_t index = 0; index < fn.syntax.parameters.size(); ++index)
+            params.push_back(fn.locals[index].passing == Passing::Value ? layouts.native(builder, fn.locals[index].type) : builder.getPtrTy());
         if (!fn.syntax.isAsync && !fn.syntax.foreignSymbol) params.push_back(builder.getPtrTy());
         auto signature = llvm::FunctionType::get(fn.syntax.isAsync ? builder.getPtrTy() : layouts.native(builder, fn.result), params, false);
         functions.push_back(llvm::Function::Create(signature, llvm::Function::InternalLinkage, "lyra.fn." + fn.syntax.name.text, *module));

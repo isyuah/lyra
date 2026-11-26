@@ -103,6 +103,90 @@ fn main(): Unit {
     def test_heap_roots_strings_and_inline_data(self):
         self.run_source(GC_FIXTURE.read_text(encoding="utf-8"), "持有\nA\0B\n1\n2\n".encode())
 
+    def test_reference_parameters_keep_slots_and_value_arguments_keep_snapshots(self):
+        (self.package / 'lyra.json5').write_text('''{
+            name:"test/refs", version:"0.1.0",
+            dependencies:{models:{name:"test/models", version:"^0.1.0", path:"models"}}
+        }''')
+        library = self.package / 'models'
+        (library / 'src').mkdir(parents=True)
+        (library / 'lyra.json5').write_text('{name:"test/models", version:"0.1.0", kind:"lib"}')
+        (library / 'src' / 'packet.ly').write_text('''
+pub struct Packet(pub var text: String, pub var id: Int, pub val values: List<Int>, pub val backup: List<Int>)
+pub class Storage(pub var packet: Packet)
+pub fn check(packet: Packet): Int { packet.id + 10 }
+pub fn check(in packet: Packet): Int { packet.id }
+pub fn forward<T>(in value: T): T { value }
+pub fn change(ref packet: Packet, id: Int = packet.id + 1): Int {
+    packet.id = id
+    gcCollect()
+    packet.id
+}
+pub fn alias(ref first: Packet, in second: Packet): Int {
+    first.id += 1
+    second.id
+}
+pub fn capturedValue(packet: Packet, changed: Int): Int { packet.id }
+pub class Editor {
+    pub init() {}
+    pub fn rewrite(ref packet: Packet): Unit { packet.text = "changed" }
+}
+''', encoding='utf-8')
+        self.run_source('''
+import models
+fn main(): Unit {
+    val store = models.Storage(models.Packet("原稿", 1, [41], [42]))
+    print(models.capturedValue(store.packet, models.change(packet: ref store.packet)))
+    print(models.check(in store.packet))
+    print(models.check(store.packet))
+    print(models.alias(ref store.packet, in store.packet))
+    val previous = models.forward(in store.packet)
+    models.Editor().rewrite(ref store.packet)
+    print(previous.text)
+    print(store.packet.text)
+    print(previous.values[0] + store.packet.backup[0])
+}
+''', '1\n2\n12\n3\n原稿\nchanged\n83\n'.encode())
+
+    def test_reference_parameter_rejections(self):
+        declarations = '''
+struct Packet(var id: Int)
+class Holder(val packet: Packet) {
+    val computed: Packet get() { packet }
+}
+fn inspect(in packet: Packet): Int { packet.id }
+fn edit(ref packet: Packet): Unit { packet.id += 1 }
+fn widen(in value: Int): Int { value }
+'''
+        cases = [
+            ('val packet = Packet(1); edit(ref packet)', 'LYT0022'),
+            ('var packet = Packet(1); edit(packet)', 'LYT0022'),
+            ('var packet = Packet(1); edit(in packet)', 'LYT0022'),
+            ('val _ = inspect(in Packet(1))', 'LYT0022'),
+            ('val holder = Holder(Packet(1)); val _ = inspect(in holder.computed)', 'LYT0022'),
+            ('val packets = [Packet(1)]; val _ = inspect(in packets[0])', 'LYT0022'),
+            ('val small: Int8 = 7; val _ = widen(in small)', 'LYT0001'),
+            ('val call = inspect', 'LYT0022'),
+            ('var number = 1; print(ref number)', 'LYT0022'),
+            ('val number = 1; val _ = Some(in number)', 'LYT0022'),
+        ]
+        programs = [('fn main(): Unit { ' + body + ' }', code) for body, code in cases]
+        for declaration, code in (
+            ('fn captured(in packet: Packet): () -> Packet { () => { packet } }', 'LYT0022'),
+            ('fn deferred(ref packet: Packet): Unit { defer { packet.id = 0 } }', 'LYT0022'),
+            ('fn readonly(in packet: Packet): Unit { packet.id = 0 }', 'LYT0004'),
+            ('async fn later(in packet: Packet): Int { packet.id }', 'LYT0022'),
+            ('const fn fromSlot(in packet: Packet): Packet { packet }', 'LYCT0001'),
+        ):
+            programs.append((declaration + '\nfn main(): Unit {}', code))
+        for program, code in programs:
+            with self.subTest(program=program):
+                self.main.write_text(declarations + '\n' + program, encoding='utf-8')
+                result = subprocess.run([COMPILER, 'check', self.package, '--diagnostics=json'], capture_output=True, timeout=25)
+                self.assertNotEqual(result.returncode, 0)
+                diagnostic, = json.loads(result.stderr)
+                self.assertEqual(diagnostic['code'], code, diagnostic)
+
     def test_order_and_single_receiver_evaluation(self):
         self.run_source("""
 class Counter(var value: Int)

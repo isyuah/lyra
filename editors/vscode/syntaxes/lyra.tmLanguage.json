@@ -103,7 +103,7 @@
       "patterns": [
         { "name": "keyword.control.lyra", "match": "\\b(?:if|else|while|for|in|return|break|continue|match|try|catch|throw|defer|await|spawn|import)\\b" },
         { "name": "keyword.control.async.lyra", "match": "(?<!\\.)\\b(?:blocking|taskGroup|parallel)\\b(?=[ \\t]*\\{)" },
-        { "name": "storage.type.lyra", "match": "\\b(?:fn|struct|class|enum|trait|val|var|implicit)\\b" },
+        { "name": "storage.type.lyra", "match": "\\b(?:fn|struct|class|enum|trait|val|var|implicit|ref)\\b" },
         { "name": "storage.modifier.lyra", "match": "\\b(?:pub|async|static|extern)\\b|\\bconst\\b(?=[ \\t]+(?:fn\\b|(?:`[A-Za-z_][A-Za-z0-9_]*`|[A-Za-z_][A-Za-z0-9_]*)[ \\t]*:))" },
         { "name": "keyword.operator.word.lyra", "match": "\\b(?:as|is)\\b" },
         { "name": "variable.language.this.lyra", "match": "\\bthis\\b" },

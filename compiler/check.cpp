@@ -206,7 +206,7 @@ struct Callable {
 
 struct OverloadKey {
     std::size_t typeParameters;
-    std::vector<std::pair<std::string, bool>> parameters;
+    std::vector<std::tuple<std::string, bool, Passing>> parameters;
     bool operator==(const OverloadKey&) const = default;
 };
 
@@ -218,7 +218,7 @@ OverloadKey overloadKey(const Function& syntax, const auto& expand) {
             if (auto type = numberType(name)) return numberName(*type);
             return name;
         });
-        key.parameters.emplace_back(std::move(normalized), parameter.variadic);
+        key.parameters.emplace_back(std::move(normalized), parameter.variadic, parameter.passing);
     }
     return key;
 }
@@ -372,7 +372,7 @@ struct Symbols {
         if (syntax.constant == ConstKind::Value || syntax.property) modifiers |= Readonly;
         indexBinding(syntax.file, syntax.name, kind, fn.result, modifiers);
         for (auto slot = static_cast<std::size_t>(syntax.hasReceiver); slot < syntax.parameters.size(); ++slot)
-            indexBinding(syntax.file, syntax.parameters[slot].name, EditorKind::Parameter, fn.locals[slot].type, Readonly);
+            indexBinding(syntax.file, syntax.parameters[slot].name, EditorKind::Parameter, fn.locals[slot].type, fn.locals[slot].writable ? 0u : Readonly);
     }
 
     struct TypeTrial {
@@ -513,6 +513,7 @@ struct Symbols {
         for (auto slot = static_cast<std::size_t>(syntax.hasReceiver); slot < syntax.parameters.size(); ++slot) {
             const auto& parameter = syntax.parameters[slot];
             if (slot != syntax.hasReceiver) text += ", ";
+            if (parameter.passing != Passing::Value) { text += passingName(parameter.passing); text += ' '; }
             text += format(parameter.type);
             if (parameter.variadic) text += "...";
         }
@@ -533,7 +534,7 @@ struct Symbols {
         RequiredMethod result{{}, {}, type(resultAnnotation(candidate, use, actual.name.span)), actual.isAsync};
         for (std::size_t slot = 1; slot < actual.parameters.size(); ++slot) {
             const auto& parameter = actual.parameters[slot];
-            if (parameter.variadic) return {};
+            if (parameter.variadic || parameter.passing != Passing::Value) return {};
             result.labels.push_back(parameter.name.text);
             result.parameters.push_back(type(parameter.type));
         }
@@ -565,7 +566,7 @@ struct Symbols {
             if (candidate.isAsync || candidate.typeParameters.size() != arguments.size()) continue;
             bool equality = operation == ValueOperation::Equal;
             if (candidate.parameters.size() != (equality ? 2u : 1u)) continue;
-            if (equality && (candidate.parameters[1].variadic || resolve(candidate, candidate.parameters[1].type, arguments) != type)) continue;
+            if (equality && (candidate.parameters[1].variadic || candidate.parameters[1].passing != Passing::Value || resolve(candidate, candidate.parameters[1].type, arguments) != type)) continue;
             const auto& result = resultAnnotation(callable, sources[candidate.file], candidate.name.span);
             if (resolve(candidate, result, arguments) == (equality ? Type::Bool : Type::Int)) return index;
         }
@@ -1239,7 +1240,7 @@ struct Symbols {
         std::vector<Local> locals;
         for (const auto& param : syntax.parameters) {
             auto type = resolve(syntax, param.type, arguments);
-            locals.push_back({param.variadic ? list(type) : type, false});
+            locals.push_back({.type = param.variadic ? list(type) : type, .writable = param.passing == Passing::Ref, .passing = param.passing});
         }
         std::vector<CheckedExpr> expressions(syntax.expressions.size());
         CheckedFunction function{std::move(syntax), result, std::move(locals), std::move(expressions)};
@@ -1434,7 +1435,7 @@ struct Checker {
 
     std::optional<std::size_t> stableLocal(ExprId id, Type::Kind kind) const {
         const auto* name = std::get_if<Identifier>(&fn.syntax.expressions[id].node);
-        if (auto slot = name ? lookupLocal(*name) : std::nullopt; slot && !fn.locals[*slot].writable && !fn.locals[*slot].constant && fn.locals[*slot].type.kind == kind)
+        if (auto slot = name ? lookupLocal(*name) : std::nullopt; slot && !fn.locals[*slot].writable && !fn.locals[*slot].constant && fn.locals[*slot].passing == Passing::Value && fn.locals[*slot].type.kind == kind)
             return slot;
         return {};
     }
@@ -1729,7 +1730,10 @@ struct Checker {
         if (!hint && !discard && !collecting(id) && branchJoin(id)) hint = probeJoin(id);
         resolveReceiver(id);
         const auto& expr = fn.syntax.expressions[id];
-        return fn.expressions[id].type = std::visit([&](const auto& node) { return infer(id, node, hint, discard); }, expr.node);
+        auto type = std::visit([&](const auto& node) { return infer(id, node, hint, discard); }, expr.node);
+        if (const auto* call = std::get_if<Call>(&expr.node); call && fn.expressions[id].callee != Callee::Function)
+            rejectReferenceArguments(*call);
+        return fn.expressions[id].type = type;
     }
 
     ErrorDisplay displayError(Type type, Span site, bool requireMessage, bool useMethod = true) {
@@ -2371,6 +2375,8 @@ struct Checker {
 
     std::size_t captureSlot(std::size_t slot, Span site) {
         for (const auto& worker : workers) if (slot < worker.firstLocal) {
+            if (fn.locals[slot].passing != Passing::Value)
+                throw at(source, site, "LYT0022", "不能在闭包、任务或 defer 中捕获 in/ref 形参；先保存按值快照");
             if (worker.compileTime) throw at(source, site, "LYCT0001", "块内 const 不能引用运行时绑定或 this");
             fn.locals[slot].captured = true;
             auto& captures = fn.expressions[worker.id].captures;
@@ -2388,6 +2394,8 @@ struct Checker {
     std::pair<Type, std::vector<Type>> functionValue(std::size_t index, const Identifier& name, std::optional<Type> expected,
         std::span<const Type> ownerTypes = {}, std::size_t skip = 0) {
         const auto& item = symbols.callables[index];
+        if (std::ranges::any_of(symbols.declaration(item).parameters, [](const auto& param) { return param.passing != Passing::Value; }))
+            throw at(source, name.span, "LYT0022", "有 in/ref 形参的函数或方法必须直接调用，不能用作普通函数值");
         if (item.generic) {
             std::vector<Type> types(ownerTypes.begin(), ownerTypes.end());
             if (types.size() != item.generic->typeParameters.size()) {
@@ -2681,6 +2689,7 @@ struct Checker {
 
     template<class GetName, class GetType>
     bool arguments(ExprId id, const Call& call, std::size_t count, GetName getName, GetType getType) {
+        rejectReferenceArguments(call);
         std::vector<ParameterShape> parameters;
         for (std::size_t slot = 0; slot < count; ++slot) parameters.push_back({getName(slot), false, false});
         auto last = count ? std::optional<Type>(getType(count - 1)) : std::nullopt;
@@ -2746,10 +2755,17 @@ struct Checker {
         order.insert(order.end(), contextual.begin(), contextual.end());
         for (auto index : order) {
             auto selected = plan.explicitSlots[index];
+            const auto& argument = call.arguments[index];
+            const auto& parameter = target.parameters[selected.index + skip];
+            auto expr = argument.value;
+            if (argument.passing != parameter.passing) {
+                auto message = parameter.passing == Passing::Value ? std::string("按值形参不接受 in/ref 实参") :
+                    "形参 " + parameter.name.text + " 的实参必须显式写 " + std::string(passingName(parameter.passing));
+                throw at(source, arguments[index].site, "LYT0022", std::move(message));
+            }
             std::optional<Type> type = getType(selected.index + skip, index, checked);
             if (type && selected.mode == ArgumentMode::Spread) type = symbols.list(*type);
-            auto expr = call.arguments[index].value;
-            auto inferred = inspect(expr, type);
+            auto inferred = argument.passing == Passing::Value ? inspect(expr, type) : referenceArgument(argument);
             if (selected.mode == ArgumentMode::Item && type && *type != Type::Any && inferred.kind == Type::List && module.listElements[inferred.id] == *type) {
                 auto error = mismatch(module, source, arguments[index].site, *type, inferred);
                 error.hint = "若要逐项传入列表，请在实参前写 ...。";
@@ -2760,7 +2776,9 @@ struct Checker {
                 auto site = Span{call.arguments[index].spread->begin, fn.syntax.expressions[expr].span.end};
                 throw at(source, site, "LYT0001", "展开需要 List，实际是 " + typeName(module, inferred));
             }
-            auto value = fitArgument(expr, inferred, type, spread);
+            auto value = inferred;
+            if (argument.passing == Passing::Value) value = fitArgument(expr, inferred, type, spread);
+            else if (type && inferred != *type) throw mismatch(module, source, arguments[index].site, *type, inferred);
             if (const auto& label = call.arguments[index].label)
                 refer(*label, target.file, target.parameters[selected.index + skip].name.span,
                     fields.empty() ? EditorKind::Parameter : EditorKind::Field);
@@ -3093,7 +3111,8 @@ struct Checker {
             auto type = symbols.resolve(target, target.parameters[argument.slot].type, types);
             auto expr = call.arguments[index].value;
             auto spread = call.arguments[index].spread.has_value();
-            fitArgument(expr, fn.expressions[expr].type, spread ? symbols.list(type) : type, spread);
+            if (call.arguments[index].passing == Passing::Value) fitArgument(expr, fn.expressions[expr].type, spread ? symbols.list(type) : type, spread);
+            else if (argument.type != type) throw mismatch(module, source, argument.span, type, argument.type);
         }
         return {std::move(types), exits};
     }
@@ -3633,6 +3652,34 @@ struct Checker {
         loops = previous;
         workers.pop_back();
         return Type::Unit;
+    }
+
+    void rejectReferenceArguments(const Call& call) const {
+        for (const auto& argument : call.arguments) if (argument.passing != Passing::Value)
+            throw at(source, fn.syntax.expressions[argument.value].span, "LYT0022", "in/ref 实参需要直接调用有对应形参的同步函数或方法");
+    }
+
+    bool stablePlace(ExprId id) const {
+        const auto& node = fn.syntax.expressions[id].node;
+        const auto& info = fn.expressions[id];
+        if (info.narrowed || info.constantRef || info.callableType) return false;
+        if (std::holds_alternative<Identifier>(node) || std::holds_alternative<This>(node)) return true;
+        const auto* member = std::get_if<Member>(&node);
+        return member && fn.expressions[member->receiver].type.kind == Type::Record && info.callee == Callee::Function && stablePlace(member->receiver);
+    }
+
+    Type referenceArgument(const Argument& argument) {
+        auto id = argument.value;
+        auto type = inspect(id, {});
+        auto& info = fn.expressions[id];
+        if (info.narrowed && std::holds_alternative<Identifier>(fn.syntax.expressions[id].node)) {
+            info.narrowed.reset();
+            type = info.type = fn.locals[info.target].type;
+        }
+        auto site = fn.syntax.expressions[id].span;
+        if (!stablePlace(id)) throw at(source, site, "LYT0022", "in/ref 需要局部绑定或稳定的字段位置，不能传临时值、计算属性或列表下标");
+        if (argument.passing == Passing::Ref && !writable(id)) throw at(source, site, "LYT0022", "ref 需要可写位置；只读位置可用于 in 形参");
+        return type;
     }
 
     bool writable(ExprId id) const {

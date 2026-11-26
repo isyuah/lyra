@@ -25,7 +25,11 @@ struct Identifier {
     bool moduleMember{};
 };
 struct Attribute { Identifier name; std::optional<Identifier> argument; };
-struct Argument { std::optional<Identifier> label; ExprId value; std::optional<Span> spread{}, trailing{}; };
+enum class Passing { Value, In, Ref };
+constexpr std::string_view passingName(Passing passing) {
+    return passing == Passing::In ? "in" : passing == Passing::Ref ? "ref" : "";
+}
+struct Argument { std::optional<Identifier> label; ExprId value; std::optional<Span> spread{}, trailing{}; Passing passing{}; };
 struct TypeQualifier { Identifier name; std::vector<Identifier> arguments{}; std::optional<ExprId> moduleReceiver{}; };
 struct Call {
     Identifier name;
@@ -110,7 +114,7 @@ struct Expr {
     std::variant<IntegerLiteral, RealLiteral, bool, StringLiteral, BytesLiteral, CharLiteral, DisplayValue, TextTemplate, Identifier, This, Call, Member, QualifiedMember, Unary, Binary, RangeValue, TypeOperation, Block, Binding, PatternBinding, Conditional, While, For, Return, Raise, Attempt, Jump, TaskOp, Blocking, UnsafeBlock, AsyncBlock, Deferred, EmptyOption, Propagate, Match, Select, ListLiteral, Index, Lambda> node;
 };
 
-struct Parameter { Identifier name, type; bool variadic{}; std::optional<ExprId> defaultValue{}; std::vector<Attribute> attributes{}; };
+struct Parameter { Identifier name, type; bool variadic{}; std::optional<ExprId> defaultValue{}; std::vector<Attribute> attributes{}; Passing passing{}; };
 struct AssociatedBinding { Identifier member, type; };
 struct Bound { std::size_t parameter; Identifier trait; std::vector<AssociatedBinding> bindings{}; };
 struct ExtensionProperty { Identifier name, type; std::size_t getter; };

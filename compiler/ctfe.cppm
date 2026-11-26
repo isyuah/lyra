@@ -110,6 +110,8 @@ struct Validator {
         if (state.macro && syntax.file == state.macro->prelude) return;
         if (syntax.pendingExpansion)
             throw at(state.sources[fn.syntax.file], site, "LYM0004", "编译期阶段环：依赖尚未展开或装饰的函数：" + syntax.name.text);
+        if (std::ranges::any_of(syntax.parameters, [](const auto& param) { return param.passing != Passing::Value; }))
+            reject(site, "编译期不能调用含 in/ref 形参的函数：" + syntax.name.text);
         if (syntax.isAsync || syntax.foreignSymbol || syntax.conversion ||
             (!syntax.parameters.empty() && syntax.parameters.back().variadic))
             reject(site, "编译期不能调用异步、外部、隐式转换或变长函数：" + syntax.name.text);

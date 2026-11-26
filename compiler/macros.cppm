@@ -819,7 +819,7 @@ void expandMacros(Module& syntax, std::vector<Source>& sources, const std::map<s
         std::vector<Argument> args;
         for (auto slot = static_cast<std::size_t>(fn.hasReceiver); slot < fn.parameters.size(); ++slot) {
             const auto& param = fn.parameters[slot];
-            args.push_back({{}, add(Identifier{param.name.text, param.name.span}), param.variadic ? std::optional(site) : std::nullopt});
+            args.push_back({{}, add(Identifier{param.name.text, param.name.span}), param.variadic ? std::optional(site) : std::nullopt, {}, param.passing});
         }
         auto value = call(name, std::move(args));
         if (fn.isAsync) value = add(TaskOp{false, site, value});
