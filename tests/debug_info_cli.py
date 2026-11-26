@@ -118,6 +118,30 @@ class DebugInfoTest(unittest.TestCase):
                         field = symbols.split('("payloadNode")', 1)[1].split("DW_TAG_", 1)[0]
                         self.assertRegex(field, r'DW_AT_data_member_location\s+\(0x08\)')
 
+    def test_async_step_symbols_keep_source_and_local_variables(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            package = Path(temporary)
+            source = package / "src" / "main.ly"
+            source.parent.mkdir()
+            source.write_text(
+                "async fn calculate(base: Int): Int {\n"
+                "    val beforeWait = base + 1\n"
+                "    await sleepMs(1)\n"
+                "    val afterWait = beforeWait + 1\n"
+                "    afterWait\n"
+                "}\n"
+                "async fn main(): Unit { print(await calculate(40)) }\n",
+                encoding="utf-8",
+            )
+            built = subprocess.run([COMPILER, "build", package, "--debug-info"], capture_output=True, text=True, timeout=40)
+            self.assertEqual(built.returncode, 0, built.stderr)
+            executable = package / "build" / "debug" / ("app.exe" if WINDOWS else "app")
+            symbols = self.inspect(executable)
+            for fragment in ("lyra.fn.calculate.step", "lyra.fn.main.step", "beforeWait", "afterWait", "main.ly"):
+                self.assertIn(fragment, symbols)
+            executed = subprocess.run([executable], capture_output=True, text=True, timeout=10)
+            self.assertEqual((executed.returncode, executed.stdout), (0, "42\n"))
+
     def test_optional_native_backtrace_keeps_the_logical_throw_location(self):
         with tempfile.TemporaryDirectory() as temporary:
             package = Path(temporary)

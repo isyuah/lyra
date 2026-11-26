@@ -5,6 +5,7 @@ module;
 #include <utility>
 #include <vector>
 #include <llvm/IR/IRBuilder.h>
+#include <llvm/IR/IntrinsicInst.h>
 #include <llvm/IR/InstIterator.h>
 #include <llvm/IR/Module.h>
 #include <llvm/Transforms/Utils/Local.h>
@@ -267,8 +268,13 @@ export void lowerAsync(llvm::Function& factory, llvm::Function& body, llvm::Allo
         slots.push_back(slot);
         fields.push_back(slot->getAllocatedType());
     }
+    std::vector<llvm::DbgVariableIntrinsic*> debugVariables;
+    for (auto& instruction : llvm::instructions(body))
+        if (auto* variable = llvm::dyn_cast<llvm::DbgVariableIntrinsic>(&instruction)) debugVariables.push_back(variable);
     auto* frameType = llvm::StructType::create(context, fields, factory.getName().str() + ".frame");
     auto* step = llvm::Function::Create(llvm::FunctionType::get(noResult, {pointer, pointer}, false), llvm::Function::InternalLinkage, factory.getName() + ".step", module);
+    step->setSubprogram(body.getSubprogram());
+    body.setSubprogram(nullptr);
     builder.SetInsertPoint(llvm::BasicBlock::Create(context, "create.cold", &factory));
     auto* captured = allocate(builder, frameType);
     for (auto& parameter : factory.args()) builder.CreateStore(&parameter, builder.CreateStructGEP(frameType, captured, 1 + parameter.getArgNo()));
@@ -296,10 +302,29 @@ export void lowerAsync(llvm::Function& factory, llvm::Function& body, llvm::Allo
         parameter.replaceAllUsesWith(builder.CreateLoad(parameter.getType(), source));
     }
     unsigned field = 1 + factory.arg_size();
+    std::vector<llvm::AllocaInst*> stackSlots;
+    std::vector<llvm::Value*> frameSlots;
     for (auto* slot : slots) {
-        slot->replaceAllUsesWith(builder.CreateStructGEP(frameType, frame, field++));
+        auto* saved = builder.CreateStructGEP(frameType, frame, field++);
+        bool hasDebugLocation = false;
+        for (auto* variable : debugVariables) for (auto* value : variable->location_ops()) if (value == slot) hasDebugLocation = true;
+        if (hasDebugLocation) {
+            builder.SetInsertPoint(dispatch);
+            auto* local = builder.CreateAlloca(slot->getAllocatedType());
+            for (auto* variable : debugVariables) {
+                bool located = false;
+                for (auto* value : variable->location_ops()) if (value == slot) located = true;
+                if (!located) continue;
+                variable->replaceVariableLocationOp(slot, local);
+                if (llvm::isa<llvm::DbgDeclareInst>(variable)) variable->moveBefore(*dispatch, dispatch->end());
+            }
+            slot->replaceAllUsesWith(local);
+            stackSlots.push_back(local);
+            frameSlots.push_back(saved);
+        } else slot->replaceAllUsesWith(saved);
         slot->eraseFromParent();
     }
+    builder.SetInsertPoint(dispatch);
     builder.CreateCondBr(cancellationRequested(builder, task), cancelled, select);
     builder.SetInsertPoint(cancelled);
     builder.CreateCall(runtime(builder, "lyraTaskFinishCancelled", noResult, {pointer}), {task});
@@ -316,14 +341,26 @@ export void lowerAsync(llvm::Function& factory, llvm::Function& body, llvm::Allo
     for (auto site : sites) {
         auto* wait = site.instruction;
         auto* target = wait->getArgOperand(0);
+        auto* restore = llvm::BasicBlock::Create(context, "await.restore", step, site.resume);
+        Builder reload(context);
+        reload.SetInsertPoint(restore);
+        for (std::size_t index = 0; index < stackSlots.size(); ++index) {
+            auto* type = stackSlots[index]->getAllocatedType();
+            reload.CreateStore(reload.CreateLoad(type, frameSlots[index]), stackSlots[index]);
+        }
+        reload.CreateBr(site.resume);
         site.resume->getTerminator()->eraseFromParent();
         std::vector<llvm::Instruction*> after;
         for (auto* next = wait->getNextNode(); next; next = next->getNextNode()) after.push_back(next);
         for (auto cursor = after.rbegin(); cursor != after.rend(); ++cursor) (*cursor)->moveBefore(&*site.read->getFirstInsertionPt());
         builder.SetInsertPoint(wait);
         auto* index = builder.getInt32(++state);
-        branch->addCase(index, site.resume);
+        branch->addCase(index, restore);
         builder.CreateStore(index, pc);
+        for (std::size_t slot = 0; slot < stackSlots.size(); ++slot) {
+            auto* type = stackSlots[slot]->getAllocatedType();
+            builder.CreateStore(builder.CreateLoad(type, stackSlots[slot]), frameSlots[slot]);
+        }
         auto* errorSlot = wait->getArgOperand(1);
         if (wait->getCalledFunction()->getFnAttribute("lyra.suspension").getValueAsString() == "lyra.awaitOutcome") {
             auto* status = builder.CreateCall(runtime(builder, "lyraTaskAwaitOutcome", integer, {pointer, pointer, pointer}), {task, target, errorSlot});

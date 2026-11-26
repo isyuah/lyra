@@ -606,9 +606,9 @@ struct DebugInfo {
     }
 
     llvm::DISubprogram* function(llvm::Function& native, const Site& site, llvm::ArrayRef<llvm::Metadata*> signature,
-                                llvm::DINode::DIFlags flags = llvm::DINode::FlagZero) {
+                                llvm::DINode::DIFlags flags = llvm::DINode::FlagZero, llvm::StringRef linkage = {}) {
         auto* shape = builder.createSubroutineType(builder.getOrCreateTypeArray(signature));
-        auto name = native.getName();
+        auto name = linkage.empty() ? native.getName() : linkage;
         auto line = static_cast<unsigned>(site.start.line);
         auto properties = llvm::DISubprogram::SPFlagDefinition;
         if (optimized) properties |= llvm::DISubprogram::SPFlagOptimized;
@@ -760,7 +760,7 @@ struct Emitter {
         } else builder.CreateStore(value, locals[slot]);
     }
 
-    void run(std::optional<ExprId> workerId = {}) {
+    void run(std::optional<ExprId> workerId = {}, const llvm::Function* factory = nullptr) {
         worker = workerId;
         builder.SetInsertPoint(label("entry"));
         if (debug) {
@@ -772,7 +772,8 @@ struct Emitter {
             } else if (lambda()) {
                 for (auto slot : fn.expressions[*worker].argumentSlots) signature.push_back(debug->type(fn.locals[slot].type));
             }
-            debugScope = debug->function(*native, site, signature);
+            auto linkage = factory ? (factory->getName() + ".step").str() : std::string{};
+            debugScope = debug->function(*native, site, signature, llvm::DINode::FlagZero, linkage);
             debugLocation(site);
         }
         errorSlot = NativeExceptions{builder}.slot();
@@ -821,7 +822,7 @@ struct Emitter {
         auto* type = debug->type(local.type);
         auto line = static_cast<unsigned>(site.start.line);
         unsigned argument = 0;
-        if (!worker && slot < fn.syntax.parameters.size()) argument = static_cast<unsigned>(slot + 1);
+        if (!asyncBody() && !worker && slot < fn.syntax.parameters.size()) argument = static_cast<unsigned>(slot + 1);
         if (lambda()) {
             const auto& slots = fn.expressions[*worker].argumentSlots;
             if (auto found = std::ranges::find(slots, slot); found != slots.end()) argument = static_cast<unsigned>(found - slots.begin() + 1);
@@ -1067,7 +1068,7 @@ struct Emitter {
             auto* factory = closures.function(llvm::FunctionType::get(call->getReturnType(), call->params().drop_back(2), false), code->getName() + ".factory");
             auto* body = lyra::asyncBody(*factory, layouts.native(builder, layouts.program.taskResults[shape.result.id]));
             Emitter child{fn, source, module, body, functions, layouts, debug};
-            child.run(id);
+            child.run(id, factory);
             lowerAsync(*factory, *body, child.cleanupHead);
             Builder invoke(llvm::BasicBlock::Create(builder.getContext(), "entry", code));
             std::vector<Value> arguments;
@@ -1190,7 +1191,7 @@ struct Emitter {
         auto* factory = llvm::Function::Create(signature, llvm::Function::InternalLinkage, native->getName() + (parallel ? ".parallel" : group ? ".group" : ".async"), module);
         auto* body = lyra::asyncBody(*factory, layouts.native(builder, type));
         Emitter child{fn, source, module, body, functions, layouts, debug};
-        child.run(id);
+        child.run(id, factory);
         lowerAsync(*factory, *body, child.cleanupHead);
         std::vector<Value> cells;
         for (auto slot : captures) cells.push_back(cell(slot));
@@ -2234,7 +2235,7 @@ std::unique_ptr<llvm::Module> lower(const CheckedModule& program, const std::vec
         }
         auto* body = fn.syntax.isAsync ? asyncBody(*factory, layouts.native(builder, fn.result)) : factory;
         Emitter emitter{fn, sources[fn.syntax.file], *module, body, functions, layouts, debug ? &*debug : nullptr};
-        emitter.run();
+        emitter.run({}, fn.syntax.isAsync ? factory : nullptr);
         if (fn.syntax.isAsync) lowerAsync(*factory, *body, emitter.cleanupHead);
     }
     bool commandLine = windows || module->getFunction("lyraIoArgCount") || module->getFunction("lyraIoArgument");
