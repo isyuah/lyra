@@ -665,6 +665,15 @@ int main(int argc, char **argv) {
     lyraTaskStart(origin, selfCancel);
     lyraDomainRun(origin);
     check(lyraTaskState(selfCancel) == LYRA_TASK_CANCELLED, "normal return swallowed a pending cancellation");
+    std::thread observer([&] {
+        auto registration = lyraGcEnterWorker();
+        for (int index = 0; index < 4096; ++index)
+            check(lyraTaskState(selfCancel) == LYRA_TASK_CANCELLED, "observing cleanup changed the cancelled task");
+        lyraGcLeaveWorker(registration);
+    });
+    for (int index = 0; index < 4096; ++index)
+        check(lyraListSize(lyraTaskCancellationFailures(selfCancel)) == 0, "cancelled task gained a cleanup failure");
+    observer.join();
 
     auto *ticket = static_cast<NativeTicket *>(calloc(1, sizeof(NativeTicket)));
     handOff(origin, ticket);

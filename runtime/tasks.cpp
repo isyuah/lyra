@@ -1300,9 +1300,11 @@ const LyraException *lyraTaskException(const LyraTask *task) {
 }
 
 LyraList *lyraTaskCancellationFailures(const LyraTask *task) {
-    TaskLock lock;
-    require(task->state == LYRA_TASK_CANCELLED, "task has not finished cancellation");
-    auto *error = task->error;
-    lock.unlock();
+    const LyraException *error;
+    {
+        TaskLock lock;
+        require(task->state == LYRA_TASK_CANCELLED, "task has not finished cancellation");
+        error = task->error;
+    }
     return error ? lyraExceptionCleanupFailures(error) : lyraListCreate();
 }
