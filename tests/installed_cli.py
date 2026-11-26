@@ -51,9 +51,8 @@ class Installed(unittest.TestCase):
             cache = root / '独立缓存 private'
             environment = {**os.environ, 'LYRA_CACHE': str(cache), 'NO_PROXY': '127.0.0.1', 'no_proxy': '127.0.0.1'}
 
-            def run(*args, good=True, online=False):
-                env = environment if online else isolated_environment(environment)
-                process = subprocess.run(args, cwd=root, env=env, capture_output=True, text=True, timeout=60)
+            def run(*args, good=True):
+                process = subprocess.run(args, cwd=root, env=isolated_environment(environment), capture_output=True, text=True, timeout=60)
                 self.assertEqual(process.returncode == 0, good, f'{args}\n{process.stdout}{process.stderr}')
                 return process
 
@@ -102,7 +101,7 @@ class Installed(unittest.TestCase):
             self.addCleanup(server.shutdown)
             origin = f'http://127.0.0.1:{server.server_port}'
             manifest(app, dependencies={'catalog': {'name': 'release/catalog', 'version': '^0.1.0', 'registry': origin}})
-            run(compiler, 'lock', app, online=True)
+            run(compiler, 'lock', app)
 
             lock = app / 'lyra.lock'
             frozen = lock.read_bytes()

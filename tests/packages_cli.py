@@ -182,14 +182,16 @@ class Packages(unittest.TestCase):
         self.addCleanup(lambda: (httpd.shutdown(), thread.join(), httpd.server_close()))
         base = f'http://127.0.0.1:{httpd.server_port}'
         app = self.pkg('app', 'client', deps={'read': self.dep('acme/read', '^1.0.0', base)})
-        warnings = self.cli('fetch', app)
+        forbidden = {**self.env, 'PATH': ''}
+        warnings = self.cli('fetch', app, env=forbidden)
         self.assertIn('prepare', warnings.stdout + warnings.stderr)
         self.assertFalse(marker.exists())
         pin = self.locked(app, 'acme/read')
         self.assertEqual(pin['source'], base)
         self.assertEqual(httpd.requests, ['/index/acme/read.json', '/artifacts/' + pin['sha256'] + '.lypkg'])
         self.assertEqual((self.cache / 'sources' / pin['sha256'] / 'src/main.ly').read_bytes(), (library / 'src/main.ly').read_bytes())
-        forbidden = {**self.env, 'PATH': ''}
+        self.cli('fetch', app, '--locked', env=forbidden)
+        self.cli('fetch', app, env=forbidden)
         self.cli('fetch', app, '--offline', '--locked', env=forbidden)
         self.assertEqual(len(httpd.requests), 2)
         previous = (app / 'lyra.lock').read_bytes()
@@ -198,9 +200,11 @@ class Packages(unittest.TestCase):
         self.assertIn('acme/read@1.0.0', missing.stderr)
         self.assertIn(pin['sha256'], missing.stderr)
         self.assertEqual(len(httpd.requests), 2)
-        self.cli('fetch', app, '--locked')
-        self.assertEqual(len(httpd.requests), 4)
+        self.cli('fetch', app, '--locked', env=forbidden)
+        self.assertEqual(httpd.requests[2:], ['/artifacts/' + pin['sha256'] + '.lypkg'])
         self.assertEqual((app / 'lyra.lock').read_bytes(), previous)
+        self.cli('lock', app, '--update', env=forbidden)
+        self.assertEqual(httpd.requests[3:], ['/index/acme/read.json'])
         self.assertFalse(marker.exists())
 
     def test_invalid_manifest_or_incomplete_archive_is_rejected(self):

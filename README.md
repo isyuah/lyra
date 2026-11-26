@@ -28,7 +28,7 @@ lyra test hello --locked --offline
 lyra run hello --release --locked --offline
 ```
 
-测试运行项目自带的 `tests/answer.ly`，最后一条命令打印 `42`。搬迁时保留整个 SDK 目录；部署时只需分发 `hello/build/release/app.exe`（Windows）或 `hello/build/release/app`（Linux）。本地项目和已缓存的依赖可离线构建；只有从 HTTP(S) 注册中心下载包时才需要外部 `curl` 命令。Lyra 应用使用 HTTPS 时走 SDK 的静态库，不运行 `curl` 或 `openssl` 命令；客户端默认使用系统信任根（Linux 通常由 `ca-certificates` 提供），也可以显式提供 PEM。[原生工具链 RFC](rfc/native-toolchain.md#打包与复验-sdk)提供打包和验收命令。
+测试运行项目自带的 `tests/answer.ly`，最后一条命令打印 `42`。搬迁时保留整个 SDK 目录；部署时只需分发 `hello/build/release/app.exe`（Windows）或 `hello/build/release/app`（Linux）。本地项目和已缓存的依赖可离线构建；获取远程包由 Lyra SDK 自带下载器完成，不要求宿主 `curl`。Lyra 应用使用 HTTPS 时走 SDK 的静态库，不运行 `curl` 或 `openssl` 命令；客户端默认使用系统信任根（Linux 通常由 `ca-certificates` 提供），也可以显式提供 PEM。[原生工具链 RFC](rfc/native-toolchain.md#打包与复验-sdk)提供打包和验收命令。
 
 ## 从源码构建
 

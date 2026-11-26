@@ -11,7 +11,7 @@
 - Windows 开发机可直接构建 Windows x64 程序。给 Linux 服务器构建时仍用 Linux 或 WSL；当前不做跨目标链接和 sysroot 管理。
 - Linux x86-64 以 Ubuntu 22.04/glibc 2.35 为发布基线。[部署验收](../tests/jammy-smoke.sh)检查 ELF 的动态依赖：整数、对象、标准 I/O 和 JSONL 样例只需系统 `libc.so.6`；SQLite 与 HTTP/SQLite 样例静态链接 SQLite，另用系统 `libm.so.6`。入站 HTTPS 只在使用 `std.httpTls` 时链接静态 OpenSSL，出站 HTTP(S) 额外链接静态 libcurl；部署不需要 TLS 动态库。
 - Windows 使用 x64 C ABI，通过 LLVM-MinGW 的开放启动代码和导入库链接系统 UCRT。GC、libuv、Jansson、llhttp、tomlc17 和 SQLite 静态链接进使用它们的应用。PE 默认只导入系统 DLL；通过外部导入库引入的 DLL 由应用另行部署。
-- 预编译 SDK 本身包含编译器、私有 LLD、链接库和标准库。`new`、`check`、`test`、`build` 和 `run` 不需要另外安装 Clang、LLVM、VS Build Tools、VC Redistributable 或 C 开发库，也不会在首次构建时联网安装工具。仅 `import-c` 显式加载 SDK 自带的 Clang 前端。未缓存的远程包另走现有注册中心下载流程；本地或冻结离线构建不用 `curl`。
+- 预编译 SDK 本身包含编译器、私有 LLD、链接库、注册中心传输程序和标准库。`new`、`check`、`test`、`build` 和 `run` 不需要另外安装 Clang、LLVM、VS Build Tools、VC Redistributable 或 C 开发库，也不会在首次构建时联网安装工具。仅 `import-c` 显式加载 SDK 自带的 Clang 前端。未缓存的远程包经 SDK 自带下载程序获取；本地或冻结离线构建不访问网络。
 - 类 Go `scratch` 的零基础镜像/全静态交付是后续优化目标，不是首期门槛。不得以支持 scratch 为由让第一版构建链无法运行。
 
 程序包大小与常驻内存分别看待。目标是内置 Runtime/GC 但不用虚拟机、单程序易分发且能够在服务器上多进程运行；目前不设与 Go 对比的硬 MB 上限。建立可执行服务后，再以等价负载与 Go 对照报告多进程总内存、二进制大小、启动时间、吞吐和尾延迟。

@@ -674,11 +674,12 @@ struct Store {
         StagingDirectory scratch(cache);
         auto file = scratch.path / "download";
         auto target = pathText(file);
-        auto curl = llvm::sys::findProgramByName("curl");
-        if (!curl) io("下载 " + label + " 需要 curl");
-        llvm::SmallVector<llvm::StringRef> args{*curl, "-q", "--silent", "--fail", "--proto", "=http,https", "--max-time", "30", "--max-filesize", "67108864", "--", url};
+        auto helper = executablePath(sdkRoot() / "libexec/lyra/lyra-registry-download");
+        if (!fs::is_regular_file(helper)) io("Lyra SDK 缺少注册中心下载器：" + pathText(helper));
+        auto program = pathText(helper);
+        llvm::StringRef args[] = {program, url};
         std::optional<llvm::StringRef> redirects[] = {std::nullopt, llvm::StringRef(target), std::nullopt};
-        if (llvm::sys::ExecuteAndWait(*curl, args, std::nullopt, redirects, 35) != 0) io("从只读注册中心下载失败：" + label + " (" + url + ")");
+        if (llvm::sys::ExecuteAndWait(program, args, std::nullopt, redirects, 35) != 0) io("从只读注册中心下载失败：" + label + " (" + url + ")");
         return readFile(file);
     }
 
@@ -798,6 +799,13 @@ std::variant<State, Conflict> solve(Store& store, State state, std::vector<Need>
         return solve(store, std::move(next), std::move(work), attempts);
     };
     if (!req.path.empty()) return tryNode(store.local(req.path));
+    if (pinned && isWeb(req.source) && !store.options.update) {
+        auto version = versionOf(lock->second.version);
+        if (range.accepts(version)) {
+            auto answer = tryNode(store.released(req, {std::move(version), lock->second.hash, false}));
+            if (std::holds_alternative<State>(answer) || store.options.locked) return answer;
+        } else if (store.options.locked) return Conflict{"锁定版本不满足约束：" + joined(need.path)};
+    }
     std::vector<Record> versions;
     bool localIndex = !isWeb(req.source) && fs::is_regular_file(store.registryPath(req.source) / "index" / (req.name + ".json"));
     if (store.options.offline && pinned && !store.options.update && range.accepts(versionOf(lock->second.version)) && !localIndex &&
