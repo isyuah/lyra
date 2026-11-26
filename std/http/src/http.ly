@@ -1,5 +1,6 @@
 import std.io.{writeError}
 import std.json.{JsonCodec}
+import std.sync.{Locked}
 import std.task.{withTimeout}
 
 extern fn lyraHttpListen(host: String, port: Int, options: CPtr): CPtr;
@@ -31,6 +32,8 @@ extern fn lyraHttpRespondAsync(request: CPtr, code: Int, mediaType: String, body
 extern fn lyraHttpRouteMethodValid(method: String): Bool;
 extern fn lyraHttpRoutePattern(route: String): CPtr;
 extern fn lyraHttpRouteValid(route: CPtr): Bool;
+extern fn lyraHttpRouteSameShape(left: CPtr, right: CPtr): Bool;
+extern fn lyraHttpRouteMoreSpecific(left: CPtr, right: CPtr): Bool;
 extern fn lyraHttpRouteMatch(request: CPtr, route: CPtr): Bool;
 extern fn lyraHttpRouteBind(request: CPtr, route: CPtr): Unit;
 extern fn lyraHttpPathIndex(request: CPtr, name: String): Int;
@@ -242,7 +245,11 @@ pub fn listen(port: Int, host: String = "127.0.0.1", options: HttpServerOptions 
     listenerResult(lyraHttpListen(host, port, serverOptions(options)), "listen")
 }
 
-struct Route(val method: String, val pattern: CPtr, val handler: (Request) -> Task<Response>)
+pub struct RouteRegistration(pub val method: String, pub val path: String, pub val handler: (Request) -> Task<Response>, pub val origin: String = "manual registration")
+
+struct Route(val registration: RouteRegistration, val pattern: CPtr)
+
+fn describeRoute(route: RouteRegistration): String { "${route.method} ${route.path} (${route.origin})" }
 
 pub class Shutdown {
     val signal: Channel<Unit> = Channel<Unit>(1)
@@ -251,7 +258,7 @@ pub class Shutdown {
 }
 
 pub class Router {
-    val routes: List<Route> = []
+    val routes: Locked<List<Route>> = Locked([])
 
     pub fn get(pattern: String, handler: (Request) -> Task<Response>): Unit { route("GET", pattern, handler) }
     pub fn post(pattern: String, handler: (Request) -> Task<Response>): Unit { route("POST", pattern, handler) }
@@ -262,16 +269,32 @@ pub class Router {
     pub fn head(pattern: String, handler: (Request) -> Task<Response>): Unit { route("HEAD", pattern, handler) }
 
     pub fn route(method: String, pattern: String, handler: (Request) -> Task<Response>): Unit {
-        if !lyraHttpRouteMethodValid(method) { throw Exception("unsupported HTTP method: " + method) }
-        val compiled = lyraHttpRoutePattern(pattern)
-        if !lyraHttpRouteValid(compiled) { throw Exception("invalid HTTP route: " + pattern) }
-        routes.add(Route(method, compiled, handler))
+        mount([RouteRegistration(method, pattern, handler)])
+    }
+
+    pub fn mount(registrations: List<RouteRegistration>): Unit {
+        if registrations.size == 0 { return }
+        routes.update { previous =>
+            val next: List<Route> = []
+            for route in previous { next.add(route) }
+            for registration in registrations {
+                if !lyraHttpRouteMethodValid(registration.method) { throw Exception("unsupported HTTP method: " + describeRoute(registration)) }
+                val pattern = lyraHttpRoutePattern(registration.path)
+                if !lyraHttpRouteValid(pattern) { throw Exception("invalid HTTP route: " + describeRoute(registration)) }
+                for existing in next {
+                    if existing.registration.method == registration.method && lyraHttpRouteSameShape(pattern, existing.pattern) {
+                        throw Exception("conflicting HTTP routes: " + describeRoute(existing.registration) + " and " + describeRoute(registration))
+                    }
+                }
+                next.add(Route(registration, pattern))
+            }
+            next
+        }
     }
 
     pub async fn serve(listener: Listener, shutdown: Shutdown? = None): Unit {
         lyraHttpKeepListener(listener.handle)
-        val snapshot: List<Route> = []
-        for route in routes { snapshot.add(route) }
+        val snapshot = routes.snapshot()
         taskGroup {
             spawn lyraHttpListenerScopeAsync(listener.handle);
             val slots: List<Task<Unit>> = []
@@ -293,28 +316,36 @@ fn allow(methods: List<String>, method: String): Unit {
 async fn dispatch(request: Request, routes: List<Route>): Response {
     val method = request.method()
     val allowed: List<String> = []
+    var selected: Route? = None
     var headFallback: Route? = None
     for route in routes {
         if lyraHttpRouteMatch(request.handle, route.pattern) {
-            if method == route.method {
-                lyraHttpRouteBind(request.handle, route.pattern)
-                return await route.handler(request)
+            val registered = route.registration.method
+            if method == registered {
+                selected = preferRoute(selected, route)
             }
-            allow(allowed, route.method)
-            if route.method == "GET" {
+            allow(allowed, registered)
+            if registered == "GET" {
                 allow(allowed, "HEAD")
-                if method == "HEAD" && headFallback == None { headFallback = Some(route) }
+                if method == "HEAD" { headFallback = preferRoute(headFallback, route) }
             }
         }
     }
-    if let Some(route) = headFallback {
+    if let Some(route) = (if selected == None { headFallback } else { selected }) {
         lyraHttpRouteBind(request.handle, route.pattern)
-        return await route.handler(request)
+        return await route.registration.handler(request)
     }
     if allowed.size == 0 { return Response.text(404, "not found") }
     var methods = allowed[0]
     for index in 1..<allowed.size { methods += ", " + allowed[index] }
     Response.text(405, "method not allowed").withHeader("Allow", methods)
+}
+
+fn preferRoute(current: Route?, candidate: Route): Route? {
+    if let Some(previous) = current {
+        if !lyraHttpRouteMoreSpecific(candidate.pattern, previous.pattern) { return current }
+    }
+    Some(candidate)
 }
 
 async fn respond(request: Request, routes: List<Route>): Unit {

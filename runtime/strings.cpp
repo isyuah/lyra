@@ -33,18 +33,7 @@ LyraBytesView lyraBytesView(const LyraBytes* value) {
 }
 
 uint8_t lyraUtf8Valid(const char* bytes, std::size_t size) {
-    for (std::size_t index = 0; index < size;) {
-        auto lead = static_cast<unsigned char>(bytes[index++]);
-        if (lead < 0x80) continue;
-        if (lead < 0xc2 || lead > 0xf4) return false;
-        auto count = lead < 0xe0 ? 1u : lead < 0xf0 ? 2u : 3u;
-        if (size - index < count) return false;
-        auto first = static_cast<unsigned char>(bytes[index]);
-        if ((lead == 0xe0 && first < 0xa0) || (lead == 0xed && first >= 0xa0) ||
-            (lead == 0xf0 && first < 0x90) || (lead == 0xf4 && first >= 0x90)) return false;
-        for (unsigned item = 0; item < count; ++item) if ((static_cast<unsigned char>(bytes[index++]) & 0xc0) != 0x80) return false;
-    }
-    return true;
+    return lyra::utf8::valid(bytes, size);
 }
 
 static std::size_t combinedSize(std::size_t first, std::size_t second) {

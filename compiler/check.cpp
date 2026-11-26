@@ -478,7 +478,9 @@ struct Symbols {
 
     std::vector<std::size_t> visibleFunctions(const Source& use, const Identifier& name) const {
         auto found = functions.find(linkedName(name));
-        return found == functions.end() ? std::vector<std::size_t>{} : visibleCandidates(found->second, use, name.exportedOnly);
+        if (found == functions.end()) return {};
+        if (name.internalReference) return found->second;
+        return visibleCandidates(found->second, use, name.exportedOnly);
     }
 
     std::size_t enclosingParameters(const Function& syntax) const {

@@ -50,7 +50,7 @@ async fn createUser(
 }
 ```
 
-按[已定的宏规则](../../rfc/metaprogramming-data.md#f1-macro-inputs)，声明宏可以读取这些形参标记，并生成接收 `Request` 的同模块适配函数。适配器做与手写版相同的检查，成功才调用 `await createUser(teamId, tags, input)`；原函数仍能直接测试，若有 `@trace` 也照常生效。怎样显式挂载路由是 HTTP 库的 API 设计；不靠导入副作用，不把 `path`、`query`、`body` 做成语言关键字。需要流式 body 或自定义校验时仍可直接用 `Request`。
+按[宏规则](../../rfc/metaprogramming-data.md#f1-macro-inputs)，声明宏可以读取这些形参标记，并生成接收 `Request` 的同模块适配函数。适配器做与手写版相同的检查，成功才调用 `await createUser(teamId, tags, input)`；原函数仍能直接测试，若有 `@trace` 也照常生效。应用启动时调用 `#mountRoutes(router)`，一次挂载包内标注的路由，不靠导入副作用。需要流式 body 或自定义校验时仍可直接用 `Request`。
 
 用同一请求检验短写：缺少必需路径段是路由未匹配；已匹配但整数越界、必填 body 缺失或 JSON 无法解码，回 400 且不调用业务函数。若再声明 `[query] notify: Bool = false`，仅缺失才用默认值；建议非法布尔值或同一标量传了两次都回 400，而 `tags` 明确是列表，允许重复。路径绑定名不在模板中，或声明了两个 `[body]`，建议在形参处报错，而不是等第一个请求才发现。
 

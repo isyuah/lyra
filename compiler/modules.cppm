@@ -781,7 +781,7 @@ struct MacroImports {
                 throw at(source, name.span, "LYM0001", "derive 是声明宏；请写 #derive(Json)");
             throw fail();
         }
-        return {std::move(bundled), package.id, name.text, false};
+        return {std::move(bundled), package.id, name.text, false, true};
     }
 };
 
@@ -1392,7 +1392,8 @@ Compilation loadProgram(const PackageGraph& graph, const std::string& entry, con
     std::map<std::string, MacroPackage> macroPackages;
     auto macroCache = overlays ? fs::path{} : cacheOverride();
     if (!overlays) macroCache = (macroCache.empty() ? graph.workspace / ".lyra" / "cache" : macroCache) / "compiler" / "macros";
-    for (const auto& [module, space] : spaces) macroPackages.emplace(module, MacroPackage{space.package->root, space.package->macroInputs, overlays, macroCache});
+    for (const auto& [module, space] : spaces)
+        macroPackages.emplace(module, MacroPackage{space.package->root, space.package->id, space.package->macroInputs, overlays, macroCache});
     for (std::size_t file = 0; file < program.sources.size(); ++file) {
         auto& source = program.sources[file];
         if (expressionMacros[file]) {
@@ -1405,15 +1406,17 @@ Compilation loadProgram(const PackageGraph& graph, const std::string& entry, con
             else parseFile(program.syntax, source, file);
         } else appendCachedSyntax(program.syntax, fileSyntax[file], file);
     }
+    HttpRoutes routes;
     if (!program.syntax.expansions.empty()) {
         auto declarations = spaces;
         Linker linker{program.sources, declarations, prefixes, root, program.references, false};
         linker.collect(program.syntax, false);
         DeclarationTypes types(linker, program.syntax);
         expandMacros(program.syntax, program.sources, macroPackages, program.macroInputs,
-            [&](auto file, const auto& annotation, auto parameters) { return types.resolve(file, annotation, parameters); }, types.fingerprint(), environment);
+            [&](auto file, const auto& annotation, auto parameters) { return types.resolve(file, annotation, parameters); }, types.fingerprint(), environment, routes);
+        assembleHttpRoutes(program.syntax, program.sources, macroPackages, routes);
         loadBundled(program.syntax, false);
-    }
+    } else if (hasExpressions) assembleHttpRoutes(program.syntax, program.sources, macroPackages, routes);
     if (program.incompleteDeclaration) return program;
     Linker{program.sources, spaces, prefixes, root, program.references, overlays != nullptr}.rewrite(program.syntax, nullptr, diagnostics);
     return program;

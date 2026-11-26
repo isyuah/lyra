@@ -12,9 +12,11 @@ module;
 #include <span>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <utility>
 #include <variant>
 #include <vector>
+#include <lyra/http_route.hpp>
 #include <llvm/ADT/StringExtras.h>
 #include <llvm/Support/FileSystem.h>
 #include <llvm/Support/FormatVariadic.h>
@@ -29,18 +31,22 @@ import lyra.platform;
 export namespace lyra {
 inline constexpr std::size_t macroInputByteLimit = 1024 * 1024;
 using MacroFiles = std::map<std::string, std::map<std::string, std::filesystem::path>>;
-struct MacroPackage { std::filesystem::path root; MacroFiles inputs; const SourceOverlay* overlays{}; std::filesystem::path cache{}; };
+struct MacroPackage { std::filesystem::path root; std::string id; MacroFiles inputs; const SourceOverlay* overlays{}; std::filesystem::path cache{}; };
 enum class MacroKind { Declaration, Expression, Decorator };
-struct MacroOrigin { std::filesystem::path path; std::string package, name; bool imported; };
+struct MacroOrigin { std::filesystem::path path; std::string package, name; bool imported; bool bundled{}; };
 using MacroResolver = std::function<MacroOrigin(const Source&, const Identifier&, MacroKind)>;
 using MacroLinker = std::function<std::string(const MacroOrigin&, Module&, std::vector<Source>&)>;
 struct MacroEnvironment { const MacroResolver& resolve; const MacroLinker& link; };
 struct MacroType { std::string kind, name, module; std::vector<MacroType> arguments{}; };
 using MacroTypeResolver = std::function<MacroType(std::size_t, const Identifier&, std::span<const Identifier>)>;
+struct HttpRouteContribution { std::string factory; std::vector<std::string> dependencies; };
+using HttpRoutes = std::map<std::string, std::vector<HttpRouteContribution>>;
 void expandMacros(Module& syntax, std::vector<Source>& sources, const std::map<std::string, MacroPackage>& packages,
-    std::vector<std::filesystem::path>& inputs, const MacroTypeResolver& resolveType, std::string_view typeEnvironment, const MacroEnvironment& environment);
+    std::vector<std::filesystem::path>& inputs, const MacroTypeResolver& resolveType, std::string_view typeEnvironment, const MacroEnvironment& environment,
+    HttpRoutes& routes);
 void expandExpressions(Source& source, std::size_t file, const MacroPackage& package, std::vector<std::filesystem::path>& inputs,
     const MacroEnvironment& environment, bool recovering = false);
+void assembleHttpRoutes(Module& syntax, const std::vector<Source>& sources, const std::map<std::string, MacroPackage>& packages, const HttpRoutes& routes);
 std::string_view macroDirectory(MacroKind kind);
 }
 
@@ -112,6 +118,7 @@ fn macroQuote(text: String): String { "" }
 fn macroContains(text: String, fragment: String): Bool { false }
 fn macroInput(key: String): String { "" }
 fn macroFail(message: String): String { "" }
+fn httpRouteOrigin(): String { "" }
 )";
 
 struct ExpandedMacro {
@@ -358,6 +365,7 @@ struct MacroContext {
     std::optional<SyntaxRef> target{}, body{};
     std::map<std::string, std::string> inputs{};
     std::set<std::size_t> defaultFields{};
+    std::string routeOrigin{};
 
     [[noreturn]] void error(const std::string& message) const { throw at(use, expansion.name.span, "LYM0002", message); }
     MacroValue input(const std::string& key) {
@@ -408,6 +416,10 @@ struct MacroContext {
         if (name == "macroQuote") return quote(std::get<std::string>(args.front()));
         if (name == "macroContains") return std::get<std::string>(args[0]).find(std::get<std::string>(args[1])) != std::string::npos;
         if (name == "macroInput") return input(std::get<std::string>(args.front()));
+        if (name == "httpRouteOrigin") {
+            if (routeOrigin.empty()) error("此查询仅适用于标准 HTTP 路由宏");
+            return routeOrigin;
+        }
         if (name == "$quoteText") return arena.add({SyntaxForm::Code, "quote", std::get<std::string>(args[0])});
         if (name == "$quoteJoin") return arena.add({SyntaxForm::Join, "quote", {}, {std::get<SyntaxRef>(args[0]), std::get<SyntaxRef>(args[1])}});
         if (name == "argumentCount" || name == "syntaxArgument" || name == "argumentString") {
@@ -518,12 +530,12 @@ struct MacroDeclaration {
     const Enumeration* enumeration{};
     const MacroTypeResolver* resolveType{};
     std::string_view typeEnvironment{};
+    std::string routeOrigin{};
 };
 
 ExpandedMacro expand(const Source& source, const Expansion& prefix, const MacroPackage& package, const Identifier* target,
     const std::vector<Field>& fields, const std::string& kind, std::vector<fs::path>& files, const MacroEnvironment& environment,
-    const ExpressionExpansion* expression = nullptr, MacroDeclaration declaration = {}) {
-    auto origin = environment.resolve(source, prefix.name, expression ? MacroKind::Expression : prefix.decorator ? MacroKind::Decorator : MacroKind::Declaration);
+    const MacroOrigin& origin, const ExpressionExpansion* expression = nullptr, MacroDeclaration declaration = {}) {
     const auto& path = origin.path;
     auto overlaid = package.overlays && package.overlays->contains(path);
     if ((overlaid ? package.overlays->at(path).size() : fs::file_size(path)) > byteLimit) throw at(source, prefix.name.span, "LYM0002", "宏实现超过大小限制");
@@ -555,6 +567,12 @@ ExpandedMacro expand(const Source& source, const Expansion& prefix, const MacroP
     if (origin.imported && !parsed.functions[*entry].isPublic)
         throw at(source, prefix.name.span, "LYM0001", "导入的宏或装饰器入口必须是 pub fn：" + origin.name);
     auto definition = std::make_shared<const Site>(code[1].site(parsed.functions[*entry].name.span));
+    if (!declaration.routeOrigin.empty()) {
+        auto support = path.parent_path().parent_path() / "support/httpRoute.ly";
+        files.push_back(support);
+        code.push_back(loadSource(support, "$macroImplementation", package.overlays));
+        parseFile(parsed, code.back(), code.size() - 1, nullptr, true);
+    }
     auto dependencies = environment.link(origin, parsed, code);
     std::optional<InputSnapshot> prepared;
     fs::path cache;
@@ -567,8 +585,9 @@ ExpandedMacro expand(const Source& source, const Expansion& prefix, const MacroP
             return std::move(*hit);
         }
     }
-    auto [function, aggregate, enumeration, resolveType, typeEnvironment] = declaration;
+    auto [function, aggregate, enumeration, resolveType, typeEnvironment, routeOrigin] = declaration;
     MacroContext machine{source, prefix, fields, kind, package, files, expression, {source, prefix.name.span}, prepared ? &*prepared : nullptr, resolveType};
+    machine.routeOrigin = std::move(routeOrigin);
     auto generics = [&](const auto& item) { machine.parameters = item.typeParameters; machine.bounds = item.bounds; };
     if (function) generics(*function);
     if (aggregate) generics(*aggregate);
@@ -650,7 +669,8 @@ void expandExpressions(Source& source, std::size_t file, const MacroPackage& pac
             auto argument = call.argumentsSpan;
             auto wrapper = call.arguments.empty() ? call.name.span : call.argumentsSpan;
             Expansion prefix{file, call.name, Identifier{std::string(original.substr(argument.begin, argument.end - argument.begin)), argument}, false, ExpansionTarget::Function, 0};
-            auto generated = expand(source, prefix, package, nullptr, {}, "expression", inputs, environment, &call);
+            auto origin = environment.resolve(source, call.name, MacroKind::Expression);
+            auto generated = expand(source, prefix, package, nullptr, {}, "expression", inputs, environment, origin, &call);
             std::string skeleton;
             for (const auto& piece : generated.output.code) skeleton += piece.copied && piece.text.contains('#') ? "0" : piece.text;
             auto output = sourceText(fromUtf8(pathText(source.path) + "(#" + call.name.text + ")"), std::move(skeleton), source.moduleId);
@@ -677,11 +697,18 @@ void expandExpressions(Source& source, std::size_t file, const MacroPackage& pac
 }
 
 void expandMacros(Module& syntax, std::vector<Source>& sources, const std::map<std::string, MacroPackage>& packages,
-    std::vector<fs::path>& inputs, const MacroTypeResolver& resolveType, std::string_view typeEnvironment, const MacroEnvironment& environment) {
+    std::vector<fs::path>& inputs, const MacroTypeResolver& resolveType, std::string_view typeEnvironment, const MacroEnvironment& environment,
+    HttpRoutes& routes) {
     auto prefixes = std::exchange(syntax.expansions, {});
     std::vector<std::pair<Expansion, ExpandedMacro>> decorators;
+    using RouteShape = std::vector<std::pair<bool, std::string>>;
+    std::map<std::tuple<std::string, std::string, RouteShape>, Site> routeShapes;
+    std::size_t routeNumber = 0;
     for (const auto& prefix : prefixes) {
         const auto& source = sources[prefix.file];
+        const auto& package = packages.at(source.moduleId);
+        auto origin = environment.resolve(source, prefix.name, prefix.decorator ? MacroKind::Decorator : MacroKind::Declaration);
+        auto routeMethod = origin.bundled && !prefix.decorator ? origin.name == "get" ? "GET" : origin.name == "post" ? "POST" : "" : "";
         std::vector<Field> fields;
         MacroDeclaration declaration{.resolveType = &resolveType, .typeEnvironment = typeEnvironment};
         if (prefix.kind == ExpansionTarget::Aggregate) {
@@ -699,7 +726,45 @@ void expandMacros(Module& syntax, std::vector<Source>& sources, const std::map<s
         }
         const auto& name = declaration.enumeration ? declaration.enumeration->name : declaration.aggregate ? declaration.aggregate->name : declaration.function->name;
         auto kind = declaration.enumeration ? "enum" : declaration.aggregate ? declaration.aggregate->reference ? "class" : "struct" : "fn";
-        auto generated = expand(source, prefix, packages.at(source.moduleId), &name, fields, kind, inputs, environment, nullptr, declaration);
+        std::optional<HttpRouteContribution> route;
+        if (*routeMethod) {
+            auto relative = source.path.lexically_relative(package.root / "src");
+            if (relative.empty() || *relative.begin() == "..")
+                throw at(source, prefix.name.span, "LYM0002", "标准 HTTP 路由声明必须位于当前包的 src 模块内");
+            const auto* handler = declaration.function;
+            if (!handler || !handler->isAsync || handler->owner || handler->extensionGroup || handler->foreignSymbol ||
+                !handler->typeParameters.empty() || !prefix.exports.empty())
+                throw at(source, prefix.name.span, "LYM0002", "HTTP 路由必须标记顶层、非泛型的 async fn；适配器是私有生成物");
+            RouteShape shape;
+            std::set<std::string> pathParameters;
+            if (!prefix.argument || !httpRoute::parse(prefix.argument->text, [&](bool parameter, std::string_view value) {
+                if (parameter) pathParameters.emplace(value);
+                shape.emplace_back(parameter, parameter ? "" : std::string(value));
+            })) throw at(source, prefix.argument ? prefix.argument->span : prefix.name.span, "LYM0002", "HTTP 路由需要合法的路径模式");
+            auto site = source.userSite(prefix.argument->span);
+            auto original = routeShapes.try_emplace({package.id, routeMethod, std::move(shape)}, site);
+            if (!original.second) {
+                auto error = at(source, prefix.argument->span, "LYM0002", "HTTP 路由与同一方法的另一路由具有相同形状：" + prefix.argument->text);
+                error.notes.push_back({original.first->second, "同形状的 HTTP 路由声明在这里"});
+                throw error;
+            }
+            route.emplace();
+            route->factory = "$httpRoute$" + std::to_string(routeNumber++);
+            for (const auto& param : handler->parameters) {
+                if (param.passing != Passing::Value || param.variadic || param.defaultValue || param.attributes.size() != 1)
+                    throw at(source, param.name.span, "LYM0002", "HTTP 形参必须按值传递并标注一个来源：[path]、[query]、[body] 或 [inject]");
+                const auto& attribute = param.attributes.front();
+                if (attribute.name.text == "inject") {
+                    if (attribute.argument) throw at(source, attribute.name.span, "LYM0002", "[inject] 不接收参数；使用同名依赖字段");
+                    route->dependencies.push_back(param.name.text);
+                } else if (attribute.name.text == "path") {
+                    if (attribute.argument || !pathParameters.contains(param.name.text))
+                        throw at(source, attribute.name.span, "LYM0002", "[path] 需要路由模式中的同名路径段：" + param.name.text);
+                }
+            }
+            declaration.routeOrigin = pathText(relative) + ':' + std::to_string(site.start.line) + ':' + std::to_string(site.start.column);
+        }
+        auto generated = expand(source, prefix, package, &name, fields, kind, inputs, environment, origin, nullptr, declaration);
         if (prefix.decorator) {
             if (prefix.kind == ExpansionTarget::Aggregate) {
                 if (generated.output.hooks) throw at(source, prefix.name.span, "LYM0002", "类型装饰器应生成辅助声明，不能返回 syntaxAround");
@@ -716,6 +781,21 @@ void expandMacros(Module& syntax, std::vector<Source>& sources, const std::map<s
         sources.push_back(std::move(output));
         auto start = syntax.functions.size(), records = syntax.aggregates.size(), imports = syntax.imports.size(), traits = syntax.traits.size(), enums = syntax.enums.size(), extensions = syntax.extensions.size(), exceptions = syntax.exceptions.size(), aliases = syntax.aliases.size();
         parseFile(syntax, sources.back(), sources.size() - 1);
+        if (route) {
+            auto adapter = route->factory + "$adapter";
+            for (auto index = start; index < syntax.functions.size(); ++index) {
+                auto& function = syntax.functions[index];
+                if (function.name.text == "__lyraHttpAdapter") { function.name.text = adapter; continue; }
+                if (function.name.text != "__lyraHttpFactory") continue;
+                function.name.text = route->factory;
+                for (auto& expression : function.expressions) {
+                    if (auto* call = std::get_if<Call>(&expression.node); call && !call->receiver && !call->function && call->name.text == "__lyraHttpAdapter")
+                        call->name.text = adapter;
+                }
+            }
+            route->factory = sources.back().moduleId + "::" + route->factory;
+            routes[package.id].push_back(std::move(*route));
+        }
         std::map<std::string, std::size_t> defaultReferences;
         for (auto field : generated.defaultFields) defaultReferences.emplace(fieldDefaultReference(field), fields[field].defaultValue->function);
         if (!defaultReferences.empty()) for (auto index = start; index < syntax.functions.size(); ++index) {
@@ -842,6 +922,52 @@ void expandMacros(Module& syntax, std::vector<Source>& sources, const std::map<s
         statements.push_back({value, {}});
         fn.body = block(std::move(statements));
         storeExpansion(generated);
+    }
+}
+
+void assembleHttpRoutes(Module& syntax, const std::vector<Source>& sources, const std::map<std::string, MacroPackage>& packages, const HttpRoutes& routes) {
+    auto definition = pathText(sdkRoot() / "share/lyra/std/meta/expressions/mountRoutes.ly");
+    for (auto& function : syntax.functions) {
+        const auto& source = sources[function.file];
+        auto count = function.expressions.size();
+        for (ExprId index = 0; index < count; ++index) {
+            const auto* call = std::get_if<Call>(&function.expressions[index].node);
+            if (!call || call->name.text != "__lyraHttpMountRoutes" || call->receiver || call->function || source.authoredSpan(call->name.span)) continue;
+            const auto* macro = source.macroSite(call->name.span);
+            if (!macro || macro->file != definition) continue;
+            auto site = call->name.span;
+            auto arguments = call->arguments;
+            auto entries = routes.find(packages.at(source.moduleId).id);
+            auto add = [&](auto node) {
+                function.expressions.push_back({site, std::move(node)});
+                return function.expressions.size() - 1;
+            };
+            std::vector<Statement> statements;
+            auto local = [&](std::string name, ExprId value) {
+                Identifier binding{std::move(name), site};
+                statements.push_back({add(Binding{binding, false, {}, value}), site});
+                return binding;
+            };
+            auto router = local("$httpRouter", arguments[0].value);
+            std::optional<Identifier> dependencies;
+            if (arguments.size() > 1) dependencies = local("$httpDeps", arguments[1].value);
+            std::vector<ExprId> registrations;
+            if (entries != routes.end()) for (const auto& entry : entries->second) {
+                std::vector<Argument> injected;
+                for (const auto& name : entry.dependencies) {
+                    if (!dependencies) throw at(source, site, "LYM0002", "#mountRoutes 缺少依赖参数，路由需要 [inject] " + name);
+                    auto field = add(Member{add(*dependencies), {name, site}});
+                    auto value = local("$httpInjected" + std::to_string(statements.size()), field);
+                    injected.push_back({{}, add(value), {}, {}, Passing::In});
+                }
+                auto spelling = entry.factory.substr(entry.factory.rfind("::") + 2);
+                Identifier factory{.text = std::move(spelling), .span = site, .linked = entry.factory, .internalReference = true};
+                registrations.push_back(add(Call{std::move(factory), std::move(injected)}));
+            }
+            auto values = add(ListLiteral{std::move(registrations)});
+            statements.push_back({add(Call{{"mount", site}, {{{}, values}}, add(router)}), {}});
+            function.expressions[index].node = Block{std::move(statements), site};
+        }
     }
 }
 }

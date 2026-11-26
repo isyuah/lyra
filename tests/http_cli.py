@@ -554,6 +554,108 @@ async fn main(): Unit {
                             self.assertEqual(output.remaining(), b"handler released\nstopped\n")
                     self.assertEqual(connection.execute("SELECT value FROM writes").fetchall(), [(1,)])
 
+    def test_mount_annotated_routes_across_modules_and_commit_atomically(self):
+        package = self.root / "mounted"
+        (package / "src/handlers").mkdir(parents=True)
+        (package / "other/src").mkdir(parents=True)
+        (package / "lyra.json5").write_text('''{name:'test/mounted',version:'1.0.0',
+            dependencies:{other:{name:'test/other',version:'^1.0.0',path:'other'}}}''')
+        (package / "other/lyra.json5").write_text("{name:'test/other',version:'1.0.0',kind:'lib'}")
+        (package / "other/src/routes.ly").write_text('''
+import std.http.{Router, Response}
+#get("/other")
+async fn privateRoute(): Response { Response.text(200, "other") }
+pub fn install(router: Router): Unit { #mountRoutes(router) }
+''')
+        (package / "src/handlers/routes.ly").write_text('''
+import std.http.{Response}
+type Prefix = String
+#get("/teams/{name}")
+async fn team([path] name: String, [inject] prefix: Prefix): Response { Response.text(200, prefix + name) }
+#get("/{section}/current")
+async fn generic([path] section: String): Response { Response.text(200, section) }
+#post("/teams/{name}")
+async fn post([path] name: String): Response { Response.text(201, name) }
+''')
+        (package / "src/main.ly").write_text(HTTP_HELPERS + '''
+import std.http.{Router, Request}
+import std.sync.{AtomicInt}
+import std.text.{StringOps}
+import other
+
+struct AppDeps(val prefix: String)
+fn deps(calls: AtomicInt): AppDeps { val _ = calls.fetchAdd(1); AppDeps("team:") }
+fn pick(router: Router, calls: AtomicInt): Router { val _ = calls.fetchAdd(1); router }
+
+#get("/atomic")
+async fn atomic(): Response { Response.text(200, "atomic") }
+
+async fn main(): Unit {
+    val router = Router()
+    val calls = AtomicInt()
+    #mountRoutes(pick(router, calls), deps(calls))
+    #assert(calls.load() == 2)
+    router.get("/teams/current", async (request: Request) => { Response.text(200, "literal") })
+    val conflict = Router()
+    conflict.get("/teams/{other}", async (request: Request) => { Response.text(200, "manual") })
+    val rejected = try { #mountRoutes(conflict, AppDeps("unused")); false } catch error: Exception {
+        #assert(error.message.startsWith("conflicting HTTP routes: GET /teams/{other} (manual registration) and GET /teams/{name}"))
+        true
+    }
+    #assert(rejected)
+    conflict.get("/atomic", async (request: Request) => { Response.text(200, "still available") })
+    other.install(conflict)
+    val listener = requireHttp(listen(0))
+    print(listener.port())
+    await router.serve(listener)
+}
+''', encoding="utf-8")
+        for profile, app in self.profiles(package):
+            with self.subTest(profile=profile), server(app) as (port, _, _):
+                for method, target, status, body in [
+                    ("GET", "/teams/alpha", 200, b"team:alpha"),
+                    ("GET", "/teams/current", 200, b"literal"),
+                    ("GET", "/otherSection/current", 200, b"otherSection"),
+                    ("POST", "/teams/current", 201, b"current"),
+                    ("GET", "/other", 404, b"not found"),
+                ]:
+                    self.assertEqual(exchange(port, method, target)[::2], (status, body))
+
+    def test_annotated_route_rejects_duplicate_shapes_and_inexact_dependencies(self):
+        package = self.root / "route-errors"
+        (package / "src").mkdir(parents=True)
+        (package / "lyra.json5").write_text("{name:'test/route-errors',version:'1.0.0'}")
+        source = package / "src/main.ly"
+        first = package / "src/first.ly"
+        first.write_text('''import std.http.{Response}
+#get("/caf%C3%A9/{one}")
+async fn first(): Response { Response.text(200, "first") }
+''', encoding="utf-8")
+        source.write_text('''import std.http.{Response}
+#get("/caf\u00e9/{other}")
+async fn second(): Response { Response.text(200, "second") }
+fn main(): Unit {}
+''', encoding="utf-8")
+
+        def diagnostics():
+            result = subprocess.run([COMPILER, 'check', package, '--diagnostics=json'], capture_output=True, timeout=20)
+            self.assertNotEqual(result.returncode, 0)
+            return json.loads(result.stderr)
+
+        duplicate, = diagnostics()
+        self.assertEqual(duplicate["code"], "LYM0002")
+        self.assertEqual(Path(duplicate["file"]), source)
+        self.assertEqual(Path(duplicate["notes"][0]["file"]), first)
+        source.write_text('''import std.http.{Response, Router}
+struct AppDeps(val count: Int8)
+#get("/x")
+async fn count([inject] count: Int): Response { Response.text(200, count.toString()) }
+fn main(): Unit { #mountRoutes(Router(), AppDeps(1)) }
+''', encoding="utf-8")
+        mismatch, = diagnostics()
+        self.assertEqual((mismatch["code"], mismatch["expected"], mismatch["actual"]), ("LYT0001", "Int", "Int8"))
+        self.assertEqual(Path(mismatch["file"]), source)
+
     def test_bind_methods_head_and_allow(self):
         package = self.root / "methods"
         (package / "src").mkdir(parents=True)

@@ -4,6 +4,8 @@
 
 #include "net.h"
 
+#include <lyra/http_route.hpp>
+
 #include <algorithm>
 #include <array>
 #include <cerrno>
@@ -16,12 +18,13 @@
 #include <string_view>
 
 using namespace lyraRuntime::http;
+using lyra::httpRoute::maxTarget;
+using lyra::httpRoute::split;
 
 namespace {
 
 struct PathInteger { int64_t value; bool valid; };
 constexpr std::size_t maxBody = 128 * 1024;
-constexpr std::size_t maxTarget = 8192;
 constexpr std::size_t maxHeaderBytes = 32 * 1024;
 
 int append(RequestParser& parsed, std::string& storage, std::size_t limit, const char* data, std::size_t size) {
@@ -92,65 +95,25 @@ bool validFieldName(std::string_view value) {
     });
 }
 
-int hex(char ch) {
-    if (ch >= '0' && ch <= '9') return ch - '0';
-    if (ch >= 'A' && ch <= 'F') return ch - 'A' + 10;
-    if (ch >= 'a' && ch <= 'f') return ch - 'a' + 10;
-    return -1;
-}
-
 const void* decoded(std::string_view input, bool query) {
-    char bytes[maxTarget];
-    std::size_t size = 0;
-    for (std::size_t index = 0; index < input.size(); ++index) {
-        auto ch = input[index];
-        if (ch == '%') {
-            if (input.size() - index < 3) return nullptr;
-            auto high = hex(input[index + 1]), low = hex(input[index + 2]);
-            if (high < 0 || low < 0) return nullptr;
-            ch = static_cast<char>(high * 16 + low);
-            index += 2;
-        } else if (query && ch == '+') ch = ' ';
-        bytes[size++] = ch;
-    }
-    return lyraUtf8Valid(bytes, size) ? lyraStringFromBytes(bytes, size) : nullptr;
+    std::array<char, maxTarget> bytes;
+    auto value = lyra::httpRoute::decode(input, query, bytes);
+    return value ? lyraStringFromBytes(value->data(), value->size()) : nullptr;
 }
 
-bool identifier(std::string_view input) {
-    auto letter = [](char ch) { return ch == '_' || (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z'); };
-    if (input.empty() || !letter(input.front())) return false;
+Segment* pathSegments(std::string_view path) {
+    auto count = static_cast<std::size_t>(std::ranges::count(path, '/')) + 1;
+    return static_cast<Segment*>(lyraGcAlloc(count * sizeof(Segment)));
+}
+
+bool pathParts(RoutePattern& result, std::string_view input) {
+    if (!input.starts_with('/')) return false;
     input.remove_prefix(1);
-    return std::ranges::all_of(input, [&](char ch) { return letter(ch) || (ch >= '0' && ch <= '9'); });
-}
-
-template<class Visit>
-bool split(std::string_view input, char separator, Visit visit) {
-    for (;;) {
-        auto end = input.find(separator);
-        if (!visit(first(input, end))) return false;
-        if (end == input.npos) return true;
-        input.remove_prefix(end + 1);
-    }
-}
-
-bool pathParts(RoutePattern& result, std::string_view input, bool pattern) {
-    if (!input.starts_with('/') || input.find('#') != input.npos) return false;
-    input.remove_prefix(1);
-    auto capacity = static_cast<std::size_t>(std::ranges::count(input, '/')) + 1;
-    result.segments = static_cast<Segment*>(lyraGcAlloc(capacity * sizeof(Segment)));
+    result.segments = pathSegments(input);
     return split(input, '/', [&](std::string_view part) {
-        bool parameter = pattern && part.find_first_of("{}") != part.npos;
-        if (parameter) {
-            if (!part.starts_with('{') || !part.ends_with('}')) return false;
-            part.remove_prefix(1);
-            part.remove_suffix(1);
-            if (!identifier(part)) return false;
-            for (std::size_t index = 0; index < result.count; ++index)
-                if (result.segments[index].parameter && text(result.segments[index].text) == part) return false;
-        }
         auto value = decoded(part, false);
         if (!value) return false;
-        result.segments[result.count++] = {value, parameter};
+        result.segments[result.count++] = {value, false};
         return true;
     });
 }
@@ -158,7 +121,7 @@ bool pathParts(RoutePattern& result, std::string_view input, bool pattern) {
 bool parseTarget(Request* request, std::string_view target) {
     if (target.find('#') != target.npos) return false;
     auto question = target.find('?');
-    if (!pathParts(request->path, first(target, question), false)) return false;
+    if (!pathParts(request->path, first(target, question))) return false;
     if (question == target.npos) return true;
     target.remove_prefix(question + 1);
     auto capacity = static_cast<std::size_t>(std::ranges::count(target, '&')) + 1;
@@ -316,11 +279,33 @@ extern "C" uint8_t lyraHttpRouteMethodValid(const void* method) {
 extern "C" RoutePattern* lyraHttpRoutePattern(const void* route) {
     auto* pattern = ::new (lyraGcAlloc(sizeof(RoutePattern))) RoutePattern{};
     auto source = text(route);
-    if (source.size() > maxTarget || source.find('?') != source.npos || !pathParts(*pattern, source, true)) pattern->count = 0;
+    if (source.size() > maxTarget || !source.starts_with('/')) return pattern;
+    pattern->segments = pathSegments(source.substr(1));
+    if (!lyra::httpRoute::parse(source, [&](bool parameter, std::string_view part) {
+        pattern->segments[pattern->count++] = {lyraStringFromBytes(part.data(), part.size()), parameter};
+    })) pattern->count = 0;
     return pattern;
 }
 
 extern "C" uint8_t lyraHttpRouteValid(const RoutePattern* route) { return route->count > 0; }
+
+extern "C" uint8_t lyraHttpRouteSameShape(const RoutePattern* left, const RoutePattern* right) {
+    if (left->count != right->count) return false;
+    for (std::size_t index = 0; index < left->count; ++index) {
+        const auto& before = left->segments[index];
+        const auto& after = right->segments[index];
+        if (before.parameter != after.parameter || (!before.parameter && !lyraStringEqual(before.text, after.text))) return false;
+    }
+    return true;
+}
+
+extern "C" uint8_t lyraHttpRouteMoreSpecific(const RoutePattern* left, const RoutePattern* right) {
+    for (std::size_t index = 0; index < left->count; ++index) {
+        auto parameter = left->segments[index].parameter;
+        if (parameter != right->segments[index].parameter) return !parameter;
+    }
+    return false;
+}
 
 extern "C" uint8_t lyraHttpRouteMatch(const Request* req, const RoutePattern* route) {
     if (req->path.count != route->count) return false;

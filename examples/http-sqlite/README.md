@@ -24,7 +24,7 @@ lyra build examples/http-sqlite --locked --offline -o "$work/users-app"
 
 ## 路由与请求适配
 
-手写 `GET /users/{id}` 处理器和宏生成的 `POST` 适配器共用 `Router` 注册表。`#post` 读取 `[path]`、`[query("tag")]` 和 `[body("newUserCodec")]` 参数标记，在同模块生成 `createUserRoute(router)` 挂载函数。body 解码使用从库导入的 `JsonCodec<NewUser>` 工厂；宏不扫描运行时类型。`@trace` 仍装饰业务函数，所以有效请求调用时会记录，参数校验失败和 JSON 解码失败不会调用它。
+`#mountRoutes(router, AppDeps(path, logger))` 一次挂载当前包中 `#get` 和 `#post` 标注的路由。`GET /users/{id}` 用 `[inject]` 拿到数据库路径和 logger；`POST /teams/{teamId}` 用 `[path]`、`[query("tag")]` 和 `[body("newUserCodec")]` 解码请求。生成的适配器与手写 `POST /users` 共用注册表。body 解码使用从库导入的 `JsonCodec<NewUser>` 工厂；`@trace` 仍装饰业务函数，参数校验或 JSON 解码失败时不调用它。
 
 `Router.serve(listener)` 使用 `listen` / `listenTls` 的 `HttpServerOptions` 限制并发。连接由独立的 libuv Reactor 推进，先读完请求再占用 handler 槽。断线只取消所属 handler；SQLite 工作安全收尾后，请求作用域才结束。即使阻塞池只有一个 Worker，网络读写和 TLS 握手也能继续推进。
 

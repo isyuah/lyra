@@ -63,7 +63,7 @@ async fn createUser([path] teamId: Int, [query("tag")] tags: List<String>, [body
 }
 ```
 
-声明宏可读取形参名 `tags`、显式类型 `List<String>` 和标记 `query("tag")`，并生成同模块适配函数。标准库 `#post` 据此生成 `request.queryAll("tag")`，再调用原 `createUser`，因此仍经过 `@trace`；生成的 `createUserRoute(router)` 与手写 handler 一样调用 `Router.post` 注册。运行时只解析本次请求的值，不需要反射查找形参或扫描路由。完整示例见[HTTP/SQLite 服务](../examples/http-sqlite/README.md)。
+声明宏可读取形参名 `tags`、显式类型 `List<String>` 和标记 `query("tag")`，并生成同模块私有适配函数。标准库 `#post` 据此生成 `request.queryAll("tag")`，再调用原 `createUser`，因此仍经过 `@trace`。启动时由 `#mountRoutes(router)`（有 `[inject]` 参数时带依赖值）一次汇总当前包的 `src/` 路由，与手写 handler 使用同一个 Router 注册表。根据包解析结果确定收集范围，不扫描依赖包或运行时类型；依赖包可以公开自己的挂载函数。完整示例见[HTTP/SQLite 服务](../examples/http-sqlite/README.md)。
 
 声明前缀位置的 `[path]` 是标记；表达式 `val ids = [id]` 中的 `[id]` 是列表，`users[id]` 是索引。局部声明可以附加哪些标记及其跨行规则仍开放。
 

@@ -39,8 +39,10 @@ val handled = await server.withAccepted<Unit>(5000, async (request: Request) => 
 - `target()` 保留原始目标和查询串。`path(name)` 读取路由模板绑定，`pathInt(name)` 区分未绑定、合法整数、非法或越界的值。`queryAll(name)` 保留重复值及出现顺序。
 - `header(name): Result<String?, HttpError>` 读取单值头，缺失为 `Ok(None)`、重复为 `DuplicateHeader`；`headers(name)` 按出现顺序取全部。字段名按 ASCII 大小写无关匹配。`cookie(name)` 查找 `Cookie` 内同名项，Cookie 名区分大小写。请求头必须是 UTF-8；分块传输的尾部字段不作为请求头。
 - `body()` 提供原始 `Bytes`，保留 NUL 和非 UTF-8 字节；`text()` 显式验证 UTF-8，`json(codec)` 在此基础上按 codec 解码，两者都返回 `Result`。用 `Response.text`、`Response.bytes` 或 `Response.json` 创建响应；`withHeader` 返回带新增字段的独立响应。响应写出时验证字段名和值，`Content-Length`、`Content-Type`、`Connection` 等由库维护。
-- `Router.get/post/put/delete/patch/options/head(pattern, handler)` 都调用 `route(method, pattern, handler)`；方法区分大小写。路由按注册顺序匹配，同一路径上的显式 `HEAD` 优先于回退到 `GET`，两者都只发送响应头。存在路径但方法不符返回 `405` 和 `Allow`，不存在路径返回 `404`。
-- `#post("/teams/{id}")` 生成调用 `router.route("POST", ...)` 的 `<function>Route(router)`，由应用显式挂载。`[path]` 支持 `Int`/`String`；`[query("tag")]` 的 `String` 要求恰好一次，`List<String>` 保留所有值；`[body]` 使用同模块可见的 `jsonCodec<Type>()`，也可写 `[body("codecFactory")]` 指定零参数工厂。参数不符或 JSON 解码失败回 `400`，不调用业务函数。
+- `Router.get/post/put/delete/patch/options/head(pattern, handler)` 都调用 `route(method, pattern, handler)`；方法区分大小写。同方法的路径同时匹配时，从左往右比较，在首个有区别的段优先选字面量。显式 `HEAD` 优先于回退到 `GET`，两者都只发送响应头。存在路径但方法不符返回 `405` 和 `Allow`，不存在路径返回 `404`。
+- `#get` 和 `#post` 在 `src/` 下的 `async fn` 上生成私有适配器。启动时写一次 `#mountRoutes(router, AppDeps(...))`，按当前包收集各模块的路由；没有依赖时写 `#mountRoutes(router)`。`[inject]` 读取依赖对象的同名可见成员，类型必须精确匹配（透明别名按原类型匹配）；路由器和依赖表达式各求值一次。依赖包需显式调用自己公开的挂载函数，导入不会自动注册。
+- `[path]` 支持 `Int`/`String`；`[query("tag")]` 的 `String` 要求恰好一次，`List<String>` 保留所有值；`[body]` 使用同模块可见的 `jsonCodec<Type>()`，也可写 `[body("codecFactory")]` 指定零参数工厂。参数不符或 JSON 解码失败回 `400`，不调用业务函数。
+- 相同方法、相同路径形状是冲突，参数改名不影响形状。两个宏路由冲突时，编译诊断定位到两个声明。与手写注册冲突时，`Router.mount` 报告两条路由，并且整批都不提交；已经启动的 `serve` 继续用其启动时的路由快照。
 
 一条连接一个 HTTP 请求。请求线、头部和传输体总计最多 256 KiB，目标最多 8 KiB，头部最多 100 项且字段名和值合计最多 32 KiB，解码后正文最多 128 KiB。超限回 `413`，格式或头部文本非法回 `400`。HTTP/1.1 必须有且只有一个有效的 `Host`；携带 `Expect` 的请求在读完首部后直接回 `417`，不等待正文。`request.respond(response)` 写出响应后关闭连接，返回 `Result<Unit, HttpError>`；响应在写前验证失败可改正后重试。TLS 见 [`std.httpTls`](../httpTls/README.md)，暂不支持 HTTP/2 和长连接。
 

@@ -170,10 +170,10 @@ async function checkTyping() {
         await waitForDiagnostics(source, listing => listing.some(item => item.code === 'LYN0001'), 'missing unfinished-name diagnostic');
         const keywords = (await complete(start.translate(0, 1))).items.map(item => item.label);
         assert.ok(keywords.includes('val') && keywords.includes('var'), `keyword completions: ${JSON.stringify(keywords)}`);
-        const generated = document.getText().indexOf('createUserRoute(router)');
-        assert.notEqual(generated, -1);
-        const routeItems = (await complete(document.positionAt(generated + 'createUserRo'.length))).items;
-        assert.ok(routeItems.some(item => item.label === 'createUserRoute' && item.kind === vscode.CompletionItemKind.Function),
+        const mount = document.getText().indexOf('#mountRoutes(router,');
+        assert.notEqual(mount, -1);
+        const routeItems = (await complete(document.positionAt(mount + '#mountRo'.length))).items;
+        assert.ok(routeItems.some(item => item.label === 'mountRoutes' && item.kind === vscode.CompletionItemKind.Function),
             `route completions: ${JSON.stringify(routeItems.map(item => [item.label, item.kind]))}`);
         expectTypes(await inlays());
         const known = await vscode.commands.executeCommand('vscode.executeDefinitionProvider', source, use);

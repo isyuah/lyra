@@ -51,4 +51,4 @@ fn trace(target: String, argument: String): Syntax {
 
 `macroQuote` 将文本编码成 Lyra 字符串字面量，`macroContains` 做大小写敏感、按字节的子串匹配，`macroInput` 读取授权快照。宏展开受嵌套深度、语法节点、源码字节数及求值步数限制；耗尽预算会给出宏诊断。表达式宏必须生成一个表达式，最多嵌套 32 层。**不要把 `syntaxCode` 的文本与 `syntaxArgument` 的源码节点混为一谈**：前者是宏作者构造的代码，后者保留实参作用域与错误映射。
 
-示例 HTTP 的 `#post` 读取 `[path]`、`[query("tag")]`、`[body]` 标记，生成同模块的适配器与显式路由注册函数；调用业务 handler 仍经过其装饰器。标记本身不引入运行时反射，手写 handler 也使用相同的 Router API。
+示例 HTTP 的 `#get` / `#post` 读取 `[path]`、`[query("tag")]`、`[body]` 和 `[inject]` 标记，生成私有适配器。`#mountRoutes` 由编译器按包汇总，并把适配器一次交给 Router。调用业务 handler 仍经过装饰器；运行时不扫描声明。

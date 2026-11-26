@@ -319,13 +319,13 @@ class LanguageServer(unittest.TestCase):
             items = {item['id']: {entry['label']: entry['kind'] for entry in item['result']['items']}
                      for item in output if item.get('id', 0) > 1}
             self.assertEqual(items[2], {})
-            self.assertEqual(items[3], {'derive': 3, 'post': 3})
+            self.assertEqual(items[3], {'derive': 3, 'get': 3, 'post': 3})
             self.assertEqual(items[4], {'trace': 23})
             self.assertEqual(items[5], {'String': 7})
             self.assertEqual(items[6]['print'], 3)
             self.assertNotIn('import', items[7])
             self.assertNotIn('implicit', items[7])
-            self.assertEqual(items[8], {'assert': 3})
+            self.assertEqual(items[8], {'assert': 3, 'mountRoutes': 3})
             self.assertEqual(items[9], {})
 
     def test_generated_completion_preserves_only_necessary_escapes(self):

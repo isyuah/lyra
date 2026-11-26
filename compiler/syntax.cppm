@@ -23,6 +23,7 @@ struct Identifier {
     std::optional<SourceAnchor> renameTarget{};
     std::optional<SourceAnchor> moduleAlias{};
     bool moduleMember{};
+    bool internalReference{};
 };
 struct Attribute { Identifier name; std::optional<Identifier> argument; };
 enum class Passing { Value, In, Ref };
