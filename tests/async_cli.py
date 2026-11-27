@@ -97,6 +97,35 @@ async fn main(): Unit {
     try { Channel<Int>(-1); } catch reason: Exception { print("invalid capacity") }
 }''', 'cold\ntrue\n81\ntrue\nsend on closed channel\ninvalid capacity\n')
 
+    def test_channel_try_operations_distinguish_temporarily_unavailable_and_closed(self):
+        self.run_source('''
+fn label(result: ChannelReceiveResult<Int?>): String {
+    match result {
+        ChannelReceiveResult.Received(None) => "received empty element",
+        ChannelReceiveResult.Received(Some(value)) => value.toString(),
+        ChannelReceiveResult.Empty => "empty channel",
+        ChannelReceiveResult.Closed => "closed channel",
+    }
+}
+
+fn main(): Unit {
+    val channel = Channel<Int?>(2)
+    print(label(channel.tryReceive()))
+    print(channel.trySend(None) == ChannelSendResult.Sent)
+    print(channel.trySend(Some(42)) == ChannelSendResult.Sent)
+    print(channel.trySend(Some(9)) == ChannelSendResult.Full)
+    channel.close()
+    print(channel.trySend(Some(9)) == ChannelSendResult.Closed)
+    print(label(channel.tryReceive()))
+    print(label(channel.tryReceive()))
+    print(label(channel.tryReceive()))
+
+    val direct = Channel<Int>(0)
+    print(direct.trySend(0) == ChannelSendResult.Full)
+    print(direct.tryReceive() == ChannelReceiveResult.Empty)
+}
+''', 'empty channel\ntrue\ntrue\ntrue\ntrue\nreceived empty element\n42\nclosed channel\ntrue\ntrue\n')
+
     def test_for_await_uses_the_protocol_and_does_not_close_channels(self):
         self.run_source('''class Cursor(var index: Int) {
     async fn next(): Int? {

@@ -1,5 +1,6 @@
 module;
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <cmath>
 #include <cstdio>
@@ -194,7 +195,9 @@ struct Validator {
                     info.callee == Callee::Size || info.callee == Callee::FreezeList || info.callee == Callee::SumPresent ||
                     info.callee == Callee::SumAbsent || info.callee == Callee::SumUnwrap || info.callee == Callee::CarryFailure ||
                     info.callee == Callee::ListGetOrNone || info.callee == Callee::ListFirstOrNone || info.callee == Callee::ListLastOrNone ||
-                    info.callee == Callee::BytesSlice) return;
+                    info.callee == Callee::BytesSlice || info.callee == Callee::NumericAbs || info.callee == Callee::NumericMin ||
+                    info.callee == Callee::NumericMax || info.callee == Callee::NumericClamp || info.callee == Callee::IsFinite ||
+                    info.callee == Callee::IsNaN || info.callee == Callee::IsInfinite) return;
                 if (info.callee == Callee::ValueEqual || info.callee == Callee::ValueHash) {
                     auto operation = info.callee == Callee::ValueEqual ? ValueOperation::Equal : ValueOperation::Hash;
                     validateValueOperation(fn.expressions[*node.receiver].type, operation, node.name.span);
@@ -765,6 +768,38 @@ struct Evaluation {
         return result.getZExtValue();
     }
 
+    EvalValue numericMember(const CheckedFunction& fn, Span site, Type type, Callee operation, const ConstScalar& input,
+                            std::span<const ConstScalar> args) const {
+        if (type.kind == Type::Real) {
+            auto value = real(type, std::get<double>(input));
+            if (operation == Callee::IsFinite) return value.isFinite();
+            if (operation == Callee::IsNaN) return value.isNaN();
+            if (operation == Callee::IsInfinite) return value.isInfinity();
+            if (operation == Callee::NumericAbs) return asDouble(llvm::abs(value), type);
+            auto other = real(type, std::get<double>(args[0]));
+            if (operation == Callee::NumericMin) return asDouble(llvm::minimum(value, other), type);
+            if (operation == Callee::NumericMax) return asDouble(llvm::maximum(value, other), type);
+            auto upper = real(type, std::get<double>(args[1]));
+            auto order = other.compare(upper);
+            if (order == llvm::APFloat::cmpGreaterThan || order == llvm::APFloat::cmpUnordered)
+                error(sources, fn, site, "LYCT0003", "invalid clamp bounds");
+            return asDouble(llvm::minimum(llvm::maximum(value, other), upper), type);
+        }
+        auto value = integer(type, input);
+        bool signedValue = type.kind == Type::Int;
+        if (operation == Callee::NumericAbs) {
+            if (signedValue && value.isMinSignedValue()) error(sources, fn, site, "LYCT0003", numberName(type) + " overflow (abs)");
+            return signedValue && value.isNegative() ? (-value).getZExtValue() : value.getZExtValue();
+        }
+        auto less = [&](const llvm::APInt& left, const llvm::APInt& right) { return signedValue ? left.slt(right) : left.ult(right); };
+        auto other = integer(type, args[0]);
+        if (operation == Callee::NumericMin) return (less(value, other) ? value : other).getZExtValue();
+        if (operation == Callee::NumericMax) return (less(value, other) ? other : value).getZExtValue();
+        auto upper = integer(type, args[1]);
+        if (less(upper, other)) error(sources, fn, site, "LYCT0003", "invalid clamp bounds");
+        return (less(value, other) ? other : less(upper, value) ? upper : value).getZExtValue();
+    }
+
     std::optional<std::uint64_t> convertInteger(Type from, Type option, const ConstScalar& value) const {
         auto target = module.sumTypes[option.id].success;
         auto width = numberWidth(target);
@@ -1078,6 +1113,13 @@ struct Evaluation {
                 if (item.receiver && info.callee != Callee::Function && info.callee != Callee::Variant) {
                     auto receiver = sub(*item.receiver);
                     auto from = fn.expressions[*item.receiver].type;
+                    if (info.callee == Callee::NumericAbs || info.callee == Callee::NumericMin || info.callee == Callee::NumericMax ||
+                        info.callee == Callee::NumericClamp || info.callee == Callee::IsFinite || info.callee == Callee::IsNaN || info.callee == Callee::IsInfinite) {
+                        std::array<ConstScalar, 2> args;
+                        for (std::size_t index = 0; index < item.arguments.size(); ++index)
+                            args[info.argumentSlots[index]] = scalarValue(sub(item.arguments[index].value), fn, site);
+                        return numericMember(fn, item.name.span, from, info.callee, scalarValue(receiver, fn, site), args);
+                    }
                     if (info.callee == Callee::SumPresent || info.callee == Callee::SumAbsent || info.callee == Callee::SumUnwrap ||
                         info.callee == Callee::CarryFailure) {
                         const auto& sum = composite(receiver);

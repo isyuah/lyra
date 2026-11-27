@@ -576,6 +576,20 @@ void checkChannels(LyraDomain* origin, LyraDomain* other) {
     lyraDomainRun(origin);
     choice = static_cast<LyraSelection*>(lyraTaskOutcome(conflicting));
     check(choice->arm == 0 && !choice->outcome, "close ignored source order when both arms became ready");
+
+    auto* direct = lyraChannelCreate(0, &closedType, &error);
+    auto* receiver = start(origin, receive(direct));
+    lyraDomainRun(origin);
+    check(lyraChannelTrySend(direct, &initial) == LYRA_CHANNEL_READY, "trySend did not match a waiting receiver");
+    lyraDomainRun(origin);
+    check(lyraTaskOutcome(receiver) == &initial, "trySend lost the rendezvous value");
+    sender = start(other, lyraChannelSend(direct, &last));
+    lyraDomainRun(other);
+    void* received = nullptr;
+    check(lyraChannelTryReceive(direct, &received) == LYRA_CHANNEL_READY && received == &last,
+        "tryReceive did not match a waiting sender");
+    lyraDomainRun(other);
+    check(lyraTaskState(sender) == LYRA_TASK_COMPLETED, "tryReceive did not resume the sender");
 }
 
 void checkSingleWorker() {

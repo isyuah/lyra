@@ -315,6 +315,8 @@ fn main(): Unit {
             ('val value: UInt64 = 0', 'value - 1', 'UInt overflow'),
             ('val value: Int8 = -128', 'value / -1', 'Int8 overflow'),
             ('val value: Int16 = -32768', '-value', 'Int16 overflow'),
+            ('val value: Int8 = -128', 'value.abs()', 'Int8 overflow (abs)'),
+            ('val value: Int = 4', 'value.clamp(2, 1)', 'invalid clamp bounds'),
             ('val value: UInt16 = 2', 'value % 0', 'UInt16 division by zero'),
         ):
             self.main.write_text(f'fn main(): Unit {{ {declaration}; print({operation}) }}', encoding='utf-8')
@@ -327,6 +329,33 @@ fn main(): Unit {
                     self.assertNotEqual(run.returncode, 0)
                     self.assertIn(fragment, run.stderr)
                     self.assertIn('main.ly:1:', run.stderr)
+
+    def test_numeric_members_preserve_width_check_bounds_and_handle_non_finite_values(self):
+        self.main.write_text('''
+const clamped: Int8 = (-11).toInt8Checked().unwrap().abs().clamp(3, 8)
+const finite: Bool = !(1.0 / 0.0).isFinite() && (0.0 / 0.0).isNaN()
+const signedZero: Bool = (1.0 / 0.0.min(-0.0)) < 0.0
+
+fn main(): Unit {
+    val small: Int16 = -7
+    val unsigned: UInt64 = 18446744073709551615
+    val fraction: Float32 = -2.5
+    val nan = 0.0 / 0.0
+    val infinity = 1.0 / 0.0
+    print(clamped)
+    print(finite && signedZero)
+    print(small.abs().min(3).max(-5))
+    print(unsigned.abs().clamp(0, 10))
+    print(fraction.abs().clamp(upper: 2.0, lower: 1.0))
+    print(fraction.isFinite() && !nan.isFinite() && nan.min(1.0).isNaN() && infinity.isInfinite() && !nan.isInfinite())
+    print((1.0 / 0.0.min(-0.0)) < 0.0 && (1.0 / (-0.0).max(0.0)) > 0.0)
+    print(try { val _ = infinity.clamp(nan, infinity); false } catch problem: ArithmeticError { true })
+}
+''', encoding='utf-8')
+        for flags in ([], ['--release']):
+            with self.subTest(flags=flags):
+                result = self.cli('run', *flags)
+                self.assertEqual((result.returncode, result.stdout, result.stderr), (0, '8\ntrue\n3\n10\n2\ntrue\ntrue\ntrue\n', ''))
 
     def test_numeric_c_abi(self):
         source = self.package / 'numbers.c'

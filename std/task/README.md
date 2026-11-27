@@ -42,3 +42,5 @@ async fn main(): Unit {
 ```
 
 `Channel<T>(0)` 直接交接，正容量提供缓冲和背压。关闭后 `for await` 先读完缓冲再结束；退出循环不会自动关闭通道。`await select { val item = jobs.receive() => item, sleepMs(250) => None }` 在收发和计时器间择一提交，同时就绪时按源码顺序。`awaitOutcome` 把目标的成功、失败与取消分别表示为值；等待者自己的取消仍会触发清理。详细契约见[异步 RFC](../../rfc/async-execution.md)。
+
+不用等待时可同步调用 `jobs.trySend(value)` 或 `jobs.tryReceive()`。发送返回 `ChannelSendResult.Sent`、`.Full`（缓冲满或零容量时暂无等待者）、`.Closed`；接收返回 `ChannelReceiveResult.Received(value)`、`.Empty`（暂时没有消息）、`.Closed`（已关闭且缓冲排空）。这两个操作使用同一个队列，也能与已等待的异步收发直接交接。

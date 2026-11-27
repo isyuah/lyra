@@ -102,9 +102,9 @@ lyra fmt [--check] <文件.ly>...
 - `fn draw<T: Render & Identifiable>(item: T)` 可调用两个 trait 要求的方法。业务类型有可见、签名匹配的方法即可，不用声明 `implements`。trait 可声明 `type Item`，实现类型提供 `pub type Item = String`，泛型中用 `T.Item` 引用。见[泛型与接口](rfc/generics-and-interfaces.md)。
 - [函数值与闭包](compiler/closures.md)可以返回、传参或存入集合。`apply(4) { it * 2 }` 把尾块传给末尾的固定函数形参；闭包共享被捕获的绑定，跨 `await`、GC 后仍可调用，`return` 和 `?` 只退出最近的 lambda。
 - [列表和变长参数](compiler/collections.md)支持 `[1, 2]`、按下标读写、`.size`、`.add(value)`、参数默认值、`fn sum(values: Int...)`。`sum(...ids)` 展开元素；函数收到本次调用自己的列表，更改槽位不影响调用方。如果元素是对象引用，引用的仍是同一个对象。
-- `Option<T>`（简写 `T?`）和 `Result<T,E>` 支持嵌套和 `?` 提前返回。可用 [`enum`](rfc/language-core.md#封闭枚举与匹配) 定义带位置或命名载荷的分支。`match` 要求穷尽，支持嵌套解构、`A(x) | B(x)`、整数范围和 `Some(x) if x > 0 => x` 形式的守卫。
+- `Option<T>`（简写 `T?`）和 `Result<T,E>` 支持嵌套和 `?` 提前返回；`map`、`flatMap`、`orElse`、`unwrap`、`expect` 和[显式互转](std/core/README.md)无需导入。可用 [`enum`](rfc/language-core.md#封闭枚举与匹配) 定义带位置或命名载荷的分支。`match` 要求穷尽，支持嵌套解构、`A(x) | B(x)`、整数范围和 `Some(x) if x > 0 => x` 形式的守卫。
 - `for value in values` 遍历列表，或通过可见的同步 `iterator()`、`next(): Option<T>` 遍历自定义集合。整数循环可写 `for i in 0..<count`（不包含 `count`）或 `for i in 1..count`（包含 `count`）。`user?.name ?? "unknown"` 只在接收者有值时访问成员，只在结果为空时计算兜底表达式。
-- [std.collections](std/collections/README.md) 提供 `map`、`filter`、`fold`、`any`、`find`、稳定 `sortedBy`、`sum` 和 `distinct`；导入扩展组 `ListOps` 后可链式调用。`HashMap` 和 `HashSet` 可直接用 `for` 遍历进入循环时的快照。
+- [std.collections](std/collections/README.md) 为 `List` 和 `FrozenList` 提供 `map`、`filter`、`fold`、`any`、`find`、稳定 `sortedBy`；导入对应的 `ListOps` / `FrozenListOps` 可链式调用。两种列表都内置 `getOrNone`、`firstOrNone` 和 `lastOrNone`。`HashMap` 和 `HashSet` 可直接用 `for` 遍历进入循环时的快照。
 - 在源或目标类型的定义模块写 `implicit (user: User): Response { ... }`，即可在需要 `Response` 时直接传入或返回 `User`。不同具体错误之间的 `?` 也用同一种直接转换；不额外声明 trait、不串接转换，两端各有一条可见转换时在使用处报歧义。
 - `async fn` 调用返回冷 `Task<T>`；`await` 在需要时启动，重复等待复用结果，`spawn` 在同一串行域调度。`await blocking { ... }` 把同步工作交给有界线程池，不占住当前域；跨挂起点存活的局部值由 GC 扫描。`async fn main(): Result<Unit,String>` 的 `Err` 打印到 stderr 并以非零状态退出。见[异步实现说明](runtime/managed-tasks.md)。
 - `taskGroup` 等待孩子收尾；`parallel` 和 [`parallelFor`](std/collections/README.md#有界并行遍历) 可在多个 OS 线程上同时执行。用 `LYRA_PARALLEL_WORKERS` 调整 CPU Worker 数，复合共享更新可用 [std.sync](std/sync/README.md) 的锁和原子操作。

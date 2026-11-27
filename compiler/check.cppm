@@ -43,10 +43,11 @@ struct ConstantUse { enum Kind { Global, Block, Uninstantiated }; Kind kind; std
 struct Local { Type type; bool writable; std::optional<ExprId> worker{}; bool captured{}; std::optional<Span> declaration{}; std::string name{}; std::optional<ConstantUse> constant{}; bool parameter{}; Passing passing{}; };
 enum class Callee { Function, Constructor, Variant, Print, Collect, Sum, SumPresent, SumAbsent, SumUnwrap, CarryFailure, RemapFailure,
     ListAdd, ListSlice, ListRemoveAt, ListGetOrNone, ListFirstOrNone, ListLastOrNone, FreezeList, BytesSlice, BytesHex, BytesFromHex, TaskCancel, TaskCancelled,
-    TaskCheckCancellation, AwaitOutcome, Exception, Indirect, ToReal, ToIntegerChecked, ToString, ToBytes, DecodeUtf8, Dynamic,
+    TaskCheckCancellation, AwaitOutcome, Exception, Indirect, ToReal, ToIntegerChecked, NumericAbs, NumericMin, NumericMax, NumericClamp,
+    IsFinite, IsNaN, IsInfinite, ToString, ToBytes, DecodeUtf8, Dynamic,
     BusinessError, ErrorSuppress, FailureInfo, LocalKey, LocalGet, WithLocal, ExtensionProperty, BoundMethod, ReflectTypeName,
     ReflectFieldCount, ReflectFieldName, ReflectField, Size, ValueEqual, ValueHash, ChannelCreate, ChannelIterator, ChannelSend,
-    ChannelReceive, ChannelClose, Sleep, PtrAllocate, PtrNull, PtrIsNull, PtrFree, PtrOffset, PtrRead, PtrWrite, CallbackRegister,
+    ChannelReceive, ChannelTrySend, ChannelTryReceive, ChannelClose, Sleep, PtrAllocate, PtrNull, PtrIsNull, PtrFree, PtrOffset, PtrRead, PtrWrite, CallbackRegister,
     CallbackContext, CallbackFunction, CallbackClose, CallbackTakeError };
 enum class ValueOperation { Equal, Hash };
 struct PatternSlot { std::size_t local; };

@@ -77,6 +77,8 @@ Task Context 绑定逻辑 Task，不绑定 Worker 线程。**在首次激活时*
 
 `close(): Unit` 同步关闭通道，可重复调用。关闭时唤醒等待中的发送者并抛出 `ChannelClosed`；关闭后的发送同样失败。接收先按 FIFO 耗尽缓冲，再返回 `None`。`Channel<T?>` 内的空元素返回 `Some(None)`，不会与结束信号混淆。
 
+`trySend(value): ChannelSendResult` 同步尝试一次，返回 `Sent`、`Full` 或 `Closed`。`tryReceive(): ChannelReceiveResult<T>` 返回 `Received(value)`、`Empty` 或 `Closed`；已关闭但缓冲未排空时仍返回 `Received`。两者与等待式操作使用同一个 FIFO 队列，可与已经在等待的对端直接交接；暂时不能完成时立即返回，不启动 Task、不为本次调用登记等待。空载荷仍是 `Received(None)`。
+
 `for await item in source { ... }` 只能写在异步执行体。先对 `source` 求值一次，再调用一次同步 `asyncIterator()` 取得游标；每轮调用并等待 `next(): Task<Option<T>>`，也可由 `async fn next(): Option<T>` 提供。`Some(value)` 进入循环，只有外层 `None` 结束；迭代中的失败和取消按普通 `await` 传播。`Channel<T>` 的游标就是通道自身，`next()` 等同接收；`break` 结束循环，不关闭通道，也不预取下一项。
 
 ```lyra

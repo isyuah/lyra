@@ -658,9 +658,9 @@ struct DeclarationTypes {
                 return make(dynamic ? "dyn" : standard ? "standard" : "named", lookup.substr(separator + 2), std::move(module));
             }
             if (!dynamic) {
-                if (form.arguments.empty() && (numberType(name) || builtinException(name) || name == "Bool" || name == "String" || name == "Char" || name == "Bytes" || name == "Unit" || name == "Never" || name == "CPtr" || name == "CCallback" || name == "Any" || name == "Error"))
+                if (form.arguments.empty() && (numberType(name) || builtinException(name) || name == "Bool" || name == "String" || name == "Char" || name == "Bytes" || name == "Unit" || name == "Never" || name == "CPtr" || name == "CCallback" || name == "Any" || name == "Error" || name == "ChannelSendResult"))
                     return make("builtin", name);
-                if (form.arguments.size() == 1 && (name == "List" || name == "FrozenList" || name == "Option" || name == "Range" || name == "Task" || name == "TaskLocal" || name == "Channel" || name == "TaskOutcome"))
+                if (form.arguments.size() == 1 && (name == "List" || name == "FrozenList" || name == "Option" || name == "Range" || name == "Task" || name == "TaskLocal" || name == "Channel" || name == "TaskOutcome" || name == "ChannelReceiveResult"))
                     return make("builtin", name);
                 if (form.arguments.size() == 2 && name == "Result") return make("builtin", name);
             }

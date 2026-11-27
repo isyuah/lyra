@@ -1887,6 +1887,23 @@ struct Emitter {
                 auto pack = layouts.channelPacker(builder, layouts.program.taskResults[rawType(id).id]);
                 return NativeExceptions{builder}.created(pointerCall("lyraChannelReceive", {receiver, pack}), source, call.name.span);
             }
+            case Callee::ChannelTrySend: case Callee::ChannelTryReceive: {
+                auto pointer = builder.getPtrTy();
+                auto flag = builder.getInt8Ty();
+                auto type = rawType(id);
+                Value result = llvm::Constant::getNullValue(layouts.native(builder, type));
+                Value status;
+                if (info.callee == Callee::ChannelTrySend) {
+                    auto send = module.getOrInsertFunction("lyraChannelTrySend", flag, pointer, pointer);
+                    status = builder.CreateCall(send, {receiver, lists.box(args[1])});
+                } else {
+                    auto receive = module.getOrInsertFunction("lyraChannelTryReceive", flag, pointer, pointer);
+                    auto box = temporary(builder, pointer, "channel.message");
+                    status = builder.CreateCall(receive, {receiver, box});
+                    result = builder.CreateInsertValue(result, builder.CreateLoad(pointer, box), 1);
+                }
+                return builder.CreateInsertValue(result, builder.CreateZExt(status, builder.getInt32Ty()), 0);
+            }
             case Callee::ChannelClose:
                 builder.CreateCall(module.getOrInsertFunction("lyraChannelClose", builder.getVoidTy(), builder.getPtrTy()), args);
                 return unit();
@@ -2040,6 +2057,9 @@ struct Emitter {
             case Callee::Variant: return makeVariant(id, args);
             case Callee::ToReal: return castNumber(receiver, fn.expressions[*call.receiver].type, rawType(id));
             case Callee::ToIntegerChecked: return checkedInteger(receiver, fn.expressions[*call.receiver].type, rawType(id));
+            case Callee::NumericAbs: case Callee::NumericMin: case Callee::NumericMax: case Callee::NumericClamp:
+            case Callee::IsFinite: case Callee::IsNaN: case Callee::IsInfinite:
+                return numericMember(info.callee, fn.expressions[*call.receiver].type, args, call.name.span);
             case Callee::ToString: return displayScalar(receiver, fn.expressions[*call.receiver].type);
             case Callee::ToBytes: return receiver;
             case Callee::BytesHex: return pointerCall("lyraBytesHex", {receiver});
@@ -2107,6 +2127,36 @@ struct Emitter {
         auto* error = exceptions.create(stringConstant(message), layouts.typeToken(builder, arithmeticError), builtinExceptionNames[arithmeticError.id]);
         propagate(exceptions.locate(error, source, site), handlers.size());
         builder.SetInsertPoint(next);
+    }
+
+    Value numericMember(Callee operation, Type type, llvm::ArrayRef<Value> args, Span site) {
+        auto value = args[0];
+        auto* width = value->getType();
+        auto intrinsic = [&](llvm::Intrinsic::ID kind, llvm::ArrayRef<Value> operands) {
+            return builder.CreateCall(llvm::Intrinsic::getDeclaration(&module, kind, {width}), operands);
+        };
+        auto floating = type.kind == Type::Real;
+        auto signedValue = type.kind == Type::Int;
+        if (operation == Callee::IsNaN) return builder.CreateFCmpUNO(value, value);
+        if (operation == Callee::IsFinite || operation == Callee::IsInfinite) {
+            auto absolute = intrinsic(llvm::Intrinsic::fabs, {value});
+            auto infinity = llvm::ConstantFP::getInfinity(width);
+            return operation == Callee::IsFinite ? builder.CreateFCmpOLT(absolute, infinity) : builder.CreateFCmpOEQ(absolute, infinity);
+        }
+        if (operation == Callee::NumericAbs) {
+            if (floating) return intrinsic(llvm::Intrinsic::fabs, {value});
+            if (!signedValue) return value;
+            auto minimum = llvm::ConstantInt::get(width, llvm::APInt::getSignedMinValue(numberWidth(type)));
+            arithmeticCheck(builder.CreateICmpEQ(value, minimum), site, numberName(type) + " overflow (abs)");
+            return intrinsic(llvm::Intrinsic::abs, {value, builder.getFalse()});
+        }
+        auto min = floating ? llvm::Intrinsic::minimum : signedValue ? llvm::Intrinsic::smin : llvm::Intrinsic::umin;
+        auto max = floating ? llvm::Intrinsic::maximum : signedValue ? llvm::Intrinsic::smax : llvm::Intrinsic::umax;
+        if (operation != Callee::NumericClamp) return intrinsic(operation == Callee::NumericMin ? min : max, {value, args[1]});
+        auto invalid = floating ? builder.CreateFCmpUGT(args[1], args[2]) :
+            builder.CreateICmp(signedValue ? llvm::CmpInst::ICMP_SGT : llvm::CmpInst::ICMP_UGT, args[1], args[2]);
+        arithmeticCheck(invalid, site, "invalid clamp bounds");
+        return intrinsic(min, {intrinsic(max, {value, args[1]}), args[2]});
     }
 
     Value arithmetic(Op op, Value left, Value right, Type type, Span site) {

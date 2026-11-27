@@ -180,6 +180,7 @@ std::vector<EditorSymbol> editorBuiltins(bool types, bool constraints) {
             }
         for (auto name : {"Int", "UInt", "Float", "Never", "List", "FrozenList", "Range", "Option", "Result", "Task", "TaskLocal", "TaskOutcome", "Channel"})
             symbols.push_back({name, EditorKind::TypeAlias});
+        for (auto name : {"ChannelSendResult", "ChannelReceiveResult"}) symbols.push_back({name, EditorKind::Enum});
     } else {
         symbols = {{"print", EditorKind::Function, {}, "fn print(value: Number | Bool | Char | String): Unit", "将标量值和换行写入 stdout。"},
             {"sleepMs", EditorKind::Function, {}, "fn sleepMs(milliseconds: Int): Task<Unit>"},
@@ -188,6 +189,7 @@ std::vector<EditorSymbol> editorBuiltins(bool types, bool constraints) {
         for (auto name : {"Channel", "TaskLocal", "FrozenList", "Error"}) symbols.push_back({name, EditorKind::Constructor});
         for (auto name : builtinExceptionNames) symbols.push_back({std::string(name), EditorKind::Constructor});
         for (auto name : {"Task", "TaskOutcome", "CPtr", "CCallback"}) symbols.push_back({name, EditorKind::Class});
+        for (auto name : {"ChannelSendResult", "ChannelReceiveResult"}) symbols.push_back({name, EditorKind::Enum});
     }
     return symbols;
 }
@@ -843,6 +845,8 @@ struct Symbols {
                 emit("receive", Callee::ChannelReceive, result);
                 emit("next", Callee::ChannelReceive, result);
             }
+            if (matches("trySend")) emit("trySend", Callee::ChannelTrySend, enumType(enums.at("ChannelSendResult"), {}, sources.front(), {}), {"value"}, {element});
+            if (matches("tryReceive")) emit("tryReceive", Callee::ChannelTryReceive, enumType(enums.at("ChannelReceiveResult"), {element}, sources.front(), {}));
             emit("asyncIterator", Callee::ChannelIterator, type);
             emit("close", Callee::ChannelClose, Type::Unit);
         }
@@ -883,6 +887,17 @@ struct Symbols {
             emit("isNull", Callee::PtrIsNull, Type::Bool);
             emit("free", Callee::PtrFree, Type::Unit, {}, {}, MemberContext::Unsafe);
             emit("offset", Callee::PtrOffset, Type::CPtr, {"bytes"}, {Type::Int}, MemberContext::Unsafe);
+        }
+        if (numericType(type)) {
+            emit("abs", Callee::NumericAbs, type);
+            emit("min", Callee::NumericMin, type, {"other"}, {type});
+            emit("max", Callee::NumericMax, type, {"other"}, {type});
+            emit("clamp", Callee::NumericClamp, type, {"lower", "upper"}, {type, type});
+            if (type.kind == Type::Real) {
+                emit("isFinite", Callee::IsFinite, Type::Bool);
+                emit("isNaN", Callee::IsNaN, Type::Bool);
+                emit("isInfinite", Callee::IsInfinite, Type::Bool);
+            }
         }
         auto conversion = [&](std::string_view name) {
             if (!name.starts_with("to")) return;
@@ -4383,7 +4398,9 @@ static CheckedModule checkProgram(Module module, const std::vector<Source>& sour
         for (Type builtin : scalarTypes) {
             if (name == typeName(checked, builtin)) throw at(sources[decl.file], decl.name.span, "LYN0002", "类型名与内置类型冲突：" + std::string(name));
         }
-        if (name == "Never" || name == "TaskLocal" || name == "Range" || name == "Eq" || name == "Hash" || name == "Channel" || name == "TaskOutcome" || name == "FrozenList") throw at(sources[decl.file], decl.name.span, "LYN0002", "类型名与内置类型冲突：" + std::string(name));
+        if (name == "Never" || name == "TaskLocal" || name == "Range" || name == "Eq" || name == "Hash" || name == "Channel" || name == "TaskOutcome" ||
+            name == "ChannelSendResult" || name == "ChannelReceiveResult" || name == "FrozenList")
+            throw at(sources[decl.file], decl.name.span, "LYN0002", "类型名与内置类型冲突：" + std::string(name));
         if (decl.name.text == "print" || decl.name.text == "gcCollect" || !names.emplace(declaration, index).second) throw at(sources[decl.file], decl.name.span, "LYN0002", "类型名称已声明：" + decl.name.text);
     };
     for (auto& decl : module.aggregates) {
@@ -4391,11 +4408,18 @@ static CheckedModule checkProgram(Module module, const std::vector<Source>& sour
         symbols.recordDeclarations.push_back(std::move(decl));
     }
     if (!sources.empty()) {
-        symbols.enums.emplace("TaskOutcome", 0);
-        symbols.enumDeclarations.push_back({0, {"TaskOutcome", {}}, {
+        auto addBuiltinEnum = [&](Enumeration declaration) {
+            symbols.enums.emplace(declaration.name.text, symbols.enumDeclarations.size());
+            symbols.enumDeclarations.push_back(std::move(declaration));
+        };
+        addBuiltinEnum({0, {"TaskOutcome", {}}, {
             {{"Completed", {}}, {{Identifier{"value", {}}, {"T", {}}}}},
             {{"Failed", {}}, {{Identifier{"exception", {}}, {"Exception", {}}}}},
             {{"Cancelled", {}}, {{Identifier{"cleanupFailures", {}}, {"List<Exception>", {}}}}},
+        }, true, {{"T", {}}}});
+        addBuiltinEnum({0, {"ChannelSendResult", {}}, {{{"Sent", {}}, {}}, {{"Full", {}}, {}}, {{"Closed", {}}, {}}}, true});
+        addBuiltinEnum({0, {"ChannelReceiveResult", {}}, {
+            {{"Received", {}}, {{Identifier{"value", {}}, {"T", {}}}}}, {{"Empty", {}}, {}}, {{"Closed", {}}, {}},
         }, true, {{"T", {}}}});
     }
     for (auto& decl : module.enums) {

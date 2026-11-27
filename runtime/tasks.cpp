@@ -464,36 +464,42 @@ void *popMessage(LyraChannel& channel) {
     return value;
 }
 
+LyraChannelStatus sendMessage(LyraChannel& channel, void *boxed, int64_t now) {
+    if (channel.closed) return LYRA_CHANNEL_CLOSED;
+    if (auto *receiver = peer(channel.receivers, now)) commitChoice(*receiver, boxed);
+    else if (channel.count < channel.capacity) pushMessage(channel, boxed);
+    else return LYRA_CHANNEL_UNAVAILABLE;
+    return LYRA_CHANNEL_READY;
+}
+
+LyraChannelStatus receiveMessage(LyraChannel& channel, void*& value, int64_t now) {
+    if (channel.count) {
+        value = popMessage(channel);
+        if (!channel.closed) if (auto *sender = peer(channel.senders, now)) {
+            pushMessage(channel, sender->boxed);
+            commitChoice(*sender);
+        }
+    } else {
+        if (channel.closed) return LYRA_CHANNEL_CLOSED;
+        auto *sender = peer(channel.senders, now);
+        if (!sender) return LYRA_CHANNEL_UNAVAILABLE;
+        value = sender->boxed;
+        commitChoice(*sender);
+    }
+    return LYRA_CHANNEL_READY;
+}
+
 bool tryChoice(WaitChoice& choice, int64_t now) {
     if (choice.kind == WaitKind::Timer) {
         if (choice.time > now) return false;
         commitChoice(choice);
         return true;
     }
-    auto& channel = *choice.channel;
-    if (choice.kind == WaitKind::Send) {
-        if (channel.closed) commitChoice(choice, nullptr, true);
-        else if (auto *receiver = peer(channel.receivers, now)) {
-            commitChoice(*receiver, choice.boxed);
-            commitChoice(choice);
-        } else if (channel.count < channel.capacity) {
-            pushMessage(channel, choice.boxed);
-            commitChoice(choice);
-        } else return false;
-    } else {
-        if (channel.count) {
-            auto *value = popMessage(channel);
-            if (!channel.closed) if (auto *sender = peer(channel.senders, now)) {
-                pushMessage(channel, sender->boxed);
-                commitChoice(*sender);
-            }
-            commitChoice(choice, value);
-        } else if (channel.closed) commitChoice(choice);
-        else if (auto *sender = peer(channel.senders, now)) {
-            commitChoice(choice, sender->boxed);
-            commitChoice(*sender);
-        } else return false;
-    }
+    bool sending = choice.kind == WaitKind::Send;
+    void *value = nullptr;
+    auto status = sending ? sendMessage(*choice.channel, choice.boxed, now) : receiveMessage(*choice.channel, value, now);
+    if (status == LYRA_CHANNEL_UNAVAILABLE) return false;
+    commitChoice(choice, value, sending && status == LYRA_CHANNEL_CLOSED);
     return true;
 }
 
@@ -1066,6 +1072,17 @@ LyraTask *lyraChannelReceive(LyraChannel *channel, LyraChannelPack pack) {
     auto& set = makeWait(1, false);
     set.choices[0] = {.kind = WaitKind::Receive, .channel = channel, .pack = pack, .set = &set};
     return set.task;
+}
+
+uint8_t lyraChannelTrySend(LyraChannel *channel, void *boxed) {
+    TaskLock lock;
+    return sendMessage(*channel, boxed, lyraContextClock());
+}
+
+uint8_t lyraChannelTryReceive(LyraChannel *channel, void **boxed) {
+    TaskLock lock;
+    *boxed = nullptr;
+    return receiveMessage(*channel, *boxed, lyraContextClock());
 }
 
 void lyraChannelClose(LyraChannel *channel) {

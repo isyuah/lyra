@@ -25,6 +25,7 @@ typedef enum LyraTaskState {
 } LyraTaskState;
 
 typedef enum LyraAwaitStatus { LYRA_AWAIT_PENDING, LYRA_AWAIT_VALUE, LYRA_AWAIT_EXCEPTION, LYRA_AWAIT_CANCELLED, LYRA_AWAIT_CYCLE } LyraAwaitStatus;
+typedef enum LyraChannelStatus { LYRA_CHANNEL_READY, LYRA_CHANNEL_UNAVAILABLE, LYRA_CHANNEL_CLOSED } LyraChannelStatus;
 
 LyraDomain *lyraDomainCreate(void);
 int64_t lyraTaskParallelism(void);
@@ -39,6 +40,8 @@ LyraTask *lyraTaskWithLocal(const void *key, void *boxed, LyraTask *body);
 LyraChannel *lyraChannelCreate(int64_t capacity, const void *closedType, const LyraException **error);
 LyraTask *lyraChannelSend(LyraChannel *channel, void *boxed);
 LyraTask *lyraChannelReceive(LyraChannel *channel, LyraChannelPack pack);
+uint8_t lyraChannelTrySend(LyraChannel *channel, void *boxed);
+uint8_t lyraChannelTryReceive(LyraChannel *channel, void **boxed);
 void lyraChannelClose(LyraChannel *channel);
 LyraTask *lyraTaskSleep(int64_t milliseconds);
 LyraTask *lyraTaskSelect(size_t arms);
