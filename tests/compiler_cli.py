@@ -76,7 +76,7 @@ fn main(): Unit { print(choose(1)) }
         self.assertEqual(result.returncode, 1)
         error, = json.loads(result.stderr)
         self.assertEqual(error['code'], 'LYT0019')
-        self.assertEqual({(Path(note['file']), note['range']['start']['line']) for note in error['notes']},
+        self.assertEqual({(Path(note['file']).resolve(), note['range']['start']['line']) for note in error['notes']},
                          {(self.main.resolve(), 1), (self.main.resolve(), 2)})
 
     def test_check_retains_signature_after_missing_closing_brace(self):

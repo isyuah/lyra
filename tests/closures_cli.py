@@ -31,8 +31,14 @@ class Closures(unittest.TestCase):
                 ran = subprocess.run([app], text=True, capture_output=True, timeout=15)
                 self.assertEqual((ran.returncode != 0, ran.stdout.splitlines()), (bool(frames), lines), ran.stderr)
                 if frames:
-                    observed = [frame.strip().rsplit(':', 1)[0] for frame in ran.stderr.splitlines() if ' at ' in frame]
-                    self.assertEqual(observed, [f'{role} at {self.main.as_posix()}:{line}' for role, line in frames], ran.stderr)
+                    observed = []
+                    for frame in ran.stderr.splitlines():
+                        if ' at ' in frame:
+                            role, location = frame.strip().split(' at ', 1)
+                            path, line, _column = location.rsplit(':', 2)
+                            observed.append((role, Path(path).resolve(), int(line)))
+                    main = self.main.resolve()
+                    self.assertEqual(observed, [(role, main, line) for role, line in frames], ran.stderr)
                 else:
                     self.assertEqual(ran.stderr, '')
 

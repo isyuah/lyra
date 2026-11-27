@@ -140,7 +140,7 @@ fn main(): Unit { print(generated()) }
         sibling = self.src / 'sibling.ly'
         sibling.write_text('fn leak(): Int { extras.value() }')
         error = self.diagnostic('LYN0001', 'extras')
-        self.assertEqual(Path(error['file']), sibling)
+        self.assertEqual(Path(error['file']).resolve(), sibling.resolve())
 
     def test_macro_phase_rejects_generated_and_decorated_dependencies(self):
         provider = self.library('provider')
@@ -165,7 +165,7 @@ pub fn current(target: String, argument: String): Syntax { syntaxInt(answer()) }
             with self.subTest(body=body):
                 functions.write_text(body)
                 error = self.diagnostic('LYM0002' if fragment == 'print' else 'LYM0004', fragment)
-                self.assertEqual(Path(error['file']), main)
+                self.assertEqual(Path(error['file']).resolve(), main.resolve())
         (provider / 'src/nested').mkdir()
         functions.write_text('pub import macro self.nested.second as current')
         (provider / 'src/nested/api.ly').write_text('pub import macro self.current as second')
@@ -228,7 +228,7 @@ async fn main(): Unit {
         source = 'fn requireInt(value: Int): Int { value }\nfn main(): Unit { val label = "值🙂"; print(#increment(label)) }'
         main.write_text(source, encoding='utf-8', newline='\n')
         error = self.diagnostic('LYT0001', '实际是 String')
-        self.assertEqual(Path(error['file']), main)
+        self.assertEqual(Path(error['file']).resolve(), main.resolve())
         self.assertEqual(error['range']['start']['offset'], source.encode('utf-8').rfind(b'label'))
 
     def test_declared_input_and_cold_decorator(self):
@@ -285,7 +285,7 @@ async fn main(): Unit { val pending = work(); print("cold"); print(await pending
 
         helper.write_text('fn combine(first: Bool, second: Int): Int { second }')
         error = self.diagnostic('LYT0001')
-        self.assertEqual((Path(error['file']), error['range']['start']['offset']), (main, source.index('7')))
+        self.assertEqual((Path(error['file']).resolve(), error['range']['start']['offset']), (main.resolve(), source.index('7')))
         self.assertEqual(entry.stat().st_mtime_ns, old_time)
         helper.write_text('fn combine(first: Int, second: Int): Int { first + second }')
 
@@ -379,7 +379,8 @@ fn main(): Unit {}
         self.diagnostic('LYM0002', '公开')
         self.macro('"fn wrong(): Int { false }"')
         error = self.diagnostic('LYT0001')
-        self.assertEqual((Path(error['file']), error['range']['start']['line'], error['range']['start']['column']), (main, 1, 2))
+        self.assertEqual((Path(error['file']).resolve(), error['range']['start']['line'], error['range']['start']['column']),
+                         (main.resolve(), 1, 2))
         self.assertIn('fn wrong', error['generated']['source'])
         (self.src / '.macros/make.ly').write_text('extern fn forbidden(): Int;\nfn make(target: String, argument: String): Syntax { syntaxCode("") }')
         self.diagnostic('LYM0002', 'extern')
@@ -675,7 +676,7 @@ fn main(): Unit {
             with self.subTest(fields=fields):
                 main.write_text('#derive(Json)\nstruct Bad(' + fields + ')\nfn main(): Unit {}', encoding='utf-8')
                 error = self.diagnostic('LYM0002', fragment)
-                self.assertEqual((Path(error['file']), error['range']['start']['line']), (main, 1))
+                self.assertEqual((Path(error['file']).resolve(), error['range']['start']['line']), (main.resolve(), 1))
 
     def test_macro_contains_matches_exact_substrings(self):
         self.macro('if macroContains("ab\\0cd", "\\0c") && macroContains("abc", "") && !macroContains("Case", "case") && !macroContains("\u00e9", "e\u0301") { "" } else { macroFail("substring comparison lost data") }')

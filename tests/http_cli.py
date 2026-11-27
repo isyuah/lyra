@@ -930,8 +930,8 @@ fn main(): Unit {}
 
         duplicate, = diagnostics()
         self.assertEqual(duplicate["code"], "LYM0002")
-        self.assertEqual(Path(duplicate["file"]), source)
-        self.assertEqual(Path(duplicate["notes"][0]["file"]), first)
+        self.assertEqual(Path(duplicate["file"]).resolve(), source.resolve())
+        self.assertEqual(Path(duplicate["notes"][0]["file"]).resolve(), first.resolve())
         source.write_text('''import std.http.{Response, Router}
 struct AppDeps(val count: Int8)
 #get("/x")
@@ -940,7 +940,7 @@ fn main(): Unit { #mountRoutes(Router(), AppDeps(1)) }
 ''', encoding="utf-8")
         mismatch, = diagnostics()
         self.assertEqual((mismatch["code"], mismatch["expected"], mismatch["actual"]), ("LYT0001", "Int", "Int8"))
-        self.assertEqual(Path(mismatch["file"]), source)
+        self.assertEqual(Path(mismatch["file"]).resolve(), source.resolve())
 
     def test_bind_methods_head_and_allow(self):
         package = self.root / "methods"
