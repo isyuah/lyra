@@ -121,7 +121,7 @@ async fn main(): Int {
     router.post("/users", (request: http.Request) => { postUser(request, path, logger) })
     router.get("/barrier", (request: http.Request) => { barrier(request) })
     if let Some(url) = arguments.value("--upstream") {
-        val ca = match arguments.value("--ca") { Some(file) => Some(pem(file)), None => None }
+        val ca = arguments.value("--ca").map { pem(it) }
         val options = httpClient.HttpClientOptions(caPem: ca)
         router.get("/upstream", (request: http.Request) => { getUpstream(url, options, logger) })
     }

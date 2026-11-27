@@ -30,7 +30,9 @@ inline constexpr Type channelClosed{Type::Exception, 1};
 inline constexpr Type boundsError{Type::Exception, 2};
 inline constexpr Type arithmeticError{Type::Exception, 3};
 inline constexpr Type taskCycleError{Type::Exception, 4};
-inline constexpr std::string_view builtinExceptionNames[] = {"Exception", "ChannelClosed", "BoundsError", "ArithmeticError", "TaskCycleError"};
+inline constexpr Type unwrapError{Type::Exception, 5};
+inline constexpr const char* coreModule = "$std/core";
+inline constexpr std::string_view builtinExceptionNames[] = {"Exception", "ChannelClosed", "BoundsError", "ArithmeticError", "TaskCycleError", "UnwrapError"};
 inline constexpr std::size_t firstDeclaredException = sizeof(builtinExceptionNames) / sizeof(builtinExceptionNames[0]);
 inline std::optional<Type> builtinException(std::string_view name) {
     for (std::size_t index = 0; index < firstDeclaredException; ++index)
@@ -39,7 +41,7 @@ inline std::optional<Type> builtinException(std::string_view name) {
 }
 struct ConstantUse { enum Kind { Global, Block, Uninstantiated }; Kind kind; std::size_t index{}; };
 struct Local { Type type; bool writable; std::optional<ExprId> worker{}; bool captured{}; std::optional<Span> declaration{}; std::string name{}; std::optional<ConstantUse> constant{}; bool parameter{}; Passing passing{}; };
-enum class Callee { Function, Constructor, Variant, Print, Collect, Sum, ListAdd, ListSlice, ListRemoveAt, FreezeList, TaskCancel, TaskCancelled, TaskCheckCancellation, AwaitOutcome, Exception, Indirect, ToReal, ToIntegerChecked, ToString, ToBytes, DecodeUtf8, Dynamic, BusinessError, ErrorSuppress, FailureInfo, LocalKey, LocalGet, WithLocal, ExtensionProperty, BoundMethod, ReflectTypeName, ReflectFieldCount, ReflectFieldName, ReflectField, Size, ValueEqual, ValueHash, ChannelCreate, ChannelIterator, ChannelSend, ChannelReceive, ChannelClose, Sleep, PtrAllocate, PtrNull, PtrIsNull, PtrFree, PtrOffset, PtrRead, PtrWrite, CallbackRegister, CallbackContext, CallbackFunction, CallbackClose, CallbackTakeError };
+enum class Callee { Function, Constructor, Variant, Print, Collect, Sum, SumPresent, SumAbsent, SumUnwrap, CarryFailure, RemapFailure, ListAdd, ListSlice, ListRemoveAt, FreezeList, TaskCancel, TaskCancelled, TaskCheckCancellation, AwaitOutcome, Exception, Indirect, ToReal, ToIntegerChecked, ToString, ToBytes, DecodeUtf8, Dynamic, BusinessError, ErrorSuppress, FailureInfo, LocalKey, LocalGet, WithLocal, ExtensionProperty, BoundMethod, ReflectTypeName, ReflectFieldCount, ReflectFieldName, ReflectField, Size, ValueEqual, ValueHash, ChannelCreate, ChannelIterator, ChannelSend, ChannelReceive, ChannelClose, Sleep, PtrAllocate, PtrNull, PtrIsNull, PtrFree, PtrOffset, PtrRead, PtrWrite, CallbackRegister, CallbackContext, CallbackFunction, CallbackClose, CallbackTakeError };
 enum class ValueOperation { Equal, Hash };
 struct PatternSlot { std::size_t local; };
 struct PatternListRest { std::size_t local; };
@@ -65,7 +67,7 @@ struct CheckedCatch { Type type; std::optional<std::size_t> local; };
 struct ErrorDisplay { std::optional<std::size_t> method; std::string fallback; };
 struct DynamicMethodKey { Type owner; std::size_t method; std::vector<Type> arguments; auto operator<=>(const DynamicMethodKey&) const = default; };
 enum class ErrorMember { Message, Original, Cause, Suppressed };
-enum class ExceptionMember { Message, TaskFailures, CleanupFailures };
+enum class ExceptionMember { Message, TaskFailures, CleanupFailures, Failure };
 struct CheckedExpr { Type type; std::size_t target{}; std::vector<std::size_t> argumentSlots{}; Callee callee{}; std::optional<Type> sourceType{}; std::vector<std::size_t> captures{}; std::vector<std::size_t> omittedDefaults{}; std::optional<std::size_t> conversion{}, errorConversion{}, functionRef{}; std::optional<ConstantUse> constantRef{}; std::optional<Type> callableType{}; std::optional<CheckedIteration> iteration{}; std::vector<CheckedPattern> patterns{}; std::optional<double> realLiteral{}; std::optional<Type> narrowed{}; std::optional<std::string> boundTrait{}; std::vector<std::string> alternateTraits{}; std::optional<Type> testedType{}; bool boxedSpread{}; std::optional<DynamicMethodKey> dynamicMethod{}; bool interfaceAsync{}; std::vector<CheckedCatch> catches{}; ErrorDisplay errorDisplay{}, errorPromotion{}; std::vector<std::optional<std::size_t>> selectSlots{}; };
 struct CheckedFunction {
     Function syntax;

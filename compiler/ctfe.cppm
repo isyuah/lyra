@@ -191,7 +191,8 @@ struct Validator {
                 if (info.callee == Callee::ToString || info.callee == Callee::ToReal || info.callee == Callee::ToBytes ||
                     info.callee == Callee::ToIntegerChecked || info.callee == Callee::Sum || info.callee == Callee::Variant ||
                     info.callee == Callee::ListAdd || info.callee == Callee::ListSlice || info.callee == Callee::ListRemoveAt ||
-                    info.callee == Callee::Size || info.callee == Callee::FreezeList) return;
+                    info.callee == Callee::Size || info.callee == Callee::FreezeList || info.callee == Callee::SumPresent ||
+                    info.callee == Callee::SumAbsent || info.callee == Callee::SumUnwrap || info.callee == Callee::CarryFailure) return;
                 if (info.callee == Callee::ValueEqual || info.callee == Callee::ValueHash) {
                     auto operation = info.callee == Callee::ValueEqual ? ValueOperation::Equal : ValueOperation::Hash;
                     validateValueOperation(fn.expressions[*node.receiver].type, operation, node.name.span);
@@ -1075,6 +1076,19 @@ struct Evaluation {
                 if (item.receiver && info.callee != Callee::Function && info.callee != Callee::Variant) {
                     auto receiver = sub(*item.receiver);
                     auto from = fn.expressions[*item.receiver].type;
+                    if (info.callee == Callee::SumPresent || info.callee == Callee::SumAbsent || info.callee == Callee::SumUnwrap ||
+                        info.callee == Callee::CarryFailure) {
+                        const auto& sum = composite(receiver);
+                        if (info.callee == Callee::CarryFailure)
+                            return makeComposite(fn, site, rawType(fn, id), SumTag::Err, {sum.fields.front()});
+                        auto present = successTag(std::get<SumTag>(sum.tag));
+                        if (info.callee == Callee::SumPresent) return present;
+                        if (info.callee == Callee::SumAbsent) return !present;
+                        auto message = item.arguments.empty() ? std::string(from.kind == Type::Option ? "unwrap on None" : "unwrap on Err")
+                            : std::get<std::string>(scalarValue(sub(item.arguments.front().value), fn, site));
+                        if (!present) error(sources, fn, item.name.span, "LYCT0003", std::move(message));
+                        return composite(receiver).fields.front();
+                    }
                     if (info.callee == Callee::ValueEqual || info.callee == Callee::ValueHash || info.callee == Callee::Size) {
                         if (info.callee == Callee::ValueHash) return hash(receiver, from, fn, item.name.span);
                         if (info.callee == Callee::ValueEqual) return equal(receiver, sub(item.arguments.front().value), from, fn, item.name.span);

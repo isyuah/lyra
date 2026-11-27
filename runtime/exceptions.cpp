@@ -34,9 +34,16 @@ struct LyraException {
     const Failures *suppressed{}, *tasks{}, *cleanups{};
     const LyraException* identity{};
     const lyraRuntime::Backtrace* native{};
+    const void* failure{};
 };
 
 namespace {
+
+LyraException* createException(const void* message, const void* type, const char* name) {
+    auto* error = managed<LyraException>(message, type, name);
+    error->identity = error;
+    return error;
+}
 
 std::size_t failureCount(const Failures* list) { return list ? list->count : 0; }
 
@@ -70,8 +77,12 @@ const LyraException* lyraExceptionCreate(const void* message) {
 }
 
 const LyraException* lyraExceptionCreateTyped(const void* message, const void* type, const char* name) {
-    auto error = managed<LyraException>(message, type, name);
-    error->identity = error;
+    return createException(message, type, name);
+}
+
+const LyraException* lyraExceptionCreateUnwrap(const void* message, const void* type, const void* failure) {
+    auto* error = createException(message, type, "UnwrapError");
+    error->failure = failure;
     return error;
 }
 
@@ -82,6 +93,7 @@ const LyraException* lyraIndexError(const void* type, const char* collection, st
 }
 
 const void* lyraExceptionMessage(const LyraException* error) { return error->message; }
+const void* lyraExceptionFailure(const LyraException* error) { return error->failure; }
 const void* lyraExceptionType(const LyraException* error) { return error->type; }
 int lyraExceptionSame(const LyraException* left, const LyraException* right) { return left->identity == right->identity; }
 

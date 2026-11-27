@@ -4,6 +4,7 @@
 
 | 场景 | 标准库入口 |
 |---|---|
+| 可空值和业务错误 | 无需导入的 [`Option` / `Result` 方法](core/README.md)；如 `map`、`orElse`、`expect`、`toResult` 和 `transpose` |
 | 文本、排序、去重 | [`std.text`](text/README.md) 的 `StringOps`；[`std.collections`](collections/README.md) 的 `ListOps`、`sortedBy`、`distinct`、`HashMap` |
 | 标准流、文件和目录 | [`std.io`](io/README.md) 的 `LineReader`、`File`；[`std.fs`](fs/README.md) 的 `stat`、`rename`、`copy`、`listDir`、`atomicWrite` |
 | 程序参数、环境与子进程 | [`std.os`](os/README.md) 的 `args`、`env`、`runProcess`；入口函数可用 `Int` 返回退出状态 |

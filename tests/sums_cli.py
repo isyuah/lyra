@@ -55,6 +55,74 @@ fn main(): Unit {
 }
 ''', b"outer\ninner\nvalue\n")
 
+    def test_core_sum_methods_preserve_layers_and_call_only_the_selected_branch(self):
+        self.native('''
+const mapped: Int = Some(5).map { it * 2 }.unwrap()
+
+fn none(): Int? { None }
+fn nested(): Option<Int?> { Some(None) }
+fn good(): Result<Int?,String> { Ok(None) }
+fn bad(): Result<Int?,String> { Err("bad") }
+fn backup(): Result<Int?,Int> { Ok(Some(42)) }
+
+fn main(): Unit {
+    var calls = 0
+    print(mapped)
+    print(Some(2).map { calls += 1; it * 3 }.flatMap { Some(it.toString()) }.unwrap())
+    print(none().map { calls += 100; it }.isNone())
+    print(nested().orElse { calls += 100; Some(Some(0)) } == Some(None))
+    print(none().orElse { calls += 1; Some(9) }.expect("backup missing"))
+    print(Some(3).toResult { calls += 100; "missing" }.isOk())
+    print(none().toResult { calls += 1; "missing" }.isErr())
+
+    print(good().toOption() == Some(None))
+    print(good().transpose().isNone())
+    print(bad().transpose().transpose().isErr())
+    print(Some(backup()).transpose().unwrap() == Some(Some(42)))
+    print(good().map { it ?? 7 }.unwrapOr(0))
+    print(bad().map { calls += 100; it }.flatMap { calls += 100; good() }.unwrapOrElse { calls += 1; Some(it.size) } ?? 0)
+    print(bad().orElse { calls += 1; backup() }.unwrap() ?? 0)
+    print(good().orElse { calls += 100; backup() }.unwrapOr(Some(1)) == None)
+    print(calls)
+}
+''', b"10\n6\ntrue\ntrue\n9\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\n7\n3\n42\ntrue\n5\n")
+
+    def test_unwrap_and_explicit_error_mapping_keep_failure_information(self):
+        self.native('''
+struct Failure(val status: Int)
+fn bad(): Result<Option<Int>,String> { Err("original") }
+fn missing(): String? { None }
+
+fn main(): Unit {
+    try {
+        defer { print("cleaned") }
+        val _ = missing().unwrap()
+    } catch problem: UnwrapError {
+        print(problem.message)
+        print(problem.failure.isNone())
+    }
+    val mapped = bad().mapErr { Failure(it.size) }
+    try { val _ = mapped.transpose().unwrap().expect("load failed") }
+    catch problem: UnwrapError {
+        val failure = problem.failure.unwrap()
+        print(problem.message == "load failed: Failure")
+        print((failure.original as? Failure).unwrap().status)
+        print((failure.cause.unwrap().original as? String).unwrap())
+    }
+    val wrapped = bad().mapErr { Error("mapped", cause: Error("own cause")) }.failureInfo().unwrap()
+    print(wrapped.message)
+    print(wrapped.cause.unwrap().message)
+    print(wrapped.suppressed[0].message)
+}
+''', b"cleaned\nunwrap on None\ntrue\ntrue\n8\noriginal\nmapped\nown cause\noriginal\n")
+
+    def test_uncaught_expect_points_at_the_call(self):
+        self.main.write_text('fn main(): Unit { val item: Int? = None\n    print(item.expect("must be present"))\n}\n', encoding='utf-8')
+        result = subprocess.run([COMPILER, 'run', self.package], capture_output=True, timeout=30)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(b'UnwrapError: must be present', result.stderr)
+        self.assertIn(b'main.ly:2:16', result.stderr)
+
     def test_near_enum_variant_warns_only_for_an_unescaped_binding(self):
         self.main.write_text('''
 enum Color { Red, Blue }

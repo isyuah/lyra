@@ -223,7 +223,7 @@ Workspace loadWorkspace(const fs::path& root, const SourceOverlay& overlays, con
                 if (found == sources.end()) return workspace;
                 program.sources = {std::move(*found)};
                 program.syntax = indexFileSyntax(program.sources.front());
-            } else program = loadLooseProgram(std::move(sources), workspace.diagnostics, &parseCache);
+            } else program = loadLooseProgram(std::move(sources), &workspace.diagnostics, &parseCache);
         }
         workspace.sources = std::move(program.sources);
         workspace.editor.references = std::move(program.references);

@@ -845,7 +845,15 @@ struct Symbols {
             if (type == Type::Bytes) emit("toString", Callee::DecodeUtf8, sum(Type::Option, Type::String));
         }
         if (type.kind == Type::TaskLocal && matches("get")) emit("get", Callee::LocalGet, sum(Type::Option, module.taskLocalValues[type.id]));
-        if (type.kind == Type::Result && matches("failureInfo")) emit("failureInfo", Callee::FailureInfo, sum(Type::Option, Type::Error));
+        if (type.kind == Type::Option || type.kind == Type::Result) {
+            auto success = module.sumTypes[type.id].success;
+            auto optional = type.kind == Type::Option;
+            emit(optional ? "isSome" : "isOk", Callee::SumPresent, Type::Bool);
+            emit(optional ? "isNone" : "isErr", Callee::SumAbsent, Type::Bool);
+            emit("unwrap", Callee::SumUnwrap, success);
+            emit("expect", Callee::SumUnwrap, success, {"message"}, {Type::String});
+            if (!optional && matches("failureInfo")) emit("failureInfo", Callee::FailureInfo, sum(Type::Option, Type::Error));
+        }
         if (type == Type::Error) emit("withSuppressed", Callee::ErrorSuppress, Type::Error, {"error"}, {Type::Error});
         if (type == Type::Any) {
             emit("typeName", Callee::ReflectTypeName, Type::String);
@@ -1993,7 +2001,7 @@ struct Checker {
             if (auto selected = symbols.shapedMethod(type, "message", source, hasMessage)) {
                 if (!materializing()) return {};
                 const auto& item = symbols.callables[selected->first];
-                return {item.generic ? symbols.instantiate(selected->first, module.aggregates[type.id].arguments, source, site) : item.target, {}};
+                return {item.generic ? symbols.instantiate(selected->first, symbols.instanceArguments(type), source, site) : item.target, {}};
             }
         }
         auto name = typeName(module, type);
@@ -3142,6 +3150,7 @@ struct Checker {
             if (owner.kind == Type::Exception) {
                 property("taskFailures", symbols.list(Type::Exception));
                 property("cleanupFailures", symbols.list(Type::Exception));
+                if (owner == unwrapError) property("failure", symbols.sum(Type::Option, Type::Error));
             }
             if (owner == Type::Error) {
                 property("original", Type::Any);
@@ -3226,6 +3235,7 @@ struct Checker {
         if (owner.kind == Type::Exception) {
             auto slot = [&](ExceptionMember field, Type type) { fn.expressions[id].target = static_cast<std::size_t>(field); return type; };
             if (member.name.text == "message") return slot(ExceptionMember::Message, Type::String);
+            if (owner == unwrapError && member.name.text == "failure") return slot(ExceptionMember::Failure, symbols.sum(Type::Option, Type::Error));
             if (member.name.text == "taskFailures") return slot(ExceptionMember::TaskFailures, symbols.list(Type::Exception));
             if (member.name.text == "cleanupFailures") return slot(ExceptionMember::CleanupFailures, symbols.list(Type::Exception));
         }
@@ -3458,14 +3468,19 @@ struct Checker {
     std::optional<Type> extensionCall(ExprId id, const Call& call, Type receiver, std::optional<Type> expected) {
         std::vector<std::size_t> candidates;
         std::map<std::size_t, std::vector<Type>> receiverTypes;
-        for (auto index : symbols.visibleExtensions[fn.syntax.file]) {
-            const auto& members = symbols.extensionMethods[index];
-            auto found = members.find(call.name.text);
-            if (found == members.end()) continue;
-            auto types = symbols.extensionTypes(index, receiver);
-            if (!types) continue;
-            receiverTypes.emplace(index, std::move(*types));
-            candidates.insert(candidates.end(), found->second.begin(), found->second.end());
+        for (bool core : {true, false}) {
+            for (auto index : symbols.visibleExtensions[fn.syntax.file]) {
+                const auto& group = symbols.extensionDeclarations[index];
+                if ((symbols.sources[group.file].moduleId == coreModule) != core) continue;
+                const auto& members = symbols.extensionMethods[index];
+                auto found = members.find(call.name.text);
+                if (found == members.end()) continue;
+                auto types = symbols.extensionTypes(index, receiver);
+                if (!types) continue;
+                receiverTypes.emplace(index, std::move(*types));
+                candidates.insert(candidates.end(), found->second.begin(), found->second.end());
+            }
+            if (!candidates.empty()) break;
         }
         if (candidates.empty()) return {};
         auto types = [&](std::size_t declaration) -> std::span<const Type> {
@@ -3627,10 +3642,21 @@ struct Checker {
                 if (builtin->context == Symbols::MemberContext::AsyncBody && !inAsync())
                     throw at(source, call.name.span, "LYT0008", "Task.cancel() 只能在异步执行体中调用，不能在同步 lambda、blocking 或 defer 中调用");
                 info.callee = builtin->callee;
-                if (info.callee == Callee::FailureInfo) info.errorDisplay = displayError(module.sumTypes[owner.id].failure, call.name.span, false);
+                if (info.callee == Callee::FailureInfo || (info.callee == Callee::SumUnwrap && owner.kind == Type::Result))
+                    info.errorDisplay = displayError(module.sumTypes[owner.id].failure, call.name.span, false, info.callee == Callee::FailureInfo);
                 const auto& shape = builtin->shape;
                 return arguments(id, call, shape.parameters.size(), [&](auto slot) -> std::string_view { return shape.labels[slot]; },
                     [&](auto slot) { return shape.parameters[slot]; }) ? Type{Type::Never} : shape.result;
+            }
+            if (source.moduleId == coreModule && owner.kind == Type::Result && (key == "carryFailure" || key == "remapFailure")) {
+                if (call.typeArguments.size() != 1) throw at(source, call.name.span, "LYG0001", "此调用需要一个类型实参");
+                auto input = module.sumTypes[owner.id];
+                auto replacement = symbols.resolve(fn.syntax, call.typeArguments.front(), variables);
+                bool remap = key == "remapFailure";
+                info.callee = remap ? Callee::RemapFailure : Callee::CarryFailure;
+                if (remap) info.errorDisplay = displayError(input.failure, call.name.span, false, false);
+                if (arguments(id, call, remap ? 1 : 0, [](auto) { return "error"; }, [&](auto) { return replacement; })) return Type::Never;
+                return remap ? symbols.sum(Type::Result, input.success, replacement) : symbols.sum(Type::Result, replacement, input.failure);
             }
             auto valueMember = [&](ValueOperation operation) {
                 bool equality = operation == ValueOperation::Equal;
@@ -4392,8 +4418,11 @@ static CheckedModule checkProgram(Module module, const std::vector<Source>& sour
     if (!symbols.extensionDeclarations.empty()) for (std::size_t file = 0; file < sources.size(); ++file) {
         std::set<std::size_t> visible;
         if (!module.importedExtensions.empty()) for (const auto& group : module.importedExtensions[file]) visible.insert(symbols.extensions.at(group));
-        for (std::size_t index = 0; index < symbols.extensionDeclarations.size(); ++index)
-            if (sources[symbols.extensionDeclarations[index].file].moduleId == sources[file].moduleId) visible.insert(index);
+        for (std::size_t index = 0; index < symbols.extensionDeclarations.size(); ++index) {
+            const auto& group = symbols.extensionDeclarations[index];
+            const auto& owner = sources[group.file].moduleId;
+            if (owner == sources[file].moduleId || (owner == coreModule && group.isPublic)) visible.insert(index);
+        }
         symbols.visibleExtensions[file].assign(visible.begin(), visible.end());
     }
     for (const auto& trait : module.traits) {

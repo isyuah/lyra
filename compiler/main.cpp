@@ -243,15 +243,12 @@ int project(const Options& opts, bool json, AnalysisDiagnostics& diagnostics) {
     if (!fs::exists(opts.directory / "lyra.json5")) {
         if (opts.packages.locked || opts.packages.offline) throw Diagnostic{"LYK0001", "此操作需要包清单 lyra.json5"};
         if (opts.command == "check") {
-            analyze(false, [&](auto& current) { return loadLooseProgram(loadSources(opts.directory), current); });
+            analyze(false, [&](auto& current) { return loadLooseProgram(loadSources(opts.directory), &current); });
             return !diagnostics.errors.empty();
         }
         auto output = binary(opts.directory);
         compileCached(opts, opts.directory, nullptr, {}, output, false, diagnostics.warnings, [&]() -> Compilation {
-            auto sources = loadSources(opts.directory);
-            auto module = parse(sources);
-            if (!module.imports.empty()) throw at(sources[module.imports.front().file], module.imports.front().path.front().span, "LYN0003", "使用 import 需要包清单 lyra.json5");
-            return {std::move(sources), std::move(module)};
+            return loadLooseProgram(loadSources(opts.directory));
         });
         return opts.command == "build" ? 0 : execute(output, opts.arguments);
     }

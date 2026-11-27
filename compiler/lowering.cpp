@@ -1104,7 +1104,7 @@ struct Emitter {
     }
 
     Value wrapError(Value value, Type type, const ErrorDisplay& display, Value cause, Span site) {
-        if (type == Type::Error) return value;
+        if (type == Type::Error) return llvm::isa<llvm::ConstantPointerNull>(cause) ? value : pointerCall("lyraErrorAttachCause", {value, cause});
         auto message = display.method ? callFunction(*display.method, {value}, site) : type == Type::String ? value : stringConstant(display.fallback);
         auto original = boxAny(value, type);
         return pointerCall("lyraErrorCreate", {builder.CreateExtractValue(original, 0), builder.CreateExtractValue(original, 1), message, cause});
@@ -1680,6 +1680,10 @@ struct Emitter {
         if (owner.kind == Type::Exception) {
             switch (static_cast<ExceptionMember>(fn.expressions[id].target)) {
                 case ExceptionMember::Message: return NativeExceptions{builder}.message(object);
+                case ExceptionMember::Failure: {
+                    auto failure = pointerCall("lyraExceptionFailure", {object});
+                    return builder.CreateInsertValue(makeSum(rawType(id), SumTag::Some, failure), builder.CreateIsNotNull(failure), 0);
+                }
                 case ExceptionMember::TaskFailures: return pointerCall("lyraExceptionTaskFailures", {object});
                 case ExceptionMember::CleanupFailures: return pointerCall("lyraExceptionCleanupFailures", {object});
             }
@@ -1900,6 +1904,35 @@ struct Emitter {
                 return wrapError(args[0], fn.expressions[argument].type, info.errorDisplay, cause, call.name.span);
             }
             case Callee::ErrorSuppress: return pointerCall("lyraErrorSuppress", args);
+            case Callee::SumPresent: return builder.CreateExtractValue(receiver, 0);
+            case Callee::SumAbsent: return builder.CreateNot(builder.CreateExtractValue(receiver, 0));
+            case Callee::SumUnwrap: {
+                auto owner = fn.expressions[*call.receiver].type;
+                bool optional = owner.kind == Type::Option;
+                auto success = label("unwrap.value"), failed = label("unwrap.error");
+                builder.CreateCondBr(builder.CreateExtractValue(receiver, 0), success, failed);
+                builder.SetInsertPoint(failed);
+                auto message = args.size() == 2 ? args[1] : stringConstant(optional ? "unwrap on None" : "unwrap on Err");
+                Value failure = nullPointer();
+                if (!optional) {
+                    failure = wrapError(builder.CreateExtractValue(receiver, 2), layouts.program.sumTypes[owner.id].failure,
+                        info.errorDisplay, builder.CreateExtractValue(receiver, 3), call.name.span);
+                    message = pointerCall("lyraStringConcat", {message, stringConstant(": ")});
+                    message = pointerCall("lyraStringConcat", {message, pointerCall("lyraErrorMessage", {failure})});
+                }
+                auto error = pointerCall("lyraExceptionCreateUnwrap", {message, layouts.typeToken(builder, unwrapError), failure});
+                propagate(NativeExceptions{builder}.locate(error, source, call.name.span), handlers.size());
+                builder.SetInsertPoint(success);
+                return builder.CreateExtractValue(receiver, 1);
+            }
+            case Callee::CarryFailure:
+                return makeSum(rawType(id), SumTag::Err, builder.CreateExtractValue(receiver, 2), builder.CreateExtractValue(receiver, 3));
+            case Callee::RemapFailure: {
+                auto owner = fn.expressions[*call.receiver].type;
+                auto previous = wrapError(builder.CreateExtractValue(receiver, 2), layouts.program.sumTypes[owner.id].failure,
+                    info.errorDisplay, builder.CreateExtractValue(receiver, 3), call.name.span);
+                return makeSum(rawType(id), SumTag::Err, args[1], previous);
+            }
             case Callee::FailureInfo: {
                 auto missing = builder.GetInsertBlock(), failure = label("result.error"), done = label("result.end");
                 builder.CreateCondBr(builder.CreateExtractValue(receiver, 0), done, failure);

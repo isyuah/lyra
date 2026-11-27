@@ -145,6 +145,8 @@ implicit (user: User): Response { Response.json(user) }
 
 后缀 `?` 同时支持 `Result` 和 `Option`；由静态类型决定是传播 `Err`，还是从返回兼容 Optional 的函数提前返回 `None`，两者不隐式互转。嵌套类型可用 `Option<Option<T>>` 明确表达。
 
+核心库为两种类型提供无需导入的[取值、组合和显式转换方法](../std/core/README.md)，核心方法优先于用户扩展。普通 `map` 保持一层包装，`flatMap` 才合并包装；`transpose` 交换内外层，不混淆缺失与失败。
+
 ## 文本与字节
 
 `String` 是不可变 UTF-8 文本，`Char` 是 Unicode 标量（不等同于用户感知的字素），`Bytes` 是不可变的原始字节。`String.size` 和 `text[index]` 按标量计数，`String.byteSize` 和 `Bytes.size` 按字节计数，`bytes[index]` 得到 `UInt8`。下标从零开始，越界抛出定位到 `[` 的 `BoundsError`。`Char.codePoint` 为 `UInt32`；可用 `character.toString()` 得到文本。

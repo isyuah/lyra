@@ -34,7 +34,7 @@ struct ParseCache { std::map<std::string, ParsedFileSyntax> files; };
 struct EditorProbeEnvironment;
 Compilation loadProgram(const PackageGraph& graph, const std::string& entry, const std::optional<std::filesystem::path>& testFile = {}, const SourceOverlay* overlays = nullptr,
     ParseCache* parseCache = nullptr, bool editorProbe = false, AnalysisDiagnostics* diagnostics = nullptr, EditorProbeEnvironment* probe = nullptr);
-Compilation loadLooseProgram(std::vector<Source> sources, AnalysisDiagnostics& diagnostics, ParseCache* parseCache = nullptr);
+Compilation loadLooseProgram(std::vector<Source> sources, AnalysisDiagnostics* diagnostics = nullptr, ParseCache* parseCache = nullptr);
 struct EditorFileSyntax { std::string text; Module syntax; std::vector<ExpressionExpansion> expressions; std::optional<std::string> catalogKey{}; };
 struct EditorParseCache { std::map<std::filesystem::path, EditorFileSyntax> files; };
 struct EditorDeclaration { std::size_t file; std::string name; EditorSymbol symbol; bool visible; };
@@ -81,6 +81,8 @@ struct Space {
 struct ImportTarget { std::string package, module; fs::path directory; };
 using SymbolDependencies = std::map<std::string, std::set<std::string>>;
 using TypedExports = std::set<std::pair<std::string, std::string>>;
+
+fs::path standardRoot() { return sdkRoot() / "share" / "lyra" / "std"; }
 
 std::vector<fs::path> sourcePaths(const fs::path& directory, const SourceOverlay* overlays, bool strict, bool recursive = true) {
     std::set<fs::path> paths;
@@ -455,6 +457,8 @@ struct Linker {
                 for (const auto& name : syntax.importedExtensions[fn.file]) needs->insert(name);
                 if (auto found = moduleExtensions.find(sources[fn.file].moduleId); found != moduleExtensions.end())
                     needs->insert(found->second.begin(), found->second.end());
+                if (auto core = moduleExtensions.find(coreModule); core != moduleExtensions.end())
+                    needs->insert(core->second.begin(), core->second.end());
             }
             for (auto& bound : fn.bounds) {
                 renameTypeIn(fn.file, bound.trait);
@@ -881,6 +885,13 @@ struct MacroDependencies {
             code.push_back(source);
             appendCachedSyntax(syntax, parsed, code.size() - 1);
         };
+        auto appendModule = [&](const std::string& module) {
+            scopes.emplace(module, Space{spaces.at(module).package});
+            for (std::size_t file = 0; file < sources.size(); ++file)
+                if (sources[file].moduleId == module) append(sources[file], files[file]);
+        };
+        read.insert(coreModule);
+        appendModule(coreModule);
         for (std::size_t index = 0; index < syntax.imports.size(); ++index) {
             const auto use = syntax.imports[index];
             if (use.kind != ImportKind::Runtime) continue;
@@ -911,11 +922,7 @@ struct MacroDependencies {
             try { target = importTarget(code[use.file], from, use.path, names); }
             catch (const Diagnostic&) { if (use.file == 1) throw; }
             if (!target || !read.insert(target->module).second) continue;
-            auto space = spaces.find(target->module);
-            if (space == spaces.end()) continue;
-            scopes.emplace(target->module, Space{space->second.package});
-            for (std::size_t file = 0; file < sources.size(); ++file)
-                if (sources[file].moduleId == target->module) append(sources[file], files[file]);
+            if (spaces.contains(target->module)) appendModule(target->module);
         }
         llvm::SHA256 hash;
         auto text = [&](std::string_view value) { hash.update(std::to_string(value.size()) + ':'); hash.update(value); };
@@ -1430,19 +1437,34 @@ std::vector<fs::path> testEntries(const fs::path& root) {
     return sourcePaths(root / "tests", nullptr, true, false);
 }
 
-Compilation loadLooseProgram(std::vector<Source> sources, AnalysisDiagnostics& diagnostics, ParseCache* parseCache) {
+Compilation loadLooseProgram(std::vector<Source> sources, AnalysisDiagnostics* diagnostics, ParseCache* parseCache) {
     Compilation program{std::move(sources), {}};
-    for (std::size_t file = 0; file < program.sources.size(); ++file) {
+    if (!diagnostics) program.syntax = parse(program.sources);
+    else for (std::size_t file = 0; file < program.sources.size(); ++file) {
         const auto& source = program.sources[file];
         auto parsed = parseCache ? cachedFileSyntax(source, *parseCache) : recoverFileSyntax(source);
-        for (auto& error : parsed.errors) diagnostics.add(std::move(error));
+        for (auto& error : parsed.errors) diagnostics->add(std::move(error));
         program.incompleteDeclaration |= parsed.incompleteDeclaration;
-        for (const auto& use : parsed.syntax.imports) {
-            diagnostics.add(at(source, use.path.front().span, "LYN0003", "使用 import 需要包清单 lyra.json5"));
-            program.incompleteDeclaration = true;
-        }
         appendCachedSyntax(program.syntax, parsed.syntax, file);
     }
+    for (const auto& use : program.syntax.imports) {
+        auto error = at(program.sources[use.file], use.path.front().span, "LYN0003", "使用 import 需要包清单 lyra.json5");
+        if (!diagnostics) throw error;
+        diagnostics->add(std::move(error));
+        program.incompleteDeclaration = true;
+    }
+    if (program.incompleteDeclaration) return program;
+    auto root = standardRoot() / "core";
+    ResolvedPackage package{coreModule, "core", "builtin", root, {}, true};
+    std::vector<Source> sourcesCore{loadSource(root / "src/sums.ly", coreModule)};
+    Module core;
+    parseFile(core, sourcesCore.front(), 0);
+    std::map<std::string, Space> spaces{{coreModule, {&package}}};
+    std::map<std::string, std::string> prefixes{{coreModule, coreModule}};
+    std::vector<NameReference> references;
+    Linker{sourcesCore, spaces, prefixes, coreModule, references, false}.rewrite(core);
+    appendCachedSyntax(program.syntax, core, program.sources.size());
+    program.sources.push_back(std::move(sourcesCore.front()));
     return program;
 }
 
@@ -1511,33 +1533,38 @@ Compilation loadProgram(const PackageGraph& graph, const std::string& entry, con
     };
     for (std::size_t file = 0; file < program.sources.size(); ++file) parseAuthored(file);
     std::map<std::string, ResolvedPackage> bundled;
-    auto standard = sdkRoot() / "share" / "lyra" / "std";
+    auto standard = standardRoot();
     std::size_t loadedImports = 0;
+    auto loadStandard = [&](const std::string& name, bool handwritten, const Import* use = nullptr) {
+        auto key = "$std/" + name;
+        if (bundled.contains(key)) return;
+        auto packageRoot = standard / name;
+        if (use && !fs::is_directory(packageRoot / "src"))
+            throw at(program.sources[use->file], use->path[1].span, "LYN0003", "找不到随工具链安装的标准包：" + name);
+        auto& package = bundled.emplace(key, ResolvedPackage{key, name, "builtin", packageRoot, {}, true}).first->second;
+        packages.emplace(key, &package);
+        prefixes.emplace(key, key);
+        spaces.emplace(key, Space{&package});
+        for (auto source : loadSources(packageRoot)) {
+            source.moduleId = key;
+            if (overlays) if (auto found = overlays->find(source.path); found != overlays->end())
+                source = sourceText(source.path, found->second, key);
+            program.sources.push_back(std::move(source));
+            auto file = program.sources.size() - 1;
+            if (handwritten) parseAuthored(file);
+            else if (diagnostics) appendCachedSyntax(program.syntax, parseRecovering(program.sources.back(), nullptr), file);
+            else parseFile(program.syntax, program.sources.back(), file);
+        }
+    };
     auto loadBundled = [&](Module& syntax, bool handwritten) {
         for (; loadedImports < syntax.imports.size(); ++loadedImports) {
             const auto& use = syntax.imports[loadedImports];
             if (use.kind != ImportKind::Runtime || use.path.size() < 2 || use.path[0].text != "std") continue;
             auto name = use.path[1].text;
-            auto key = "$std/" + name;
-            if (bundled.contains(key)) continue;
-            auto packageRoot = standard / name;
-            if (!fs::is_directory(packageRoot / "src")) throw at(program.sources[use.file], use.path[1].span, "LYN0003", "找不到随工具链安装的标准包：" + name);
-            auto& package = bundled.emplace(key, ResolvedPackage{key, name, "builtin", packageRoot, {}, true}).first->second;
-            packages.emplace(key, &package);
-            prefixes.emplace(key, key);
-            spaces.emplace(key, Space{&package});
-            for (auto source : loadSources(packageRoot)) {
-                source.moduleId = key;
-                if (overlays) if (auto found = overlays->find(source.path); found != overlays->end())
-                    source = sourceText(source.path, found->second, key);
-                program.sources.push_back(std::move(source));
-                auto file = program.sources.size() - 1;
-                if (handwritten) parseAuthored(file);
-                else if (diagnostics) appendCachedSyntax(program.syntax, parseRecovering(program.sources.back(), nullptr), file);
-                else parseFile(program.syntax, program.sources.back(), file);
-            }
+            loadStandard(name, handwritten, &use);
         }
     };
+    loadStandard("core", true);
     loadBundled(authored, true);
     if (diagnostics && program.incompleteDeclaration) return program;
     auto linkProgram = [&] {

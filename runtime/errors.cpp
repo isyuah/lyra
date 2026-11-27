@@ -42,6 +42,15 @@ extern "C" const Error* lyraErrorSuppress(const Error* error, const Error* addit
     return result;
 }
 
+extern "C" const Error* lyraErrorAttachCause(const Error* error, const Error* cause) {
+    if (!cause) return error;
+    for (auto* current = error; current; current = current->cause) if (current == cause) return error;
+    if (error->cause) return lyraErrorSuppress(error, cause);
+    auto* result = ::new (lyraGcAlloc(sizeof(Error))) Error(*error);
+    result->cause = cause;
+    return result;
+}
+
 extern "C" int lyraErrorReport(const Error* error) {
     struct Line { const Error* error; const char* label; const Line* next; };
     auto push = [](const Error* value, const char* label, const Line* next) {
