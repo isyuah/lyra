@@ -272,6 +272,7 @@ fn deriveEnum(target: String, prefix: String, format: String): Syntax {
     syntaxConcat(helpers, syntaxCode(encoding + "}\n}\n" + decoding + wrappers(target, prefix, format)))
 }
 
+/// 在结构体或枚举前写 `#derive(Json)` 或 `#derive(Toml)`，生成对应的静态编解码实现。
 fn derive(target: String, argument: String): Syntax {
     if argument != "Json" && argument != "Toml" { return syntaxError(syntaxTarget(), "#derive expects Json or Toml") }
     if targetKind() != "struct" && targetKind() != "enum" { return syntaxError(syntaxTarget(), "#derive(" + argument + ") expects a struct or enum") }

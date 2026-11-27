@@ -74,28 +74,51 @@ namespace json = llvm::json;
 constexpr auto byteLimit = macroInputByteLimit;
 constexpr std::size_t cacheByteLimit = 16 * byteLimit;
 constexpr std::size_t checksumLength = 64;
-constexpr auto prelude = R"(pub struct Syntax(val handle: Int)
+constexpr auto prelude = R"(/// 编译期语法节点，可用于查看源码、查询类型和构造宏展开结果。
+pub struct Syntax(val handle: Int)
+/// 返回目标的字段、枚举分支或函数形参数量，取决于目标种类。
 fn fieldCount(): Int { 0 }
+/// 按声明顺序读取零基位置上的字段名、分支名或形参名；越界报告宏诊断。
 fn fieldName(index: Int): String { "" }
+/// 读取指定字段或形参的类型文本；需要解析别名和模块时使用语法节点查询。
 fn fieldType(index: Int): String { "" }
+/// 查询指定项是否公开，可用于派生时跳过私有字段。
 fn fieldPublic(index: Int): Bool { false }
+/// 查询结构体字段默认值：`required` 表示没有默认值，`none` 表示字面空值，`expression` 表示其他默认表达式。
 fn fieldDefaultKind(index: Int): String { "" }
+/// 取得结构体字段默认值在生成代码中可调用的内部名称；缺少默认值时报错。
 fn fieldDefaultFunction(index: Int): String { "" }
+/// 检查指定字段或形参是否带有名为 `name` 的属性标记。
 fn fieldHasAttribute(index: Int, name: String): Bool { false }
+/// 读取指定属性的参数文本；无参数返回空串，属性不存在时报告宏诊断。
 fn fieldAttributeValue(index: Int, name: String): String { "" }
+/// 返回当前表达式宏调用的实参数量；不能用于声明宏。
 fn argumentCount(): Int { 0 }
+/// 读取表达式宏指定实参的字符串字面量内容；下标从零开始，其他表达式不接受。
 fn argumentString(index: Int): String { "" }
+/// 返回宏所附着语法的种类，例如 `struct` 或 `enum`。
 fn targetKind(): String { "" }
+/// 返回目标声明的泛型形参数量。
 fn typeParameterCount(): Int { 0 }
+/// 按声明顺序读取零基位置上的泛型形参名，不含约束。
 fn typeParameterName(index: Int): String { "" }
+/// 返回可放入生成声明的泛型形参文本，含尖括号和约束；非泛型目标返回空串。
 fn typeParameterDeclarations(): String { "" }
+/// 返回可放入类型实参位置的文本，含尖括号但不含约束；非泛型目标返回空串。
 fn typeParameterArguments(): String { "" }
+/// 取得宏附着的源语法节点；没有目标的调用位置报告宏诊断。
 fn syntaxTarget(): Syntax { Syntax(0) }
+/// 取得目标函数或方法的源码函数体；没有函数体时报错。
 fn syntaxBody(): Syntax { Syntax(0) }
+/// 取表达式宏的零基实参节点。插入输出时保留调用处的绑定、位置和求值语义。
 fn syntaxArgument(index: Int): Syntax { Syntax(index) }
+/// 返回直接语法子节点数；源码注释不占子节点下标。
 fn syntaxChildCount(node: Syntax): Int { 0 }
+/// 按零基下标取一个直接子节点；越界报告宏诊断。
 fn syntaxChild(node: Syntax, index: Int): Syntax { node }
+/// 返回节点种类标签，例如 `name`、`comment` 或类型节点的 `builtin`。
 fn syntaxKind(node: Syntax): String { "" }
+/// 读取源码原文、已解析类型节点的名称，或无源码位置的生成节点文本。
 fn syntaxText(node: Syntax): String { "" }
 /// 读取源码声明附带的 Markdown 文档；没有文档时返回空字符串。
 fn syntaxDoc(node: Syntax): String { "" }
@@ -103,35 +126,63 @@ fn syntaxDoc(node: Syntax): String { "" }
 fn syntaxCommentCount(node: Syntax): Int { 0 }
 /// 按源码顺序读取一条注释，保留注释分隔符和位置。
 fn syntaxComment(node: Syntax, index: Int): Syntax { node }
+/// 读取源码名称节点的标识符，去掉用于转义的反引号。
 fn syntaxIdentifier(node: Syntax): String { "" }
+/// 读取映射回用户源码的零基起始字节偏移；未标位置的生成节点使用宏调用位置。
 fn syntaxStart(node: Syntax): Int { 0 }
+/// 读取映射回用户源码的结束字节偏移，不包含偏移处的字节。
 fn syntaxEnd(node: Syntax): Int { 0 }
+/// 返回用户源码中的起始行号，从 `1` 开始。
 fn syntaxLine(node: Syntax): Int { 0 }
+/// 返回用户源码中的起始列号，从 `1` 开始。
 fn syntaxColumn(node: Syntax): Int { 0 }
+/// 将宏作者构造的 Lyra 源码片段包装成输出节点；展开后仍需正常解析和类型检查。
 fn syntaxCode(text: String): Syntax { Syntax(0) }
+/// 创建生成源码片段，并把该片段的诊断映射到 `node` 的来源位置。
 fn syntaxCodeAt(node: Syntax, text: String): Syntax { node }
+/// 解析目标声明的显式类型标注，跟随导入、展开透明别名并保留泛型形参。
 fn syntaxResolvedType(node: Syntax): Syntax { node }
+/// 在类型宏中查询表达式、绑定或签名节点的静态类型；无类型节点返回 `None`。
 fn syntaxTypeOf(node: Syntax): Syntax? { None }
+/// 在类型宏中读取目标函数或方法的实际返回类型，包括推断结果。
 fn syntaxResultType(): Syntax { Syntax(0) }
+/// 读取已解析类型节点所属的模块名；没有所属模块时返回空串。
 fn syntaxTypeModule(node: Syntax): String { "" }
+/// 构造转义过的 Lyra 字符串字面量节点，不将输入当作源码执行。
 fn syntaxString(text: String): Syntax { Syntax(0) }
+/// 构造表示该整数的十进制节点，可用于生成表达式。
 fn syntaxInt(number: Int): Syntax { Syntax(0) }
+/// 校验标识符并构造带反引号的名称节点，允许关键字用作被转义的名称。
 fn syntaxName(text: String): Syntax { Syntax(0) }
+/// 拼接两段语法，在它们之间用换行分隔。
 fn syntaxJoin(left: Syntax, right: Syntax): Syntax { left }
+/// 直接拼接两个语法片段，不插入空格或分隔符。
 fn syntaxConcat(left: Syntax, right: Syntax): Syntax { left }
+/// 用逗号和空格连接两段实参语法，可组合成调用的实参列表。
 fn syntaxArgs(left: Syntax, right: Syntax): Syntax { left }
+/// 组合被调用表达式和实参序列，生成一个带括号的调用。
 fn syntaxCall(callee: Syntax, arguments: Syntax): Syntax { callee }
+/// 在接收者节点上生成一次带转义名称的成员访问。
 fn syntaxMember(receiver: Syntax, name: String): Syntax { receiver }
+/// 将语句片段包在一对花括号中，形成块节点。
 fn syntaxBlock(statements: Syntax): Syntax { statements }
+/// 为函数装饰器构造进入、成功和异常钩子；后两者分别可读取 `result` 和 `exception`。
 fn syntaxAround(before: Syntax, after: Syntax, failure: Syntax): Syntax { before }
+/// 停止宏展开，把 `message` 作为诊断指向给定节点的源位置。
 fn syntaxError(node: Syntax, message: String): Syntax { node }
 fn quoteText(text: String): Syntax { Syntax(0) }
 fn quoteJoin(left: Syntax, right: Syntax): Syntax { left }
+/// 提取 `Option<...>` 类型文本尖括号内的部分；不符合该文本形状时返回空串。
 fn optionInner(typeName: String): String { "" }
+/// 提取 `List<...>` 类型文本尖括号内的部分；不符合该文本形状时返回空串。
 fn listElement(typeName: String): String { "" }
+/// 将文本编码为完整的 Lyra 字符串字面量，包含引号与转义。
 fn macroQuote(text: String): String { "" }
+/// 按字节查找子串，区分大小写，不做 Unicode 归一化。
 fn macroContains(text: String, fragment: String): Bool { false }
+/// 按键读取调用包在 `macroInputs` 中授权的输入快照，不读取任意宿主文件。
 fn macroInput(key: String): String { "" }
+/// 停止展开并在当前宏调用处报告错误；不会正常返回字符串。
 fn macroFail(message: String): String { "" }
 fn httpRouteOrigin(): String { "" }
 )";

@@ -20,6 +20,8 @@ lyra doc --stdlib -o build/lyra-reference.json
 pub fn answer(value: Int = 42): Int { value }
 ```
 
+标准库的公开声明、字段和枚举分支都需要有说明，优先写清返回值、失败条件或使用限制，不必重复签名。隐式构造器和重导出默认沿用原声明的说明。编译器内置类型和操作的说明维护在 `compiler/check.cpp`，宏内置 API 则使用 `compiler/macros.cppm` 中宏前导的 `///`。用 `lyra doc --stdlib` 查看 `missingDocumentation`，`doc` 验收测试也会检查这一列表为空。
+
 ## JSON v1
 
 - `schemaVersion` 是数据格式版本，`compilerVersion` 是实际生成数据的 Lyra 版本。

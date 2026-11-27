@@ -144,7 +144,7 @@ function renderReference(data) {
   };
 
   add("", "参考总览", [
-    `Lyra ${code(data.compilerVersion)} 的语法、内置 API 和标准库接口。部分条目只有签名。`,
+    `Lyra ${code(data.compilerVersion)} 的语法、内置 API 和标准库接口。${data.missingDocumentation.length ? `有 ${data.missingDocumentation.length} 个条目尚无说明。` : ""}`,
     "- [语法速查](syntax/)：关键字、运算符优先级和结合性。",
     "- [编译器内置](builtins/)：类型、全局函数和宏实现可用的接口。",
     "- [标准库](std/)：按模块查找公开类型、函数和扩展。",

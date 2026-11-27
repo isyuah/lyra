@@ -170,6 +170,8 @@ async fn writeEncoded(encoder: GzipEncoder, writer: ResponseWriter, content: Byt
     Ok({})
 }
 
+/// 按请求的 `Accept-Encoding` 协商 gzip 或原响应；两种编码均被拒绝时返回 `406`。
+/// 不修改已有内容编码、范围响应和禁止转换的响应；应由调用方决定哪些正文适合压缩。
 pub fn gzipResponse(request: Request, response: Response, level: Int = -1): Result<Response, HttpError> {
     if level < -1 || level > 9 { return Err(HttpError(HttpErrorKind.Invalid, "gzipResponse", "compression level must be -1 through 9")) }
     if response.code == 204 || response.code == 205 || response.code == 206 || response.code == 304 ||
@@ -216,6 +218,7 @@ pub fn gzipResponse(request: Request, response: Response, level: Int = -1): Resu
 
 enum ReadState { Open, Finished, Failed(HttpError), Closed }
 
+/// 对流式 HTTP 请求正文做增量 gzip 解压，解压预算独立于监听器的正文上限。
 pub class GzipRequestReader {
     val request: Request
     val decoder: GzipDecoder
@@ -227,6 +230,7 @@ pub class GzipRequestReader {
         this.decoder = decoder
     }
 
+    /// 要求流式请求和单一 `Content-Encoding: gzip`；同一请求只使用一个读取器，不混用 `readBody()`。
     pub static fn fromRequest(request: Request, maxOutputBytes: Int = 8388608): Result<GzipRequestReader, HttpError> {
         if !request.bodyStreaming() {
             return Err(HttpError(HttpErrorKind.Invalid, "GzipRequestReader", "enable streamRequestBody on the listener"))
@@ -239,6 +243,7 @@ pub class GzipRequestReader {
         Ok(GzipRequestReader(request, decoder))
     }
 
+    /// 返回下一解压块；只有 HTTP 正文结束且 gzip 校验完成才返回 `Ok(None)`。并发读取返回 `Busy`。
     pub async fn read(): Result<Bytes?, HttpError> {
         if !access.compareExchange(0, 1) { return Err(HttpError(HttpErrorKind.Busy, "GzipRequestReader.read")) }
         defer access.store(0)
@@ -282,6 +287,7 @@ pub class GzipRequestReader {
         throw Exception("unreachable gzip reader state")
     }
 
+    /// 放弃并关闭解码器，不关闭 HTTP 请求，也不校验尚未读到的尾部。
     pub fn close(): Result<Unit, HttpError> {
         if !access.compareExchange(0, 1) { return Err(HttpError(HttpErrorKind.Busy, "GzipRequestReader.close")) }
         defer access.store(0)

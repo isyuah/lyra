@@ -134,6 +134,7 @@ pub fn target(): Unit {}
         standard = COMPILER.parent.parent / 'share/lyra/std'
         expected = {'std.' + folder.name for folder in standard.iterdir() if (folder / 'src').is_dir()}
         self.assertEqual(module_names, expected | {'std.meta', 'builtin'})
+        self.assertFalse(data['missingDocumentation'], '\n'.join(data['missingDocumentation']))
         self.assertTrue(entries['builtin::Option.unwrap']['documentation'])
         self.assertEqual(entries['builtin::Bytes.fromHex']['parameters'][0]['type'], 'String')
         self.assertEqual(entries['builtin::Error.cause']['kind'], 'property')

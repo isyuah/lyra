@@ -5,6 +5,7 @@ module;
 #include <compare>
 #include <cstdint>
 #include <functional>
+#include <initializer_list>
 #include <map>
 #include <memory>
 #include <optional>
@@ -83,11 +84,27 @@ using Overloads = std::unordered_map<std::string, std::vector<std::size_t>>;
 
 const std::string& linkedName(const Identifier& name) { return name.linked.empty() ? name.text : name.linked; }
 
-constexpr Type scalarTypes[] = {Type::Bool, Type::String, Type::Char, Type::Bytes, Type::Unit, Type::CPtr, Type::CCallback, Type::Any, Type::Error};
-struct BuiltinGeneric { std::string_view name; Type::Kind kind; std::array<std::string_view, 2> parameters; };
+struct BuiltinScalar { Type type; std::string_view documentation; };
+constexpr BuiltinScalar scalarTypes[] = {
+    {Type::Bool, "布尔值，仅有 `true` 和 `false`。条件表达式需要布尔值，不隐式使用数字或空值判断真假。"},
+    {Type::String, "不可变 UTF-8 文本，可包含 NUL。下标与 `size` 按 Unicode 标量计数，`byteSize` 按字节计数。"},
+    {Type::Char, "单个 Unicode 标量，不等同于用户看到的字素；可用 `codePoint` 读取其数值。"},
+    {Type::Bytes, "不可变原始字节串，不要求有效 UTF-8。下标从零开始，元素类型为 `UInt8`。"},
+    {Type::Unit, "没有有用载荷的单值类型，例如没有结果的函数或空块的值。"},
+    {Type::CPtr, "不透明 C 指针。调用方负责原生内存的边界、对齐、生命周期与线程同步；读写等操作要求 `unsafe`。"},
+    {Type::CCallback, "为 C 调用登记的同步 Lyra 闭包。登记保活捕获环境，必须先停止原生调用再显式关闭。"},
+    {Type::Any, "装箱任意具体值，保留运行时类型；用 `as? T` 做检查转换，也可以读取结构体或类的公开字段。"},
+    {Type::Error, "用于 `Result` 的共同业务错误值，不是可抛出的 `Exception`；保留原始值、前因和附加失败。"},
+};
+struct BuiltinGeneric { std::string_view name; Type::Kind kind; std::array<std::string_view, 2> parameters; std::string_view documentation; };
 constexpr BuiltinGeneric builtinGenerics[] = {
-    {"List", Type::List, {"T"}}, {"FrozenList", Type::FrozenList, {"T"}}, {"Task", Type::Task, {"T"}},
-    {"TaskLocal", Type::TaskLocal, {"T"}}, {"Channel", Type::Channel, {"T"}}, {"Option", Type::Option, {"T"}}, {"Result", Type::Result, {"T", "E"}}
+    {"List", Type::List, {"T"}, "有序可变列表，索引从零开始；普通赋值共享列表，切片创建独立的浅拷贝。"},
+    {"FrozenList", Type::FrozenList, {"T"}, "列表槽位的只读浅快照，可索引和遍历；如果元素是类实例，仍共享同一个对象。"},
+    {"Task", Type::Task, {"T"}, "异步工作及其结果。异步调用构造冷任务，在首次 `await` 或 `spawn` 时启动，之后共享结果。"},
+    {"TaskLocal", Type::TaskLocal, {"T"}, "任务作用域值的独立键。用 `withLocal` 绑定，用 `get` 读取，相同类型的不同键互不影响。"},
+    {"Channel", Type::Channel, {"T"}, "支持跨任务传值的有界通道；容量为零时直接交接，正容量提供缓冲。"},
+    {"Option", Type::Option, {"T"}, "可选值：`Some(value)` 或 `None`。`T?` 是 `Option<T>` 的简写。"},
+    {"Result", Type::Result, {"T", "E"}, "成功时保存 `Ok(value)`，业务失败时保存 `Err(error)`。"},
 };
 
 bool builtInDisplay(Type type) { return numericType(type) || type == Type::Bool || type == Type::String || type == Type::Char; }
@@ -177,7 +194,7 @@ std::vector<EditorSymbol> editorBuiltins(bool types, bool constraints) {
     if (constraints) return {{"Eq", EditorKind::Trait}, {"Hash", EditorKind::Trait}};
     if (types) {
         CheckedModule module;
-        for (auto type : scalarTypes) symbols.push_back({typeName(module, type), EditorKind::TypeAlias});
+        for (const auto& item : scalarTypes) symbols.push_back({typeName(module, item.type), EditorKind::TypeAlias});
         for (auto name : builtinExceptionNames) symbols.push_back({std::string(name), EditorKind::TypeAlias});
         for (auto kind : {Type::Int, Type::UInt, Type::Real}) for (auto width : {8u, 16u, 32u, 64u})
             if (kind != Type::Real || width >= 32) {
@@ -223,20 +240,29 @@ struct BuiltinCallRule {
 
 constexpr BuiltinCallRule builtinCalls[] = {
     {Callee::Print, "print", "Unit", {{{"value", "Number | Bool | Char | String"}}}, {}, {}, {}, "Writes a scalar value followed by a newline to stdout."},
-    {Callee::Collect, "gcCollect", "Unit"},
-    {Callee::Sleep, "sleepMs", "Task<Unit>", {{{"milliseconds", "Int"}}}},
-    {Callee::AwaitOutcome, "awaitOutcome", "TaskOutcome<T>", {{{"task", "Task<T>"}}}, "T", {}, "async"},
-    {Callee::WithLocal, "withLocal", "Task<R>", {{{"key", "TaskLocal<T>"}, {"value", "T"}, {"task", "Task<R>"}}}, "T,R"},
-    {Callee::ChannelCreate, "Channel", "Channel<T>", {{{"capacity", "Int"}}}, "T"},
-    {Callee::LocalKey, "TaskLocal", "TaskLocal<T>", {}, "T"},
-    {Callee::FreezeList, "FrozenList", "FrozenList<T>", {{{"items", "List<T>"}}}, "T"},
-    {Callee::BusinessError, "Error", "Error", {{{"value", "T"}, {"cause", "Error?"}}}, "T"},
-    {Callee::BytesFromHex, "fromHex", "Option<Bytes>", {{{"text", "String"}}}, {}, "Bytes"},
-    {Callee::TaskCancelled, "cancelled", "Bool", {}, {}, "Task"},
-    {Callee::TaskCheckCancellation, "checkCancellation", "Unit", {}, {}, "Task"},
-    {Callee::PtrAllocate, "alloc", "CPtr", {{{"bytes", "Int"}}}, {}, "CPtr", "unsafe"},
-    {Callee::PtrNull, "nullPtr", "CPtr", {}, {}, "CPtr"},
-    {Callee::CallbackRegister, "register", "CCallback", {{{"callback", "(Args...) -> R"}, {"fallback", "R"}}}, "R", "CCallback", "unsafe"},
+    {Callee::Collect, "gcCollect", "Unit", {}, {}, {}, {}, "主动执行一次垃圾回收；不替代文件等资源的显式清理。"},
+    {Callee::Sleep, "sleepMs", "Task<Unit>", {{{"milliseconds", "Int"}}}, {}, {}, {}, "创建延时冷任务，不阻塞执行线程；非正延时在启动后立即就绪。"},
+    {Callee::AwaitOutcome, "awaitOutcome", "TaskOutcome<T>", {{{"task", "Task<T>"}}}, "T", {}, "async",
+        "等待任务，并把目标的成功、异常与取消作为值返回；等待者自身的取消仍会中断等待。"},
+    {Callee::WithLocal, "withLocal", "Task<R>", {{{"key", "TaskLocal<T>"}, {"value", "T"}, {"task", "Task<R>"}}}, "T,R", {}, {},
+        "构造冷任务，在启动时建立 `key = value` 的子作用域再等待传入任务，不改写调用者的作用域值。"},
+    {Callee::ChannelCreate, "Channel", "Channel<T>", {{{"capacity", "Int"}}}, "T", {}, {},
+        "创建通道；容量为零时直接交接，正数为可缓冲元素数，负容量无效。"},
+    {Callee::LocalKey, "TaskLocal", "TaskLocal<T>", {}, "T", {}, {}, "创建新的任务局部键；尚未绑定时查询得到 `None`。"},
+    {Callee::FreezeList, "FrozenList", "FrozenList<T>", {{{"items", "List<T>"}}}, "T", {}, {},
+        "取列表槽位的只读浅快照；原列表之后的增删或替换不影响快照。"},
+    {Callee::BusinessError, "Error", "Error", {{{"value", "T"}, {"cause", "Error?"}}}, "T", {}, {},
+        "将字符串或提供同步 `message()` 的业务错误包装成共同 `Error`，可附带前因。"},
+    {Callee::BytesFromHex, "fromHex", "Option<Bytes>", {{{"text", "String"}}}, {}, "Bytes", {},
+        "每两个十六进制字符解码一个字节，接受大小写，不接受前缀或空格。非法字符或奇数长度返回 `None`。"},
+    {Callee::TaskCancelled, "cancelled", "Bool", {}, {}, "Task", {}, "查询当前任务是否已请求取消，不触发取消展开；没有当前任务时返回 `false`。"},
+    {Callee::TaskCheckCancellation, "checkCancellation", "Unit", {}, {}, "Task", {},
+        "执行一次协作式取消检查；发现取消时开始清理并跳过普通 `catch`，没有任务或屏蔽取消时不退出。"},
+    {Callee::PtrAllocate, "alloc", "CPtr", {{{"bytes", "Int"}}}, {}, "CPtr", "unsafe",
+        "用 C 分配器分配指定字节数的未初始化内存；负长度或分配失败会抛异常，成功后须显式释放。"},
+    {Callee::PtrNull, "nullPtr", "CPtr", {}, {}, "CPtr", {}, "返回空 C 指针，不能解引用。"},
+    {Callee::CallbackRegister, "register", "CCallback", {{{"callback", "(Args...) -> R"}, {"fallback", "R"}}}, "R", "CCallback", "unsafe",
+        "登记同步 C 回调并保活其闭包；Lyra 异常不会穿越 C 边界，失败时向 C 返回 `fallback`，用 `takeError()` 取异常。"},
 };
 
 const BuiltinCallRule* builtinCall(std::string_view name, std::string_view owner = {}) {
@@ -244,16 +270,28 @@ const BuiltinCallRule* builtinCall(std::string_view name, std::string_view owner
     return found == std::end(builtinCalls) ? nullptr : found;
 }
 
-std::vector<Enumeration> builtinEnumerations() {
-    return {{0, {"TaskOutcome", {}}, {
-         {{"Completed", {}}, {{Identifier{"value", {}}, {"T", {}}}}},
-         {{"Failed", {}}, {{Identifier{"exception", {}}, {"Exception", {}}}}},
-         {{"Cancelled", {}}, {{Identifier{"cleanupFailures", {}}, {"List<Exception>", {}}}}},
-     }, true, {{"T", {}}}},
-     {0, {"ChannelSendResult", {}}, {{{"Sent", {}}, {}}, {{"Full", {}}, {}}, {{"Closed", {}}, {}}}, true},
-     {0, {"ChannelReceiveResult", {}}, {
-         {{"Received", {}}, {{Identifier{"value", {}}, {"T", {}}}}}, {{"Empty", {}}, {}}, {{"Closed", {}}, {}},
-     }, true, {{"T", {}}}}};
+void builtinEnumerations(auto&& accept) {
+    auto emit = [&](std::string_view name, std::string_view docs, std::vector<Identifier> generics,
+                    std::initializer_list<std::pair<EnumCase, std::string_view>> cases) {
+        Enumeration declaration{0, {std::string(name), {}}, {}, true, std::move(generics)};
+        for (const auto& variant : cases) declaration.cases.push_back(variant.first);
+        accept(std::move(declaration), docs, cases);
+    };
+    emit("TaskOutcome", "`awaitOutcome` 观察到的任务终态，将异常和取消与正常结果区分开。", {{"T", {}}}, {
+        {{{"Completed", {}}, {{Identifier{"value", {}}, {"T", {}}}}}, "任务正常结束，提供返回值。"},
+        {{{"Failed", {}}, {{Identifier{"exception", {}}, {"Exception", {}}}}}, "任务以异常结束，保留原异常。"},
+        {{{"Cancelled", {}}, {{Identifier{"cleanupFailures", {}}, {"List<Exception>", {}}}}}, "任务被取消，携带清理期间发生的异常列表。"},
+    });
+    emit("ChannelSendResult", "不挂起的通道发送结果。", {}, {
+        {{{"Sent", {}}, {}}, "值已交给接收者或成功进入缓冲。"},
+        {{{"Full", {}}, {}}, "缓冲已满，或零容量通道暂无等待接收者。"},
+        {{{"Closed", {}}, {}}, "通道已关闭，没有发送该值。"},
+    });
+    emit("ChannelReceiveResult", "不挂起的通道接收结果。", {{"T", {}}}, {
+        {{{"Received", {}}, {{Identifier{"value", {}}, {"T", {}}}}}, "已取到一个值，即使该值本身是 `None`。"},
+        {{{"Empty", {}}, {}}, "通道仍打开，但暂时没有可接收的值。"},
+        {{{"Closed", {}}, {}}, "通道已关闭且没有剩余值。"},
+    });
 }
 
 SourceAnchor functionAnchor(const Function& fn) { return {fn.file, fn.name.span}; }
@@ -869,91 +907,108 @@ struct Symbols {
     struct BuiltinMember { Callee callee; RequiredMethod shape; MemberContext context; std::string_view documentation; };
 
     void builtinMembers(Type type, std::string_view filter, auto&& accept) {
-        auto emit = [&](std::string_view name, Callee callee, Type result, std::vector<std::string> labels = {}, std::vector<Type> parameters = {},
-                        MemberContext context = MemberContext::Ordinary, std::string_view documentation = {}) {
+        auto emit = [&](std::string_view name, Callee callee, Type result, std::string_view documentation,
+                        std::vector<std::string> labels = {}, std::vector<Type> parameters = {}, MemberContext context = MemberContext::Ordinary) {
             if (filter.empty() || filter == name) accept(name, BuiltinMember{callee, {std::move(labels), std::move(parameters), result, false}, context, documentation});
         };
         auto matches = [&](std::string_view name) { return filter.empty() || name == filter; };
-        builtinProperties(type, "size", [&](auto name, Type result, auto) { emit(name, Callee::Size, result); });
+        builtinProperties(type, "size", [&](auto name, Type result, auto, auto docs) { emit(name, Callee::Size, result, docs); });
         if (type.kind == Type::List) {
             auto element = module.listElements[type.id];
-            emit("add", Callee::ListAdd, Type::Unit, {"value"}, {element});
-            emit("removeAt", Callee::ListRemoveAt, element, {"index"}, {Type::Int});
+            emit("add", Callee::ListAdd, Type::Unit, "把一个值追加到列表末尾，原列表及其别名都会看到变化。", {"value"}, {element});
+            emit("removeAt", Callee::ListRemoveAt, element, "移除零基下标处的元素并返回它，后续项前移；越界抛出 `BoundsError`。", {"index"}, {Type::Int});
         }
         if (type.kind == Type::List || type.kind == Type::FrozenList) {
-            emit("slice", Callee::ListSlice, type, {"range"}, {Type::IntRange});
+            emit("slice", Callee::ListSlice, type, type.kind == Type::List ?
+                "按 `..` 闭区间或 `..<` 半开区间取独立的浅拷贝；越界或倒序抛出 `BoundsError`。" :
+                "按 `..` 或 `..<` 取只读浅切片；越界或倒序抛出 `BoundsError`。", {"range"}, {Type::IntRange});
             if (matches("getOrNone") || matches("firstOrNone") || matches("lastOrNone")) {
                 auto optional = sum(Type::Option, module.listElements[type.id]);
-                emit("getOrNone", Callee::ListGetOrNone, optional, {"index"}, {Type::Int});
-                emit("firstOrNone", Callee::ListFirstOrNone, optional);
-                emit("lastOrNone", Callee::ListLastOrNone, optional);
+                emit("getOrNone", Callee::ListGetOrNone, optional, "按零基下标读取；负数或越界返回 `None`，读取到空的可选元素返回 `Some(None)`。", {"index"}, {Type::Int});
+                emit("firstOrNone", Callee::ListFirstOrNone, optional, "返回首项，空列表返回 `None`。");
+                emit("lastOrNone", Callee::ListLastOrNone, optional, "返回末项，空列表返回 `None`。");
             }
         }
         if (type.kind == Type::Channel) {
             auto element = module.channelElements[type.id];
-            if (matches("send")) emit("send", Callee::ChannelSend, task(Type::Unit), {"value"}, {element});
+            if (matches("send")) emit("send", Callee::ChannelSend, task(Type::Unit),
+                "构造发送冷任务；无可用空间或接收者时等待，通道关闭则抛出 `ChannelClosed`。", {"value"}, {element});
             if (matches("receive") || matches("next")) {
                 auto result = task(sum(Type::Option, element));
-                emit("receive", Callee::ChannelReceive, result);
-                emit("next", Callee::ChannelReceive, result);
+                emit("receive", Callee::ChannelReceive, result, "构造接收冷任务；关闭后仍按序排空缓冲，只有关闭且无剩余消息才返回 `None`。");
+                emit("next", Callee::ChannelReceive, result, "异步迭代的接收步骤，与 `receive()` 相同；关闭且排空后结束迭代。");
             }
-            if (matches("trySend")) emit("trySend", Callee::ChannelTrySend, enumType(enums.at("ChannelSendResult"), {}, sources.front(), {}), {"value"}, {element});
-            if (matches("tryReceive")) emit("tryReceive", Callee::ChannelTryReceive, enumType(enums.at("ChannelReceiveResult"), {element}, sources.front(), {}));
-            emit("asyncIterator", Callee::ChannelIterator, type);
-            emit("close", Callee::ChannelClose, Type::Unit);
+            if (matches("trySend")) emit("trySend", Callee::ChannelTrySend, enumType(enums.at("ChannelSendResult"), {}, sources.front(), {}),
+                "立即尝试发送，不等待空间；返回已发送、暂时发不出或已关闭。", {"value"}, {element});
+            if (matches("tryReceive")) emit("tryReceive", Callee::ChannelTryReceive, enumType(enums.at("ChannelReceiveResult"), {element}, sources.front(), {}),
+                "立即尝试接收；区分收到值、暂时无值和关闭且排空。");
+            emit("asyncIterator", Callee::ChannelIterator, type, "返回通道自身供 `for await` 消费，不复制消息；提前结束循环不会自动关闭通道。");
+            emit("close", Callee::ChannelClose, Type::Unit, "关闭通道，可重复调用。唤醒等待的发送者使其失败，保留缓冲消息供接收端读完。");
         }
-        if (type.kind == Type::Task) emit("cancel", Callee::TaskCancel, Type::Unit, {}, {}, MemberContext::AsyncBody);
-        if (type == Type::String) emit("toBytes", Callee::ToBytes, Type::Bytes);
+        if (type.kind == Type::Task) emit("cancel", Callee::TaskCancel, Type::Unit,
+            "向该任务请求协作式取消，不等待清理完成，也不强制中断正在执行的原生调用。", {}, {}, MemberContext::AsyncBody);
+        if (type == Type::String) emit("toBytes", Callee::ToBytes, Type::Bytes, "返回文本的 UTF-8 字节，保留内嵌 NUL，不附加终止符。");
         if (type == Type::Bytes) {
-            emit("slice", Callee::BytesSlice, Type::Bytes, {"range"}, {Type::IntRange});
-            emit("toHex", Callee::BytesHex, Type::String);
+            emit("slice", Callee::BytesSlice, Type::Bytes, "按字节切片，不检查 UTF-8；越界或倒序抛出 `BoundsError`。", {"range"}, {Type::IntRange});
+            emit("toHex", Callee::BytesHex, Type::String, "每字节编码成两个小写十六进制字符，不加前缀或分隔符。");
         }
         if (matches("toString")) {
-            if (builtInDisplay(type)) emit("toString", Callee::ToString, Type::String);
-            if (type == Type::Bytes) emit("toString", Callee::DecodeUtf8, sum(Type::Option, Type::String));
+            if (builtInDisplay(type)) emit("toString", Callee::ToString, Type::String,
+                type == Type::String ? "返回原字符串。" : type == Type::Char ? "把一个 Unicode 标量转成字符串。" :
+                type == Type::Bool ? "格式化为 `true` 或 `false`。" : "将数值格式化为不依赖系统区域设置的字符串。");
+            if (type == Type::Bytes) emit("toString", Callee::DecodeUtf8, sum(Type::Option, Type::String),
+                "按 UTF-8 解码完整字节串；无效序列返回 `None`，不插入替换字符。");
         }
-        if (type.kind == Type::TaskLocal && matches("get")) emit("get", Callee::LocalGet, sum(Type::Option, module.taskLocalValues[type.id]));
+        if (type.kind == Type::TaskLocal && matches("get")) emit("get", Callee::LocalGet, sum(Type::Option, module.taskLocalValues[type.id]),
+            "读取当前作用域为该键绑定的值，未绑定返回 `None`。");
         if (type.kind == Type::Option || type.kind == Type::Result) {
             auto success = module.sumTypes[type.id].success;
             auto optional = type.kind == Type::Option;
-            emit(optional ? "isSome" : "isOk", Callee::SumPresent, Type::Bool, {}, {}, MemberContext::Ordinary,
+            emit(optional ? "isSome" : "isOk", Callee::SumPresent, Type::Bool,
                 optional ? "判断是否为 `Some`。" : "判断是否为 `Ok`。");
-            emit(optional ? "isNone" : "isErr", Callee::SumAbsent, Type::Bool, {}, {}, MemberContext::Ordinary,
+            emit(optional ? "isNone" : "isErr", Callee::SumAbsent, Type::Bool,
                 optional ? "判断是否为 `None`。" : "判断是否为 `Err`。");
-            emit("unwrap", Callee::SumUnwrap, success, {}, {}, MemberContext::Ordinary, optional ?
+            emit("unwrap", Callee::SumUnwrap, success, optional ?
                 "取出 `Some` 的值；遇到 `None` 时抛出 `UnwrapError`。\n\n```lyra\nSome(42).unwrap()\n```" :
                 "取出 `Ok` 的值；遇到 `Err` 时抛出附带失败信息的 `UnwrapError`。\n\n```lyra\nval result: Result<Int,String> = Ok(42)\nresult.unwrap()\n```");
-            emit("expect", Callee::SumUnwrap, success, {"message"}, {Type::String}, MemberContext::Ordinary,
-                "取出成功值；失败时抛出带指定消息的 `UnwrapError`。");
-            if (!optional && matches("failureInfo")) emit("failureInfo", Callee::FailureInfo, sum(Type::Option, Type::Error));
+            emit("expect", Callee::SumUnwrap, success, "取出成功值；失败时抛出带指定消息的 `UnwrapError`。", {"message"}, {Type::String});
+            if (!optional && matches("failureInfo")) emit("failureInfo", Callee::FailureInfo, sum(Type::Option, Type::Error),
+                "在 `Err` 时返回包含原始失败与错误历史的共同 `Error`；`Ok` 返回 `None`，不改变原结果。");
         }
-        if (type == Type::Error) emit("withSuppressed", Callee::ErrorSuppress, Type::Error, {"error"}, {Type::Error});
+        if (type == Type::Error) emit("withSuppressed", Callee::ErrorSuppress, Type::Error,
+            "构造带新增附加失败的错误值，主错误和原值保持不变。", {"error"}, {Type::Error});
         if (type == Type::Any) {
-            emit("typeName", Callee::ReflectTypeName, Type::String);
-            emit("fieldCount", Callee::ReflectFieldCount, Type::Int);
-            if (matches("fieldNames")) emit("fieldNames", Callee::ReflectFieldName, list(Type::String));
-            if (matches("field")) emit("field", Callee::ReflectField, sum(Type::Option, Type::Any), {"name"}, {Type::String});
+            emit("typeName", Callee::ReflectTypeName, Type::String, "返回装箱值的可读运行时类型名，而不是 `Any`。");
+            emit("fieldCount", Callee::ReflectFieldCount, Type::Int, "统计结构体或类的公开字段，其他值返回 `0`。");
+            if (matches("fieldNames")) emit("fieldNames", Callee::ReflectFieldName, list(Type::String), "返回公开字段名列表，不包含私有字段或计算属性。");
+            if (matches("field")) emit("field", Callee::ReflectField, sum(Type::Option, Type::Any),
+                "读取指定公开字段，保留其具体运行时类型；缺失或不可见时返回 `None`。", {"name"}, {Type::String});
         }
         if (type == Type::CCallback) {
-            if (matches("takeError")) emit("takeError", Callee::CallbackTakeError, sum(Type::Option, Type::Exception));
-            emit("context", Callee::CallbackContext, Type::CPtr, {}, {}, MemberContext::Unsafe);
-            emit("function", Callee::CallbackFunction, Type::CPtr, {}, {}, MemberContext::Unsafe);
-            emit("close", Callee::CallbackClose, Type::Unit, {}, {}, MemberContext::Unsafe);
+            if (matches("takeError")) emit("takeError", Callee::CallbackTakeError, sum(Type::Option, Type::Exception),
+                "取走第一条尚未读取的回调异常；没有失败返回 `None`，关闭后仍可取走已有异常。");
+            emit("context", Callee::CallbackContext, Type::CPtr, "返回传给 C 回调的首个实参，即登记的上下文指针；关闭后返回空指针。", {}, {}, MemberContext::Unsafe);
+            emit("function", Callee::CallbackFunction, Type::CPtr, "返回 C ABI 函数地址，用匹配的函数签名调用；关闭后返回空指针。", {}, {}, MemberContext::Unsafe);
+            emit("close", Callee::CallbackClose, Type::Unit,
+                "释放回调登记，可重复调用。必须先在 C 端停止并等所有回调返回，不能在该回调内部关闭。", {}, {}, MemberContext::Unsafe);
         }
         if (type == Type::CPtr) {
-            emit("isNull", Callee::PtrIsNull, Type::Bool);
-            emit("free", Callee::PtrFree, Type::Unit, {}, {}, MemberContext::Unsafe);
-            emit("offset", Callee::PtrOffset, Type::CPtr, {"bytes"}, {Type::Int}, MemberContext::Unsafe);
+            emit("isNull", Callee::PtrIsNull, Type::Bool, "检查是否为空指针，不访问指向的内存。");
+            emit("free", Callee::PtrFree, Type::Unit, "释放由同一 C 分配器分配的基址；不可释放借用指针或偏移地址，也不能重复释放。", {}, {}, MemberContext::Unsafe);
+            emit("offset", Callee::PtrOffset, Type::CPtr, "按有符号字节数偏移指针，不读写和不检查边界；不可用来释放原分配。", {"bytes"}, {Type::Int}, MemberContext::Unsafe);
         }
         if (numericType(type)) {
-            emit("abs", Callee::NumericAbs, type);
-            emit("min", Callee::NumericMin, type, {"other"}, {type});
-            emit("max", Callee::NumericMax, type, {"other"}, {type});
-            emit("clamp", Callee::NumericClamp, type, {"lower", "upper"}, {type, type});
-            if (type.kind == Type::Real) {
-                emit("isFinite", Callee::IsFinite, Type::Bool);
-                emit("isNaN", Callee::IsNaN, Type::Bool);
-                emit("isInfinite", Callee::IsInfinite, Type::Bool);
+            emit("abs", Callee::NumericAbs, type, type.kind == Type::Int ? "返回绝对值；最小负值无对应正值，抛出 `ArithmeticError`。" :
+                type.kind == Type::UInt ? "返回原值，无符号整数本身非负。" : "返回浮点绝对值，移除符号；NaN 仍为 NaN。");
+            bool real = type.kind == Type::Real;
+            emit("min", Callee::NumericMin, type, real ? "取较小值，传播 NaN；两个零的符号不同时取 `-0.0`。" : "取两个数中较小的值。", {"other"}, {type});
+            emit("max", Callee::NumericMax, type, real ? "取较大值，传播 NaN；两个零的符号不同时取 `+0.0`。" : "取两个数中较大的值。", {"other"}, {type});
+            emit("clamp", Callee::NumericClamp, type, real ? "将值限制在闭区间内；边界倒序或任一参数为 NaN 时抛出 `ArithmeticError`。" :
+                "将值限制在闭区间内；下界大于上界时抛出 `ArithmeticError`。", {"lower", "upper"}, {type, type});
+            if (real) {
+                emit("isFinite", Callee::IsFinite, Type::Bool, "判断是否为有限浮点值；NaN 和正负无穷大都返回 `false`。");
+                emit("isNaN", Callee::IsNaN, Type::Bool, "判断是否为 NaN，不依赖相等比较。");
+                emit("isInfinite", Callee::IsInfinite, Type::Bool, "判断是否为正无穷大或负无穷大；NaN 返回 `false`。");
             }
         }
         auto conversion = [&](std::string_view name) {
@@ -962,8 +1017,10 @@ struct Symbols {
             bool checked = targetName.ends_with("Checked");
             if (checked) targetName.remove_suffix(7);
             if (auto target = numberType(targetName); target && (checked ? integerType(*target) : target->kind == Type::Real)) {
-                if (checked) emit(name, Callee::ToIntegerChecked, sum(Type::Option, *target));
-                else emit(name, Callee::ToReal, *target);
+                if (checked) emit(name, Callee::ToIntegerChecked, sum(Type::Option, *target), type.kind == Type::Real ?
+                    "精确转为目标整数；超出范围、有小数部分、NaN 或无穷大时返回 `None`，不截断。" :
+                    "检查目标整数能否表示这个值；越界（包括负数转无符号）时返回 `None`，不回绕。");
+                else emit(name, Callee::ToReal, *target, "转为目标浮点类型，按目标精度舍入，可能损失精度。");
             }
         };
         auto pointerAccess = [&](std::string_view name) {
@@ -972,8 +1029,10 @@ struct Symbols {
             auto suffix = name.substr(write ? 5 : 4);
             auto value = suffix == "CPtr" ? std::optional(Type{Type::CPtr}) : numberType(suffix);
             if (!value) return;
-            if (write) emit(name, Callee::PtrWrite, Type::Unit, {"offset", "value"}, {Type::Int, *value}, MemberContext::Unsafe);
-            else emit(name, Callee::PtrRead, *value, {"offset"}, {Type::Int}, MemberContext::Unsafe);
+            if (write) emit(name, Callee::PtrWrite, Type::Unit, "在字节偏移处按值类型的原生布局写入；地址有效、对齐及同步由调用方保证。",
+                {"offset", "value"}, {Type::Int, *value}, MemberContext::Unsafe);
+            else emit(name, Callee::PtrRead, *value, "在字节偏移处按返回类型的原生布局读取；地址有效、对齐及同步由调用方保证。",
+                {"offset"}, {Type::Int}, MemberContext::Unsafe);
         };
         if (!filter.empty()) {
             if (numericType(type)) conversion(filter);
@@ -991,27 +1050,36 @@ struct Symbols {
     }
 
     void builtinProperties(Type type, std::string_view filter, auto&& accept) {
-        auto emit = [&](std::string_view name, auto result, std::size_t slot = 0) {
-            if (filter.empty() || filter == name) accept(name, result(), slot);
+        auto emit = [&](std::string_view name, auto result, std::string_view documentation, std::size_t slot = 0) {
+            if (filter.empty() || filter == name) accept(name, result(), slot, documentation);
         };
         auto integer = [] { return Type{Type::Int}; };
         auto string = [] { return Type{Type::String}; };
-        if (type.kind == Type::List || type.kind == Type::FrozenList || type == Type::String || type == Type::Bytes) emit("size", integer);
-        if (type == Type::String) emit("byteSize", integer);
-        if (type == Type::Char) emit("codePoint", [] { return number(Type::UInt, 32); });
-        if (type.kind == Type::IntRange) for (std::size_t slot = 0; slot < std::size(rangeFields); ++slot)
-            emit(rangeFieldNames[slot], [&] { return rangeFields[slot]; }, slot);
+        if (type.kind == Type::List || type.kind == Type::FrozenList) emit("size", integer, "当前列表的元素数，空列表为 `0`。");
+        if (type == Type::Bytes) emit("size", integer, "所含字节数，不尝试按文本解码。");
+        if (type == Type::String) {
+            emit("size", integer, "Unicode 标量数量，不是 UTF-8 字节数或字素数量。");
+            emit("byteSize", integer, "UTF-8 编码的字节数，包括内容中的 NUL。");
+        }
+        if (type == Type::Char) emit("codePoint", [] { return number(Type::UInt, 32); }, "这个 Unicode 标量的数值码点。");
+        if (type.kind == Type::IntRange) {
+            constexpr std::string_view docs[] = {"区间的起始值。", "区间的结束边界，是否纳入由 `inclusive` 决定。", "闭区间 `..` 为真，半开区间 `..<` 为假。"};
+            static_assert(std::size(docs) == std::size(rangeFields));
+            for (std::size_t slot = 0; slot < std::size(rangeFields); ++slot)
+                emit(rangeFieldNames[slot], [&] { return rangeFields[slot]; }, docs[slot], slot);
+        }
         if (type.kind == Type::Exception) {
-            emit("message", string, static_cast<std::size_t>(ExceptionMember::Message));
-            emit("taskFailures", [&] { return list(Type::Exception); }, static_cast<std::size_t>(ExceptionMember::TaskFailures));
-            emit("cleanupFailures", [&] { return list(Type::Exception); }, static_cast<std::size_t>(ExceptionMember::CleanupFailures));
-            if (type == unwrapError) emit("failure", [&] { return sum(Type::Option, Type::Error); }, static_cast<std::size_t>(ExceptionMember::Failure));
+            emit("message", string, "异常的可读消息，不包含附加失败列表。", static_cast<std::size_t>(ExceptionMember::Message));
+            emit("taskFailures", [&] { return list(Type::Exception); }, "与主异常一起报告的其他子任务失败。", static_cast<std::size_t>(ExceptionMember::TaskFailures));
+            emit("cleanupFailures", [&] { return list(Type::Exception); }, "展开期间发生的附加清理失败；主异常仍保留。", static_cast<std::size_t>(ExceptionMember::CleanupFailures));
+            if (type == unwrapError) emit("failure", [&] { return sum(Type::Option, Type::Error); },
+                "解包 `Err` 时保留的业务失败；解包 `None` 或没有原始失败时返回 `None`。", static_cast<std::size_t>(ExceptionMember::Failure));
         }
         if (type == Type::Error) {
-            emit("message", string, static_cast<std::size_t>(ErrorMember::Message));
-            emit("original", [] { return Type{Type::Any}; }, static_cast<std::size_t>(ErrorMember::Original));
-            emit("cause", [&] { return sum(Type::Option, Type::Error); }, static_cast<std::size_t>(ErrorMember::Cause));
-            emit("suppressed", [&] { return list(Type::Error); }, static_cast<std::size_t>(ErrorMember::Suppressed));
+            emit("message", string, "用于展示的业务错误消息。", static_cast<std::size_t>(ErrorMember::Message));
+            emit("original", [] { return Type{Type::Any}; }, "装箱后的原始错误值，可用 `as? T` 检查具体类型。", static_cast<std::size_t>(ErrorMember::Original));
+            emit("cause", [&] { return sum(Type::Option, Type::Error); }, "原有错误的前因，没有前因时返回 `None`。", static_cast<std::size_t>(ErrorMember::Cause));
+            emit("suppressed", [&] { return list(Type::Error); }, "附加失败的列表快照；修改列表不改变此错误。", static_cast<std::size_t>(ErrorMember::Suppressed));
         }
     }
 
@@ -1561,7 +1629,7 @@ struct Symbols {
             if (found != parameters.end()) return lookup(static_cast<std::size_t>(found - parameters.begin()));
             if (auto type = numberType(form.name)) return type;
             if (form.name == "$never") return Type::Never;
-            for (Type type : scalarTypes) if (form.name == typeName(module, type)) return type;
+            for (const auto& item : scalarTypes) if (form.name == typeName(module, item.type)) return item.type;
             if (auto exception = builtinException(form.name)) return *exception;
             if (auto exception = exceptionTypes.find(form.name); exception != exceptionTypes.end()) return Type{Type::Exception, exception->second + firstDeclaredException};
         }
@@ -3265,7 +3333,7 @@ struct Checker {
                 if (builtin.callee == Callee::Size) property(std::string(name), builtin.shape.result);
                 else shape(std::string(name), builtin.shape);
             });
-            symbols.builtinProperties(owner, {}, [&](auto name, auto type, auto) { property(std::string(name), type); });
+            symbols.builtinProperties(owner, {}, [&](auto name, auto type, auto, auto) { property(std::string(name), type); });
             if (!symbols.valueSupport(owner, ValueOperation::Equal).missing) shape("equals", {{"other"}, {owner}, Type::Bool, false});
             if (!symbols.valueSupport(owner, ValueOperation::Hash).missing) shape("hashCode", {{}, {}, Type::Int, false});
             auto traitMembers = [&](const Trait& trait) {
@@ -3332,7 +3400,7 @@ struct Checker {
         auto owner = visit(member.receiver);
         if (owner == Type::Never) return owner;
         std::optional<Type> builtin;
-        symbols.builtinProperties(owner, member.name.text, [&](auto, Type type, auto slot) {
+        symbols.builtinProperties(owner, member.name.text, [&](auto, Type type, auto slot, auto) {
             fn.expressions[id].target = slot;
             builtin = type;
         });
@@ -4474,8 +4542,8 @@ static CheckedModule checkProgram(Module module, const std::vector<Source>& sour
         auto separator = declaration.rfind("::");
         auto name = std::string_view(declaration).substr(separator == declaration.npos ? 0 : separator + 2);
         if (numberType(name) || builtinException(name)) throw at(sources[decl.file], decl.name.span, "LYN0002", "类型名与内置类型冲突：" + std::string(name));
-        for (Type builtin : scalarTypes) {
-            if (name == typeName(checked, builtin)) throw at(sources[decl.file], decl.name.span, "LYN0002", "类型名与内置类型冲突：" + std::string(name));
+        for (const auto& item : scalarTypes) {
+            if (name == typeName(checked, item.type)) throw at(sources[decl.file], decl.name.span, "LYN0002", "类型名与内置类型冲突：" + std::string(name));
         }
         if (name == "Never" || name == "TaskLocal" || name == "Range" || name == "Eq" || name == "Hash" || name == "Channel" || name == "TaskOutcome" ||
             name == "ChannelSendResult" || name == "ChannelReceiveResult" || name == "FrozenList")
@@ -4487,11 +4555,10 @@ static CheckedModule checkProgram(Module module, const std::vector<Source>& sour
         symbols.recordDeclarations.push_back(std::move(decl));
     }
     if (!sources.empty()) {
-        auto addBuiltinEnum = [&](Enumeration declaration) {
+        builtinEnumerations([&](Enumeration declaration, auto, const auto&) {
             symbols.enums.emplace(declaration.name.text, symbols.enumDeclarations.size());
             symbols.enumDeclarations.push_back(std::move(declaration));
-        };
-        for (auto& item : builtinEnumerations()) addBuiltinEnum(std::move(item));
+        });
     }
     for (auto& decl : module.enums) {
         if (symbols.records.contains(decl.name.text)) throw at(sources[decl.file], decl.name.span, "LYN0002", "类型名称已声明：" + decl.name.text);
@@ -5100,17 +5167,26 @@ std::vector<BuiltinReference> builtinReference() {
     CheckedModule checked;
     const std::vector<Source> sources{sourceText("<builtin>", {}, {})};
     Symbols symbols{checked, sources, {}, {}, {}, {}, {}, {}, {}, {}};
-    for (auto& item : builtinEnumerations()) {
+    std::vector<BuiltinReference> entries;
+    builtinEnumerations([&](Enumeration item, std::string_view docs, const auto& cases) {
+        BuiltinReference declaration{item.name.text, "enum", {}, {}, {}, {}, {}, std::string(docs)};
+        for (const auto& parameter : item.typeParameters) declaration.typeParameters.push_back(parameter.text);
+        entries.push_back(std::move(declaration));
+        auto result = nominalAnnotation(item).text;
+        for (const auto& [variant, documentation] : cases) {
+            BuiltinReference entry{variant.name.text, "case", item.name.text, result, {}, {}, {}, std::string(documentation)};
+            for (const auto& field : variant.fields) entry.parameters.push_back({field.name ? field.name->text : "", field.type.text});
+            entries.push_back(std::move(entry));
+        }
         symbols.enums.emplace(item.name.text, symbols.enumDeclarations.size());
         symbols.enumDeclarations.push_back(std::move(item));
-    }
+    });
     symbols.variants.resize(symbols.enumDeclarations.size());
     Type element{Type::Variable, 0}, failure{Type::Variable, 1};
     checked.variableNames = {"T", "E"};
-    std::vector<BuiltinReference> entries;
-    auto addType = [&](const std::string& name, Type type, std::vector<std::string> parameters = {}) {
+    auto addType = [&](const std::string& name, Type type, std::string_view documentation, std::vector<std::string> parameters = {}) {
         auto kind = type.kind == Type::Exception ? "exception" : "type";
-        entries.push_back({name, kind, {}, {}, {}, std::move(parameters)});
+        entries.push_back({name, kind, {}, {}, {}, std::move(parameters), {}, std::string(documentation)});
         symbols.builtinMembers(type, {}, [&](auto method, const Symbols::BuiltinMember& info) {
             BuiltinReference item{std::string(method), "method", name, typeName(checked, info.shape.result)};
             for (std::size_t slot = 0; slot < info.shape.parameters.size(); ++slot)
@@ -5120,49 +5196,52 @@ std::vector<BuiltinReference> builtinReference() {
             item.documentation = info.documentation;
             entries.push_back(std::move(item));
         });
-        symbols.builtinProperties(type, {}, [&](auto property, auto value, auto) {
-            entries.push_back({std::string(property), "property", name, typeName(checked, value)});
+        symbols.builtinProperties(type, {}, [&](auto property, auto value, auto, std::string_view docs) {
+            entries.push_back({std::string(property), "property", name, typeName(checked, value), {}, {}, {}, std::string(docs)});
         });
     };
-    for (auto type : scalarTypes) addType(typeName(checked, type), type);
+    for (const auto& item : scalarTypes) addType(typeName(checked, item.type), item.type, item.documentation);
     for (const auto& symbol : editorBuiltins(true)) if (auto type = numberType(symbol.label)) {
         auto name = typeName(checked, *type);
-        if (name == symbol.label) addType(name, *type);
-        else entries.push_back({symbol.label, "typeAlias", {}, name});
+        auto width = std::to_string(numberWidth(*type));
+        if (name != symbol.label) entries.push_back({symbol.label, "typeAlias", {}, name, {}, {}, {}, "`" + name + "` 的透明别名，使用相同的表示和操作。"});
+        else if (type->kind == Type::Real) addType(name, *type, width + " 位 IEEE 754 浮点数，支持正负零、无穷大和 NaN。");
+        else if (type->kind == Type::Int) addType(name, *type, width + " 位有符号整数。运算溢出时抛出 `ArithmeticError`。");
+        else addType(name, *type, width + " 位无符号整数。运算溢出时抛出 `ArithmeticError`。");
     }
-    addType("Range", Type::IntRange, {"Int"});
+    addType("Range", Type::IntRange, "整数区间，用 `start..end` 包含结束值，或用 `start..<end` 排除结束值。", {"Int"});
     for (const auto& item : builtinGenerics) {
         std::vector<std::string> parameters;
         for (auto name : item.parameters) if (!name.empty()) parameters.emplace_back(name);
         const Type types[] = {element, failure};
         auto type = symbols.instantiateBuiltin(item.kind, std::span(types).first(parameters.size()));
-        addType(std::string(item.name), type, std::move(parameters));
+        addType(std::string(item.name), type, item.documentation, std::move(parameters));
     }
-    for (auto& item : entries) {
-        if (item.kind != "type") continue;
-        if (item.name == "Option") item.documentation = "可选值：`Some(value)` 或 `None`。`T?` 是 `Option<T>` 的简写。";
-        if (item.name == "Result") item.documentation = "成功时保存 `Ok(value)`，业务失败时保存 `Err(error)`。";
-    }
-    for (auto tag : {SumTag::None, SumTag::Some, SumTag::Ok, SumTag::Err}) {
+    constexpr std::pair<SumTag, std::string_view> sums[] = {
+        {SumTag::None, "没有值，不携带载荷。"},
+        {SumTag::Some, "携带一个存在的值；如果值也是可选类型，可以表示 `Some(None)`。"},
+        {SumTag::Ok, "操作成功，携带结果值。"},
+        {SumTag::Err, "操作因业务原因失败，携带 `E` 类型的错误值。"},
+    };
+    for (auto [tag, docs] : sums) {
         bool optional = optionTag(tag);
-        BuiltinReference item{std::string(tagName(tag)), "case", optional ? "Option" : "Result", optional ? "Option<T>" : "Result<T,E>"};
+        BuiltinReference item{std::string(tagName(tag)), "case", optional ? "Option" : "Result", optional ? "Option<T>" : "Result<T,E>", {}, {}, {}, std::string(docs)};
         if (tag != SumTag::None) item.parameters.push_back({successTag(tag) ? "value" : "error", successTag(tag) ? "T" : "E"});
         entries.push_back(std::move(item));
     }
-    for (auto name : builtinExceptionNames) {
-        addType(std::string(name), *builtinException(name));
-        entries.push_back({std::string(name), "constructor", std::string(name), std::string(name), {{"message", "String"}}});
-    }
-    for (const auto& item : symbols.enumDeclarations) {
-        auto declaration = BuiltinReference{item.name.text, "enum"};
-        for (const auto& parameter : item.typeParameters) declaration.typeParameters.push_back(parameter.text);
-        entries.push_back(std::move(declaration));
-        auto result = nominalAnnotation(item).text;
-        for (const auto& variant : item.cases) {
-            BuiltinReference entry{variant.name.text, "case", item.name.text, result};
-            for (const auto& field : variant.fields) entry.parameters.push_back({field.name ? field.name->text : "", field.type.text});
-            entries.push_back(std::move(entry));
-        }
+    constexpr std::string_view exceptionDocs[] = {
+        "可抛出的异常类型，也是其他异常的共同类型；业务失败通常用 `Result` 表示。",
+        "异步发送无法完成，因为通道已经关闭。",
+        "列表、文本或字节的索引或切片超出有效范围。",
+        "整数溢出、除零或无效数值运算等算术失败。",
+        "任务等待形成循环依赖，无法继续推进。",
+        "从 `None` 或 `Err` 强制取值失败；可通过 `failure` 查看附带的业务错误。",
+    };
+    static_assert(std::size(exceptionDocs) == std::size(builtinExceptionNames));
+    for (std::size_t index = 0; index < std::size(builtinExceptionNames); ++index) {
+        std::string name(builtinExceptionNames[index]);
+        addType(name, Type{Type::Exception, index}, exceptionDocs[index]);
+        entries.push_back({name, "constructor", name, name, {{"message", "String"}}, {}, {}, "构造带自定义消息的 `" + name + "`；构造本身不会抛出它。"});
     }
     for (const auto& rule : builtinCalls) {
         bool constructor = rule.callee == Callee::ChannelCreate || rule.callee == Callee::LocalKey || rule.callee == Callee::FreezeList || rule.callee == Callee::BusinessError;
@@ -5182,14 +5261,15 @@ std::vector<BuiltinReference> builtinReference() {
             unit.parameters.resize(1);
             unit.parameters.front().type = "(Args...) -> Unit";
             unit.typeParameters.clear();
+            unit.documentation = "登记无返回值的同步 C 回调，无须提供回退值；回调失败时用 `takeError()` 取出 Lyra 异常。";
             entries.push_back(std::move(unit));
         }
         entries.push_back(std::move(entry));
     }
-    entries.push_back({"Eq", "trait"});
-    entries.push_back({"Hash", "trait"});
-    entries.push_back({"equals", "method", "Eq", "Bool", {{"other", "Self"}}});
-    entries.push_back({"hashCode", "method", "Hash", "Int"});
+    entries.push_back({"Eq", "trait", {}, {}, {}, {}, {}, "用于泛型约束，要求类型支持相等比较；值类型可由其字段或载荷自动获得该能力。"});
+    entries.push_back({"Hash", "trait", {}, {}, {}, {}, {}, "用于泛型约束，要求类型可以计算哈希；与 `Eq` 一起用于哈希集合时，相等值必须产生相同哈希。"});
+    entries.push_back({"equals", "method", "Eq", "Bool", {{"other", "Self"}}, {}, {}, "判断两个同类型值是否相等。自定义实现应满足自反、对称和传递。"});
+    entries.push_back({"hashCode", "method", "Hash", "Int", {}, {}, {}, "返回用于哈希容器的整数；哈希相同不代表值相等，不应当作跨版本的持久化标识。"});
     return entries;
 }
 
