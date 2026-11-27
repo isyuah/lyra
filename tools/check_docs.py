@@ -109,7 +109,8 @@ def main() -> int:
     parser.add_argument("--list", action="store_true", help="list blocks without compiling")
     args = parser.parse_args()
 
-    if not args.lyra.exists():
+    lyra = args.lyra.resolve()
+    if not lyra.is_file():
         raise SystemExit(f"Lyra compiler not found: {args.lyra}")
 
     generated_reference = Path(__file__).resolve().parents[1] / "docs/src/content/docs/reference"
@@ -146,7 +147,7 @@ def main() -> int:
                 print(f"{path}:{block.line}: {'run' if should_run else 'check'}")
                 continue
             checked += 1
-            ok, stdout, stderr = compile_or_run(args.lyra, block.body, should_run)
+            ok, stdout, stderr = compile_or_run(lyra, block.body, should_run)
             location = f"{path}:{block.line}"
             if not ok:
                 failures.append(f"{location}: {'run' if should_run else 'check'} failed\n{stderr.strip()}")

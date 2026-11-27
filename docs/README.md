@@ -58,7 +58,9 @@ Linux 上把 `--lyra` 换成 `build/dev/bin/lyra` 或 SDK 里的 `bin/lyra`。�
 
 ## 部署
 
-`.github/workflows/docs.yml` 在文档、编译器或标准库等相关源码变更时，从同一提交构建 Lyra、生成参考并构建站点。PR 只构建，`main` 分支的匹配变更会部署到 GitHub Pages。仓库设置里把 Pages 的来源设为 **GitHub Actions**；站点地址是 `https://isyuah.github.io/lyra/`。如果以后换自定义域名，同步修改 `astro.config.mjs` 的 `site` 和 `site.mjs` 的 `siteBase`。
+`.github/workflows/docs.yml` 在文档、编译器或标准库等相关源码变更时，从同一提交构建 Lyra、验证教程示例，再运行 `npm run check` 和 `npm run build`。PR 只验证；官方仓库 `main` 的匹配变更会自动部署，也可在 Actions 中选择 `main` 手动运行 `Docs`。这与 tag 触发的 SDK 发布相互独立。
+
+仓库的 Pages 来源为 **GitHub Actions**，`github-pages` 环境只允许 `main`。站点地址是 [isyuah.github.io/lyra](https://isyuah.github.io/lyra/)。如果以后换自定义域名，同步修改 `astro.config.mjs` 的 `site` 和 `site.mjs` 的 `siteBase`。
 
 ## 写作边界
 
