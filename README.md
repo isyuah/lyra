@@ -99,6 +99,8 @@ Windows CI 固定使用 Clang 23.1.6 构建 Lyra，避免依赖 Runner 自带的
 lyra --version
 lyra new <目录> [--name <包名>] [--lib]
 lyra check|build|run|test <包目录> [--locked] [--offline] [--diagnostics=json]
+lyra doc <包目录> [--locked] [--offline] [-o <文件>]
+lyra doc --stdlib [-o <文件>]
 lyra build <包目录> [-o <产物>] [--release] [--debug-info]
 lyra run <包目录> [--release] [-- <程序参数>...]
 lyra lock|fetch <目录> [--locked] [--offline]
@@ -109,6 +111,7 @@ lyra fmt [--check] <文件.ly>...
 
 - `lyra.json5` 包中一个目录组成一个模块。`import self.net` 只在本文件绑定 `net`；`import cfg.net as remote` 可换名，写 `remote.port()`。用 `import cfg.net.{Endpoint, port as remotePort}` 才引入裸名，`pub import cfg.net.{Endpoint}` 可重导出。无清单的单模块冒烟样例只读取 `src` 直属文件。库包可独立 `check`，无需 `main`。详见[模块 RFC](rfc/modules-packages.md)。
 - `test` 编译并运行每个 `tests/*.ly` 中的 `fn main(): Unit`，用 `import self as app` 或 `import self.{名称}` 访问包的公开 API。workspace 根支持一次检查或测试多个成员。锁、缓存、只读 HTTP(S) 源和脚本边界见[包工具手册](compiler/packages.md)。
+- `doc` 从编译后的公开接口生成参考数据，标准库模式还包含内置 API 和语法速查。说明和例子只需写在声明前的 `///` 中；[JSON 接入和注释约定](compiler/reference.md)适用于自建文档站。
 - 支持有符号和无符号整数 `Int8/16/32/64`、`UInt8/16/32/64`（`Int`、`UInt` 为 64 位别名）、`Float32`、`Float64`（`Float`）、`Bool` 和 `Unit`。提供数值四则、余数、比较和复合赋值；整数溢出或除零在 Debug/Release 都带源码位置报错。窄化可用 `value.toInt8Checked()` 等方法，返回 `Option`。
 - 支持具名形参、按源码顺序求值的命名实参、`val` / `var`、嵌套作用域、短路 `&&` / `||`、`if` / `else`、`while`、`break`、`continue` 和 `return`。普通块以末表达式为值，空块或带末尾分号的块取 `Unit`。
 - [文本与字节](rfc/language-core.md#文本与字节)：`String` 支持 UTF-8、拼接和 `"Hello, ${name}"` 插值；单引号给出 Unicode `Char`，`b"\xFF"` 给出不可变 `Bytes`，可显式检查和转换为文本。

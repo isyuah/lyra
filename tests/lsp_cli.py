@@ -888,6 +888,25 @@ class LanguageServer(unittest.TestCase):
             hover = next(item['result'] for item in output if item.get('id') == 2)
             self.assertEqual(hover['contents']['value'], '```lyra\nfn read(): Unit throws Closed, Exception\n```')
 
+    def test_hover_refreshes_after_a_comment_only_edit(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / 'lyra.json5').write_text('{name:"app",version:"0.1.0"}', encoding='utf-8')
+            source = root / 'src/main.ly'
+            source.parent.mkdir()
+            text = '/// First doc.\nfn answer(): Int { 42 }\nfn main(): Unit { print(answer()) }\n'
+            source.write_text(text, encoding='utf-8')
+            position = position_at(text, text.rindex('answer') + 2)
+            output = run_server([(source, text)], [
+                document_request(2, source, 'hover', position=position),
+                {'method': 'textDocument/didChange', 'params': {'textDocument': {'uri': uri(source), 'version': 2},
+                 'contentChanges': [{'text': text.replace('First', 'Fresh')}]}},
+                document_request(3, source, 'hover', position=position),
+            ])
+            for number, expected in ((2, 'First doc.'), (3, 'Fresh doc.')):
+                hover = next(item['result'] for item in output if item.get('id') == number)
+                self.assertTrue(hover['contents']['value'].endswith(expected), hover)
+
     def test_formatting_uses_unsaved_source_and_preserves_raw_strings_despite_type_errors(self):
         with tempfile.TemporaryDirectory() as temporary:
             source = Path(temporary) / 'src' / 'main.ly'

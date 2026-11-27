@@ -22,6 +22,7 @@ struct SyntaxNode {
     std::string canonical{};
     std::string module{};
     std::optional<ExprId> expression{};
+    std::optional<Span> documentation{};
 };
 struct SyntaxPiece { std::string text; std::optional<Span> span{}; bool copied{}; };
 struct SyntaxOutput { std::vector<SyntaxPiece> code; std::optional<std::vector<std::vector<SyntaxPiece>>> hooks{}; };
@@ -45,8 +46,8 @@ struct SyntaxArena {
         return nodes[ref.index];
     }
     std::string text(Span span) const { return source.text.substr(span.begin, span.end - span.begin); }
-    SyntaxRef input(std::string kind, Span span, std::vector<SyntaxRef> children = {}, bool argument = false) {
-        return add({argument ? SyntaxForm::Argument : SyntaxForm::Input, std::move(kind), {}, std::move(children), span});
+    SyntaxRef input(std::string kind, Span span, std::vector<SyntaxRef> children = {}, bool argument = false, std::optional<Span> documentation = {}) {
+        return add({argument ? SyntaxForm::Argument : SyntaxForm::Input, std::move(kind), {}, std::move(children), span, {}, {}, {}, documentation});
     }
 
     SyntaxRef expression(const Function& fn, ExprId id) {
@@ -156,7 +157,7 @@ struct SyntaxArena {
                 if (mark.argument) items.push_back(input("argument", mark.argument->span));
                 signature.push_back(input("attribute", mark.name.span, std::move(items)));
             }
-            children.push_back(input(aggregate ? "field" : "parameter", {field.name.span.begin, field.type.span.end}, std::move(signature)));
+            children.push_back(input(aggregate ? "field" : "parameter", {field.name.span.begin, field.type.span.end}, std::move(signature), false, field.name.documentation));
         }
         if (enumeration) for (const auto& entry : enumeration->cases) {
             std::vector<SyntaxRef> parts{input("name", entry.name.span)};
@@ -168,13 +169,13 @@ struct SyntaxArena {
                 parts.push_back(input("payload", {field.name ? field.name->span.begin : field.type.span.begin, field.type.span.end}, std::move(payload)));
                 span.end = field.type.span.end;
             }
-            children.push_back(input("case", span, std::move(parts)));
+            children.push_back(input("case", span, std::move(parts), false, entry.name.documentation));
         }
         if (fn && !fn->result.text.empty()) children.push_back(annotation(fn->result));
         if (body) children.push_back(*body);
         auto span = enumeration ? enumeration->span : aggregate ? aggregate->span
             : Span{name.span.begin, body ? get(*body).span->end : fn->result.span.end};
-        return input(enumeration ? "enum" : aggregate ? aggregate->reference ? "class" : "struct" : "fn", span, std::move(children));
+        return input(enumeration ? "enum" : aggregate ? aggregate->reference ? "class" : "struct" : "fn", span, std::move(children), false, name.documentation);
     }
 
     void emit(SyntaxRef ref, std::vector<SyntaxPiece>& out, std::size_t& size, std::size_t& steps, unsigned depth = 0) const {

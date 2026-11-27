@@ -147,6 +147,16 @@ struct EditorBodyBaseline {
     const EditorBodyCache* cache{};
     std::span<const Source> sources{};
 };
+struct BuiltinParameter { std::string name, type; std::optional<std::string> defaultValue{}; };
+struct BuiltinReference {
+    std::string name, kind, owner{}, result{};
+    std::vector<BuiltinParameter> parameters{};
+    std::vector<std::string> typeParameters{};
+    std::string context{}, documentation{};
+};
+std::vector<BuiltinReference> builtinReference();
+using ReferenceOverloads = std::map<SourceAnchor, std::vector<std::string>>;
+CheckedModule checkReference(const Module& module, const std::vector<Source>& sources, ReferenceOverloads& overloads);
 std::vector<EditorSymbol> editorBuiltins(bool types, bool constraints = false);
 const std::optional<ConstValue>& constantValue(const CheckedModule& module, ConstantUse target);
 std::string typeName(const CheckedModule& module, Type type, bool canonical = false);

@@ -56,6 +56,82 @@ class Macros(unittest.TestCase):
     def dependency(name):
         return {'name': name, 'version': '^0.1.0', 'path': '../' + name}
 
+    def test_comment_queries_preserve_docs_trivia_and_original_locations(self):
+        (self.src / '.macros/verify.ly').write_text(r'''fn verify(target: String, argument: String): Syntax {
+    val declaration = syntaxTarget()
+    val member = syntaxChild(declaration, 1)
+    if syntaxDoc(declaration) != "中文\n\n  example" { return syntaxError(declaration, "bad declaration documentation") }
+    if syntaxDoc(member) != "Member documentation." { return syntaxError(member, "bad member documentation") }
+    if targetKind() == "fn" {
+        val body = syntaxBody()
+        if syntaxCommentCount(body) != 2 { return syntaxError(body, "bad comment count") }
+        val comment = syntaxComment(body, 0)
+        if syntaxKind(comment) != "comment" || syntaxText(comment) != "// actual" || syntaxLine(comment) != 27 {
+            return syntaxError(comment, "bad source location: " + syntaxLine(comment).toString())
+        }
+        if syntaxText(syntaxComment(body, 1)) != "/* trailing */" { return syntaxError(body, "bad block comment") }
+        if syntaxCommentCount(syntaxCode("// synthetic")) != 0 { return syntaxError(body, "bad synthetic comment") }
+    }
+    syntaxCode("")
+}
+''', encoding='utf-8')
+        expressions = self.src / '.expressions'
+        expressions.mkdir()
+        (expressions / 'comment.ly').write_text('''fn comment(target: String, argument: String): Syntax {
+    val node = syntaxArgument(0)
+    val comment = syntaxComment(node, 0)
+    if syntaxCommentCount(node) != 1 || syntaxText(comment) != "/* real */" { return syntaxError(node, "bad argument comment") }
+    if syntaxColumn(comment) != 31 { return syntaxError(comment, "bad argument column: " + syntaxColumn(comment).toString()) }
+    syntaxInt(1)
+}
+''', encoding='utf-8')
+        source = '''/// 中文
+///
+///   example
+#verify(
+    "record"
+)
+struct Record(
+    /// Member documentation.
+    [tag] val value: Int
+)
+/// 中文
+///
+///   example
+#verify
+enum Outcome {
+    /// Member documentation.
+    Success
+}
+/// 中文
+///
+///   example
+#verify
+fn inspected(
+    /// Member documentation.
+    value: Int
+): Unit {
+    // actual
+    val looksLikeComment = r"/* not a comment */"
+    val computed = #comment(1 /* real */ + 1) /* trailing */
+}
+fn main(): Unit {}
+'''
+        original = self.src / 'main.ly'
+        original.write_bytes(source.replace('\n', '\r\n').encode('utf-8'))
+        result = self.cli('check', self.pkg)
+        self.assertEqual(result.returncode, 0, result.stderr.decode('utf-8'))
+        original.write_bytes(source.replace('/// 中文', '/// 文档', 1).replace('\n', '\r\n').encode('utf-8'))
+        self.diagnostic('LYM0002', 'bad declaration documentation')
+
+    def test_comment_query_reports_out_of_bounds(self):
+        (self.src / '.macros/make.ly').write_text('''fn make(target: String, argument: String): Syntax {
+    syntaxComment(syntaxBody(), 0)
+}
+''', encoding='utf-8')
+        (self.src / 'main.ly').write_text('#make\nfn main(): Unit {}\n', encoding='utf-8')
+        self.diagnostic('LYM0002', '注释下标越界')
+
     def test_imported_macro_reexport_ctfe_and_cache_follow_the_provider(self):
         provider = self.library('provider', macroInputs={'emitValue': {'amount': 'own.txt'}})
         facade = self.library('facade', dependencies={'provider': self.dependency('provider')})

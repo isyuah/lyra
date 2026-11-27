@@ -1,5 +1,6 @@
 module;
 #include <algorithm>
+#include <array>
 #include <charconv>
 #include <compare>
 #include <cstdint>
@@ -83,6 +84,11 @@ using Overloads = std::unordered_map<std::string, std::vector<std::size_t>>;
 const std::string& linkedName(const Identifier& name) { return name.linked.empty() ? name.text : name.linked; }
 
 constexpr Type scalarTypes[] = {Type::Bool, Type::String, Type::Char, Type::Bytes, Type::Unit, Type::CPtr, Type::CCallback, Type::Any, Type::Error};
+struct BuiltinGeneric { std::string_view name; Type::Kind kind; std::array<std::string_view, 2> parameters; };
+constexpr BuiltinGeneric builtinGenerics[] = {
+    {"List", Type::List, {"T"}}, {"FrozenList", Type::FrozenList, {"T"}}, {"Task", Type::Task, {"T"}},
+    {"TaskLocal", Type::TaskLocal, {"T"}}, {"Channel", Type::Channel, {"T"}}, {"Option", Type::Option, {"T"}}, {"Result", Type::Result, {"T", "E"}}
+};
 
 bool builtInDisplay(Type type) { return numericType(type) || type == Type::Bool || type == Type::String || type == Type::Char; }
 
@@ -178,8 +184,9 @@ std::vector<EditorSymbol> editorBuiltins(bool types, bool constraints) {
                 auto prefix = kind == Type::Int ? "Int" : kind == Type::UInt ? "UInt" : "Float";
                 symbols.push_back({prefix + std::to_string(width), EditorKind::TypeAlias});
             }
-        for (auto name : {"Int", "UInt", "Float", "Never", "List", "FrozenList", "Range", "Option", "Result", "Task", "TaskLocal", "TaskOutcome", "Channel"})
+        for (auto name : {"Int", "UInt", "Float", "Never", "Range", "TaskOutcome"})
             symbols.push_back({name, EditorKind::TypeAlias});
+        for (const auto& item : builtinGenerics) symbols.push_back({std::string(item.name), EditorKind::TypeAlias});
         for (auto name : {"ChannelSendResult", "ChannelReceiveResult"}) symbols.push_back({name, EditorKind::Enum});
     } else {
         symbols = {{"print", EditorKind::Function, {}, "fn print(value: Number | Bool | Char | String): Unit", "将标量值和换行写入 stdout。"},
@@ -202,6 +209,52 @@ struct EditorBodyCache {
 };
 
 namespace {
+
+struct BuiltinCallRule {
+    Callee callee;
+    std::string_view name, result;
+    std::array<std::pair<std::string_view, std::string_view>, 3> parameters{};
+    std::string_view generics{}, owner{}, context{}, documentation{};
+
+    std::size_t arity() const {
+        return static_cast<std::size_t>(std::ranges::count_if(parameters, [](const auto& param) { return !param.first.empty(); }));
+    }
+};
+
+constexpr BuiltinCallRule builtinCalls[] = {
+    {Callee::Print, "print", "Unit", {{{"value", "Number | Bool | Char | String"}}}, {}, {}, {}, "Writes a scalar value followed by a newline to stdout."},
+    {Callee::Collect, "gcCollect", "Unit"},
+    {Callee::Sleep, "sleepMs", "Task<Unit>", {{{"milliseconds", "Int"}}}},
+    {Callee::AwaitOutcome, "awaitOutcome", "TaskOutcome<T>", {{{"task", "Task<T>"}}}, "T", {}, "async"},
+    {Callee::WithLocal, "withLocal", "Task<R>", {{{"key", "TaskLocal<T>"}, {"value", "T"}, {"task", "Task<R>"}}}, "T,R"},
+    {Callee::ChannelCreate, "Channel", "Channel<T>", {{{"capacity", "Int"}}}, "T"},
+    {Callee::LocalKey, "TaskLocal", "TaskLocal<T>", {}, "T"},
+    {Callee::FreezeList, "FrozenList", "FrozenList<T>", {{{"items", "List<T>"}}}, "T"},
+    {Callee::BusinessError, "Error", "Error", {{{"value", "T"}, {"cause", "Error?"}}}, "T"},
+    {Callee::BytesFromHex, "fromHex", "Option<Bytes>", {{{"text", "String"}}}, {}, "Bytes"},
+    {Callee::TaskCancelled, "cancelled", "Bool", {}, {}, "Task"},
+    {Callee::TaskCheckCancellation, "checkCancellation", "Unit", {}, {}, "Task"},
+    {Callee::PtrAllocate, "alloc", "CPtr", {{{"bytes", "Int"}}}, {}, "CPtr", "unsafe"},
+    {Callee::PtrNull, "nullPtr", "CPtr", {}, {}, "CPtr"},
+    {Callee::CallbackRegister, "register", "CCallback", {{{"callback", "(Args...) -> R"}, {"fallback", "R"}}}, "R", "CCallback", "unsafe"},
+};
+
+const BuiltinCallRule* builtinCall(std::string_view name, std::string_view owner = {}) {
+    auto found = std::ranges::find_if(builtinCalls, [&](const auto& call) { return call.name == name && call.owner == owner; });
+    return found == std::end(builtinCalls) ? nullptr : found;
+}
+
+std::vector<Enumeration> builtinEnumerations() {
+    return {{0, {"TaskOutcome", {}}, {
+         {{"Completed", {}}, {{Identifier{"value", {}}, {"T", {}}}}},
+         {{"Failed", {}}, {{Identifier{"exception", {}}, {"Exception", {}}}}},
+         {{"Cancelled", {}}, {{Identifier{"cleanupFailures", {}}, {"List<Exception>", {}}}}},
+     }, true, {{"T", {}}}},
+     {0, {"ChannelSendResult", {}}, {{{"Sent", {}}, {}}, {{"Full", {}}, {}}, {{"Closed", {}}, {}}}, true},
+     {0, {"ChannelReceiveResult", {}}, {
+         {{"Received", {}}, {{Identifier{"value", {}}, {"T", {}}}}}, {{"Empty", {}}, {}}, {{"Closed", {}}, {}},
+     }, true, {{"T", {}}}}};
+}
 
 SourceAnchor functionAnchor(const Function& fn) { return {fn.file, fn.name.span}; }
 
@@ -813,16 +866,15 @@ struct Symbols {
     }
 
     enum class MemberContext { Ordinary, Unsafe, AsyncBody };
-    struct BuiltinMember { Callee callee; RequiredMethod shape; MemberContext context; };
+    struct BuiltinMember { Callee callee; RequiredMethod shape; MemberContext context; std::string_view documentation; };
 
     void builtinMembers(Type type, std::string_view filter, auto&& accept) {
         auto emit = [&](std::string_view name, Callee callee, Type result, std::vector<std::string> labels = {}, std::vector<Type> parameters = {},
-                        MemberContext context = MemberContext::Ordinary) {
-            if (filter.empty() || filter == name) accept(name, BuiltinMember{callee, {std::move(labels), std::move(parameters), result, false}, context});
+                        MemberContext context = MemberContext::Ordinary, std::string_view documentation = {}) {
+            if (filter.empty() || filter == name) accept(name, BuiltinMember{callee, {std::move(labels), std::move(parameters), result, false}, context, documentation});
         };
         auto matches = [&](std::string_view name) { return filter.empty() || name == filter; };
-        if (type.kind == Type::List || type.kind == Type::FrozenList || type == Type::String || type == Type::Bytes)
-            emit("size", Callee::Size, Type::Int);
+        builtinProperties(type, "size", [&](auto name, Type result, auto) { emit(name, Callee::Size, result); });
         if (type.kind == Type::List) {
             auto element = module.listElements[type.id];
             emit("add", Callee::ListAdd, Type::Unit, {"value"}, {element});
@@ -864,10 +916,15 @@ struct Symbols {
         if (type.kind == Type::Option || type.kind == Type::Result) {
             auto success = module.sumTypes[type.id].success;
             auto optional = type.kind == Type::Option;
-            emit(optional ? "isSome" : "isOk", Callee::SumPresent, Type::Bool);
-            emit(optional ? "isNone" : "isErr", Callee::SumAbsent, Type::Bool);
-            emit("unwrap", Callee::SumUnwrap, success);
-            emit("expect", Callee::SumUnwrap, success, {"message"}, {Type::String});
+            emit(optional ? "isSome" : "isOk", Callee::SumPresent, Type::Bool, {}, {}, MemberContext::Ordinary,
+                optional ? "判断是否为 `Some`。" : "判断是否为 `Ok`。");
+            emit(optional ? "isNone" : "isErr", Callee::SumAbsent, Type::Bool, {}, {}, MemberContext::Ordinary,
+                optional ? "判断是否为 `None`。" : "判断是否为 `Err`。");
+            emit("unwrap", Callee::SumUnwrap, success, {}, {}, MemberContext::Ordinary, optional ?
+                "取出 `Some` 的值；遇到 `None` 时抛出 `UnwrapError`。\n\n```lyra\nSome(42).unwrap()\n```" :
+                "取出 `Ok` 的值；遇到 `Err` 时抛出附带失败信息的 `UnwrapError`。\n\n```lyra\nval result: Result<Int,String> = Ok(42)\nresult.unwrap()\n```");
+            emit("expect", Callee::SumUnwrap, success, {"message"}, {Type::String}, MemberContext::Ordinary,
+                "取出成功值；失败时抛出带指定消息的 `UnwrapError`。");
             if (!optional && matches("failureInfo")) emit("failureInfo", Callee::FailureInfo, sum(Type::Option, Type::Error));
         }
         if (type == Type::Error) emit("withSuppressed", Callee::ErrorSuppress, Type::Error, {"error"}, {Type::Error});
@@ -930,6 +987,31 @@ struct Symbols {
                     pointerAccess("write" + target.label);
                 }
             }
+        }
+    }
+
+    void builtinProperties(Type type, std::string_view filter, auto&& accept) {
+        auto emit = [&](std::string_view name, auto result, std::size_t slot = 0) {
+            if (filter.empty() || filter == name) accept(name, result(), slot);
+        };
+        auto integer = [] { return Type{Type::Int}; };
+        auto string = [] { return Type{Type::String}; };
+        if (type.kind == Type::List || type.kind == Type::FrozenList || type == Type::String || type == Type::Bytes) emit("size", integer);
+        if (type == Type::String) emit("byteSize", integer);
+        if (type == Type::Char) emit("codePoint", [] { return number(Type::UInt, 32); });
+        if (type.kind == Type::IntRange) for (std::size_t slot = 0; slot < std::size(rangeFields); ++slot)
+            emit(rangeFieldNames[slot], [&] { return rangeFields[slot]; }, slot);
+        if (type.kind == Type::Exception) {
+            emit("message", string, static_cast<std::size_t>(ExceptionMember::Message));
+            emit("taskFailures", [&] { return list(Type::Exception); }, static_cast<std::size_t>(ExceptionMember::TaskFailures));
+            emit("cleanupFailures", [&] { return list(Type::Exception); }, static_cast<std::size_t>(ExceptionMember::CleanupFailures));
+            if (type == unwrapError) emit("failure", [&] { return sum(Type::Option, Type::Error); }, static_cast<std::size_t>(ExceptionMember::Failure));
+        }
+        if (type == Type::Error) {
+            emit("message", string, static_cast<std::size_t>(ErrorMember::Message));
+            emit("original", [] { return Type{Type::Any}; }, static_cast<std::size_t>(ErrorMember::Original));
+            emit("cause", [&] { return sum(Type::Option, Type::Error); }, static_cast<std::size_t>(ErrorMember::Cause));
+            emit("suppressed", [&] { return list(Type::Error); }, static_cast<std::size_t>(ErrorMember::Suppressed));
         }
     }
 
@@ -1186,6 +1268,19 @@ struct Symbols {
     Type channel(Type element) const { return unaryType(Type::Channel, module.channelElements, element); }
     Type list(Type element) const { return unaryType(Type::List, module.listElements, element); }
     Type frozenList(Type element) const { return unaryType(Type::FrozenList, module.listElements, element); }
+
+    Type instantiateBuiltin(Type::Kind kind, std::span<const Type> arguments) const {
+        switch (kind) {
+            case Type::List: return list(arguments.front());
+            case Type::FrozenList: return frozenList(arguments.front());
+            case Type::Task: return task(arguments.front());
+            case Type::TaskLocal: return taskLocal(arguments.front());
+            case Type::Channel: return channel(arguments.front());
+            case Type::Option: return sum(kind, arguments.front());
+            case Type::Result: return sum(kind, arguments.front(), arguments.back());
+            default: throw std::logic_error("invalid builtin generic type");
+        }
+    }
 
     Type dynamicType(std::size_t trait, std::vector<Type> bindings) const {
         DynamicType shape{trait, std::move(bindings)};
@@ -1486,17 +1581,13 @@ struct Symbols {
             arguments.pop_back();
             return closure(std::move(arguments), result);
         }
-        if (arguments.size() == 1 && form.name == "Task") return task(arguments[0]);
-        if (arguments.size() == 1 && form.name == "TaskLocal") return taskLocal(arguments[0]);
-        if (arguments.size() == 1 && form.name == "Channel") return channel(arguments[0]);
-        if (arguments.size() == 1 && form.name == "List") return list(arguments[0]);
-        if (arguments.size() == 1 && form.name == "FrozenList") return frozenList(arguments[0]);
+        auto builtin = std::ranges::find(builtinGenerics, form.name, &BuiltinGeneric::name);
+        if (builtin != std::end(builtinGenerics) && arguments.size() == (builtin->parameters.back().empty() ? 1u : 2u))
+            return instantiateBuiltin(builtin->kind, arguments);
         if (form.name == "Range") {
             if (arguments.size() == 1 && arguments.front() == Type::Int) return Type::IntRange;
             throw at(source, span, "LYT0003", "区间类型目前只支持 Range<Int>");
         }
-        if (arguments.size() == 1 && form.name == "Option") return sum(Type::Option, arguments[0]);
-        if (arguments.size() == 2 && form.name == "Result") return sum(Type::Result, arguments[0], arguments[1]);
         if (auto record = records.find(form.name); record != records.end()) return recordType(record->second, std::move(arguments), source, span);
         if (auto item = enums.find(form.name); item != enums.end()) return enumType(item->second, std::move(arguments), source, span);
         throw missingName(source, span, "LYT0003", "找不到类型或类型实参数量不符：" + form.name, MissingNameKind::Type, form.name);
@@ -3131,23 +3222,25 @@ struct Checker {
                     }
                     detail += ')';
                 }
-                add(variant.name.text, EditorKind::EnumCase, std::move(detail), editorDocumentation(symbols.sources[declaration.file], variant.name.span.begin));
+                add(variant.name.text, EditorKind::EnumCase, std::move(detail), documentationText(symbols.sources[declaration.file], variant.name.documentation));
             }
         } else if (auto record = symbols.records.find(std::string(key)); record != symbols.records.end()) {
             std::vector<Type> arguments;
             if (qualifier) for (const auto& type : qualifier->arguments) arguments.push_back(symbols.resolve(fn.syntax, type, variables));
             overloads(symbols.staticMethods[record->second], arguments);
         } else if (key == "Task" || key == "CPtr" || key == "CCallback" || key == "Bytes") {
-            if (key == "Task") {
-                shape("cancelled", {{}, {}, Type::Bool, false});
-                shape("checkCancellation", {{}, {}, Type::Unit, false});
+            auto type = [&](std::string_view name) { return symbols.resolve(source, Identifier{std::string(name), site}); };
+            for (const auto& rule : builtinCalls) if (rule.owner == key && (rule.context != "unsafe" || unsafeDepth)) {
+                if (rule.callee == Callee::CallbackRegister) add(std::string(rule.name), EditorKind::Method, "register(callback, fallback): CCallback");
+                else {
+                    RequiredMethod method{{}, {}, type(rule.result), false};
+                    for (auto [label, annotation] : rule.parameters) if (!label.empty()) {
+                        method.labels.emplace_back(label);
+                        method.parameters.push_back(type(annotation));
+                    }
+                    shape(std::string(rule.name), method);
+                }
             }
-            if (key == "CPtr") {
-                shape("nullPtr", {{}, {}, Type::CPtr, false});
-                if (unsafeDepth) shape("alloc", {{"bytes"}, {Type::Int}, Type::CPtr, false});
-            }
-            if (key == "CCallback" && unsafeDepth) add("register", EditorKind::Method, "register(callback, fallback): CCallback");
-            if (key == "Bytes") shape("fromHex", {{"text"}, {Type::String}, symbols.sum(Type::Option, Type::Bytes), false});
         } else if (receiver) {
             auto owner = visit(*receiver);
             auto property = [&](const std::string& name, Type type) { add(name, EditorKind::Property, name + ": " + typeName(module, type)); };
@@ -3160,7 +3253,7 @@ struct Checker {
                         fields.insert(field.name.text);
                         if (field.isPublic || symbols.sources[record.syntax.file].moduleId == source.moduleId)
                             add(field.name.text, EditorKind::Field, field.name.text + ": " + typeName(module, record.fields[slot]),
-                                editorDocumentation(symbols.sources[record.syntax.file], field.name.span.begin));
+                                documentationText(symbols.sources[record.syntax.file], field.name.documentation));
                     }
                     for (const auto& [name, getter] : symbols.properties[record.declaration]) method(getter, name, arguments, true);
                 }
@@ -3172,20 +3265,7 @@ struct Checker {
                 if (builtin.callee == Callee::Size) property(std::string(name), builtin.shape.result);
                 else shape(std::string(name), builtin.shape);
             });
-            if (owner.kind == Type::IntRange) for (std::size_t slot = 0; slot < std::size(rangeFields); ++slot) property(rangeFieldNames[slot], rangeFields[slot]);
-            if (owner == Type::String) property("byteSize", Type::Int);
-            if (owner == Type::Char) property("codePoint", number(Type::UInt, 32));
-            if (owner.kind == Type::Exception || owner == Type::Error) property("message", Type::String);
-            if (owner.kind == Type::Exception) {
-                property("taskFailures", symbols.list(Type::Exception));
-                property("cleanupFailures", symbols.list(Type::Exception));
-                if (owner == unwrapError) property("failure", symbols.sum(Type::Option, Type::Error));
-            }
-            if (owner == Type::Error) {
-                property("original", Type::Any);
-                property("cause", symbols.sum(Type::Option, Type::Error));
-                property("suppressed", symbols.list(Type::Error));
-            }
+            symbols.builtinProperties(owner, {}, [&](auto name, auto type, auto) { property(std::string(name), type); });
             if (!symbols.valueSupport(owner, ValueOperation::Equal).missing) shape("equals", {{"other"}, {owner}, Type::Bool, false});
             if (!symbols.valueSupport(owner, ValueOperation::Hash).missing) shape("hashCode", {{}, {}, Type::Int, false});
             auto traitMembers = [&](const Trait& trait) {
@@ -3251,7 +3331,12 @@ struct Checker {
         if (const auto* item = enumNamespace(member.receiver)) return variant(id, TypeQualifier{*item}, Call{member.name, {}}, expected, true);
         auto owner = visit(member.receiver);
         if (owner == Type::Never) return owner;
-        if ((owner.kind == Type::List || owner.kind == Type::FrozenList) && member.name.text == "size") return Type::Int;
+        std::optional<Type> builtin;
+        symbols.builtinProperties(owner, member.name.text, [&](auto, Type type, auto slot) {
+            fn.expressions[id].target = slot;
+            builtin = type;
+        });
+        if (builtin) return *builtin;
         if (owner == Type::IntRange) {
             for (std::size_t slot = 0; slot < std::size(rangeFields); ++slot) if (member.name.text == rangeFieldNames[slot]) {
                 fn.expressions[id].target = slot;
@@ -3585,35 +3670,32 @@ struct Checker {
         if (!call.receiver && !call.typeOwner) if (auto local = lookupLocal(call.name)) return invoke(readLocal(id, call.name, *local));
         if (key.starts_with(pendingTypedDeclaration)) throw at(source, call.name.span, "LYM0004", "编译期阶段环：类型查询依赖尚未生成的类型宏声明：" + call.name.text);
         if (call.name.moduleAlias) throw at(source, call.name.span, "LYN0003", "模块不是函数；请用点号访问公开声明：" + call.name.text);
+        auto builtinType = [&](std::string_view name) { return symbols.resolve(source, Identifier{std::string(name), call.name.span}); };
+        auto builtinArguments = [&](const BuiltinCallRule& rule, auto&& expect) {
+            return arguments(id, call, rule.arity(), [&](auto slot) { return rule.parameters[slot].first; }, expect);
+        };
+        auto fixedBuiltin = [&](const BuiltinCallRule& rule) -> Type {
+            noTypeArgs();
+            if (rule.context == "unsafe") requireUnsafe(call.name.span);
+            info.callee = rule.callee;
+            if (rule.arity() == 0 && !call.arguments.empty()) {
+                auto qualified = rule.owner.empty() ? std::string(rule.name) : std::string(rule.owner) + '.' + std::string(rule.name);
+                throw at(source, call.name.span, "LYT0002", qualified + " 不接收实参");
+            }
+            if (builtinArguments(rule, [&](auto slot) { return builtinType(rule.parameters[slot].second); })) return Type::Never;
+            return builtinType(rule.result);
+        };
         if (call.receiver && !call.typeOwner) {
             const auto* qualifier = std::get_if<Identifier>(&fn.syntax.expressions[*call.receiver].node);
             auto builtin = qualifier && !lookupLocal(*qualifier) && !implicitMember(*qualifier) ? std::string_view(linkedName(*qualifier)) : std::string_view{};
-            if (builtin == "Bytes" && call.name.text == "fromHex") {
-                noTypeArgs();
-                info.callee = Callee::BytesFromHex;
-                if (arguments(id, call, 1, [](auto) { return "text"; }, [](auto) { return Type{Type::String}; })) return Type::Never;
-                return symbols.sum(Type::Option, Type::Bytes);
-            }
-            if (builtin == "Task" &&
-                (call.name.text == "cancelled" || call.name.text == "checkCancellation")) {
-                noTypeArgs();
-                if (!call.arguments.empty()) throw at(source, call.name.span, "LYT0002", "Task." + call.name.text + " 不接收实参");
-                info.callee = call.name.text == "cancelled" ? Callee::TaskCancelled : Callee::TaskCheckCancellation;
-                return call.name.text == "cancelled" ? Type{Type::Bool} : Type{Type::Unit};
-            }
-            if (builtin == "CPtr" && (call.name.text == "alloc" || call.name.text == "nullPtr")) {
-                noTypeArgs();
-                bool allocate = call.name.text == "alloc";
-                if (allocate) requireUnsafe(call.name.span);
-                info.callee = allocate ? Callee::PtrAllocate : Callee::PtrNull;
-                return arguments(id, call, allocate ? 1 : 0, [](auto) { return "bytes"; }, [](auto) { return Type{Type::Int}; }) ? Type{Type::Never} : Type{Type::CPtr};
-            }
-            if (builtin == "CCallback" && call.name.text == "register") {
+            auto rule = builtinCall(call.name.text, builtin);
+            if (!builtin.empty() && rule && rule->generics.empty()) return fixedBuiltin(*rule);
+            if (rule && rule->callee == Callee::CallbackRegister) {
                 noTypeArgs();
                 requireUnsafe(call.name.span);
                 if (call.arguments.empty() || call.arguments.size() > 2 || call.arguments.front().label ||
                     std::ranges::any_of(call.arguments, [](const auto& arg) { return arg.spread || arg.trailing; }) ||
-                    (call.arguments.size() == 2 && call.arguments[1].label && call.arguments[1].label->text != "fallback"))
+                    (call.arguments.size() == 2 && call.arguments[1].label && call.arguments[1].label->text != rule->parameters[1].first))
                     throw at(source, call.name.span, "LYF0002", "写作 CCallback.register(callback, fallback: value)；Unit 回调不传 fallback");
                 info.callee = Callee::CallbackRegister;
                 auto callback = visit(call.arguments.front().value);
@@ -3634,6 +3716,7 @@ struct Checker {
                 return Type::CCallback;
             }
         }
+        auto rule = !call.receiver && !call.typeOwner ? builtinCall(key) : nullptr;
         std::size_t declaration;
         std::span<const Type> ownerTypes;
         if (call.typeOwner) {
@@ -3762,7 +3845,7 @@ struct Checker {
             info.argumentSlots.push_back(0);
             if (value == Type::Never) return value;
             return expected ? *expected : symbols.sum(kind, value);
-        } else if (key == "Channel") {
+        } else if (rule && rule->callee == Callee::ChannelCreate) {
             std::optional<Type> type;
             if (call.typeArguments.size() == 1) type = symbols.channel(symbols.resolve(fn.syntax, call.typeArguments.front(), variables));
             else if (call.typeArguments.empty()) {
@@ -3771,12 +3854,10 @@ struct Checker {
             }
             if (!type) throw at(source, call.name.span, "LYG0001", "Channel 需要一个类型实参或明确的 Channel<T> 目标类型");
             info.callee = Callee::ChannelCreate;
-            return arguments(id, call, 1, [](auto) { return "capacity"; }, [](auto) { return Type{Type::Int}; }) ? Type{Type::Never} : *type;
-        } else if (key == "sleepMs") {
-            noTypeArgs();
-            info.callee = Callee::Sleep;
-            return arguments(id, call, 1, [](auto) { return "milliseconds"; }, [](auto) { return Type{Type::Int}; }) ? Type{Type::Never} : symbols.task(Type::Unit);
-        } else if (key == "TaskLocal") {
+            return builtinArguments(*rule, [&](auto slot) { return builtinType(rule->parameters[slot].second); }) ? Type{Type::Never} : *type;
+        } else if (rule && rule->callee == Callee::Sleep) {
+            return fixedBuiltin(*rule);
+        } else if (rule && rule->callee == Callee::LocalKey) {
             if (!call.arguments.empty()) throw at(source, call.name.span, "LYT0002", "TaskLocal 不接收值实参");
             info.callee = Callee::LocalKey;
             if (call.typeArguments.size() == 1) return symbols.taskLocal(symbols.resolve(fn.syntax, call.typeArguments.front(), variables));
@@ -3785,9 +3866,9 @@ struct Checker {
                 if (expected && expected->kind == Type::TaskLocal) return *expected;
             }
             throw at(source, call.name.span, "LYG0001", "TaskLocal 需要一个类型实参或明确的 TaskLocal<T> 目标类型");
-        } else if (key == "withLocal") {
+        } else if (rule && rule->callee == Callee::WithLocal) {
             noTypeArgs();
-            if (call.arguments.size() != 3 || std::ranges::any_of(call.arguments, [](const Argument& item) { return item.label || item.spread || item.trailing; }))
+            if (call.arguments.size() != rule->arity() || std::ranges::any_of(call.arguments, [](const Argument& item) { return item.label || item.spread || item.trailing; }))
                 throw at(source, call.name.span, "LYT0002", "withLocal 写作 withLocal(key, value, task)");
             auto key = visit(call.arguments[0].value);
             if (key == Type::Never) return key;
@@ -3798,12 +3879,12 @@ struct Checker {
             info.callee = Callee::WithLocal;
             info.argumentSlots = {0, 1, 2};
             return value == Type::Never ? value : task;
-        } else if (key == "Error") {
+        } else if (rule && rule->callee == Callee::BusinessError) {
             noTypeArgs();
             if (call.arguments.empty() || call.arguments.size() > 2) throw at(source, call.name.span, "LYT0002", "Error 需要 value 及可选的 cause 实参");
             info.callee = Callee::BusinessError;
             auto cause = symbols.sum(Type::Option, Type::Error);
-            if (arguments(id, call, call.arguments.size(), [](auto slot) { return slot ? "cause" : "value"; }, [&](auto slot) -> std::optional<Type> { return slot ? std::optional(cause) : std::nullopt; })) return Type::Never;
+            if (arguments(id, call, call.arguments.size(), [&](auto slot) { return rule->parameters[slot].first; }, [&](auto slot) -> std::optional<Type> { return slot ? std::optional(cause) : std::nullopt; })) return Type::Never;
             auto value = call.arguments[std::ranges::find(info.argumentSlots, 0) - info.argumentSlots.begin()].value;
             auto type = fn.expressions[value].type;
             if (type == Type::Error) throw at(source, fn.syntax.expressions[value].span, "LYE0003", "已有 Error 值无需再次包装");
@@ -3819,44 +3900,41 @@ struct Checker {
             refer(call.name, type.file, type.name.span);
             info.callee = Callee::Exception;
             return arguments(id, call, 1, [](auto) { return "message"; }, [](auto) { return Type{Type::String}; }) ? Type{Type::Never} : Type{Type::Exception, named->second + firstDeclaredException};
-        } else if (key == "print") {
+        } else if (rule && rule->callee == Callee::Print) {
             noTypeArgs();
             info.callee = Callee::Print;
-            bool exits = arguments(id, call, 1, [](auto) { return "value"; }, [](auto) { return std::nullopt; });
+            bool exits = builtinArguments(*rule, [](auto) { return std::nullopt; });
             auto arg = call.arguments.front().value;
             auto type = fn.expressions[arg].type;
             if (!exits && !builtInDisplay(type)) throw at(source, fn.syntax.expressions[arg].span, "LYT0001", "print 需要数值、Bool、Char 或 String，实际是 " + typeName(module, type));
-            return exits ? Type::Never : Type::Unit;
-        } else if (key == "FrozenList") {
+            return exits ? Type{Type::Never} : builtinType(rule->result);
+        } else if (rule && rule->callee == Callee::FreezeList) {
             if (call.typeArguments.size() > 1) throw at(source, call.name.span, "LYG0001", "FrozenList 只接受一个类型实参");
             if (expected && expected->kind == Type::Option) expected = module.sumTypes[expected->id].success;
             std::optional<Type> element;
             if (!call.typeArguments.empty()) element = symbols.resolve(fn.syntax, call.typeArguments.front(), variables);
             else if (expected && expected->kind == Type::FrozenList) element = module.listElements[expected->id];
             info.callee = Callee::FreezeList;
-            if (arguments(id, call, 1, [](auto) { return "items"; }, [&](auto) -> std::optional<Type> { return element ? std::optional(symbols.list(*element)) : std::nullopt; }))
+            if (builtinArguments(*rule, [&](auto) -> std::optional<Type> { return element ? std::optional(symbols.list(*element)) : std::nullopt; }))
                 return Type::Never;
             auto value = call.arguments.front().value;
             auto items = fn.expressions[value].type;
             if (items.kind != Type::List) throw at(source, fn.syntax.expressions[value].span, "LYT0014", "FrozenList 需要 List，实际是 " + typeName(module, items));
             return symbols.frozenList(module.listElements[items.id]);
-        } else if (key == "awaitOutcome") {
+        } else if (rule && rule->callee == Callee::AwaitOutcome) {
             noTypeArgs();
             if (!inAsync()) throw at(source, call.name.span, "LYT0008", "awaitOutcome 只能在异步执行体中调用");
             std::optional<Type> hint;
             if (expected && expected->kind == Type::Enum && module.enums[expected->id].syntax.name.text == "TaskOutcome")
                 hint = symbols.task(module.enums[expected->id].arguments.front());
             info.callee = Callee::AwaitOutcome;
-            if (arguments(id, call, 1, [](auto) { return "task"; }, [&](auto) { return hint; })) return Type::Never;
+            if (builtinArguments(*rule, [&](auto) { return hint; })) return Type::Never;
             auto value = call.arguments.front().value;
             auto task = fn.expressions[value].type;
             if (task.kind != Type::Task) throw at(source, fn.syntax.expressions[value].span, "LYT0008", "awaitOutcome 需要 Task，实际是 " + typeName(module, task));
             return symbols.enumType(symbols.enums.at("TaskOutcome"), {module.taskResults[task.id]}, source, call.name.span);
-        } else if (key == "gcCollect") {
-            noTypeArgs();
-            info.callee = Callee::Collect;
-            if (!call.arguments.empty()) throw at(source, call.name.span, "LYT0002", "gcCollect 不接收实参");
-            return Type::Unit;
+        } else if (rule && rule->callee == Callee::Collect) {
+            return fixedBuiltin(*rule);
         } else if (auto record = symbols.records.find(key); record != symbols.records.end()) {
             const auto& decl = symbols.recordDeclarations[record->second];
             refer(call.name, decl.file, decl.name.span);
@@ -4363,7 +4441,8 @@ const Identifier& Symbols::resultAnnotation(const Callable& candidate, const Sou
 }
 
 static CheckedModule checkProgram(Module module, const std::vector<Source>& sources, bool requireEntry, MacroExecution* macro, EditorIndex* editor,
-    AnalysisDiagnostics* diagnostics, std::map<std::size_t, MacroTypeQuery>* queries = nullptr, EditorBodySession* bodies = nullptr) {
+    AnalysisDiagnostics* diagnostics, std::map<std::size_t, MacroTypeQuery>* queries = nullptr, EditorBodySession* bodies = nullptr,
+    ReferenceOverloads* reference = nullptr) {
     if (!module.expansions.empty()) {
         auto& use = module.expansions.front();
         throw at(sources[use.file], use.name.span, "LYM0001", "声明前缀未展开：" + use.name.text);
@@ -4412,15 +4491,7 @@ static CheckedModule checkProgram(Module module, const std::vector<Source>& sour
             symbols.enums.emplace(declaration.name.text, symbols.enumDeclarations.size());
             symbols.enumDeclarations.push_back(std::move(declaration));
         };
-        addBuiltinEnum({0, {"TaskOutcome", {}}, {
-            {{"Completed", {}}, {{Identifier{"value", {}}, {"T", {}}}}},
-            {{"Failed", {}}, {{Identifier{"exception", {}}, {"Exception", {}}}}},
-            {{"Cancelled", {}}, {{Identifier{"cleanupFailures", {}}, {"List<Exception>", {}}}}},
-        }, true, {{"T", {}}}});
-        addBuiltinEnum({0, {"ChannelSendResult", {}}, {{{"Sent", {}}, {}}, {{"Full", {}}, {}}, {{"Closed", {}}, {}}}, true});
-        addBuiltinEnum({0, {"ChannelReceiveResult", {}}, {
-            {{"Received", {}}, {{Identifier{"value", {}}, {"T", {}}}}}, {{"Empty", {}}, {}}, {{"Closed", {}}, {}},
-        }, true, {{"T", {}}}});
+        for (auto& item : builtinEnumerations()) addBuiltinEnum(std::move(item));
     }
     for (auto& decl : module.enums) {
         if (symbols.records.contains(decl.name.text)) throw at(sources[decl.file], decl.name.span, "LYN0002", "类型名称已声明：" + decl.name.text);
@@ -4783,7 +4854,7 @@ static CheckedModule checkProgram(Module module, const std::vector<Source>& sour
             syntax.conversion || syntax.initializer || name == "_") continue;
         if (syntax.constant == ConstKind::Value) {
             editor->descriptions.push_back({{syntax.file, syntax.name.span}, "const " + name + ": " + editorSpelling(source, syntax.result),
-                editorDocumentation(source, syntax.name.span.begin)});
+                documentationText(source, syntax.name.documentation)});
         } else {
             auto inferred = callable.inferredResult && !callable.failedInference
                 ? typeName(checked, symbols.resolve(syntax, *callable.inferredResult, callable.variables)) : std::string{};
@@ -4993,6 +5064,19 @@ static CheckedModule checkProgram(Module module, const std::vector<Source>& sour
     }
     for (const auto& match : checked.matchCoverage) if (!macro) for (auto site : redundantPatterns(checked, match))
         checked.warnings.push_back(at(sources[match.file], site, "LYW0002", "此模式已被前面的无守卫模式覆盖，或无法匹配任何值"));
+    if (reference) for (const auto& callable : symbols.callables) {
+        const auto& fn = symbols.declaration(callable);
+        if (!fn.isPublic) continue;
+        const auto& source = sources[fn.file];
+        auto key = overloadKey(fn, [&](const Identifier& type) { return symbols.expandAliases(type, source); });
+        std::vector<std::string> shape{std::to_string(key.typeParameters)};
+        for (auto slot = static_cast<std::size_t>(fn.hasReceiver); slot < key.parameters.size(); ++slot) {
+            const auto& [type, variadic, passing] = key.parameters[slot];
+            shape.push_back(std::string(passingName(passing)) + ':' + type + (variadic ? "..." : ""));
+        }
+        if (fn.conversion) shape.push_back("->" + mapTypeNames(symbols.expandAliases(fn.result, source), [](const auto& name) { return name; }));
+        reference->emplace(functionAnchor(fn), std::move(shape));
+    }
     auto warningKey = [](const Diagnostic& diagnostic) {
         return std::tuple(std::string_view(diagnostic.site->file), diagnostic.site->start.offset, diagnostic.site->end.offset, std::string_view(diagnostic.code));
     };
@@ -5006,6 +5090,107 @@ static CheckedModule checkProgram(Module module, const std::vector<Source>& sour
 
 CheckedModule check(Module module, const std::vector<Source>& sources, bool requireEntry, MacroExecution* macro, EditorIndex* editor) {
     return checkProgram(std::move(module), sources, requireEntry, macro, editor, nullptr);
+}
+
+CheckedModule checkReference(const Module& module, const std::vector<Source>& sources, ReferenceOverloads& overloads) {
+    return checkProgram(module, sources, false, nullptr, nullptr, nullptr, nullptr, nullptr, &overloads);
+}
+
+std::vector<BuiltinReference> builtinReference() {
+    CheckedModule checked;
+    const std::vector<Source> sources{sourceText("<builtin>", {}, {})};
+    Symbols symbols{checked, sources, {}, {}, {}, {}, {}, {}, {}, {}};
+    for (auto& item : builtinEnumerations()) {
+        symbols.enums.emplace(item.name.text, symbols.enumDeclarations.size());
+        symbols.enumDeclarations.push_back(std::move(item));
+    }
+    symbols.variants.resize(symbols.enumDeclarations.size());
+    Type element{Type::Variable, 0}, failure{Type::Variable, 1};
+    checked.variableNames = {"T", "E"};
+    std::vector<BuiltinReference> entries;
+    auto addType = [&](const std::string& name, Type type, std::vector<std::string> parameters = {}) {
+        auto kind = type.kind == Type::Exception ? "exception" : "type";
+        entries.push_back({name, kind, {}, {}, {}, std::move(parameters)});
+        symbols.builtinMembers(type, {}, [&](auto method, const Symbols::BuiltinMember& info) {
+            BuiltinReference item{std::string(method), "method", name, typeName(checked, info.shape.result)};
+            for (std::size_t slot = 0; slot < info.shape.parameters.size(); ++slot)
+                item.parameters.push_back({info.shape.labels[slot], typeName(checked, info.shape.parameters[slot])});
+            if (info.context == Symbols::MemberContext::AsyncBody) item.context = "async";
+            if (info.context == Symbols::MemberContext::Unsafe) item.context = "unsafe";
+            item.documentation = info.documentation;
+            entries.push_back(std::move(item));
+        });
+        symbols.builtinProperties(type, {}, [&](auto property, auto value, auto) {
+            entries.push_back({std::string(property), "property", name, typeName(checked, value)});
+        });
+    };
+    for (auto type : scalarTypes) addType(typeName(checked, type), type);
+    for (const auto& symbol : editorBuiltins(true)) if (auto type = numberType(symbol.label)) {
+        auto name = typeName(checked, *type);
+        if (name == symbol.label) addType(name, *type);
+        else entries.push_back({symbol.label, "typeAlias", {}, name});
+    }
+    addType("Range", Type::IntRange, {"Int"});
+    for (const auto& item : builtinGenerics) {
+        std::vector<std::string> parameters;
+        for (auto name : item.parameters) if (!name.empty()) parameters.emplace_back(name);
+        const Type types[] = {element, failure};
+        auto type = symbols.instantiateBuiltin(item.kind, std::span(types).first(parameters.size()));
+        addType(std::string(item.name), type, std::move(parameters));
+    }
+    for (auto& item : entries) {
+        if (item.kind != "type") continue;
+        if (item.name == "Option") item.documentation = "可选值：`Some(value)` 或 `None`。`T?` 是 `Option<T>` 的简写。";
+        if (item.name == "Result") item.documentation = "成功时保存 `Ok(value)`，业务失败时保存 `Err(error)`。";
+    }
+    for (auto tag : {SumTag::None, SumTag::Some, SumTag::Ok, SumTag::Err}) {
+        bool optional = optionTag(tag);
+        BuiltinReference item{std::string(tagName(tag)), "case", optional ? "Option" : "Result", optional ? "Option<T>" : "Result<T,E>"};
+        if (tag != SumTag::None) item.parameters.push_back({successTag(tag) ? "value" : "error", successTag(tag) ? "T" : "E"});
+        entries.push_back(std::move(item));
+    }
+    for (auto name : builtinExceptionNames) {
+        addType(std::string(name), *builtinException(name));
+        entries.push_back({std::string(name), "constructor", std::string(name), std::string(name), {{"message", "String"}}});
+    }
+    for (const auto& item : symbols.enumDeclarations) {
+        auto declaration = BuiltinReference{item.name.text, "enum"};
+        for (const auto& parameter : item.typeParameters) declaration.typeParameters.push_back(parameter.text);
+        entries.push_back(std::move(declaration));
+        auto result = nominalAnnotation(item).text;
+        for (const auto& variant : item.cases) {
+            BuiltinReference entry{variant.name.text, "case", item.name.text, result};
+            for (const auto& field : variant.fields) entry.parameters.push_back({field.name ? field.name->text : "", field.type.text});
+            entries.push_back(std::move(entry));
+        }
+    }
+    for (const auto& rule : builtinCalls) {
+        bool constructor = rule.callee == Callee::ChannelCreate || rule.callee == Callee::LocalKey || rule.callee == Callee::FreezeList || rule.callee == Callee::BusinessError;
+        auto kind = constructor ? "constructor" : rule.owner.empty() ? "function" : "staticMethod";
+        BuiltinReference entry{std::string(rule.name), kind, std::string(constructor ? rule.name : rule.owner), std::string(rule.result),
+            {}, {}, std::string(rule.context), std::string(rule.documentation)};
+        for (auto [name, type] : rule.parameters) if (!name.empty()) entry.parameters.push_back({std::string(name), std::string(type)});
+        auto generics = rule.generics;
+        while (!generics.empty()) {
+            auto next = generics.find(',');
+            entry.typeParameters.emplace_back(generics.substr(0, next));
+            generics.remove_prefix(next == generics.npos ? generics.size() : next + 1);
+        }
+        if (rule.callee == Callee::BusinessError) entry.parameters.back().defaultValue = "None";
+        if (rule.callee == Callee::CallbackRegister) {
+            auto unit = entry;
+            unit.parameters.resize(1);
+            unit.parameters.front().type = "(Args...) -> Unit";
+            unit.typeParameters.clear();
+            entries.push_back(std::move(unit));
+        }
+        entries.push_back(std::move(entry));
+    }
+    entries.push_back({"Eq", "trait"});
+    entries.push_back({"Hash", "trait"});
+    entries.push_back({"equals", "method", "Eq", "Bool", {{"other", "Self"}}});
+    entries.push_back({"hashCode", "method", "Hash", "Int"});
+    return entries;
 }
 
 void checkMacroTypes(Module module, const std::vector<Source>& sources, std::map<std::size_t, MacroTypeQuery>& queries) {

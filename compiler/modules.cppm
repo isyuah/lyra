@@ -32,8 +32,13 @@ std::vector<std::filesystem::path> testEntries(const std::filesystem::path& root
 struct ParsedFileSyntax { std::string text; RecoveredSyntax parsed; };
 struct ParseCache { std::map<std::string, ParsedFileSyntax> files; };
 struct EditorProbeEnvironment;
+struct ReferenceModule { std::string name, package, version; std::filesystem::path root; bool selected; };
+struct ReferenceExport { std::string module, name; SourceAnchor origin; std::optional<SourceAnchor> alias{}; std::optional<MacroKind> macro{}; std::optional<Span> documentation{}; };
+struct ReferenceCatalog { std::map<std::string, ReferenceModule> modules; std::vector<ReferenceExport> exports; Module macros; std::vector<Source> macroSources; };
 Compilation loadProgram(const PackageGraph& graph, const std::string& entry, const std::optional<std::filesystem::path>& testFile = {}, const SourceOverlay* overlays = nullptr,
-    ParseCache* parseCache = nullptr, bool editorProbe = false, AnalysisDiagnostics* diagnostics = nullptr, EditorProbeEnvironment* probe = nullptr);
+    ParseCache* parseCache = nullptr, bool editorProbe = false, AnalysisDiagnostics* diagnostics = nullptr, EditorProbeEnvironment* probe = nullptr,
+    ReferenceCatalog* reference = nullptr);
+Compilation loadStandardReference(ReferenceCatalog& reference);
 Compilation loadLooseProgram(std::vector<Source> sources, AnalysisDiagnostics* diagnostics = nullptr, ParseCache* parseCache = nullptr);
 struct EditorFileSyntax { std::string text; Module syntax; std::vector<ExpressionExpansion> expressions; std::optional<std::string> catalogKey{}; };
 struct EditorParseCache { std::map<std::filesystem::path, EditorFileSyntax> files; };
@@ -148,6 +153,7 @@ struct Linker {
     const TypedExports* typedExports{};
     std::map<std::size_t, std::map<std::string, Import>> fileImports{};
     std::map<const Import*, Symbol> resolvedImports{};
+    bool documenting{};
 
     void declare(std::size_t file, Identifier& id, bool visible, bool rewriteName, SymbolKind kind = SymbolKind::Type) {
         auto scope = sources[file].moduleId;
@@ -159,7 +165,7 @@ struct Linker {
             if (!callable || symbol->second.kind != SymbolKind::Callable || name == "main") throw at(sources[file], id.span, "LYN0002", "名称已声明：" + id.text);
             symbol->second.visible |= visible;
         }
-        if (indexing) symbol->second.targets.push_back({{file, id.span}, visible});
+        if (indexing || documenting) symbol->second.targets.push_back({{file, id.span}, visible});
         if (indexing) references.push_back({{file, id.span}, {file, id.span}, {}});
         if (rewriteName) id.text = std::move(name);
     }
@@ -957,7 +963,7 @@ std::vector<EditorDeclaration> editorDeclarations(const Module& syntax, std::spa
             constexpr std::array<std::string_view, 8> contextual{"None", "Self", "blocking", "parallel", "quote", "select", "taskGroup", "unsafe"};
             if (std::ranges::find(contextual, name) == contextual.end()) label = editorIdentifier(name);
         }
-        if (documentation.empty()) documentation = editorDocumentation(source, item.name.span.begin);
+        if (documentation.empty()) documentation = documentationText(source, item.name.documentation);
         result.push_back({item.file, std::move(name), {std::move(label), kind, item.name.span, std::move(detail), std::move(documentation)}, item.isPublic});
     };
     for (const auto& record : syntax.aggregates) add(record, record.reference ? EditorKind::Class : EditorKind::Struct);
@@ -1217,7 +1223,7 @@ void ModuleCatalog::macroSymbols() {
             auto spelling = editorIdentifier(name);
             auto sigil = kind == MacroKind::Decorator ? '@' : '#';
             auto description = EditorSymbol{spelling, kind == MacroKind::Decorator ? EditorKind::Decorator : EditorKind::Macro,
-                declaration->name.span, sigil + spelling, editorDocumentation(implementation, declaration->name.span.begin)};
+                declaration->name.span, sigil + spelling, documentationText(implementation, declaration->name.documentation)};
             return std::pair{EditorDefinition{{}, file, declaration->name.span, std::move(description)}, declaration->isPublic};
         } catch (const Diagnostic&) { return {}; }
     };
@@ -1468,8 +1474,13 @@ Compilation loadLooseProgram(std::vector<Source> sources, AnalysisDiagnostics* d
     return program;
 }
 
+Compilation loadStandardReference(ReferenceCatalog& reference) {
+    return loadProgram({}, {}, {}, nullptr, nullptr, false, nullptr, nullptr, &reference);
+}
+
 Compilation loadProgram(const PackageGraph& graph, const std::string& entry, const std::optional<fs::path>& testFile, const SourceOverlay* overlays,
-    ParseCache* parseCache, bool editorProbe, AnalysisDiagnostics* diagnostics, EditorProbeEnvironment* probe) {
+    ParseCache* parseCache, bool editorProbe, AnalysisDiagnostics* diagnostics, EditorProbeEnvironment* probe, ReferenceCatalog* reference) {
+    bool allStandard = reference && entry.empty();
     std::map<std::string, const ResolvedPackage*> packages;
     std::map<std::string, std::string> prefixes;
     for (const auto& package : graph.packages) {
@@ -1477,7 +1488,7 @@ Compilation loadProgram(const PackageGraph& graph, const std::string& entry, con
         packages.emplace(package.id, &package);
     }
     std::set<std::string> reachable;
-    std::vector<std::string> todo{entry};
+    auto todo = allStandard ? std::vector<std::string>{} : std::vector<std::string>{entry};
     while (!todo.empty()) {
         auto id = todo.back(); todo.pop_back();
         if (reachable.insert(id).second) for (const auto& [alias, target] : packages.at(id)->dependencies) todo.push_back(target);
@@ -1499,7 +1510,7 @@ Compilation loadProgram(const PackageGraph& graph, const std::string& entry, con
             }
         }
     }
-    auto root = prefixes.at(entry);
+    auto root = allStandard ? std::string{} : prefixes.at(entry);
     if (testFile) {
         root += "#test";
         spaces.emplace(root, Space{packages.at(entry)});
@@ -1565,11 +1576,95 @@ Compilation loadProgram(const PackageGraph& graph, const std::string& entry, con
         }
     };
     loadStandard("core", true);
+    if (allStandard) {
+        std::set<std::string> names;
+        for (const auto& folder : fs::directory_iterator(standard))
+            if (folder.is_directory() && fs::is_directory(folder.path() / "src")) names.insert(pathText(folder.path().filename()));
+        for (const auto& name : names) loadStandard(name, true);
+    }
     loadBundled(authored, true);
     if (diagnostics && program.incompleteDeclaration) return program;
     auto linkProgram = [&] {
         Linker linker{program.sources, spaces, prefixes, root, program.references, overlays != nullptr && !editorProbe};
+        linker.documenting = reference != nullptr;
         linker.rewrite(program.syntax, nullptr, diagnostics);
+        if (reference) {
+            auto addModule = [&](const std::string& module, const ResolvedPackage& package) {
+                auto isStandard = package.id.starts_with("$std/");
+                auto name = isStandard ? "std." + package.name : package.name;
+                auto suffix = module.substr(prefixes.at(package.id).size());
+                std::ranges::replace(suffix, '/', '.');
+                reference->modules.emplace(module, ReferenceModule{name + suffix, isStandard ? name : package.name, package.version, package.root,
+                    allStandard ? isStandard : package.id == entry});
+            };
+            std::set<SourceAnchor> conversions;
+            for (const auto& fn : program.syntax.functions) if (fn.conversion) conversions.emplace(fn.file, fn.name.span);
+            for (const auto& [module, space] : spaces) {
+                addModule(module, *space.package);
+                for (const auto& [name, symbol] : space.definitions) for (const auto& target : symbol.targets) if (target.visible)
+                    reference->exports.push_back({module, conversions.contains(target.anchor) ? "implicit" : name, target.anchor});
+                for (const auto& [name, use] : space.exports) for (const auto& target : linker.resolvedImports.at(&use).targets)
+                    reference->exports.push_back({module, name, target.anchor, SourceAnchor{use.file, use.alias.span}, {}, use.alias.documentation});
+            }
+            auto meta = standard / "meta";
+            if (allStandard) reference->modules.emplace("$std/meta", ReferenceModule{"std.meta", "std.meta", "builtin", meta, true});
+            std::map<fs::path, std::optional<SourceAnchor>> macroDeclarations;
+            auto macroDeclaration = [&](const fs::path& path, const std::string& module) {
+                auto [found, inserted] = macroDeclarations.try_emplace(path);
+                if (!inserted) return found->second;
+                if (fs::file_size(path) > macroInputByteLimit) throw Diagnostic{"LYM0002", "宏实现超过大小限制：" + pathText(path)};
+                auto source = loadSource(path, module);
+                Module code;
+                std::vector<ExpressionExpansion> calls;
+                parseFile(code, source, 0, &calls, true);
+                auto name = pathText(path.stem());
+                auto fn = std::ranges::find_if(code.functions, [&](const auto& item) { return !item.owner && !item.extensionGroup && item.name.text == name; });
+                if (fn == code.functions.end() || (!fn->isPublic && module != "$std/meta")) return found->second;
+                fn->file = reference->macroSources.size();
+                found->second = SourceAnchor{fn->file, fn->name.span};
+                reference->macroSources.push_back(std::move(source));
+                reference->macros.functions.push_back(std::move(*fn));
+                return found->second;
+            };
+            auto scanMacros = [&](const fs::path& folder, const std::string& module, auto&& found) {
+                for (auto kind : macroKinds) {
+                    auto directory = folder / ((allStandard ? "" : ".") + std::string(macroDirectory(kind)));
+                    for (const auto& path : sourcePaths(directory, nullptr, true, false)) if (auto origin = macroDeclaration(path, module))
+                        found(ReferenceExport{module, pathText(path.stem()), *origin, {}, kind});
+                }
+            };
+            auto addMacro = [&](ReferenceExport item) { reference->exports.push_back(std::move(item)); };
+            if (allStandard) scanMacros(meta, "$std/meta", addMacro);
+            else {
+                const auto& package = *packages.at(entry);
+                auto directory = package.root / "src";
+                scanMacros(directory, root, addMacro);
+                if (fs::is_directory(directory)) for (auto folder = fs::recursive_directory_iterator(directory); folder != fs::recursive_directory_iterator{}; ++folder) {
+                    if (!folder->is_directory()) continue;
+                    if (pathText(folder->path().filename()).starts_with('.')) { folder.disable_recursion_pending(); continue; }
+                    if (folder->is_symlink()) continue;
+                    auto module = root + '/' + pathText(folder->path().lexically_relative(directory));
+                    scanMacros(folder->path(), module, [&](ReferenceExport item) { addModule(module, package); addMacro(std::move(item)); });
+                }
+            }
+            MacroImports imports{program.sources, spaces, packages, prefixes, overlays};
+            imports.collect(program.syntax);
+            for (const auto& use : program.syntax.imports) if (use.isPublic && use.kind != ImportKind::Runtime) {
+                const auto& module = program.sources[use.file].moduleId;
+                if (!reference->modules.at(module).selected) continue;
+                for (auto kind : macroKinds) if (MacroImports::family(kind) == use.kind) {
+                    auto origin = imports.bindings.at({&use, kind});
+                    if (!origin) continue;
+                    const auto& package = *packages.at(origin->package);
+                    auto relative = origin->path.parent_path().parent_path().lexically_relative(package.root / "src");
+                    auto owner = prefixes.at(package.id);
+                    if (!relative.empty() && relative != ".") owner += '/' + pathText(relative);
+                    addModule(owner, package);
+                    if (auto anchor = macroDeclaration(origin->path, owner))
+                        reference->exports.push_back({module, use.alias.text, *anchor, SourceAnchor{use.file, use.alias.span}, kind, use.alias.documentation});
+                }
+            }
+        }
         if (probe) {
             probe->spaces = std::move(spaces);
             for (auto& [name, space] : probe->spaces) {
@@ -1595,8 +1690,8 @@ Compilation loadProgram(const PackageGraph& graph, const std::string& entry, con
     const MacroLinker linkMacro = [&](const auto& origin, auto& syntax, auto& sources) { return dependencies.link(origin, syntax, sources); };
     const MacroEnvironment environment{resolveMacro, linkMacro};
     std::map<std::string, MacroPackage> macroPackages;
-    auto macroCache = overlays ? fs::path{} : cacheOverride();
-    if (!overlays) macroCache = (macroCache.empty() ? graph.workspace / ".lyra" / "cache" : macroCache) / "compiler" / "macros";
+    auto macroCache = overlays || allStandard ? fs::path{} : cacheOverride();
+    if (!overlays && !allStandard) macroCache = (macroCache.empty() ? graph.workspace / ".lyra" / "cache" : macroCache) / "compiler" / "macros";
     for (const auto& [module, space] : spaces)
         macroPackages.emplace(module, MacroPackage{space.package->root, space.package->id, space.package->macroInputs, overlays, macroCache});
     for (std::size_t file = 0; file < program.sources.size(); ++file) {

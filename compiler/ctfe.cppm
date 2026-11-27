@@ -630,7 +630,11 @@ struct Evaluation {
             }
             if (fn.result == Type::Int) return std::bit_cast<std::uint64_t>(std::get<std::int64_t>(result));
             if (fn.result == Type::Bool) return std::get<bool>(result);
-            if (fn.result == Type::String) return std::get<std::string>(std::move(result));
+            if (fn.result == Type::String) {
+                auto value = std::get<std::string>(std::move(result));
+                chargeText(caller, call, value.size());
+                return value;
+            }
             return {};
         }
         if (++depth > (macro ? 64U : 16U)) error(sources, caller, call, "LYCT0004", "编译期调用深度超出预算（" + std::to_string(macro ? 64 : 16) + "）");

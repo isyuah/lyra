@@ -24,6 +24,7 @@ import lyra.build;
 import lyra.build_cache;
 import lyra.c_import;
 import lyra.check;
+import lyra.doc;
 import lyra.format;
 import lyra.lsp;
 import lyra.modules;
@@ -39,6 +40,7 @@ namespace {
 constexpr auto usage = "lyra --help | --version\n"
                        "lyra lsp --stdio\n"
                        "lyra fmt [--check] <文件.ly>...\n"
+                       "lyra doc (<包目录> [--locked] [--offline] | --stdlib) [-o <文件>] [--diagnostics=json]\n"
                        "lyra import-c <头文件> [-I <包含目录>] [-D <宏[=值]>] [-o <新文件.ly> [--adapter <新文件.c> [--varargs <调用形状>]...]]\n"
                        "lyra new <目录> [--name <包名>] [--lib]\n"
                        "lyra check|build|run|test <包目录> [--locked] [--offline] [--diagnostics=json]\n"
@@ -312,6 +314,9 @@ int run(std::vector<std::string_view> args) {
         if (args[0] == "fmt") {
             if (forwards) throw Diagnostic{"LYC0001", usage};
             code = format(args);
+        } else if (args[0] == "doc") {
+            if (forwards) throw Diagnostic{"LYC0001", usage};
+            code = documentReference(std::span(args).subspan(1), LYRA_TOOLCHAIN_VERSION, diagnostics);
         } else if (args[0] == "new" || args[0] == "lock" || args[0] == "fetch" || args[0] == "pack") {
             if (forwards) throw Diagnostic{"LYC0001", usage};
             code = packageCommand(args);

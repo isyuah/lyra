@@ -410,12 +410,13 @@ std::optional<std::vector<std::pair<std::size_t, Source>>> triviaOnlyUpdates(
             auto oldTokens = syntaxTokens(*found);
             auto newTokens = syntaxTokens(current);
             if (oldTokens.size() != newTokens.size()) return {};
+            auto textAt = [](const Source& source, Span span) { return std::string_view(source.text).substr(span.begin, span.end - span.begin); };
             for (std::size_t token = 0; token < oldTokens.size(); ++token) {
                 const auto& oldToken = oldTokens[token];
                 const auto& newToken = newTokens[token];
                 if (oldToken.kind != newToken.kind || oldToken.span != newToken.span ||
-                    found->text.substr(oldToken.span.begin, oldToken.span.end - oldToken.span.begin) !=
-                        current.text.substr(newToken.span.begin, newToken.span.end - newToken.span.begin)) return {};
+                    textAt(*found, oldToken.span) != textAt(current, newToken.span) || oldToken.documentation != newToken.documentation ||
+                    (oldToken.documentation && textAt(*found, *oldToken.documentation) != textAt(current, *newToken.documentation))) return {};
             }
         } catch (const Diagnostic&) {
             return {};
@@ -2301,7 +2302,7 @@ private:
             auto end = definition.text.find_first_of("\r\n", start);
             if (end == std::string::npos) end = definition.text.size();
             auto signature = std::string_view(definition.text).substr(start, end - start);
-            return hoverText(std::string(signature), editorDocumentation(definition, resolved->second.begin));
+            return hoverText(std::string(signature), editorDocumentationAt(definition, resolved->second));
         }
         return json::Value(nullptr);
     }

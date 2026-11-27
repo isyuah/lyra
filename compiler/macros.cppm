@@ -52,6 +52,8 @@ void expandExpressions(Source& source, std::size_t file, const MacroPackage& pac
     const MacroEnvironment& environment, bool recovering = false);
 void assembleHttpRoutes(Module& syntax, const std::vector<Source>& sources, const std::map<std::string, MacroPackage>& packages, const HttpRoutes& routes);
 std::string_view macroDirectory(MacroKind kind);
+Source macroPreludeSource();
+void parseMacroPrelude(Module& module, const Source& source);
 }
 
 namespace lyra {
@@ -95,6 +97,12 @@ fn syntaxChildCount(node: Syntax): Int { 0 }
 fn syntaxChild(node: Syntax, index: Int): Syntax { node }
 fn syntaxKind(node: Syntax): String { "" }
 fn syntaxText(node: Syntax): String { "" }
+/// 读取源码声明附带的 Markdown 文档；没有文档时返回空字符串。
+fn syntaxDoc(node: Syntax): String { "" }
+/// 统计完全落在语法节点范围内的源码注释。
+fn syntaxCommentCount(node: Syntax): Int { 0 }
+/// 按源码顺序读取一条注释，保留注释分隔符和位置。
+fn syntaxComment(node: Syntax, index: Int): Syntax { node }
 fn syntaxIdentifier(node: Syntax): String { "" }
 fn syntaxStart(node: Syntax): Int { 0 }
 fn syntaxEnd(node: Syntax): Int { 0 }
@@ -375,6 +383,7 @@ struct MacroContext {
     std::string routeOrigin{};
     bool typePhase{};
     const MacroTypeQuery* checked{};
+    std::optional<std::vector<Span>> comments{};
 
     [[noreturn]] void error(const std::string& message) const { throw at(use, expansion.name.span, "LYM0002", message); }
     MacroValue input(const std::string& key) {
@@ -484,6 +493,30 @@ struct MacroContext {
             if (name == "syntaxAround") return arena.add({SyntaxForm::Around, "around", {}, {syntax(0), syntax(1), syntax(2)}});
             auto ref = syntax(0);
             auto& node = arena.get(ref);
+            if (name == "syntaxDoc") {
+                if (!node.documentation) return std::string{};
+                if (node.documentation->end - node.documentation->begin > byteLimit) error("宏读取的文档注释超过字节预算");
+                return documentationText(use, node.documentation);
+            }
+            if (name == "syntaxCommentCount" || name == "syntaxComment") {
+                std::span<const Span> inside;
+                if (node.span && (node.form == SyntaxForm::Input || node.form == SyntaxForm::Argument)) {
+                    if (!comments) {
+                        comments.emplace();
+                        for (const auto& token : syntaxComments(use, !use.previous && !use.origin))
+                            if (use.authoredSpan(token.span)) comments->push_back(token.span);
+                    }
+                    auto first = std::ranges::lower_bound(*comments, node.span->begin, {}, &Span::begin);
+                    auto last = std::ranges::upper_bound(first, comments->end(), node.span->end, {}, &Span::end);
+                    inside = {first, last};
+                }
+                if (name == "syntaxCommentCount") return static_cast<std::int64_t>(inside.size());
+                auto index = std::get<std::int64_t>(args[1]);
+                if (index < 0 || static_cast<std::size_t>(index) >= inside.size()) error("注释下标越界");
+                auto span = inside[index];
+                if (span.end - span.begin > byteLimit) error("宏读取的注释超过字节预算");
+                return arena.input("comment", span);
+            }
             if (name == "syntaxResolvedType") {
                 if (!resolveType || node.canonical.empty()) error("已解析类型查询只适用于目标声明的显式类型标注");
                 return typeNode(node.canonical, *node.span);
@@ -568,13 +601,9 @@ ExpandedMacro expand(const Source& source, const Expansion& prefix, const MacroP
     auto overlaid = package.overlays && package.overlays->contains(path);
     if ((overlaid ? package.overlays->at(path).size() : fs::file_size(path)) > byteLimit) throw at(source, prefix.name.span, "LYM0002", "宏实现超过大小限制");
     files.push_back(path);
-    std::vector<Source> code{sourceText("<macro-prelude>", prelude, "$macroPrelude"), loadSource(path, "$macroImplementation", overlaid ? package.overlays : nullptr)};
+    std::vector<Source> code{macroPreludeSource(), loadSource(path, "$macroImplementation", overlaid ? package.overlays : nullptr)};
     Module parsed;
-    parseFile(parsed, code[0], 0);
-    for (auto& fn : parsed.functions) {
-        fn.isPublic = true;
-        if (fn.name.text == "quoteText" || fn.name.text == "quoteJoin") fn.name.text.insert(0, "$");
-    }
+    parseMacroPrelude(parsed, code[0]);
     auto start = parsed.functions.size();
     std::vector<ExpressionExpansion> calls;
     parseFile(parsed, code[1], 1, &calls, true);
@@ -670,6 +699,16 @@ Source generatedSource(const Source& source, const Expansion& prefix, const std:
     result.macroDefinition = std::move(definition);
     return result;
 }
+}
+
+Source macroPreludeSource() { return sourceText("<macro-prelude>", prelude, "$macroPrelude"); }
+
+void parseMacroPrelude(Module& module, const Source& source) {
+    parseFile(module, source, 0);
+    for (auto& fn : module.functions) {
+        fn.isPublic = true;
+        if (fn.name.text == "quoteText" || fn.name.text == "quoteJoin") fn.name.text.insert(0, "$");
+    }
 }
 
 void expandExpressions(Source& source, std::size_t file, const MacroPackage& package, std::vector<fs::path>& inputs,

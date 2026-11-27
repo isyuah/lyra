@@ -30,6 +30,7 @@ struct Identifier {
     std::optional<SourceAnchor> moduleAlias{};
     bool moduleMember{};
     bool internalReference{};
+    std::optional<Span> documentation{};
 };
 struct Attribute { Identifier name; std::optional<Identifier> argument; };
 enum class Passing { Value, In, Ref };
@@ -200,12 +201,16 @@ struct Expansion { std::size_t file; Identifier name; std::optional<Identifier> 
 struct MacroArgument { Span span; std::optional<std::string> literal; };
 struct ExpressionExpansion { Identifier name; Span span, argumentsSpan; std::vector<MacroArgument> arguments; };
 struct SyntaxRef { std::size_t index; };
-struct SyntaxToken { Span span; std::string kind; };
+struct SyntaxToken { Span span; std::string kind; std::optional<Span> documentation{}; };
+struct SyntaxOperator { std::string_view spelling; int precedence; std::string_view associativity, fixity; };
+std::vector<std::string_view> syntaxKeywords();
+std::vector<std::string_view> syntaxContextualKeywords();
+std::vector<SyntaxOperator> syntaxOperators();
 enum class EditorKind { Keyword, Function, Method, Constructor, Variable, Parameter, Field, Property, Constant, Class, Struct,
     Enum, EnumCase, Trait, TypeAlias, TypeParameter, Module, Macro, Decorator, Extension };
 struct NameReference { SourceAnchor use, declaration; std::optional<SourceAnchor> renameTarget{}; std::optional<EditorKind> kind{}; };
 struct EditorSymbol { std::string label; EditorKind kind; Span name{}; std::string detail{}, documentation{}, insertion{}; };
-struct OutlineSymbol { std::string name; EditorKind kind; Span selection, extent; std::vector<OutlineSymbol> children{}; };
+struct OutlineSymbol { std::string name; EditorKind kind; Span selection, extent; std::vector<OutlineSymbol> children{}; std::optional<Span> documentation{}; };
 struct EditorParameter { std::string name, label; bool variadic{}; };
 struct EditorSignature { std::string label, documentation; std::vector<EditorParameter> parameters; std::optional<std::size_t> active{}; };
 enum class CompletionPlace { None, TopLevel, MemberDeclaration, FieldDeclaration, TraitDeclaration, ExtensionDeclaration, EnumMethod, FunctionModifier,
@@ -228,11 +233,13 @@ struct RecoveredSyntax { Module syntax; std::vector<Diagnostic> errors{}; bool i
 void parseFile(Module& module, const Source& source, std::size_t file, std::vector<ExpressionExpansion>* expressions = nullptr, bool macroImplementation = false);
 void validateMacroExpression(const Source& generated);
 std::vector<SyntaxToken> syntaxTokens(const Source& source, bool comments = false, bool partial = false);
+std::vector<SyntaxToken> syntaxComments(const Source& source, bool partial);
 SyntaxCompletion completeSyntax(const Source& source, std::size_t offset);
 Module indexFileSyntax(const Source& source, std::vector<ExpressionExpansion>* expressions = nullptr);
 std::vector<OutlineSymbol> editorOutline(const Source& source, const Module& syntax);
 RecoveredSyntax recoverFileSyntax(const Source& source, std::vector<ExpressionExpansion>* expressions = nullptr);
-std::string editorDocumentation(const Source& source, std::size_t declarationStart);
+std::string documentationText(const Source& source, std::optional<Span> documentation);
+std::string editorDocumentationAt(const Source& source, Span name);
 std::string editorSpelling(const Source& source, const Identifier& name);
 std::string editorModuleAlias(std::string_view name);
 std::string editorIdentifier(std::string_view name);
