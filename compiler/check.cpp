@@ -825,7 +825,15 @@ struct Symbols {
             auto element = module.listElements[type.id];
             emit("add", Callee::ListAdd, Type::Unit, {"value"}, {element});
             emit("removeAt", Callee::ListRemoveAt, element, {"index"}, {Type::Int});
+        }
+        if (type.kind == Type::List || type.kind == Type::FrozenList) {
             emit("slice", Callee::ListSlice, type, {"range"}, {Type::IntRange});
+            if (matches("getOrNone") || matches("firstOrNone") || matches("lastOrNone")) {
+                auto optional = sum(Type::Option, module.listElements[type.id]);
+                emit("getOrNone", Callee::ListGetOrNone, optional, {"index"}, {Type::Int});
+                emit("firstOrNone", Callee::ListFirstOrNone, optional);
+                emit("lastOrNone", Callee::ListLastOrNone, optional);
+            }
         }
         if (type.kind == Type::Channel) {
             auto element = module.channelElements[type.id];
@@ -840,6 +848,10 @@ struct Symbols {
         }
         if (type.kind == Type::Task) emit("cancel", Callee::TaskCancel, Type::Unit, {}, {}, MemberContext::AsyncBody);
         if (type == Type::String) emit("toBytes", Callee::ToBytes, Type::Bytes);
+        if (type == Type::Bytes) {
+            emit("slice", Callee::BytesSlice, Type::Bytes, {"range"}, {Type::IntRange});
+            emit("toHex", Callee::BytesHex, Type::String);
+        }
         if (matches("toString")) {
             if (builtInDisplay(type)) emit("toString", Callee::ToString, Type::String);
             if (type == Type::Bytes) emit("toString", Callee::DecodeUtf8, sum(Type::Option, Type::String));
@@ -1263,6 +1275,7 @@ struct Symbols {
     }
 
     std::optional<Type> associatedType(Type owner, const std::string& member, const Source& source, Span site) {
+        if (member == "Item" && (owner.kind == Type::List || owner.kind == Type::FrozenList)) return module.listElements[owner.id];
         auto makeKey = [&] { return std::pair(owner, member); };
         auto enter = [&](const auto& key) {
             if (std::ranges::find(resolvingAssociated, key) != resolvingAssociated.end())
@@ -3109,7 +3122,7 @@ struct Checker {
             std::vector<Type> arguments;
             if (qualifier) for (const auto& type : qualifier->arguments) arguments.push_back(symbols.resolve(fn.syntax, type, variables));
             overloads(symbols.staticMethods[record->second], arguments);
-        } else if (key == "Task" || key == "CPtr" || key == "CCallback") {
+        } else if (key == "Task" || key == "CPtr" || key == "CCallback" || key == "Bytes") {
             if (key == "Task") {
                 shape("cancelled", {{}, {}, Type::Bool, false});
                 shape("checkCancellation", {{}, {}, Type::Unit, false});
@@ -3119,6 +3132,7 @@ struct Checker {
                 if (unsafeDepth) shape("alloc", {{"bytes"}, {Type::Int}, Type::CPtr, false});
             }
             if (key == "CCallback" && unsafeDepth) add("register", EditorKind::Method, "register(callback, fallback): CCallback");
+            if (key == "Bytes") shape("fromHex", {{"text"}, {Type::String}, symbols.sum(Type::Option, Type::Bytes), false});
         } else if (receiver) {
             auto owner = visit(*receiver);
             auto property = [&](const std::string& name, Type type) { add(name, EditorKind::Property, name + ": " + typeName(module, type)); };
@@ -3559,6 +3573,12 @@ struct Checker {
         if (call.receiver && !call.typeOwner) {
             const auto* qualifier = std::get_if<Identifier>(&fn.syntax.expressions[*call.receiver].node);
             auto builtin = qualifier && !lookupLocal(*qualifier) && !implicitMember(*qualifier) ? std::string_view(linkedName(*qualifier)) : std::string_view{};
+            if (builtin == "Bytes" && call.name.text == "fromHex") {
+                noTypeArgs();
+                info.callee = Callee::BytesFromHex;
+                if (arguments(id, call, 1, [](auto) { return "text"; }, [](auto) { return Type{Type::String}; })) return Type::Never;
+                return symbols.sum(Type::Option, Type::Bytes);
+            }
             if (builtin == "Task" &&
                 (call.name.text == "cancelled" || call.name.text == "checkCancellation")) {
                 noTypeArgs();
@@ -4038,7 +4058,8 @@ struct Checker {
                 if (!shift(compoundOperator(binary.op))) fit(binary.right, value, type);
                 return Type::Unit;
             }
-            if (binary.op != Op::Set && !numericType(type) && !(binary.op == Op::AddSet && type == Type::String)) throw mismatch(module, source, place.span, Type::Int, type);
+            if (binary.op != Op::Set && !numericType(type) && !(binary.op == Op::AddSet && (type == Type::String || type == Type::Bytes)))
+                throw mismatch(module, source, place.span, Type::Int, type);
             return visit(binary.right, type) == Type::Never ? Type::Never : Type::Unit;
         }
         if (shift(binary.op)) {
@@ -4106,7 +4127,7 @@ struct Checker {
         }
         right = fit(binary.right, right, left);
         if (equality) requireValueOperation(left, ValueOperation::Equal, binary.site);
-        if (binary.op == Op::Add && left == Type::String) return Type::String;
+        if (binary.op == Op::Add && (left == Type::String || left == Type::Bytes)) return left;
         if (!equality) throw mismatch(module, source, binary.site, Type::Int, left);
         return Type::Bool;
     }

@@ -192,7 +192,9 @@ struct Validator {
                     info.callee == Callee::ToIntegerChecked || info.callee == Callee::Sum || info.callee == Callee::Variant ||
                     info.callee == Callee::ListAdd || info.callee == Callee::ListSlice || info.callee == Callee::ListRemoveAt ||
                     info.callee == Callee::Size || info.callee == Callee::FreezeList || info.callee == Callee::SumPresent ||
-                    info.callee == Callee::SumAbsent || info.callee == Callee::SumUnwrap || info.callee == Callee::CarryFailure) return;
+                    info.callee == Callee::SumAbsent || info.callee == Callee::SumUnwrap || info.callee == Callee::CarryFailure ||
+                    info.callee == Callee::ListGetOrNone || info.callee == Callee::ListFirstOrNone || info.callee == Callee::ListLastOrNone ||
+                    info.callee == Callee::BytesSlice) return;
                 if (info.callee == Callee::ValueEqual || info.callee == Callee::ValueHash) {
                     auto operation = info.callee == Callee::ValueEqual ? ValueOperation::Equal : ValueOperation::Hash;
                     validateValueOperation(fn.expressions[*node.receiver].type, operation, node.name.span);
@@ -706,7 +708,7 @@ struct Evaluation {
         if (op == Op::Eq || op == Op::Ne) return equal(leftValue, rightValue, type, fn, site) == (op == Op::Eq);
         const auto& left = scalarValue(leftValue, fn, site);
         const auto& right = scalarValue(rightValue, fn, site);
-        if (type == Type::String && op == Op::Add) return std::string(std::get<std::string>(left) + std::get<std::string>(right));
+        if ((type == Type::String || type == Type::Bytes) && op == Op::Add) return std::string(std::get<std::string>(left) + std::get<std::string>(right));
         if (!numericType(type)) error(sources, fn, site, "LYCT0001", "此编译期运算不支持此类型");
         if (type.kind == Type::Real) {
             auto first = real(type, std::get<double>(left)), second = real(type, std::get<double>(right));
@@ -1113,6 +1115,14 @@ struct Evaluation {
                         fields.erase(fields.begin() + index);
                         return removed;
                     }
+                    if (info.callee == Callee::ListGetOrNone || info.callee == Callee::ListFirstOrNone || info.callee == Callee::ListLastOrNone) {
+                        auto index = info.callee == Callee::ListGetOrNone ? std::get<std::uint64_t>(scalarValue(sub(item.arguments.front().value), fn, site)) : 0;
+                        const auto& fields = composite(receiver).fields;
+                        if (info.callee == Callee::ListLastOrNone) index = static_cast<std::uint64_t>(fields.size()) - 1;
+                        auto target = rawType(fn, id);
+                        if (index >= fields.size()) return makeComposite(fn, site, target, SumTag::None);
+                        return makeComposite(fn, site, target, SumTag::Some, {fields[index]});
+                    }
                     if (info.callee == Callee::ListSlice) {
                         auto [start, end, inclusive] = rangeParts(sub(item.arguments.front().value), fn, item.name.span);
                         const auto& fields = composite(receiver).fields;
@@ -1120,6 +1130,13 @@ struct Evaluation {
                         if (!bounds) error(sources, fn, item.name.span, "LYCT0003", "编译期列表切片越界");
                         auto first = fields.begin() + bounds->start;
                         return makeComposite(fn, site, from, std::monostate{}, {first, first + bounds->count});
+                    }
+                    if (info.callee == Callee::BytesSlice) {
+                        auto [start, end, inclusive] = rangeParts(sub(item.arguments.front().value), fn, item.name.span);
+                        const auto& bytes = std::get<std::string>(scalarValue(receiver, fn, site));
+                        auto bounds = listSliceBounds(bytes.size(), start, end, inclusive);
+                        if (!bounds) error(sources, fn, item.name.span, "LYCT0003", "编译期字节切片越界");
+                        return bytes.substr(bounds->start, bounds->count);
                     }
                     if (info.callee == Callee::ToString) return display(scalarValue(receiver, fn, site), from);
                     if (info.callee == Callee::ToBytes) return receiver;

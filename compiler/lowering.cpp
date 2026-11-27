@@ -995,6 +995,20 @@ struct Emitter {
         return payload ? builder.CreateInsertValue(value, payload, payloadSlot(tag)) : value;
     }
 
+    Value boxedOption(Type option, Value box) {
+        auto payload = layouts.native(builder, layouts.program.sumTypes[option.id].success);
+        auto missing = builder.GetInsertBlock(), found = label("option.found"), done = label("option.end");
+        builder.CreateCondBr(builder.CreateIsNotNull(box), found, done);
+        builder.SetInsertPoint(found);
+        auto some = makeSum(option, SumTag::Some, builder.CreateLoad(payload, box));
+        builder.CreateBr(done);
+        builder.SetInsertPoint(done);
+        auto* result = builder.CreatePHI(some->getType(), 2);
+        result->addIncoming(llvm::Constant::getNullValue(some->getType()), missing);
+        result->addIncoming(some, found);
+        return result;
+    }
+
     Value makeVariant(Type type, std::size_t index, llvm::ArrayRef<Value> values) {
         auto tag = builder.getInt32(static_cast<unsigned>(index));
         Value result = builder.CreateInsertValue(llvm::Constant::getNullValue(layouts.native(builder, type)), tag, 0);
@@ -1781,7 +1795,7 @@ struct Emitter {
         }
         if (info.callee == Callee::TaskCheckCancellation) { pollCancellation(true); return unit(); }
         bool namespaceCall = info.callee == Callee::Variant || info.callee == Callee::PtrNull ||
-            info.callee == Callee::PtrAllocate || info.callee == Callee::CallbackRegister;
+            info.callee == Callee::PtrAllocate || info.callee == Callee::CallbackRegister || info.callee == Callee::BytesFromHex;
         auto skip = static_cast<std::size_t>(call.receiver && !namespaceCall);
         auto* target = info.callee == Callee::Function ? &layouts.program.functions[info.target] : nullptr;
         auto passedInSlot = [&](auto slot) { return target && layouts.slotParameter(*target, slot); };
@@ -1884,19 +1898,7 @@ struct Emitter {
             case Callee::WithLocal: return NativeExceptions{builder}.created(pointerCall("lyraTaskWithLocal", {args[0], NativeLists{builder}.box(args[1]), args[2]}), source, call.name.span);
             case Callee::LocalGet: {
                 auto context = pointerCall("lyraContextCurrent", {});
-                auto box = pointerCall("lyraContextLocal", {context, receiver});
-                auto option = rawType(id);
-                auto payload = layouts.native(builder, layouts.program.sumTypes[option.id].success);
-                auto missing = builder.GetInsertBlock(), found = label("local.found"), done = label("local.end");
-                builder.CreateCondBr(builder.CreateIsNotNull(box), found, done);
-                builder.SetInsertPoint(found);
-                auto some = makeSum(option, SumTag::Some, builder.CreateLoad(payload, box));
-                builder.CreateBr(done);
-                builder.SetInsertPoint(done);
-                auto* result = builder.CreatePHI(some->getType(), 2);
-                result->addIncoming(llvm::Constant::getNullValue(some->getType()), missing);
-                result->addIncoming(some, found);
-                return result;
+                return boxedOption(rawType(id), pointerCall("lyraContextLocal", {context, receiver}));
             }
             case Callee::BusinessError: {
                 auto argument = call.arguments[std::ranges::find(info.argumentSlots, 0) - info.argumentSlots.begin()].value;
@@ -2007,10 +2009,21 @@ struct Emitter {
                 builder.CreateCall(module.getOrInsertFunction("lyraTaskRequestCancel", builder.getVoidTy(), builder.getPtrTy()), args);
                 return unit();
             case Callee::ListAdd: lists.add(args[0], args[1]); return unit();
-            case Callee::ListSlice: {
-                auto slice = lists.sliceRange(receiver, args[1], layouts.typeToken(builder, boundsError), errorSlot);
+            case Callee::ListSlice: case Callee::BytesSlice: {
+                auto symbol = info.callee == Callee::BytesSlice ? "lyraBytesSlice" : "lyraListSliceRange";
+                auto slice = lists.sliceRange(symbol, receiver, args[1], layouts.typeToken(builder, boundsError), errorSlot);
                 guardSlot(call.name.span);
                 return slice;
+            }
+            case Callee::ListGetOrNone: case Callee::ListFirstOrNone: case Callee::ListLastOrNone: {
+                auto pointer = builder.getPtrTy();
+                Value box;
+                if (info.callee == Callee::ListLastOrNone) box = pointerCall("lyraListLastOrNone", {receiver});
+                else {
+                    auto get = module.getOrInsertFunction("lyraListGetOrNone", pointer, pointer, builder.getInt64Ty());
+                    box = builder.CreateCall(get, {receiver, args.size() == 2 ? args[1] : builder.getInt64(0)});
+                }
+                return boxedOption(rawType(id), box);
             }
             case Callee::ListRemoveAt: {
                 auto removed = lists.removeAt(receiver, args[1], layouts.typeToken(builder, boundsError), errorSlot);
@@ -2029,6 +2042,11 @@ struct Emitter {
             case Callee::ToIntegerChecked: return checkedInteger(receiver, fn.expressions[*call.receiver].type, rawType(id));
             case Callee::ToString: return displayScalar(receiver, fn.expressions[*call.receiver].type);
             case Callee::ToBytes: return receiver;
+            case Callee::BytesHex: return pointerCall("lyraBytesHex", {receiver});
+            case Callee::BytesFromHex: {
+                auto bytes = pointerCall("lyraBytesFromHex", {args[0]});
+                return builder.CreateInsertValue(makeSum(rawType(id), SumTag::Some, bytes), builder.CreateIsNotNull(bytes), 0);
+            }
             case Callee::DecodeUtf8: {
                 auto pointer = builder.getPtrTy();
                 auto check = module.getOrInsertFunction("lyraBytesUtf8", builder.getInt8Ty(), pointer);
@@ -2192,7 +2210,7 @@ struct Emitter {
             auto right = emit(binary.right);
             if (!live()) return unit();
             if (op != Op::Set) {
-                right = type == Type::String ? concatenate(left, right) : arithmetic(compoundOperator(op), left, right, type, binary.site);
+                right = type == Type::String || type == Type::Bytes ? concatenate(left, right) : arithmetic(compoundOperator(op), left, right, type, binary.site);
             }
             if (place.list) {
                 NativeLists lists{builder};
@@ -2228,7 +2246,7 @@ struct Emitter {
             auto equal = valueOperation(type, ValueOperation::Equal, left, right, binary.site);
             return op == Op::Eq ? equal : builder.CreateNot(equal);
         }
-        if (type == Type::String) return concatenate(left, right);
+        if (type == Type::String || type == Type::Bytes) return concatenate(left, right);
         if (type.kind == Type::Real) {
             switch (op) {
                 case Op::Lt: return builder.CreateFCmpOLT(left, right);

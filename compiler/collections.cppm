@@ -89,12 +89,12 @@ struct NativeLists {
         return builder.CreateCall(module().getOrInsertFunction("lyraListSlice", builder.getPtrTy(), builder.getPtrTy(), builder.getInt64Ty()), {list, start});
     }
 
-    llvm::Value* sliceRange(llvm::Value* list, llvm::Value* range, llvm::Value* errorType, llvm::Value* errorSlot) const {
+    llvm::Value* sliceRange(const char* symbol, llvm::Value* collection, llvm::Value* range, llvm::Value* errorType, llvm::Value* errorSlot) const {
         auto pointer = builder.getPtrTy();
         auto integer = builder.getInt64Ty();
         auto flag = builder.getInt8Ty();
-        auto slice = module().getOrInsertFunction("lyraListSliceRange", pointer, pointer, integer, integer, flag, pointer, pointer);
-        return builder.CreateCall(slice, {list, builder.CreateExtractValue(range, 0), builder.CreateExtractValue(range, 1),
+        auto slice = module().getOrInsertFunction(symbol, pointer, pointer, integer, integer, flag, pointer, pointer);
+        return builder.CreateCall(slice, {collection, builder.CreateExtractValue(range, 0), builder.CreateExtractValue(range, 1),
             builder.CreateZExt(builder.CreateExtractValue(range, 2), flag), errorType, errorSlot});
     }
 

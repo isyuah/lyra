@@ -1,6 +1,6 @@
 # std.collections
 
-`map`、`filter`、`fold`、`any` 和 `find` 都可作为普通泛型函数单独导入。显式导入 `ListOps` 后，也可用方法链调用它们。
+`map`、`filter`、`fold`、`any`、`find`、`sortedBy` 同时接受 `List<T>` 和 `FrozenList<T>`，可作为普通泛型函数单独导入。显式导入对应的 `ListOps` 或 `FrozenListOps` 后，也可用方法链调用。
 
 ```lyra
 import std.collections.{ListOps}
@@ -15,6 +15,8 @@ fn main(): Unit {
 程序打印 `14`、`8`。操作按输入列表的顺序处理，空列表不调用回调。`map`、`filter` 返回新列表；若元素是 Class，只复制对象引用。空列表的 `fold` 返回初值。`any` 和 `find` 在首个匹配处停止；无匹配分别返回 `false`、`None`，而匹配到可空元素 `None` 时，`find` 返回 `Some(None)`。单参尾部块里的 `it` 是当前元素，也可以传入已有的具名函数。
 
 `items.slice(range)` 是内置的 `List<T>` 方法，无需导入。`1..<3` 取下标 `1`、`2`，`1..3` 还包含下标 `3`。切片返回独立浅拷贝：替换新列表里的元素不会改写原列表，但 Class 元素仍是同一个对象。半开空切片可从列表末端开始；负数下标、倒序和超出列表边界与直接索引一样会报错并定位到调用处。
+
+两种列表都内置 `getOrNone(index)`、`firstOrNone()` 和 `lastOrNone()`；越界或没有元素时返回 `None`，读到空元素时返回 `Some(None)`。`FrozenList.slice(range)` 返回只读切片，`map`、`filter`、`sortedBy` 返回新的可写列表。两种列表都以 `Item` 公开元素关联类型，供结构约束使用。
 
 - `sortedBy(values, key)` 或 `values.sortedBy { ... }` 按 `Int` 键稳定升序，按输入顺序对每项求键一次。同键元素保留原顺序，输出是独立的浅拷贝；求键时不要修改输入列表。
 - `sum(values: List<Int>)` 从左到右求和，空列表返回 `0`，加法沿用普通 `Int` 溢出规则。

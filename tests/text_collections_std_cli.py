@@ -103,6 +103,65 @@ fn main(): Unit {
 }
 ''', '')
 
+    def test_index_of_parsing_floats_and_raw_byte_operations(self):
+        self.run_program(r'''
+import std.text.{ParseFloatError, StringOps}
+
+const combined: Bytes = (b"\x00" + b"\xff!").slice(0..1)
+
+fn main(): Unit {
+    #assert("中🙂e\0".indexOf("🙂e") == Some(1))
+    #assert("中🙂e\0".indexOf("\0") == Some(3))
+    #assert("ababcababd".indexOf("ababd") == Some(5))
+    #assert("🙂".indexOf("中").isNone() && "".indexOf("") == Some(0))
+    #assert("+1.25e2".parseFloat().unwrap() == 125.0)
+    #assert("-.5".parseFloat().unwrap() == -0.5)
+    #assert("".parseFloat() == Err(ParseFloatError.Empty))
+    #assert("1e309".parseFloat() == Err(ParseFloatError.OutOfRange))
+    #assert("1e-4000".parseFloat() == Err(ParseFloatError.OutOfRange))
+    for text in [" 2.5", "2.5 ", "0x10", "+-2", "2e", "NaN", "inf", "1\0", "1,5"] {
+        #assert(text.parseFloat() == Err(ParseFloatError.Invalid))
+    }
+    var bytes = combined
+    bytes += b"\x80"
+    #assert(bytes.toHex() == "00ff80")
+    #assert(Bytes.fromHex("00FF80").unwrap() == bytes)
+    #assert(Bytes.fromHex("").unwrap() == b"")
+    #assert(Bytes.fromHex("0").isNone() && Bytes.fromHex("x0").isNone() && Bytes.fromHex("🙂").isNone())
+    #assert(bytes.slice(1..<3) == b"\xff\x80" && bytes.slice(3..<3) == b"")
+    #assert(try { bytes.slice(0..3); false } catch problem: BoundsError { true })
+}
+''', '')
+
+    def test_frozen_lists_share_read_only_operations_and_keep_optional_slots(self):
+        self.run_program('''
+import std.collections.{FrozenListOps, ListOps, map}
+
+const first: Int = FrozenList([9]).firstOrNone().unwrap()
+
+fn main(): Unit {
+    #assert(first == 9)
+    val input: List<Int?> = [None, Some(4), Some(2), None]
+    val frozen = FrozenList(input)
+    #assert(input.firstOrNone() == Some(None) && input.lastOrNone() == Some(None))
+    #assert(frozen.firstOrNone() == Some(None) && frozen.lastOrNone() == Some(None))
+    #assert(frozen.getOrNone(1) == Some(Some(4)))
+    #assert(input.getOrNone(-1).isNone() && frozen.getOrNone(4).isNone())
+    val empty: List<Int> = []
+    #assert(empty.firstOrNone().isNone() && FrozenList(empty).lastOrNone().isNone())
+    input[1] = Some(7)
+    val slice = frozen.slice(1..2)
+    #assert(slice.size == 2 && slice[0] == Some(4))
+    val doubled = slice.map { (it ?? 0) * 2 }.filter { it > 4 }
+    #assert(doubled.size == 1 && doubled[0] == 8)
+    #assert(map(frozen) { it ?? 0 }[1] == 4)
+    #assert(frozen.filter { it != None }.size == 2)
+    #assert(frozen.fold(0) { total, value => total + (value ?? 0) } == 6)
+    #assert(frozen.any { it == Some(2) } && frozen.find { it == None } == Some(None))
+    #assert(frozen.sortedBy { it ?? 0 }[2] == Some(2))
+}
+''', '')
+
     def test_stable_sorted_by_sum_distinct_and_independent_shallow_keys(self):
         self.run_program('''
 import std.collections.{ListOps}

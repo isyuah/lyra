@@ -1,6 +1,7 @@
 #include "managed.h"
 #include "strings.h"
 #include <lyra/string.h>
+#include <lyra/list_slice.hpp>
 #include <lyra/utf8.hpp>
 #include <lyra/value_hash.hpp>
 
@@ -64,6 +65,21 @@ const void* lyraStringConcat(const void* left, const void* right) {
     std::memcpy(memory + sizeof(first), lyraStringBytes(left), first);
     std::memcpy(memory + sizeof(first) + first, lyraStringBytes(right), second);
     return memory;
+}
+
+const void* lyraBytesSlice(const void* bytes, std::int64_t start, std::int64_t end, std::uint8_t inclusive,
+                           const void* errorType, const LyraException** error) {
+    auto size = lyraStringLength(bytes);
+    auto bounds = lyra::listSliceBounds(size, start, end, inclusive);
+    if (!bounds) {
+        char message[128];
+        auto length = std::snprintf(message, sizeof(message), "Bytes slice %" PRId64 "%s%" PRId64 " out of bounds (size %zu)",
+                                    start, inclusive ? ".." : "..<", end, size);
+        *error = lyraExceptionCreateTyped(lyraStringFromBytes(message, length), errorType, "BoundsError");
+        return nullptr;
+    }
+    *error = nullptr;
+    return bounds->count == size ? bytes : lyraStringFromBytes(lyraStringBytes(bytes) + bounds->start, bounds->count);
 }
 
 const void* lyraStringJoin(std::size_t count, const void* const* parts) {

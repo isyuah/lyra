@@ -23,6 +23,7 @@ uint32_t lyraStringAtByte(const void* text, size_t offset);
 uint8_t lyraBytesAtByte(const void* bytes, size_t offset);
 uint32_t lyraStringIndex(const void* text, int64_t index, const void* errorType, const LyraException** error);
 uint8_t lyraBytesIndex(const void* bytes, int64_t index, const void* errorType, const LyraException** error);
+const void* lyraBytesSlice(const void* bytes, int64_t start, int64_t end, uint8_t inclusive, const void* errorType, const LyraException** error);
 uint32_t lyraCharWidth(uint32_t codePoint);
 const void* lyraCharText(uint32_t codePoint);
 const void* lyraIntText(int64_t value);

@@ -100,6 +100,16 @@ const void* lyraListGet(const LyraList* list, std::int64_t index, const void* er
     return *error ? nullptr : list->items[index];
 }
 
+const void* lyraListGetOrNone(const LyraList* list, std::int64_t index) {
+    lyraRuntime::Lock guard(listLocks[stripe(list)]);
+    return index < 0 || static_cast<std::uint64_t>(index) >= list->count ? nullptr : list->items[index];
+}
+
+const void* lyraListLastOrNone(const LyraList* list) {
+    lyraRuntime::Lock guard(listLocks[stripe(list)]);
+    return list->count ? list->items[list->count - 1] : nullptr;
+}
+
 const void* lyraFrozenListItem(const LyraList* list, std::uint64_t index) { return list->items[index]; }
 
 void lyraListSet(LyraList* list, std::int64_t index, const void* boxed, const void* errorType, const LyraException** error) {

@@ -3,8 +3,10 @@ extern fn lyraTextParts(count: Int): CPtr;
 extern fn lyraTextPart(parts: CPtr, index: Int, text: String): Unit;
 extern fn lyraStringJoin(count: Int, parts: CPtr): String;
 extern fn lyraTextInsertAtScalars(text: String, inserted: String): String;
+extern fn lyraTextParseFloat(text: String, output: CPtr): Int;
 
 pub enum ParseIntError { Empty, InvalidRadix, InvalidDigit(Int), Overflow }
+pub enum ParseFloatError { Empty, Invalid, OutOfRange }
 
 fn scalarByteWidth(point: UInt32): Int {
     if point < 0x80 { 1 } else if point < 0x800 { 2 } else if point < 0x10000 { 3 } else { 4 }
@@ -72,6 +74,35 @@ pub extension StringOps for String {
         if pattern.size == 0 { return true }
         val text = this.toBytes()
         pattern.size <= text.size && nextMatch(text, pattern, prefixLengths(pattern), 0) >= 0
+    }
+
+    fn indexOf(fragment: String): Int? {
+        val pattern = fragment.toBytes()
+        if pattern.size == 0 { return Some(0) }
+        val text = this.toBytes()
+        if pattern.size > text.size { return None }
+        val end = nextMatch(text, pattern, prefixLengths(pattern), 0)
+        if end < 0 { return None }
+        val start = end - pattern.size
+        var position = 0
+        var offset = 0
+        while offset < start {
+            if (text[offset] & 0xC0) != 0x80 { position += 1 }
+            offset += 1
+        }
+        Some(position)
+    }
+
+    fn parseFloat(): Result<Float,ParseFloatError> {
+        if this.byteSize == 0 { return Err(ParseFloatError.Empty) }
+        unsafe {
+            val output = CPtr.alloc(8)
+            defer output.free()
+            val status = lyraTextParseFloat(this, output)
+            if status == 1 { return Err(ParseFloatError.Invalid) }
+            if status == 2 { return Err(ParseFloatError.OutOfRange) }
+            Ok(output.readFloat64(0))
+        }
     }
 
     fn substring(start: Int, end: Int): String {
