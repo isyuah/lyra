@@ -2,8 +2,6 @@
 #include "managed.h"
 #include <lyra/utf8.hpp>
 
-#include <charconv>
-#include <cmath>
 #include <string>
 
 extern "C" const void* lyraTextCopyRange(const void* text, int64_t start, int64_t end) {
@@ -28,19 +26,6 @@ extern "C" const void* lyraTextInsertAtScalars(const void* text, const void* ins
         offset += width;
     }
     return lyraStringFromBytes(output.data(), output.size());
-}
-
-extern "C" std::int64_t lyraTextParseFloat(const void* text, double* output) {
-    auto first = lyraStringBytes(text);
-    auto last = first + lyraStringLength(text);
-    if (first != last && *first == '+') {
-        ++first;
-        if (first == last || *first == '-' || *first == '+') return 1;
-    }
-    auto [end, error] = std::from_chars(first, last, *output, std::chars_format::general);
-    if (end != last || error == std::errc::invalid_argument) return 1;
-    if (error == std::errc::result_out_of_range) return 2;
-    return std::isfinite(*output) ? 0 : 1;
 }
 
 extern "C" const void* lyraBytesHex(const void* bytes) {
