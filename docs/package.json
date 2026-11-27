@@ -4,9 +4,13 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "generate:reference": "node scripts/generate-reference.mjs",
+    "predev": "npm run generate:reference",
     "dev": "astro dev",
+    "prebuild": "npm run generate:reference",
     "build": "astro build",
     "preview": "astro preview",
+    "precheck": "npm run generate:reference",
     "check": "astro check"
   },
   "dependencies": {

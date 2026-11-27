@@ -1,11 +1,12 @@
 import { defineConfig } from "astro/config";
 import starlight from "@astrojs/starlight";
+import { repository, siteBase } from "./site.mjs";
 import lyraGrammar from "./src/grammars/lyra.mjs";
 
 // GitHub Pages project site: https://isyuah.github.io/lyra/
 export default defineConfig({
   site: "https://isyuah.github.io",
-  base: "/lyra",
+  base: siteBase,
   integrations: [
     starlight({
       title: {
@@ -13,7 +14,7 @@ export default defineConfig({
         en: "Lyra Docs",
       },
       description:
-        "Lyra 是一门使用 LLVM AOT 的编译型语言。这里提供从第一段程序到可交付服务的教程。",
+        "Lyra 是一门使用 LLVM AOT 的编译型语言。这里提供入门教程、语法速查和标准库 API 参考。",
       defaultLocale: "root",
       locales: {
         root: { label: "简体中文", lang: "zh-CN" },
@@ -23,11 +24,11 @@ export default defineConfig({
         {
           icon: "github",
           label: "GitHub",
-          href: "https://github.com/isyuah/lyra",
+          href: repository,
         },
       ],
       editLink: {
-        baseUrl: "https://github.com/isyuah/lyra/edit/main/docs/",
+        baseUrl: `${repository}/edit/main/docs/`,
       },
       tableOfContents: { minHeadingLevel: 2, maxHeadingLevel: 3 },
       customCss: ["./src/styles/custom.css"],
@@ -140,18 +141,36 @@ export default defineConfig({
           ],
         },
         {
+          label: "语言与 API 参考",
+          translations: { en: "Language and API reference" },
+          items: [
+            { slug: "reference" },
+            { slug: "reference/syntax" },
+            {
+              label: "编译器内置",
+              translations: { en: "Compiler built-ins" },
+              collapsed: true,
+              items: [
+                { slug: "reference/builtins" },
+                { autogenerate: { directory: "reference/builtins/types" } },
+              ],
+            },
+            {
+              label: "标准库",
+              translations: { en: "Standard library" },
+              collapsed: true,
+              items: [{ autogenerate: { directory: "reference/std" } }],
+            },
+          ],
+        },
+        {
           label: "示例与源码",
           translations: { en: "Examples and source" },
           items: [
             {
               label: "仓库示例",
               translations: { en: "Repository examples" },
-              link: "https://github.com/isyuah/lyra/tree/main/examples",
-            },
-            {
-              label: "标准库索引",
-              translations: { en: "Standard library index" },
-              link: "https://github.com/isyuah/lyra/blob/main/std/README.md",
+              link: `${repository}/tree/main/examples`,
             },
           ],
         },

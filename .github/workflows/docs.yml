@@ -5,10 +5,26 @@ on:
     branches: [main]
     paths:
       - docs/**
+      - compiler/**
+      - std/**
+      - runtime/**
+      - include/**
+      - cmake/**
+      - CMakeLists.txt
+      - CMakePresets.json
+      - VERSION
       - .github/workflows/docs.yml
   pull_request:
     paths:
       - docs/**
+      - compiler/**
+      - std/**
+      - runtime/**
+      - include/**
+      - cmake/**
+      - CMakeLists.txt
+      - CMakePresets.json
+      - VERSION
       - .github/workflows/docs.yml
   workflow_dispatch:
 
@@ -22,6 +38,7 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -31,6 +48,14 @@ jobs:
           node-version: "24"
           cache: npm
           cache-dependency-path: docs/package-lock.json
+      - name: Build Lyra from the documentation commit
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential binutils cmake ninja-build \
+            clang-18 clang-tools-18 llvm-18-dev libclang-18-dev lld-18 \
+            libgc-dev libuv1-dev libsqlite3-dev libjansson-dev libssl-dev zlib1g-dev
+          cmake --preset dev -DBUILD_TESTING=OFF
+          cmake --build --preset dev --target lyra --parallel 2
       - name: Install dependencies
         working-directory: docs
         run: npm ci

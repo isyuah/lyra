@@ -112,8 +112,13 @@ def main() -> int:
     if not args.lyra.exists():
         raise SystemExit(f"Lyra compiler not found: {args.lyra}")
 
+    generated_reference = Path(__file__).resolve().parents[1] / "docs/src/content/docs/reference"
     files = sorted(args.docs.rglob("*.md")) + sorted(args.docs.rglob("*.mdx"))
-    files = [path for path in files if args.filter in path.as_posix()]
+    files = [
+        path
+        for path in files
+        if args.filter in path.as_posix() and not path.resolve().is_relative_to(generated_reference)
+    ]
     if not files:
         raise SystemExit("no documentation files matched")
 
