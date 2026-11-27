@@ -1,5 +1,12 @@
 cmake_minimum_required(VERSION 3.28)
-project(Lyra VERSION 0.1.0 LANGUAGES C CXX)
+set(versionFile "${CMAKE_CURRENT_SOURCE_DIR}/VERSION")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${versionFile}")
+file(READ "${versionFile}" LYRA_VERSION)
+string(STRIP "${LYRA_VERSION}" LYRA_VERSION)
+if(NOT LYRA_VERSION MATCHES "^([0-9]+\\.[0-9]+\\.[0-9]+)(-[0-9A-Za-z-]+(\\.[0-9A-Za-z-]+)*)?$")
+    message(FATAL_ERROR "VERSION must contain x.y.z or x.y.z-prerelease.")
+endif()
+project(Lyra VERSION "${CMAKE_MATCH_1}" LANGUAGES C CXX)
 
 if(CMAKE_CROSSCOMPILING OR NOT CMAKE_SYSTEM_NAME MATCHES "^(Linux|Windows)$" OR NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
     message(FATAL_ERROR "Lyra builds natively on x86-64 Linux and Windows.")
@@ -42,7 +49,7 @@ endif()
 add_executable(lyra compiler/main.cpp compiler/lsp.cpp compiler/source.cpp compiler/parser.cpp compiler/check.cpp compiler/lowering.cpp compiler/build.cpp)
 include(cmake/LyraCImport.cmake)
 lyra_stage_c_frontend(lyra)
-set_source_files_properties(compiler/main.cpp PROPERTIES COMPILE_DEFINITIONS "LYRA_TOOLCHAIN_VERSION=\"${PROJECT_VERSION}-alpha.1\"")
+set_source_files_properties(compiler/main.cpp PROPERTIES COMPILE_DEFINITIONS "LYRA_TOOLCHAIN_VERSION=\"${LYRA_VERSION}\"")
 target_sources(lyra PRIVATE FILE_SET CXX_MODULES FILES
     compiler/platform.cppm compiler/source.cppm compiler/syntax.cppm compiler/check.cppm compiler/lowering.cppm compiler/build.cppm
     compiler/packages.cppm compiler/modules.cppm compiler/generics.cppm compiler/async.cppm compiler/foreign.cppm compiler/sums.cppm compiler/macros.cppm compiler/lsp.cppm)

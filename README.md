@@ -6,6 +6,8 @@ Lyra 是一门使用 LLVM AOT 的编译型语言。编译器把通过静态检�
 
 ## 用预编译 SDK 新建项目
 
+从 [GitHub Releases](https://github.com/isyuah/lyra/releases) 下载对应平台的 SDK；发布页的 `SHA256SUMS` 可校验归档。
+
 **Windows x64：** 解压 Lyra SDK 即可，在普通 PowerShell 中运行。无需安装 Clang、LLVM、VS Build Tools 或 Visual C++ Redistributable，也不需要 Developer PowerShell：
 
 ```powershell
@@ -75,6 +77,17 @@ printf '%s\n' '{"station":"东区","delta":7}' '{"station":"西区","delta":-2}'
 ```
 
 输出是 `{"rows":2,"total":5,"rejected":0}`。CLI 还支持文件输入、TOML 默认值和命令行覆盖。想做服务，可按 [HTTP/SQLite 示例](examples/http-sqlite/README.md)建库，通过 HTTP 或 HTTPS 新增并查询用户。常用模块和各自的 API 示例见[标准库索引](std/README.md)。
+
+## 发布 SDK
+
+在 `main` 提交 `VERSION` 后，推送同名的 `v` 前缀 tag。例如当前版本是 `0.1.0-alpha.1`：
+
+```sh
+git tag -a v0.1.0-alpha.1 -m "Lyra 0.1.0-alpha.1"
+git push origin v0.1.0-alpha.1
+```
+
+GitHub Actions 校验 tag 和该提交的 `VERSION` 一致，在 Windows x64 与 Ubuntu 22.04 x86-64 分别验收 Debug、Release 和可搬迁 SDK；两边都通过后才将 Windows ZIP、Ubuntu TAR.GZ 和 `SHA256SUMS` 发到同一 GitHub Release。带预发布后缀的版本标记为 Pre-release。分支和 PR 只跑验收；在 Actions 手动选择 `package_sdk` 可验证出包并下载临时制品，不会发布。
 
 ## 命令与语言子集
 

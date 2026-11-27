@@ -1,39 +1,146 @@
-name: Verify Lyra SDK
+name: Verify and release Lyra SDK
 
 on:
   push:
     branches: [main]
+    tags: ['v[0-9]*']
   pull_request:
   workflow_dispatch:
+    inputs:
+      package_sdk:
+        description: 'Build downloadable SDK artifacts without publishing a release'
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
 concurrency:
   group: verify-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
 
 jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      commit: ${{ steps.version.outputs.commit }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Check the SDK version and tag
+        id: version
+        env:
+          PACKAGE_SDK: ${{ inputs.package_sdk }}
+        run: |
+          version=$(< VERSION)
+          pattern='^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$'
+          if [[ ! "$version" =~ $pattern ]]; then
+            echo 'VERSION must contain x.y.z or x.y.z-prerelease.' >&2
+            exit 1
+          fi
+          tag="v$version"
+          if [[ "$GITHUB_REF_TYPE" == tag && "$GITHUB_REF_NAME" != "$tag" ]]; then
+            printf 'Tag %s does not match VERSION; expected %s.\n' "$GITHUB_REF_NAME" "$tag" >&2
+            exit 1
+          fi
+          if [[ "$GITHUB_REF_TYPE" == tag || "$PACKAGE_SDK" == true ]]; then
+            printf 'tag=%s\ncommit=%s\n' "$tag" "$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          fi
+
   ubuntu:
+    needs: prepare
     runs-on: ubuntu-24.04
     timeout-minutes: 80
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
       - name: Test on Ubuntu 22.04 and verify the relocated SDK
-        run: docker build --progress plain --platform linux/amd64 -f tests/jammy.Dockerfile --target verify .
+        env:
+          SDK_TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          args=(--progress plain --platform linux/amd64 -f tests/jammy.Dockerfile)
+          if [[ -n "$SDK_TAG" ]]; then
+            args+=(--target sdk-dist --build-arg "LYRA_RELEASE_TAG=$SDK_TAG"
+              --output "type=local,dest=$RUNNER_TEMP/lyra-dist")
+          else
+            args+=(--target verify)
+          fi
+          docker build "${args[@]}" .
+      - name: Upload Ubuntu SDK
+        if: needs.prepare.outputs.tag != ''
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: sdk-ubuntu22.04-x86_64
+          path: ${{ runner.temp }}/lyra-dist/*.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+          overwrite: true
 
   windows:
+    needs: prepare
     runs-on: windows-2025
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
         with:
           python-version: '3.12'
       - name: Verify native builds and relocated SDK
         shell: pwsh
-        run: ./tests/verify-windows.ps1 -Tools "${{ runner.temp }}/lyra-tools"
+        run: ./tests/verify-windows.ps1 -Tools (Join-Path $env:RUNNER_TEMP 'lyra-tools')
+      - name: Package Windows SDK
+        if: needs.prepare.outputs.tag != ''
+        env:
+          SDK_TAG: ${{ needs.prepare.outputs.tag }}
+        run: python tools/package_sdk.py build/windows-release --tag $env:SDK_TAG --output (Join-Path $env:RUNNER_TEMP 'lyra-dist')
+      - name: Upload Windows SDK
+        if: needs.prepare.outputs.tag != ''
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: sdk-windows-x64
+          path: ${{ runner.temp }}/lyra-dist/*.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+          overwrite: true
+
+  release:
+    needs: [prepare, ubuntu, windows]
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          pattern: sdk-*
+          merge-multiple: true
+          path: dist
+      - name: Publish the verified SDKs and checksums
+        working-directory: dist
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          SDK_TAG: ${{ needs.prepare.outputs.tag }}
+          SDK_COMMIT: ${{ needs.prepare.outputs.commit }}
+        run: |
+          version=${SDK_TAG#v}
+          windows="lyra-$version-windows-x64.zip"
+          ubuntu="lyra-$version-ubuntu22.04-x86_64.tar.gz"
+          test -s "$windows"
+          test -s "$ubuntu"
+          sha256sum "$windows" "$ubuntu" > SHA256SUMS
+          if [[ "$(gh api "repos/$GH_REPO/commits/refs/tags/$SDK_TAG" --jq '.sha')" != "$SDK_COMMIT" ]]; then
+            echo 'The tag no longer points at the verified commit.' >&2
+            exit 1
+          fi
+          flags=(--verify-tag --generate-notes --title "Lyra $version")
+          if [[ "$version" == *-* ]]; then flags+=(--prerelease); fi
+          gh release create "$SDK_TAG" "$windows" "$ubuntu" SHA256SUMS "${flags[@]}"

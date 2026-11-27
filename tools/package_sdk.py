@@ -30,13 +30,20 @@ def sha256(path):
     return digest.hexdigest()
 
 
-def pack(build, output):
-    revision = subprocess.check_output(["git", "-C", ROOT, "rev-parse", "--short=12", "HEAD"], text=True).strip()
+def pack(build, output, tag=None):
     binary = Path("bin/lyra.exe" if WINDOWS else "bin/lyra")
-    version = subprocess.check_output([build / binary, "--version"], text=True, timeout=15).strip().removeprefix("lyra ")
-    if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+[0-9a-zA-Z.-]*", version):
+    version = (ROOT / "VERSION").read_text(encoding="ascii").strip()
+    if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?", version):
         raise ValueError(f"Unexpected toolchain version: {version}")
-    name = f"lyra-{version}-{platform_tag()}-{revision}"
+    actual = subprocess.check_output([build / binary, "--version"], text=True, timeout=15).strip()
+    if actual != f"lyra {version}":
+        raise ValueError(f"Expected build version 'lyra {version}', got {actual!r}; rebuild the SDK")
+    name = f"lyra-{version}-{platform_tag()}"
+    if tag is None:
+        revision = subprocess.check_output(["git", "-C", ROOT, "rev-parse", "--short=12", "HEAD"], text=True).strip()
+        name += f"-{revision}"
+    elif tag != f"v{version}":
+        raise ValueError(f"Tag {tag!r} does not match VERSION; expected v{version}")
     output.mkdir(parents=True, exist_ok=True)
     artifact = output / (name + (".zip" if WINDOWS else ".tar.gz"))
     if artifact.exists():
@@ -73,5 +80,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Package a built Lyra SDK from a fresh install prefix.")
     parser.add_argument("build", type=Path)
     parser.add_argument("--output", type=Path, default=ROOT / "build/dist")
+    parser.add_argument("--tag", help="Require this v-prefixed VERSION and use the release asset name.")
     options = parser.parse_args()
-    pack(options.build.resolve(), options.output.resolve())
+    pack(options.build.resolve(), options.output.resolve(), options.tag)

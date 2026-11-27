@@ -9,7 +9,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
     && python3 -m pip install --no-cache-dir --no-deps --only-binary=:all: cmake==3.30.9 ninja==1.11.1.4 \
     && clang-scan-deps-18 --version
 WORKDIR /src
-COPY CMakeLists.txt CMakePresets.json ./
+COPY CMakeLists.txt CMakePresets.json VERSION ./
 COPY compiler/ compiler/
 COPY cmake/ cmake/
 COPY include/ include/
@@ -39,3 +39,13 @@ COPY --from=bare-sdk /sdk-verified /sdk-verified
 COPY --from=builder /out/apps/ /apps/
 COPY tests/jammy-smoke.sh /verify.sh
 RUN sh /verify.sh verify /apps
+
+FROM builder AS sdk-package
+COPY --from=verify /sdk-verified /sdk-verified
+COPY tools/package_sdk.py tools/
+ARG LYRA_RELEASE_TAG
+RUN test -n "$LYRA_RELEASE_TAG" \
+    && python3 tools/package_sdk.py build/release --tag "$LYRA_RELEASE_TAG" --output /out/dist
+
+FROM scratch AS sdk-dist
+COPY --from=sdk-package /out/dist/ /
