@@ -1,6 +1,6 @@
 param(
     [string] $Tools = (Join-Path $PSScriptRoot '../build/windows-deps'),
-    [string] $HostClang = 'clang++'
+    [string] $HostClang
 )
 
 $ErrorActionPreference = 'Stop'
@@ -9,7 +9,7 @@ $root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $Tools = [IO.Path]::GetFullPath($Tools)
 New-Item -ItemType Directory -Path $Tools -Force | Out-Null
 
-function Get-ToolArchive([string] $Name, [string] $Archive, [string] $Url, [string] $Hash) {
+function Get-ToolArchive([string] $Name, [string] $Archive, [string] $Url, [string] $Hash, [string[]] $Entries = @()) {
     $directory = Join-Path $Tools $Name
     if (Test-Path -LiteralPath $directory -PathType Container) { return $directory }
     $download = Join-Path $Tools $Archive
@@ -19,9 +19,28 @@ function Get-ToolArchive([string] $Name, [string] $Archive, [string] $Url, [stri
     if ((Get-FileHash -Algorithm SHA256 -LiteralPath $download).Hash -ne $Hash) {
         throw "Unexpected SHA-256 for $download"
     }
-    tar -xf $download -C $Tools
+    tar -xf $download -C $Tools @Entries
     return (Resolve-Path -LiteralPath $directory).Path
 }
+
+if (-not $env:VCToolsRedistDir) {
+    $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio/Installer/vswhere.exe'
+    $visualStudio = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+    if (-not $visualStudio) { throw 'Could not locate Visual Studio C++ Build Tools' }
+    & (Join-Path $visualStudio 'Common7/Tools/Launch-VsDevShell.ps1') -Arch amd64 -HostArch amd64 -SkipAutomaticLocation
+}
+if (-not $HostClang) {
+    $hostName = 'clang+llvm-23.1.6-x86_64-pc-windows-msvc'
+    $hostLlvm = Get-ToolArchive $hostName "$hostName.tar.xz" "https://github.com/llvm/llvm-project/releases/download/llvmorg-23.1.6/$hostName.tar.xz" `
+        '16AF05919CF36958DFB4DDAA4FC4D9D4FF577F5DAEB76BC112EA49CD8CED82B2' @("$hostName/bin", "$hostName/lib/clang")
+    $HostClang = Join-Path $hostLlvm 'bin/clang++.exe'
+}
+$hostCxx = (Get-Command $HostClang -CommandType Application -ErrorAction Stop).Source
+$hostBin = Split-Path $hostCxx
+$hostC = Join-Path $hostBin 'clang.exe'
+& $hostCxx --version
+Write-Output "MSVC tools: $env:VCToolsVersion"
+'#include <version>' | & $hostCxx -std=c++23 -x c++ -fsyntax-only -
 
 $llvmName = 'clang+llvm-18.1.8-x86_64-pc-windows-msvc'
 $mingwName = 'llvm-mingw-20261117-ucrt-x86_64'
@@ -30,12 +49,6 @@ $llvm = Get-ToolArchive $llvmName "$llvmName.tar.xz" "https://github.com/llvm/ll
 $mingw = Get-ToolArchive $mingwName "$mingwName.zip" "https://github.com/mstorsjo/llvm-mingw/releases/download/20261117/$mingwName.zip" `
     '4D002E330A0F703625AA5CCBC37E96F8F824413E163BFC7336774AABD2C3A412'
 
-if (-not $env:VCToolsRedistDir) {
-    $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio/Installer/vswhere.exe'
-    $visualStudio = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
-    if (-not $visualStudio) { throw 'Could not locate Visual Studio C++ Build Tools' }
-    & (Join-Path $visualStudio 'Common7/Tools/Launch-VsDevShell.ps1') -Arch amd64 -HostArch amd64 -SkipAutomaticLocation
-}
 if (-not $env:LYRA_TEST_OPENSSL) {
     $gitRoot = Split-Path (Split-Path (Get-Command git).Source)
     $openssl = Join-Path $gitRoot 'usr/bin/openssl.exe'
@@ -54,16 +67,13 @@ if (-not (Test-Path -LiteralPath (Join-Path $vcpkg 'vcpkg.exe'))) {
 }
 
 Push-Location $root
+$originalPath = $env:Path
 try {
     $prefix = Join-Path $Tools 'installed'
     $env:VCPKG_DISABLE_METRICS = '1'
-    $originalPath = $env:Path
-    try {
-        $env:Path = "$mingw/bin;$originalPath"
-        & (Join-Path $vcpkg 'vcpkg.exe') install --triplet x64-mingw-static --host-triplet x64-windows "--x-install-root=$prefix"
-    } finally { $env:Path = $originalPath }
-    $hostCxx = (Get-Command $HostClang -ErrorAction Stop).Source
-    $hostC = Join-Path (Split-Path $hostCxx) 'clang.exe'
+    $env:Path = "$mingw/bin;$originalPath"
+    & (Join-Path $vcpkg 'vcpkg.exe') install --triplet x64-mingw-static --host-triplet x64-windows "--x-install-root=$prefix"
+    $env:Path = "$hostBin;$originalPath"
     $env:PYTHONUTF8 = '1'
     foreach ($preset in 'windows-dev', 'windows-release') {
         cmake --preset $preset "-DCMAKE_CXX_COMPILER=$hostCxx" "-DCMAKE_C_COMPILER=$hostC" "-DLLVM_DIR=$llvm/lib/cmake/llvm" `
@@ -71,4 +81,7 @@ try {
         cmake --build --preset $preset --parallel 4
         ctest --preset $preset --no-tests=error
     }
-} finally { Pop-Location }
+} finally {
+    $env:Path = $originalPath
+    Pop-Location
+}

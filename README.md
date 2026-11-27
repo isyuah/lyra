@@ -89,6 +89,8 @@ git push origin v0.1.0-alpha.1
 
 GitHub Actions 校验 tag 和该提交的 `VERSION` 一致，在 Windows x64 与 Ubuntu 22.04 x86-64 分别验收 Debug、Release 和可搬迁 SDK；两边都通过后才将 Windows ZIP、Ubuntu TAR.GZ 和 `SHA256SUMS` 发到同一 GitHub Release。带预发布后缀的版本标记为 Pre-release。分支和 PR 只跑验收；在 Actions 手动选择 `package_sdk` 可验证出包并下载临时制品，不会发布。
 
+Windows CI 固定使用 Clang 23.1.6 构建 Lyra，避免依赖 Runner 自带的 Clang；SDK 内仍使用 LLVM 18.1.8。
+
 ## 命令与语言子集
 
 ```text
