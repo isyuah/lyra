@@ -1,0 +1,233 @@
+---
+title: HTTP/SQLite 用户服务
+description: 拆解 examples/http-sqlite：路由、SQL、JSON、TLS 和部署。
+---
+
+`examples/http-sqlite` 是一个可构建、可运行的 HTTP/SQLite 服务 workspace：根包负责监听、路由和 HTTP 语义，`users` 库负责 SQLite 查询、JSON 数据类型和编解码。服务默认绑定 `127.0.0.1`，启动后输出实际端口。
+
+这一章按请求路径拆：路由声明、参数解码、SQLite 查询、错误映射、启动与关闭，最后是 TLS、出站请求和部署。
+
+## 两个包
+
+根包的清单同时声明 workspace 成员和本地依赖：
+
+```json5
+{
+  name: "example/http-sqlite", version: "0.1.0", kind: "app",
+  workspace: { members: ["users"] },
+  dependencies: { users: { name: "example/users", version: "^0.1.0", path: "users" } },
+}
+```
+
+`users` 是库包，并声明 SQL 宏允许读取的只读输入：
+
+```json5
+{
+  name: "example/users", version: "0.1.0", kind: "lib",
+  macroInputs: { userQuery: { schema: "inputs/schema.sql", snapshot: "inputs/userById.snapshot" } },
+}
+```
+
+`macroInputs` 是宏访问外部文件的授权边界：构建只读这些快照，不联网、不运行准备脚本。
+
+## 数据模型与 SQLite
+
+`users` 库定义请求和响应结构，并提供 JSON codec 工厂：
+
+```lyra no-check
+import std.json.{JsonCodec}
+import std.sqlite.{Connection, DbError, Statement, withConnection}
+
+#derive(Json)
+pub struct User(pub val id: Int, pub val name: String)
+
+#derive(Json)
+pub struct NewUser(pub val name: String)
+
+#derive(Json)
+pub struct CreatedUser(pub val teamId: Int, pub val tags: List<String>, pub val label: String, pub val name: String)
+
+pub fn userCodec(): JsonCodec<User> { jsonCodecUser() }
+pub fn newUserCodec(): JsonCodec<NewUser> { jsonCodecNewUser() }
+pub fn createdUserCodec(): JsonCodec<CreatedUser> { jsonCodecCreatedUser() }
+```
+
+查询用预编译语句和参数绑定，不拼接 SQL：
+
+```lyra no-check
+fn prepareUserById(db: Connection, sql: String, id: Int): Result<Statement, DbError> {
+    val query = db.prepare(sql)?
+    match query.bindInt(1, id) {
+        Ok(_) => Ok(query),
+        Err(error) => { query.close(); Err(error) },
+    }
+}
+
+pub fn findUser(path: String, id: Int): Result<User?, DbError> {
+    withConnection<User?>(path, readOnly: true) { db =>
+        val query = #userQuery(db, "SELECT name FROM users WHERE id=?1", id)?
+        defer query.close()
+        if !query.next()? { return Ok(None) }
+        match query.readText(0)? {
+            Some(name) => Ok(Some(User(id, name))),
+            None => Err(DbError.typeMismatch("readText", "users.name must not be NULL")),
+        }
+    }
+}
+```
+
+- `withConnection` 在回调结束时关闭连接，包括返回 `Err` 或抛异常的路径。只读查询用 `readOnly: true`。
+- `db.prepare(sql)?` 返回 `Result<Statement, DbError>`；绑定和推进游标都返回 `Result`，用 `?` 传播。
+- `query.next()?` 返回 `true` 表示有一行，`false` 表示结束；`readText(0)?` 读到 `NULL` 时是 `None`，空字符串仍是 `Some("")`。
+- `#userQuery` 在编译期把 SQL 字面量和授权快照核对，再展开成普通的参数化 SQLite 调用。修改查询时同步更新调用处、`users/tools/userById.sql`，再显式运行 `python examples/http-sqlite/users/tools/prepareQuery.py` 刷新快照；普通构建不会执行这个脚本。
+
+写入在事务里完成：
+
+```lyra no-check
+pub fn insertUser(path: String, input: NewUser): Result<User, DbError> {
+    withConnection<User>(path) { db =>
+        db.transaction<User>() { tx =>
+            val insert = tx.prepare("INSERT INTO users(name) VALUES(?1)")?
+            insert.bindText(1, input.name)?
+            insert.next()?;
+            Ok(User(tx.lastInsertRowid()?, input.name))
+        }
+    }
+}
+```
+
+`transaction` 的回调返回 `Ok` 时提交，返回 `Err` 或抛异常时回滚；回调退出前会关闭该事务里未关闭的 statement。插入的 rowid 和插入本身在同一个事务回调里读取，避免并发写入把两者拆开。
+
+## 路由
+
+根包同时使用注解路由和手写路由：
+
+```lyra no-check
+#get("/users/{id}")
+async fn getUser([path] id: Int, [inject] path: String, [inject] logger: log.Logger): http.Response {
+    val result = await retryBusy<users.User?>(() => { users.findUser(path, id) })
+    match result {
+        Ok(Some(user)) => http.Response.json(user, users.userCodec()),
+        Ok(None) => text(404, "not found"),
+        Err(error) => databaseFailure(logger, "GET /users/{id}", error),
+    }
+}
+
+#post("/teams/{teamId}")
+@trace
+async fn createUser([path] teamId: Int, [query("tag")] tags: List<String>, [query("single")] label: String, [body("newUserCodec")] input: users.NewUser): http.Response {
+    http.Response.json(users.CreatedUser(teamId, tags, label, input.name), users.createdUserCodec())
+}
+```
+
+- `#get` / `#post` 在 `async fn` 上生成私有适配器。适配器先把路径、查询和 body 解码成普通参数，成功后才调用业务函数。
+- `[path]` 支持 `Int` 和 `String`；整数越界或格式错误回 400，不调用 handler。
+- `[query("tag")]` 的 `List<String>` 保留所有同名值；`[query("single")]` 的 `String` 要求恰好一次，缺失或重复都回 400。
+- `[body("newUserCodec")]` 用零参数工厂取得 `JsonCodec<NewUser>`；JSON 解码失败回 400，也不调用业务函数。
+- `[inject]` 从传给 `#mountRoutes` 的依赖对象里按同名字段取值；类型必须精确匹配。
+
+启动时一次挂载当前包的所有宏路由：
+
+```lyra no-check
+val router = http.Router()
+router.post("/users", (request: http.Request) => { postUser(request, path, logger) })
+#mountRoutes(router, AppDeps(path, logger))
+print(listener.port())
+await router.serve(listener)
+```
+
+手写的 `POST /users` 和宏路由共用同一个 `Router`。`#mountRoutes` 收集当前包中各模块的路由，不会因为导入而自动注册；依赖包要自己公开挂载函数。
+
+## 错误映射
+
+`getUser` 把查询结果分成三个业务分支：
+
+- `Ok(Some(user))` 返回 200 JSON。
+- `Ok(None)` 返回 404；这是查询正常结束但没有这一行，不是数据库错误。
+- `Err(error)` 交给 `databaseFailure`，根据 `DbErrorKind` 映射 503 或 500。
+
+```lyra no-check
+fn databaseFailure(logger: log.Logger, route: String, error: sqlite.DbError): http.Response {
+    if error.kind == sqlite.DbErrorKind.Busy && error.cleanupError == None {
+        return text(503, "database busy").withHeader("Retry-After", "1")
+    }
+    val fields = json.jsonObject().put("route", json.jsonString(route))
+        .put("operation", json.jsonString(error.operation)).put("code", json.jsonInt(error.code)).build()
+    val _ = logger.error("database error", fields: fields)
+    text(500, "database error")
+}
+```
+
+日志写结构化 JSON 到标准错误，记录路由模板、操作和错误码；不要把 URL 查询值或用户数据写进日志。锁冲突可以有限退避重试，`retryBusy` 只重试 `Busy` 且没有清理错误的失败，带清理错误的失败不重试。
+
+## 启动、TLS 与出站请求
+
+入口用 `std.cli` 解析 `--host`、`--port`、`--cert`、`--key`、`--upstream`、`--ca`：
+
+- 没有证书时 `http.listen(port, host: host)` 返回 `Result<Listener, HttpError>`。
+- 同时提供证书和私钥时用 `httpTls.listenTls(...)` 启用 TLS 1.2/1.3，沿用同一个 Router。
+- `port` 为 0 时由系统分配；启动后 `listener.port()` 打印实际端口。
+- `defer listener.close()` 登记关闭；`await router.serve(listener)` 接管监听器。
+- `--upstream` 启用 `GET /upstream`，用 `httpClient.httpGet` 请求固定上游并返回状态和字节正文；`--ca` 指定出站专用 PEM 信任根，省略时使用系统信任根。
+
+```bash
+work=$(mktemp -d)
+sqlite3 "$work/users.db" < examples/user-service/fixture.sql
+lyra build examples/http-sqlite --locked --offline -o "$work/users-app"
+"$work/users-app" "$work/users.db"
+```
+
+服务会打印类似 `54321` 的端口。另开一个终端：
+
+```bash
+curl -i http://127.0.0.1:54321/users/7
+curl -i http://127.0.0.1:54321/users/8
+curl -i http://127.0.0.1:54321/users/not-a-number
+curl -i -X POST http://127.0.0.1:54321/users -H 'Content-Type: application/json' -d '{"name":"Grace"}'
+```
+
+预期行为：
+
+- `GET /users/7` 返回 200 和 `{"id":7,"name":"Ada"}`。
+- `GET /users/8` 返回 404。
+- `GET /users/not-a-number` 在进入业务函数前返回 400。
+- `POST /users` 完成事务后返回 201 和新用户 JSON。
+- 其他已匹配路径用错方法返回 405，不存在的路径返回 404。
+
+HTTPS 用临时证书启动：
+
+```bash
+"$work/users-app" "$work/users.db" --cert server.pem --key server.key \
+  --upstream https://localhost:9443/users/7 --ca local-ca.pem
+```
+
+传入 PEM 证书链和私钥后启用入站 TLS；`--upstream` 的出站请求校验证书和主机名。证书私钥不要提交，也不要写进日志。
+
+## 部署
+
+```bash
+lyra build examples/http-sqlite --release --locked --offline
+```
+
+产物在 `examples/http-sqlite/build/release/app.exe`（Windows）或 `app`（Linux）。SQLite、TLS 和 HTTP 解析器都由 SDK 静态链接，部署不需要额外的动态库、Lyra 或 LLVM。设置 `LYRA_NATIVE_BACKTRACE=1` 可以在未捕获异常的 Lyra 调用链后显示原生帧。
+
+生产的停机流程可以创建 `http.Shutdown()`，把它传给 `serve`（下面的片段省略了信号处理，收到停机信号后调用 `request` 即可）：
+
+```lyra no-check
+val shutdown = http.Shutdown()
+val serving = spawn router.serve(listener, shutdown: Some(shutdown))
+// 收到停机信号后：
+shutdown.request()
+await serving
+```
+
+`Shutdown.request()` 先停止接入，再等待已进入的请求；超过 `graceMs` 才取消剩余 handler，并等它们释放资源。示例用 `retryBusy` 处理短暂的数据库锁冲突，带清理错误的失败不重试。
+
+## 练习
+
+1. 加一个 `GET /users` 路由，返回所有用户；用 `queryAll` 或 prepared statement 遍历，注意分页和上限。
+2. 给 `POST /users` 加请求校验：空名字返回 400，不进入事务。
+3. 用 `Shutdown` 写一个收到停机请求后等待 `serve` 退出的入口，确认已进入的请求能完成。
+4. 把 `findUser` 改成 `#userQuery` 之外的手写 prepared statement，比较编译期快照校验和手写绑定的差异。
+
+到这里，教程的主要路径走完了。接下来可以回到[标准库索引](https://github.com/isyuah/lyra/blob/main/std/README.md)按包查 API，或直接读 `examples/` 里的完整项目；语言参考会在此站点后续补齐。

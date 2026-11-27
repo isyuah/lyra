@@ -1,0 +1,217 @@
+---
+title: 泛型、接口与转换
+description: 泛型函数与类型、结构约束、dyn、extension 和 implicit 转换。
+---
+
+泛型让同一段逻辑适配多种类型；接口描述“类型需要具备哪些方法”；转换让一个类型在需要另一个类型的位置直接出现。Lyra 把这几个能力分开：泛型用结构约束，不写 `implements`；`dyn` 是显式的接口值；`extension` 按组附加成员；`implicit` 只做一次直接转换。
+
+## 泛型函数与泛型类型
+
+类型参数写在名字后面的 `<...>` 里。调用时通常可以推断，也可以在调用处显式指定。
+
+```lyra
+fn identity<T>(value: T): T { value }
+
+class Cell<Item>(var value: Item) {
+    fn get(): Item { value }
+    fn set(next: Item): Unit { value = next }
+}
+
+fn main(): Unit {
+    print(identity(7))
+    print(identity<String>("Ada"))
+    val cell = Cell("Grace")
+    cell.set("Hopper")
+    print(cell.get())
+    val numbers = Cell(1)
+    print(numbers.get())
+}
+```
+
+```output
+7
+Ada
+Hopper
+1
+```
+
+泛型函数、`struct`、`class` 和 `enum` 都可以带类型参数。`Cell("Grace")` 由构造实参推断出 `Cell<String>`；`Cell(1)` 推断出 `Cell<Int>`。同一份泛型定义在编译期为实际类型组合生成实现，未调用的泛型函数体也会做静态检查。
+
+## 结构约束：不写 implements
+
+`trait` 声明一组方法签名。泛型形参用 `T: Trait` 要求实参类型具备这些方法；编译器按方法签名做结构检查，不需要类型声明“实现了哪个 trait”。
+
+```lyra
+trait Render { fn render(): String }
+
+struct Tag(val text: String) {
+    fn render(): String { "<${text}>" }
+}
+
+fn draw<T: Render>(value: T): String { value.render() }
+
+fn main(): Unit {
+    print(draw(Tag("Ada")))
+}
+```
+
+```output
+<Ada>
+```
+
+`Tag` 没有写 `implements Render`，只要有一个可见的、签名匹配的 `fn render(): String` 实例方法，就满足约束。返回类型必须精确匹配：`fn render(): Int` 不满足 `Render`，静态方法也不算实例方法。
+
+多个约束用 `&` 连接：`fn show<T: Readable & Labelled>(value: T)`。每个约束的方法都必须存在；两个 trait 声明同名方法但返回类型不同时，调用处会报冲突，需要显式写出你想要的接口。
+
+trait 可以提供默认方法，也可以声明关联类型：
+
+```lyra
+trait Reader {
+    type Item
+    fn read(): Item
+    fn label(): String { "reader" }
+}
+
+struct TextReader(val text: String) {
+    type Item = String
+    fn read(): String { text }
+}
+
+struct NumberReader(val value: Int) {
+    type Item = Int
+    fn read(): Int { value }
+}
+
+fn readValue<T: Reader>(reader: T): T.Item { reader.read() }
+fn labelOf<T: Reader>(reader: T): String { reader.label() }
+
+fn main(): Unit {
+    val text: String = readValue(TextReader("Ada"))
+    val number: Int = readValue(NumberReader(7))
+    print(text)
+    print(number)
+    print(labelOf(TextReader("x")))
+}
+```
+
+```output
+Ada
+7
+reader
+```
+
+实现类型用 `type Item = ...` 提供关联类型，泛型代码用 `T.Item` 引用它。约束也可以写 `T: Reader<Item=String>`，把关联类型固定成 `String`；如果 trait 有多个关联类型，`dyn` 值必须全部绑定，例如 `dyn Reader<Index=Int, Item=String>`。
+
+## dyn：显式接口值
+
+泛型是静态分派；`dyn Trait` 是运行时接口值，适合把不同具体类型放进同一个列表。转换必须显式写 `as dyn`。
+
+```lyra
+trait HasSize { fn size(): Int }
+
+fn count(value: dyn HasSize): Int { value.size() }
+
+fn main(): Unit {
+    print(count("Hi" as dyn HasSize))
+    print(count([1, 2, 3] as dyn HasSize))
+}
+```
+
+```output
+2
+3
+```
+
+`String` 和 `List<Int>` 都有 `size(): Int`，所以都能转换成 `dyn HasSize`。`dyn` 值保留具体对象身份，调用通过接口表分派；它不会自动替你把任意类型装箱，转换点必须写出来。
+
+## extension：按组附加成员
+
+`extension` 给已有类型增加方法或只读计算属性。它不改变类型定义，也不参与构造、布局或自动派生。跨模块使用时，导入 extension 组的名字。
+
+```lyra
+struct Entry(val value: Int)
+
+extension EntryView for Entry {
+    val doubled: Int get() { value * 2 }
+    fn label(): String { "entry ${value}" }
+}
+
+fn main(): Unit {
+    print(Entry(3).doubled)
+    print(Entry(3).label())
+}
+```
+
+```output
+6
+entry 3
+```
+
+extension 属性是只读的，不能赋值。两个可见的 extension 组给同一类型声明同名成员时，使用处会报歧义；需要改名或只导入其中一个。扩展可以访问类型的公开成员；跨模块访问私有成员受可见性规则限制。
+
+## implicit：一次直接转换
+
+`implicit` 声明一个从源类型到目标类型的直接转换。在需要目标类型的位置，可以直接传源类型，编译器查找一条可见转换。
+
+```lyra
+struct User(val name: String)
+struct Response(val message: String)
+
+implicit (user: User): Response { Response(user.name) }
+
+fn send(user: User): Response { user }
+
+fn main(): Unit {
+    print(send(User("Ada")).message)
+}
+```
+
+```output
+Ada
+```
+
+规则可以概括成三点：
+
+- 转换写在源类型或目标类型的定义模块里；调用方不能随便添加一条全局转换。
+- 只查一条直接转换，不串接。`User -> Middle -> Response` 不会自动合成 `User -> Response`。
+- 两端各有一条可见转换时，使用处报歧义，不会按“更具体”猜。
+
+`?` 传播不同具体错误类型时复用同一套规则：`Result<T, UserError>` 可以经一条可见转换变成 `Result<T, ServiceError>`；没有转换或出现歧义就在 `?` 处报错。
+
+## 类型别名
+
+`type` 是透明别名，不创建新类型：
+
+```lyra
+type UserId = Int
+type UserIds = List<UserId>
+
+fn first(ids: UserIds): UserId { ids[0] }
+
+fn main(): Unit {
+    val id: UserId = 7
+    print(first([id]))
+}
+```
+
+```output
+7
+```
+
+公开别名可以跨模块导入；别名不能形成循环，也不能把私有类型暴露到公开签名里。
+
+## 常见坑
+
+- 结构约束检查的是签名，不是名字。方法名对但参数或返回类型不匹配，仍然不满足。
+- `dyn` 需要显式转换；不要把 `dyn` 当成自动装箱。
+- extension 成员不会自动进入类型；跨模块时要导入对应的扩展组。
+- `implicit` 不做链式转换，也不做“最具体类型”选择；歧义就是错误。
+- 泛型代码会对所有实际类型组合生成实现，不要依赖运行时类型判断来绕过约束。
+
+## 练习
+
+1. 写 `trait Area { fn area(): Float }`，让 `Circle` 和 `Rect` 通过结构约束满足它，再写一个 `totalArea<T: Area>(items: List<T>): Float`。
+2. 给 `List<Int>` 写一个 extension 组，提供 `sum()` 和 `average(): Float`。
+3. 定义 `UserId` 别名和 `implicit (id: UserId): User` 转换，观察显式传参和隐式转换的调用差异。
+
+下一章处理错误与资源：`Result`、`?`、异常和 `defer` 各自负责什么，以及清理失败和取消如何收尾。

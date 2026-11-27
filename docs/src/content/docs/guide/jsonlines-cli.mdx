@@ -1,0 +1,208 @@
+---
+title: JSONL 统计 CLI
+description: 拆解 examples/jsonlines：库、CLI、配置、错误和离线构建。
+---
+
+`examples/jsonlines` 是一个可以直接运行的双包 workspace：`metrics` 是公开库，负责解码单行 JSON 和编码报告；`stats` 是 CLI，逐行读取标准输入或文件，把合法记录的 `delta` 求和，坏行连同行号写到标准错误并继续。正常运行时标准输出只写一份 JSON 报告。
+
+这一章把它拆成几个部分：数据模型、JSONL 读取、命令行与配置、错误边界，最后是离线构建和发布。
+
+## 包结构
+
+```text
+examples/jsonlines/
+├── lyra.json5                 # workspace 成员
+├── lyra.lock
+├── metrics/
+│   ├── lyra.json5             # tools/metrics，kind: lib
+│   ├── src/metrics.ly
+│   └── tests/readings.ly
+└── stats/
+    ├── lyra.json5             # cli/stats，依赖 metrics
+    └── src/main.ly
+```
+
+workspace 根：
+
+```json5
+{ workspace: { members: ["metrics", "stats"] } }
+```
+
+`stats` 的清单用本地路径依赖 `metrics`：
+
+```json5
+{
+  name: "cli/stats",
+  version: "1.0.0",
+  kind: "app",
+  dependencies: {
+    metrics: { name: "tools/metrics", version: "^1.0.0", path: "../metrics" },
+  },
+}
+```
+
+依赖简称 `metrics` 只在 `stats` 里生效；真实包名是 `tools/metrics`。把 `path` 换成注册中心来源时，源码里的 `import metrics...` 不需要改。
+
+## 数据模型与 JSON 派生
+
+`metrics` 库只暴露两个操作：解析一行、生成报告。它用 `#derive(Json)` 把结构体映射到线格式：
+
+```lyra no-check
+#derive(Json)
+pub struct Reading(pub val station: String, pub val delta: Int)
+
+#derive(Json)
+struct Summary(pub val rows: Int, pub val total: Int, pub val rejected: Int)
+
+pub fn parseLine(line: String): Result<Reading,String> { decodeReading(line) }
+
+pub fn summary(rows: Int, total: Int, rejected: Int): String {
+    encodeSummary(Summary(rows, total, rejected))
+}
+```
+
+`Reading` 是公开类型，`Summary` 只在库内部使用；`encodeSummary` / `decodeReading` 是 `#derive(Json)` 生成的模块私有函数。库的公开 API 只有 `parseLine` 和 `summary`，调用方不需要知道 JSON 键名或派生器。
+
+`metrics/tests/readings.ly` 验证解码行为：
+
+```lyra no-check
+import self.{parseLine}
+
+fn main(): Unit {
+    val good = parseLine("{\"station\":\"north\",\"delta\":-3}")
+    #assert(match good {
+        Ok(reading) => reading.station == "north" && reading.delta == -3,
+        Err(_) => false,
+    }, "valid reading")
+
+    val bad = parseLine("{\"station\":\"north\"}")
+    #assert(match bad { Err(_) => true, Ok(_) => false }, "missing measurement")
+}
+```
+
+## CLI 与 JSONL 读取
+
+`stats` 的入口先解析命令行，再读配置，最后逐行走 JSONL：
+
+```lyra no-check
+import metrics.{parseLine, summary}
+import std.cli.{Command, parseArgs}
+import std.config.{Config, intKey, stringKey}
+import std.io.{File, IoError, LineReader, writeError}
+import std.jsonl.{JsonlErrorKind, jsonlReader}
+
+fn aggregate(input: LineReader): Result<Unit,IoError> {
+    val reader = jsonlReader(input, parseLine)
+    var rows = 0
+    var total = 0
+    var rejected = 0
+    while let Some(record) = reader.next()? {
+        match record.value {
+            Ok(reading) => { rows += 1; total += reading.delta; },
+            Err(problem) => {
+                val message = match problem.kind { JsonlErrorKind.Decode(_) => "invalid JSON reading", _ => problem.message() }
+                writeError("line ${record.lineNumber}: ${message}\n")?
+                rejected += 1;
+            },
+        }
+    }
+    print(summary(rows, total, rejected))
+    Ok({})
+}
+```
+
+几个关键点：
+
+- `jsonlReader(input, parseLine)` 把有界 `LineReader` 和单行解码器组合起来。`reader.next()?` 返回 `Option<JsonlRecord<Reading>>`；`None` 表示 EOF。
+- `record.value` 是 `Result<Reading, JsonlError>`。一行解码失败不会终止整个流，程序记录行号和错误类别后继续。
+- `writeError(...)?` 把坏行写到标准错误；如果标准错误也写失败，`?` 会把 `IoError` 传播给调用者。
+- `reader.next()?` 中的 `?` 传播的是输入流读取失败；这与单行解码失败是两条不同的错误路径。
+
+入口处理命令行和配置：
+
+```lyra no-check
+fn main(): Int {
+    val spec = Command("stats").option("--input").option("--config").option("--max-line-bytes")
+    val arguments = match parseArgs(spec) {
+        Ok(Run(command)) => command,
+        Ok(Help(text)) => { print(text); return 0 },
+        Err(problem) => return fail(problem.message(), 2),
+    }
+    if arguments.positionals.size != 0 { return fail("stats does not take positional arguments", 2) }
+    val config = match arguments.value("--config") {
+        None => Config.empty(),
+        Some(path) => match Config.load(path) {
+            Ok(settings) => settings,
+            Err(problem) => return fail(problem.message(), 2),
+        },
+    }
+    val input = stringKey("input", "-", cliName: Some("--input"), envName: Some("LYRA_STATS_INPUT"))
+    val maxBytes = intKey("maxLineBytes", 1048576, cliName: Some("--max-line-bytes"), envName: Some("LYRA_STATS_MAX_LINE_BYTES"))
+    val path = match config.get(input, Some(arguments)) {
+        Ok(value) => value,
+        Err(problem) => return fail(problem.message(), 2),
+    }
+    val limit = match config.get(maxBytes, Some(arguments)) {
+        Ok(value) => value,
+        Err(problem) => return fail(problem.message(), 2),
+    }
+    if limit <= 0 { return fail("maxLineBytes must be positive", 2) }
+    match readInput(path, limit) {
+        Ok(_) => 0,
+        Err(problem) => {
+            val source = if path == "-" { "stdin" } else { "input" }
+            fail("cannot read ${source}: ${problem.message()}", 1)
+        },
+    }
+}
+```
+
+`std.config` 的优先级是：命令行显式值 > 环境变量 > TOML > 默认值。`intKey` / `stringKey` 描述键名、默认值和可选的 CLI/环境变量名；`Config.get` 统一读取并返回 `Result`。
+
+## 运行
+
+从仓库根目录：
+
+```bash
+lyra test examples/jsonlines/metrics
+printf '%s\n' '{"station":"东区","delta":7}' '{"station":"西区","delta":-2}' |
+  lyra run examples/jsonlines/stats --release --locked --offline
+```
+
+```output
+{"rows":2,"total":5,"rejected":0}
+```
+
+再加一行坏数据，标准输出仍然只有报告，坏行写到标准错误：
+
+```bash
+printf '%s\n' '{"station":"东区","delta":7}' 'not json' '{"station":"西区","delta":-2}' |
+  lyra run examples/jsonlines/stats --release --locked --offline
+```
+
+```output
+{"rows":2,"total":5,"rejected":1}
+```
+
+标准错误会指出第 2 行解析失败。命令行错误退出码是 2，I/O 错误是 1；正常完成返回 0。`--help` 打印用法；`--config stats.toml` 读取默认值；`LYRA_STATS_INPUT` / `LYRA_STATS_MAX_LINE_BYTES` 覆盖 TOML，`--input` / `--max-line-bytes` 优先级最高。
+
+## 发布与离线构建
+
+`metrics` 可以单独作为库发布：
+
+```bash
+lyra test examples/jsonlines/metrics --locked --offline
+lyra pack examples/jsonlines/metrics -o metrics.lypkg
+```
+
+仓库的验收脚本会把两个包复制到仓库外，运行库测试、发布到临时中心、锁定和抓取；然后移走库源码和中心，只用已校验缓存以 `--locked --offline` 构建 Debug 和 Release CLI。这说明部署和重建不依赖作者机器上的路径或网络。
+
+应用产物是 `stats/build/release/app.exe`（Windows）或 `stats/build/release/app`（Linux）。部署时只需要分发这个可执行文件；Lyra、LLVM 和包缓存都不需要。
+
+## 练习
+
+1. 给 `Reading` 加一个可选字段 `note: String?`，用 `[jsonName("memo")]` 改线格式键名，并补一条测试。
+2. 给 `Summary` 加 `min` / `max`，在 `aggregate` 中维护，并更新示例输出。
+3. 把坏行错误改成按错误类别计数（解码失败、超长行、I/O），仍然只向标准输出写一份 JSON。
+
+下一章进入 HTTP/SQLite：路由、请求解码、预编译语句、事务、TLS 和出站客户端。

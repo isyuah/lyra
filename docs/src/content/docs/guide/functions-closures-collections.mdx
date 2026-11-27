@@ -1,0 +1,202 @@
+---
+title: 函数、闭包与集合
+description: 参数规则、函数值、闭包捕获，以及 List、HashMap 和集合操作。
+---
+
+函数是 Lyra 里最普通的可调用值。参数可以命名、可以有默认值、可以变长；函数本身可以放进字段、列表或另一个函数的参数。闭包捕获的是绑定，不是创建时的快照。集合操作建立在这些规则之上。
+
+## 函数声明与返回类型
+
+普通函数写 `fn name(parameters): ReturnType { ... }`。函数体是表达式，末尾表达式的值就是返回值。
+
+```lyra
+fn join(left: Int = 1, right: Int = left + 1): Int { left * 10 + right }
+
+fn sum(values: Int...): Int {
+    var total = 0
+    for value in values { total += value }
+    total
+}
+
+fn visit(values: List<Int>, show: (Int) -> Unit): Unit {
+    for value in values { show(value) }
+}
+
+fn main(): Unit {
+    print(join())
+    print(join(right: 4, left: 2))
+    val ids = [3, 4]
+    print(sum(...ids))
+    print(sum())
+    visit([3, 4]) { print(it) }
+}
+```
+
+```output
+12
+24
+7
+0
+3
+4
+```
+
+要点：
+
+- 公开函数和递归函数必须写返回类型；私有非递归函数可以省略，由函数体推断。推断只看函数体，不受调用处目标类型影响。
+- 位置实参在命名实参之前；命名实参可以换序，但不能重复绑定同一个形参。
+- 默认值只对缺省的形参求值，按声明顺序；后面的默认值可以引用前面的形参。
+- `values: Int...` 是变长形参，必须在最后，只能接收位置实参。函数体里的 `values` 是本次调用独立的可变 `List<Int>`。
+- `sum(...ids)` 把列表元素展开成多个实参；`sum(ids)` 是把整个列表当成一个实参，类型不匹配。展开只用于变长段，不会替前面的固定形参补值。
+- 只有最后一个形参本身是固定函数类型时，才能把 lambda 写在括号外，例如 `visit([3, 4]) { print(it) }`。控制流块（`if`、`while`、`for`）不会被误认成尾块 lambda。
+
+## 函数值与闭包
+
+函数类型写成 `(参数类型, ...) -> 返回类型`。lambda 可以显式写参数，也可以用 `it` 表示唯一参数。
+
+```lyra
+fn makeCounter(start: Int): () -> Int {
+    var value = start
+    () => { value += 1; value }
+}
+
+fn apply<T,R>(value: T, transform: (T) -> R): R { transform(value) }
+
+fn main(): Unit {
+    val counter = makeCounter(10)
+    print(counter())
+    print(counter())
+
+    print(apply(4) { it * 2 })
+
+    val add = (left: Int, right: Int) => { left + right }
+    print(add(2, 3))
+}
+```
+
+```output
+11
+12
+8
+5
+```
+
+`makeCounter` 返回的闭包捕获了 `value` 这个绑定，而不是 `10` 这个值。每次调用 `counter()` 都会修改同一个 `value`，所以两次输出是 11 和 12。闭包可以跨 `await`、GC 后继续调用；捕获的是共享的绑定。
+
+`return` 和 `?` 只退出最近的函数或 lambda。也就是说，lambda 里的 `return` 不会从创建它的外层函数返回；`?` 也不会跳过外层调用。需要把失败传出去时，让 lambda 返回 `Result`，再在外层显式处理。
+
+`it` 只表示最内层隐式参数；嵌套 lambda 想同时访问外层参数时，给外层参数起名字。`() => { ... }` 和 `(x: Int) => { ... }` 都是显式 lambda；`{ it * 2 }` 是尾块或单参数 lambda 的简写，具体取哪种由期望的函数类型决定。
+
+## List
+
+列表字面量用 `[a, b, c]`，元素类型可以推断，也可以显式写 `List<T>`。列表是引用对象：赋值给另一个绑定会共享同一个列表。
+
+```lyra
+import std.collections.{intSet}
+
+fn main(): Unit {
+    val values = [10, 20, 30]
+    values.add(40)
+    print(values.size)
+    print(values[1])
+    print(values.getOrNone(9) ?? -1)
+    print(values.firstOrNone() ?? 0)
+    for value in values.slice(1..2) { print(value) }
+
+    val seen = intSet()
+    print(seen.add(7))
+    print(seen.add(7))
+}
+```
+
+```output
+4
+20
+-1
+10
+20
+30
+true
+false
+```
+
+- `values` 是 `val` 绑定，但列表本身可以 `add`；`val` 只禁止把 `values` 指向另一个列表。
+- `values[i]` 越界会抛 `BoundsError`；想要可空结果用 `getOrNone(i)`。`firstOrNone()`、`lastOrNone()` 同理。
+- `slice(range)` 返回独立的浅拷贝：替换新列表里的元素不会改原列表，但元素是 `class` 时仍共享对象。
+- `0..<n` 不包含 `n`，`a..b` 包含两端；切片、字符串和字节串使用同一套范围写法。
+- `intSet()` 返回 `HashSet<Int>`；`add` 只在集合发生变化时返回 `true`。`stringMap<Value>()`、`intMap<Value>()` 返回 `HashMap`。
+
+## 集合管道
+
+`std.collections` 为 `List` 和 `FrozenList` 提供 `map`、`filter`、`fold`、`any`、`find`、`sortedBy`。显式导入 `ListOps` 后可以方法链调用。
+
+```lyra
+import std.collections.{ListOps}
+
+fn main(): Unit {
+    val values = [1, 2, 3, 4, 5]
+    val doubled = values.filter { it % 2 == 0 }.map { it * 2 }
+    print(doubled.fold(0, (total: Int, value: Int) => { total + value }))
+    print(doubled.find { it > 6 } ?? 0)
+    val ordered = doubled.sortedBy { -it }
+    for value in ordered { print(value) }
+}
+```
+
+```output
+12
+8
+8
+4
+```
+
+`map`、`filter`、`sortedBy` 返回新列表；`fold` 从左到右累积；`find` 在首个匹配处停止，返回 `Option`。`sortedBy` 按 `Int` 键稳定升序，同键元素保留输入顺序；想降序就返回负键。回调按输入顺序对每个元素最多调用一次，不要在回调里修改正在遍历的列表。
+
+字典和集合可以像列表一样 `for` 遍历：
+
+```lyra
+import std.collections.{stringMap}
+import std.text.{StringOps}
+
+fn main(): Unit {
+    val text = "the quick brown fox jumps over the lazy dog the fox"
+    val counts = stringMap<Int>()
+    for word in text.split(" ") {
+        val _ = counts.put(word, (counts.get(word) ?? 0) + 1)
+    }
+
+    print(counts.get("fox") ?? 0)
+    print(counts.size())
+
+    var total = 0
+    for entry in counts { total += entry.value }
+    print(total)
+}
+```
+
+```output
+2
+8
+11
+```
+
+- `get`、`put`、`remove` 返回 `Option`；`None` 表示没有这个键。值本身可空时，`Some(None)` 表示键存在但值为空。
+- `entries()`、`keys()`、`values()` 返回独立列表快照，不承诺顺序。
+- 每次进入 `for entry in counts` 都取一份浅快照；循环期间的增删不会改变这次遍历。
+- `HashMap` / `HashSet` 以引用共享；通过一个别名修改，其他别名能看到。默认哈希要求键满足 `Eq` 和 `Hash`；`class` 按身份比较但没有默认 Hash，需要手写或使用自定义回调。
+
+## 常见坑
+
+- 列表赋值共享同一个集合。`val copy = values; copy.add(1)` 会同时改变 `values`。
+- 变长形参的列表是本次调用独立的，但元素是对象引用时，改元素对象仍会影响调用方。
+- 闭包捕获绑定，不捕获快照。循环变量每次迭代是新绑定，但循环外的 `var` 是共享的。
+- `it` 只指最内层 lambda；嵌套时显式命名外层参数。
+- 尾块只能绑定最后一个固定函数形参；不要把 `if`、`for` 的控制块写成尾块。
+
+## 练习
+
+1. 写一个 `applyTwice<T>(value: T, transform: (T) -> T): T`，把 `transform` 连续应用两次。
+2. 用 `stringMap<Int>()` 统计一段文本中出现次数最多的单词；同次数时按字典序选第一个。
+3. 把 `[1, 2, 3, 4]` 过滤出偶数，平方后求和，分别用方法链和自由函数两种写法完成。
+
+下一章进入泛型和接口：如何写对类型参数、结构约束、关联类型，以及 `dyn`、extension 和 `implicit` 转换各自解决什么问题。

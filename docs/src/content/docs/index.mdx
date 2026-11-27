@@ -1,0 +1,48 @@
+---
+title: Lyra 文档
+description: 从第一段程序到可交付服务的 Lyra 教程。
+template: splash
+hero:
+  tagline: 一门使用 LLVM AOT 的编译型语言。用 GC 换掉生命周期标注，用冷 Task 组织并发，把业务失败写进类型。
+  actions:
+    - text: 开始教程
+      link: guide/what-is-lyra/
+      icon: right-arrow
+      variant: primary
+    - text: 查看 GitHub
+      link: https://github.com/isyuah/lyra
+      icon: external
+---
+
+import { CardGrid, LinkCard } from "@astrojs/starlight/components";
+
+## 这套教程怎么用
+
+教程按一条真实的工程路径推进：先写出可运行的小程序，再建立类型与错误模型，最后把同一套写法用到 JSONL CLI 和 HTTP/SQLite 服务上。每一章都有可复制的 Lyra 代码和预期输出；示例以当前仓库（0.1 Alpha）的实现为准。
+
+<CardGrid>
+  <LinkCard
+    title="第一次接触 Lyra"
+    href="guide/what-is-lyra/"
+    description="先弄清 GC、AOT、表达式导向和冷 Task 分别改变了什么，再安装工具链。"
+  />
+  <LinkCard
+    title="语言基础"
+    href="guide/values-and-control-flow/"
+    description="值、绑定、运算符、块表达式和控制流。"
+  />
+  <LinkCard
+    title="数据与错误"
+    href="guide/data-modeling/"
+    description="struct/class/enum、Option/Result、模式匹配与资源清理。"
+  />
+  <LinkCard
+    title="异步与并发"
+    href="guide/async-concurrency/"
+    description="冷 Task、执行域、任务组、Channel 和取消。"
+  />
+</CardGrid>
+
+## 版本边界
+
+当前文档对应 Lyra `0.1.0-alpha.1` 的仓库工作树。语言和包格式仍在开发期；教程只讲解编译器已经实现、仓库测试或示例能够验证的行为。RFC 中“已接受但未实现”的设计不会写成可用 API。

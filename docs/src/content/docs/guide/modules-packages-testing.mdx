@@ -1,0 +1,162 @@
+---
+title: 模块、包与测试
+description: 目录模块、导入、可见性、workspace、锁文件和测试。
+---
+
+Lyra 的工程单位是包，代码单位是模块。一个目录组成一个模块，同目录的多个文件共享模块命名空间；模块路径来自相对 `src` 的目录结构，不包含文件名。包由 `lyra.json5` 描述，workspace 把多个本地包放在同一张依赖图里。
+
+这一章把这些规则放到一个可运行的 workspace 里，并说明测试、锁文件和离线构建。
+
+## 目录模块
+
+```text
+demo/
+├── lyra.json5
+├── app/
+│   ├── lyra.json5
+│   ├── src/
+│   │   └── main.ly
+│   └── tests/
+│       └── endpoint.ly
+└── config/
+    ├── lyra.json5
+    └── src/
+        └── config.ly
+```
+
+- `config/src/config.ly` 属于 `config` 包的根模块。
+- `config/src/net/defaults.ly` 属于 `self.net` 模块；同目录的 `model.ly` 也在 `self.net` 里。
+- 把声明拆到同目录的多个文件不会改变模块路径；移到另一个目录才会改变。
+- 导入父模块不会自动引入子模块；要用 `import self.net` 或 `import self.net.{...}` 显式导入。
+
+`config` 包公开一个类型和一个函数：
+
+```lyra no-check
+pub struct Endpoint(pub val host: String, pub val port: Int)
+
+pub fn localhost(): Endpoint { Endpoint("127.0.0.1", 8080) }
+
+fn hidden(): Int { 1 }
+```
+
+`hidden` 没有 `pub`，只在 `config` 包的同一模块内可见。公开签名里不能出现私有类型；`pub struct Endpoint` 的字段也需要逐字段写 `pub` 才能跨模块访问。
+
+`app` 包导入 `config`：
+
+```lyra no-check
+import cfg.{Endpoint, localhost as local}
+
+fn main(): Unit {
+    val endpoint: Endpoint = local()
+    print("${endpoint.host}:${endpoint.port}")
+}
+```
+
+依赖简称 `cfg` 只在 `app` 的清单里生效，不是包名。`import cfg.{...}` 只把列出的名字引入当前文件；`import cfg` 则绑定模块名 `cfg`，用 `cfg.Endpoint` 访问。导入是文件局部的，同包其他文件看不到这条导入。
+
+## 导入与可见性
+
+- `import cfg.net` 绑定 `net`；`import cfg.net as remote` 换名；`import cfg.net.{Endpoint, localhost as local}` 引入裸名。
+- 分组可以跨行、允许尾逗号，不支持 `*` 或嵌套分组。
+- 同一文件的导入名不能互相重名，也不能和本模块声明重名；用 `as` 消歧。
+- `pub import cfg.net.{Endpoint as PublicEndpoint}` 显式重导出。不能 `pub import cfg.net` 重导出整个模块。
+- `import macro` 和 `import decorator` 使用独立的编译期命名空间，和普通导入分开。
+- 未写 `pub` 的声明只在本模块可见；workspace 里的兄弟包也不会绕过这条边界。
+
+## 包清单与 workspace
+
+根目录的 `lyra.json5` 声明 workspace 成员：
+
+```json5
+{ workspace: { members: ["app", "config"] } }
+```
+
+`app/lyra.json5` 声明包名、版本和依赖：
+
+```json5
+{
+  name: "demo/app",
+  version: "0.1.0",
+  dependencies: {
+    cfg: { name: "demo/config", version: "^0.1.0", path: "../config" },
+  },
+}
+```
+
+`config/lyra.json5` 是库包：
+
+```json5
+{ name: "demo/config", version: "0.1.0", kind: "lib" }
+```
+
+`kind` 为 `app` 时必须有入口 `fn main`；`lib` 可以没有。依赖项里的 `name` 是被依赖包的真实包名，`version` 是 SemVer 约束，`path` 指向本地目录。把 `path` 换成 `registry` 或 HTTP(S) 源时，源码里的 `import cfg...` 不需要改，只有解析来源和锁内容变化。
+
+从 workspace 根运行：
+
+```bash
+lyra run demo/app
+lyra test demo/app
+lyra lock demo/app
+```
+
+`lyra lock` 在 workspace 根生成 `lyra.lock`，记录整张依赖图、来源、确切版本和内容摘要。锁文件应该提交到版本控制；`build/`、`.lyra-cache/` 和缓存目录不应该提交。
+
+`--locked` 要求现有锁与清单兼容，缺锁或清单变化会失败；`--offline` 禁止联网，只使用本地路径、静态中心和已校验缓存。两者可以一起用：
+
+```bash
+lyra run demo/app --release --locked --offline
+lyra test demo/app --locked --offline
+```
+
+## 测试
+
+测试文件放在包的 `tests/` 下，每个 `.ly` 文件都是一个独立程序，必须有 `fn main(): Unit`。测试可以导入当前包的公开 API，也可以导入包的依赖：
+
+```lyra no-check
+import cfg.{localhost}
+
+fn main(): Unit {
+    #assert(localhost().port == 8080)
+}
+```
+
+`#assert(condition, message)` 失败时把调用位置和消息写进诊断。测试通过时，`lyra test` 为每个文件打印一行 `ok`；失败时进程以非零状态退出。
+
+常用选项：
+
+```bash
+lyra test demo/app --list
+lyra test demo/app --filter endpoint
+lyra test demo/app --case demo/app/tests/endpoint.ly
+lyra test demo/app --format=json
+lyra test demo/app --timeout-seconds 30
+```
+
+`--list` 只列出测试，不构建也不写锁；`--filter` 按路径子串筛选；`--case` 精确选择；`--format=json` 输出每个测试的状态、退出码和标准输出。测试程序返回 `Int` 时，非零退出码算失败；超时也算失败，并在 JSON 结果里给出 `LYB0003`。
+
+`lyra check` 不会生成可执行文件；`lyra build` 默认输出 Debug 产物，`--release` 输出优化版。类型错误或链接失败不会覆盖已有产物。
+
+## 工程习惯
+
+- 清单和锁文件放在 workspace 根或包根；不要把 `build/`、缓存和临时文件提交。
+- 包的公开 API 由 `pub` 声明和 `pub import` 重导出组成；删改公开名字按破坏性变更处理。
+- 新增模块时先想清楚目录层级；模块路径一旦被其他包导入，移动目录就是破坏性变更。
+- 本地路径依赖适合开发，发布前要换成注册中心来源；发布包不能依赖作者机器上的路径。
+- 测试放在 `tests/`，用 `#assert` 断言行为；不要测试私有实现细节。
+
+## 常见坑
+
+- 模块路径不包含文件名：`src/net/defaults.ly` 是 `self.net`，不是 `self.net.defaults`。
+- 导入父模块不会自动导入子模块。
+- `pub` 只对具名声明生效；字段要单独写 `pub`。
+- 导入是文件局部的；不要指望在 `main.ly` 里的导入能被子目录文件使用。
+- workspace 的锁在根目录；只锁单个成员也会生成整张图。
+- `--locked` 不会替你更新锁；需要更新时先运行 `lyra lock`。
+
+## 练习
+
+1. 把上面的 `demo` workspace 跑起来，给 `Endpoint` 加一个 `pub fn url(path: String): String`，在 `app` 里调用并补一个测试。
+2. 把 `config` 的 `hidden` 改成 `pub`，观察公开 API 和测试的变化；再把它改回去，确认外部无法导入。
+3. 用 `lyra test demo --format=json` 跑整个 workspace，读一遍每个测试的状态和标准输出。
+
+下一章进入元编程与外部边界：标记、装饰器、宏、`#derive`、`const` 求值和 C FFI。

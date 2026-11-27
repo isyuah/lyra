@@ -1,0 +1,141 @@
+---
+title: Lyra 是什么
+description: 先建立 Lyra 的执行模型与设计取舍，再决定怎么用它写代码。
+---
+
+Lyra 是一门使用 LLVM AOT 的编译型语言。编译器把通过静态检查的源码编译成 Windows x64 的 PE 或 Linux x86-64 的 ELF 可执行文件；部署应用时不需要 Lyra、LLVM 或额外的运行时。当前版本是 `0.1.0-alpha.1`，使用范围集中在单机 CLI、可发布的源码库，以及使用 SQLite 的小型 HTTP/HTTPS 服务。
+
+这门语言的设计优先级很明确：业务代码好写、错误好定位，其次才是资源占用和执行速度。理解下面几个取舍，后面的语法就不会显得零散。
+
+## GC 换掉生命周期标注
+
+Lyra 用 GC 管理对象内存。代码里没有所有权类型、借用检查或生命周期参数；`struct` 是值类型，复制时复制字段，`class` 是引用类型，赋值复制引用并保留对象身份。
+
+```lyra
+struct Point(var x: Int, var y: Int)
+
+class Counter(var value: Int)
+
+fn main(): Unit {
+    val origin = Point(0, 0)
+    var copy = origin
+    copy.x = 10
+
+    val counter = Counter(0)
+    val alias = counter
+    alias.value += 1
+
+    print(origin.x)
+    print(copy.x)
+    print(counter.value)
+}
+```
+
+```output
+0
+10
+1
+```
+
+`origin` 和 `copy` 是两个独立的 `Point`；`counter` 和 `alias` 指向同一个 `Counter`。GC 负责回收不再可达的对象，所以不需要在类型上表达“谁拥有这段内存”。代价是内存回收由运行时决定，而不是由编译器在栈上精确安排。
+
+外部资源（文件、连接、SQLite 句柄）仍然是普通引用对象。它们的关闭责任用 `defer` 或作用域 API 表达，不靠所有权类型；这部分在[错误与资源](/guide/errors-resources/)一章展开。
+
+## 表达式导向
+
+Lyra 的块、`if`、`match`、`try/catch` 都可以产生值。块正常结束时，末尾表达式的值就是块的值；在末尾加分号会丢弃结果，块值变成 `Unit`。
+
+```lyra
+fn label(score: Int): String {
+    if score >= 60 { "通过" } else { "未通过" }
+}
+
+fn main(): Unit {
+    print(label(72))
+    print(label(41))
+}
+```
+
+```output
+通过
+未通过
+```
+
+这条规则贯穿整个语言：函数体、`match` 分支、`try` 块和 lambda 都按同一套规则取值。写代码时可以先想“这个块最后留下什么值”，而不是先想“这里要写几条语句”。
+
+## 两条错误通道
+
+Lyra 把可预期的业务失败和程序约定被破坏分开：
+
+- `Result<T,E>` 和 `Option<T>` 表示调用者应该处理的失败或缺失，配合 `?` 提前返回。
+- `Exception` / `try` / `catch` 表示异常路径；未捕获的异常会带着 Lyra 源码位置终止程序。
+- `defer` 负责离开作用域时的清理，不依赖异常是否发生。
+
+```lyra
+import std.text.{StringOps}
+
+fn parsePort(text: String): Result<Int,String> {
+    match text.parseInt() {
+        Ok(port) if port > 0 && port <= 65535 => Ok(port),
+        Ok(_) => Err("端口超出范围"),
+        Err(_) => Err("端口不是整数"),
+    }
+}
+
+fn main(): Unit {
+    for input in ["8080", "70000", "abc"] {
+        print(match parsePort(input) {
+            Ok(port) => "ok ${port}",
+            Err(reason) => "bad: ${reason}",
+        })
+    }
+}
+```
+
+```output
+ok 8080
+bad: 端口超出范围
+bad: 端口不是整数
+```
+
+业务失败不会因为忘记检查而变成空指针或未定义行为；异常也不应该拿来表达“用户输入不合法”这类正常分支。两种通道的分工会在数据建模和错误处理两章里反复出现。
+
+## 冷 Task 与执行域
+
+调用 `async fn` 不会立刻执行函数体，而是返回一个冷 `Task<T>`；第一次 `await` 或 `spawn` 才启动。重复 `await` 同一个 Task 会复用第一次的结果。普通 `spawn` 在同一个串行执行域里排队，跨域并行需要显式使用 `parallel` 或 `parallelFor`。
+
+```lyra
+async fn twice(value: Int): Int {
+    print("started ${value}")
+    await sleepMs(0)
+    value * 2
+}
+
+async fn main(): Unit {
+    val cold = twice(21)
+    print("created")
+    print(await cold)
+    print(await cold)
+}
+```
+
+```output
+created
+started 21
+42
+42
+```
+
+这个模型让“创建任务”和“开始执行”分开，也让并发边界显式可见。异步、任务组、Channel 和取消集中在[异步与并发](/guide/async-concurrency/)一章。
+
+## 工具链和标准库随包提供
+
+编译器、LLVM 后端、链接器、GC、libuv、SQLite 和 TLS 库由 Lyra SDK 提供。普通构建不需要宿主 `clang`、`cmake` 或系统 SQLite 开发包；编译出的应用也不需要带 Lyra 运行时。标准库源码由工具链解析，编译产物不需要复制 `.ly` 文件。
+
+这意味着项目里只有几类东西：`lyra.json5` 清单、`src/` 下的 Lyra 源码、`tests/` 下的测试，以及构建产物。下一章会从 `lyra new` 开始，把这个结构跑通。
+
+## 当前边界
+
+`0.1 Alpha` 不是完整语言规范。编译器已经实现的能力以仓库测试和示例为准；RFC 里标注为“已接受但未实现”或仍开放的设计，不应该当成可用 API。教程会在涉及边界时明确写出“当前限制”，而不是把设计草稿包装成承诺。
+
+下一章先安装 SDK，建立第一个项目，并用 `check`、`run`、`test` 三个命令确认工具链工作正常。

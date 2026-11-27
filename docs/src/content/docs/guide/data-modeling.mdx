@@ -1,0 +1,272 @@
+---
+title: 数据建模
+description: 用 struct、class、enum、Option 和 Result 表达数据与状态。
+---
+
+Lyra 用三种类型组织业务数据：`struct` 是值类型，`class` 是引用类型，`enum` 是封闭的标签联合。`Option` 和 `Result` 不是特殊语法，它们是标准库里普通的 `enum`，只是编译器为它们提供了 `T?`、`Some`、`None`、`Ok`、`Err` 和 `?` 等便利写法。
+
+这一章的目标是：看到一段数据时，能判断复制它会发生什么、空值在哪里、状态是否穷尽。
+
+## struct：复制值
+
+`struct` 的主构造参数直接声明字段。字段可以是 `val`（初始化后不可改）或 `var`（可改）。构造时按字段名传参，顺序可以调整。
+
+```lyra
+class User(var name: String)
+struct Profile { var title: String; val owner: User }
+struct Wrapper(val profile: Profile)
+
+fn main(): Unit {
+    val original = Profile(owner: User("Lin"), title: "原稿")
+    var copy = original
+    copy.title = "修订"
+
+    val wrapper = Wrapper(copy)
+    wrapper.profile.owner.name = "Ada"
+
+    print(original.title)
+    print(copy.title)
+    print(original.owner.name)
+    if original.owner == copy.owner { print(1) }
+}
+```
+
+```output
+原稿
+修订
+Ada
+1
+```
+
+`copy = original` 复制了 `Profile` 的值：`title` 是独立的，改 `copy.title` 不影响 `original.title`。但 `owner` 是 `class` 引用，复制的是引用本身，所以 `original.owner` 和 `copy.owner` 仍指向同一个 `User`；通过任意一个别名改 `name`，另一个都能看到。
+
+这就是“值字段独立、引用字段共享”的规则。它不递归克隆整个对象图；需要深拷贝时，自己写显式的复制函数。
+
+`struct` 的字段可以有默认值，默认表达式在构造时求值，并且可以引用前面的字段：
+
+```lyra
+struct Span(val start: Int, val end: Int = start + 1) {
+    fn width(): Int { end - start }
+}
+
+fn main(): Unit {
+    print(Span(3).width())
+    print(Span(3, 10).width())
+}
+```
+
+```output
+1
+7
+```
+
+字段默认值不是“省略时补一个常量”，而是每次构造都执行的表达式。对 `class` 来说，默认值按实例分配；如果默认值是 `List`，每个实例会得到自己的列表。
+
+## class：保留对象身份
+
+`class` 是引用类型。赋值、传参和放进容器都复制引用，对象身份保持不变。普通对象由 GC 管理。
+
+```lyra
+class Badge {
+    val title: String
+    var count: Int = 0
+    init(title: String) { this.title = title }
+
+    fn label(): String { "${title} x${count}" }
+    fn bump(by: Int = 1): Unit { count += by }
+    val doubled: Int get() { count * 2 }
+
+    static fn defaultBadge(): Badge { Badge("guest") }
+}
+
+struct Point(val x: Int, val y: Int) {
+    fn sum(): Int { x + y }
+}
+
+fn main(): Unit {
+    val badge = Badge.defaultBadge()
+    badge.bump()
+    badge.bump(by: 2)
+    print(badge.label())
+    print(badge.doubled)
+    print(Point(2, 3).sum())
+}
+```
+
+```output
+guest x3
+6
+5
+```
+
+要点：
+
+- 实例方法不用声明接收者，方法体里直接读字段；参数名和字段同名时用 `this.name` 区分。
+- `init` 用于需要计算或检查的构造。字段声明为 `val` 时，每条正常路径都必须初始化一次；`init` 里可以给 `val` 字段赋值一次。
+- `static fn` 属于类型，不接收实例，用 `Badge.defaultBadge()` 调用；静态方法里没有 `this`。
+- `val doubled: Int get() { ... }` 是只读计算属性。它不占字段布局，读取时执行 getter，不能赋值。
+- `Point(2, 3).sum()` 里 `Point` 是值类型，接收者按值传入；`class` 接收者保留对象身份。
+
+`class` 的 `==` 和 `!=` 固定按对象身份比较，不能被方法覆盖。`struct` 的默认相等按字段递归比较，`enum` 按活动分支和载荷比较，`Option`、`Result` 也按标签和载荷比较。
+
+```lyra
+struct Point(val x: Int, val y: Int)
+class Node(val id: Int)
+
+fn main(): Unit {
+    print(Point(1, 2) == Point(1, 2))
+    print(Node(1) == Node(1))
+    print(Some(2) == Some(2))
+}
+```
+
+```output
+true
+false
+true
+```
+
+## enum：把状态写进类型
+
+`enum` 的每个分支可以有位置载荷或命名载荷。分支可以没有载荷；整个 `enum` 是封闭的，`match` 必须穷尽所有分支。
+
+```lyra
+enum FetchResult {
+    Pending,
+    Ok(status: Int, body: String),
+    Err(String);
+}
+
+fn display(result: FetchResult): String {
+    match result {
+        FetchResult.Pending => "pending",
+        Ok(status: 200, body: text) => text,
+        Ok(status: code, body: _) => "status ${code}",
+        Err(message) => message,
+    }
+}
+
+fn main(): Unit {
+    print(display(FetchResult.Pending))
+    print(display(FetchResult.Ok(status: 200, body: "arrived")))
+    print(display(FetchResult.Ok(status: 404, body: "missing")))
+    print(display(FetchResult.Err("failed")))
+}
+```
+
+```output
+pending
+arrived
+status 404
+failed
+```
+
+`match` 的分支可以：
+
+- 解构位置载荷：`Err(message) => ...`。
+- 解构命名载荷：`Ok(status: 200, body: text) => ...`；顺序可以调整。
+- 用 `_` 忽略不需要的部分。
+- 用 `|` 合并分支：`Text(value) | Failure(value) => value`；两侧绑定必须同名同类型。
+- 用整数范围：`-10..<0`、`0..2`。
+- 带守卫：`Some(x) if x > 0 => x`。
+
+`match` 本身是表达式，所有分支会合流到共同类型。编译器会检查 `enum`、`Option` 和 `Result` 的分支是否穷尽；漏掉分支是编译错误，不是运行时默认值。
+
+`enum` 可以有实例方法，也可以递归：
+
+```lyra
+enum Load<T> { Wait, Ready(T);
+    fn value(fallback: T): T {
+        match this { Wait => fallback, Ready(item) => item }
+    }
+}
+
+enum Tree { Leaf, Node(Int, Tree, Tree) }
+
+fn main(): Unit {
+    print(Load<Int>.Wait.value(0))
+    print(Load.Ready(42).value(0))
+    print(match Tree.Node(1, Tree.Leaf, Tree.Leaf) { Node(value, _, _) => value, Leaf => 0 })
+}
+```
+
+```output
+0
+42
+1
+```
+
+## Option 与 Result
+
+`Option<T>` 表示“可能有值”，简写为 `T?`；`Result<T,E>` 表示“成功或失败”。它们的构造和匹配不需要导入：
+
+```lyra
+fn findUser(users: List<String>, name: String): String? {
+    for user in users {
+        if user == name { return Some(user) }
+    }
+    None
+}
+
+fn main(): Unit {
+    val users = ["Ada", "Lin"]
+    print(findUser(users, "Ada") ?? "missing")
+    print(findUser(users, "Grace") ?? "missing")
+
+    if let Some(name) = findUser(users, "Lin") {
+        print("found ${name}")
+    }
+
+    var index = 0
+    while let Some(name) = users.getOrNone(index) {
+        print(name)
+        index += 1
+    }
+}
+```
+
+```output
+Ada
+missing
+found Lin
+Ada
+Lin
+```
+
+`??` 只在左侧为空时求右侧；`?.` 只在接收者非空时访问成员，并把结果保持为 `Option`。可选链会把嵌套的可空成员压平，所以下面三个会话分别得到 `unknown`、`unknown`、`Ada`：
+
+```lyra
+class User(val name: String?)
+class Session(val user: User?)
+
+fn main(): Unit {
+    val sessions = [Session(null), Session(User(null)), Session(User("Ada"))]
+    for session in sessions {
+        print(session.user?.name ?? "unknown")
+    }
+}
+```
+
+```output
+unknown
+unknown
+Ada
+```
+
+`Result` 的 `Ok` / `Err` 和 `Option` 的 `Some` / `None` 一样，可以 `match`、`if let`，也可以用标准库方法组合。完整的方法表、`?` 的传播规则和错误类型转换放在[错误与资源](/guide/errors-resources/)一章。
+
+## 常见坑
+
+- `struct` 复制不克隆 `class` 字段。需要独立对象时，显式构造一个新的。
+- `val` 绑定不可重赋值，但 `val` 持有的 `class` 对象仍可能被改字段；看字段自己的 `val` / `var`。
+- `class` 的 `==` 是身份比较，不是内容比较；两个字段相同的新对象不相等。
+- `T?` 可以嵌套，例如 `String??`。`Some(None)` 和 `None` 是不同状态；`?.` 和 `??` 会按层处理，写的时候注意当前值到底是哪一层。
+- `match` 必须穷尽。用 `_` 兜底会放弃编译器的穷尽检查；新增分支时容易漏掉业务逻辑。
+
+## 练习
+
+1. 定义 `enum Shape { Circle(radius: Float), Rect(width: Float, height: Float) }`，写 `area(shape: Shape): Float`，用 `match` 覆盖两个分支。
+2. 给 `Badge` 加一个 `static fn fromName(name: String): Badge`，并加一个只读计算属性 `label`。
+3. 写一个 `findUser` 的 `Result` 版本：用户不存在时返回 `Err("not found")`，找到时返回 `Ok(User)`；用 `if let` 和 `match` 各消费一次。
+
+下一章把函数、闭包和集合放在一起：参数怎么绑定、函数值怎么传、闭包捕获什么，以及 `List`、`HashMap`、`HashSet` 的常用操作。

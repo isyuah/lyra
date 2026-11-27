@@ -1,0 +1,214 @@
+---
+title: 元编程与外部边界
+description: 标记、装饰器、宏、#derive、const 求值和 C FFI。
+---
+
+Lyra 的元编程分成几层：标记和装饰器改变声明周围的生成代码；`#derive` 是标准库提供的声明宏；`const` / `const fn` 在编译期求值；`extern fn` 和 `unsafe` 处理 C 边界。它们的共同点是：生成物仍然经过普通的名称解析、可见性和类型检查，宏不能绕过语言规则。
+
+## 标记与装饰器
+
+标记写在形参或字段前，用方括号；装饰器写在声明前，用 `@`。标准 HTTP 路由就是一组标记加声明宏：
+
+```lyra
+import std.http
+
+#get("/hello/{name}")
+async fn hello([path] name: String): http.Response {
+    http.Response.text(200, "Hello, ${name}")
+}
+```
+
+`#get` 在编译期为这个 handler 生成私有适配器，把路径参数解码后传给 `name`；`#mountRoutes(router, deps)` 再按包汇总所有 `#get` / `#post` 路由，一次交给 `Router`。生成的适配器不是公开 API，运行时也不扫描声明。
+
+`[query("tag")]`、`[body("codec")]`、`[inject]` 分别读取查询参数、JSON 请求体和依赖注入值。它们只在声明宏展开时生效，普通函数调用看不到这些标记。
+
+`@trace` 是标准库自带的装饰器，在函数进入时打印目标名：
+
+```lyra
+@trace
+fn add(left: Int, right: Int): Int { left + right }
+
+fn main(): Unit { print(add(2, 3)) }
+```
+
+```output
+trace: add
+5
+```
+
+装饰器可以包装同步函数、实例方法和异步函数。异步函数的包装保留冷 `Task`：构造任务时不运行钩子，第一次激活才执行包装体。多层装饰器从外向内进入，返回值和异常按内向外处理。
+
+## #derive(Json) 与 #derive(Toml)
+
+`#derive(Json)` 为当前模块的 `struct` / `enum` 生成 `encode类型名`、`decode类型名` 和 `jsonCodec类型名()`。生成物默认模块私有；需要跨包复用时，用公开工厂返回 `JsonCodec<T>`。
+
+```lyra
+#derive(Json)
+struct User(pub val id: Int, [jsonName("display-name")] pub val name: String)
+
+fn main(): Unit {
+    val text = encodeUser(User(7, "Ada"))
+    print(text)
+    match decodeUser(text) {
+        Ok(user) => print(user.name),
+        Err(reason) => print(reason),
+    }
+}
+```
+
+```output
+{"id":7,"display-name":"Ada"}
+Ada
+```
+
+`[jsonName("display-name")]` 改变线格式的键名，Lyra 代码仍访问 `user.name`。解码默认拒绝未知键；需要宽松解码时用 `decodeUserIgnoringUnknownFields(text)`。字段默认值、可空字段和嵌套 `Option` 的状态规则见 `std.json` 文档；类身份图需要手写映射。
+
+`#derive(Toml)` 的入口是 `encode类型名`、`decode类型名`，对配置结构同样默认严格：
+
+```lyra
+#derive(Toml)
+struct Server(pub val host: String, pub val port: UInt16 = 8080)
+
+#derive(Toml)
+struct Config(pub val servers: List<Server>, pub val debug: Bool = false)
+
+fn main(): Unit {
+    val config = Config([Server("localhost")], true)
+    val text = encodeConfigToml(config)
+    print(text)
+    match decodeConfigToml(text) {
+        Ok(value) => print(value.servers[0].port),
+        Err(reason) => print(reason),
+    }
+}
+```
+
+```output
+servers = [{host = "localhost", port = 8080}]
+debug = true
+8080
+```
+
+派生器本身是 Lyra 宏，源码在 `std/meta/macros/derive.ly`；生成代码和手写代码一起做静态检查。JSON/TOML 格式不能表示的多层空值、对象身份图等仍需显式映射，派生不会静默丢信息。
+
+## 宏的边界
+
+`#assert` 是内置的表达式宏：条件为假时把调用位置和消息写进诊断。自定义宏用 Lyra 编写，入口返回 `Syntax`，放在包的编译期目录：
+
+| 目录 | 用途 | 调用写法 |
+|---|---|---|
+| `src/.macros/` | 普通声明宏 | `#name` |
+| `src/.typedMacros/` | 类型宏 | `#name` |
+| `src/.expressions/` | 表达式宏 | `#name(...)` |
+| `src/.decorators/` | 装饰器 | `@name` |
+
+宏可以读取目标声明、函数体、实参文本和授权的外部快照，然后用 `syntaxCode`、`quote` / `splice` 或 `syntaxCall` 等构造生成物。生成物进入正常类型检查，宏不能绕过可见性或类型规则。
+
+```lyra no-check
+pub fn increment(target: String, argument: String): Syntax {
+    val input = syntaxArgument(0)
+    quote { splice(input) + 1 }
+}
+```
+
+宏读取的外部文件必须在调用包的 `macroInputs` 中按使用处名称显式授权；展开只读这些快照，不联网、不启动准备脚本、不读取其他宿主文件或环境变量。宏展开受嵌套深度、节点数、源码字节数和求值步数限制，耗尽预算会给出宏诊断。
+
+## const 与编译期求值
+
+`const fn` 和 `const` 在编译期求值。纯同步函数、结构体、枚举、`Option`、`Result` 和 `FrozenList` 都可以参与；`print`、I/O、网络、随机数和未授权的外部输入不行。
+
+```lyra
+const fn double(value: Int): Int { value * 2 }
+const answer: Int = double(21)
+const Values: FrozenList<Int> = FrozenList([1, 2, 3])
+
+fn main(): Unit {
+    print(answer)
+    print(Values.size)
+}
+```
+
+```output
+42
+3
+```
+
+`FrozenList` 是只读浅快照，适合把编译期算出的列表发布成常量。常量求值失败是编译诊断，不会留到运行时；超出求值预算也会报错。不要用 `const` 做需要外部状态的工作。
+
+## 反射
+
+`std.reflect` 提供显式的运行时字段读取，只列公开字段：
+
+```lyra
+import std.reflect.{typeName}
+import std.reflect.{fieldCount}
+import std.reflect.{fieldNames}
+import std.reflect.{field}
+
+struct User(pub val name: String, pub val age: Int)
+
+fn main(): Unit {
+    val value: Any = User("Ada", 42)
+    print(value.typeName())
+    print(value.fieldCount())
+    for name in value.fieldNames() { print(name) }
+    match value.field("name") {
+        Some(item) => print(item as? String ?? "not a string"),
+        None => print("missing"),
+    }
+}
+```
+
+```output
+User
+2
+name
+age
+Ada
+```
+
+反射只读取公开字段，不提供动态写入、构造或 Class 身份图遍历。JSON/TOML 仍优先使用静态派生；反射是显式入口，不是自动兜底。
+
+## C FFI
+
+`extern fn` 声明 C ABI 函数。参数和返回值必须按 C ABI 对照表映射：
+
+| Lyra 声明 | C ABI |
+|---|---|
+| `Int` | `int64_t`，不是 32 位 `int` |
+| `Bool` | `uint8_t`，传 `0/1`，返回非零为真 |
+| `CPtr` | 不透明 C 指针；安全代码不解引用、不做指针算术 |
+| `String` | 不可变、有长度的 UTF-8 句柄，不是 `char*` |
+| `Bytes` | 不可变、带长度的字节句柄，不是 `unsigned char*` |
+| 返回 `Unit` | C `void`；不能作为形参 |
+
+```lyra
+extern fn llabs(value: Int): Int;
+
+fn main(): Unit { print(llabs(-12)) }
+```
+
+```output
+12
+```
+
+声明 C 函数属于受信任的底层边界。作者必须对照 C 头文件保证 ABI、线程和生命周期相符；绑定需要原生指针或出参时，通常写一层薄 C 适配层。`unsafe` 块支持定宽指针读写和同步闭包回调；Lyra 异常不能未经明确适配越过 C 帧。
+
+`lyra import-c api.h -I include -o src/bindings.ly` 用 SDK 自带的 Clang 解析头文件并生成 `extern` 声明。`--link` 接受 Linux 的 `.o`、`.a`、`.so`，或 Windows x64 COFF 的 `.obj`、`.lib`、`.a`。包的 `native` 清单可以随包分发 C 源码和目标静态库，构建时自动编译并链接传递依赖。
+
+## 常见坑
+
+- 宏生成的代码不是“跳过检查”的后门；可见性、类型和泛型规则照常生效。
+- 宏输入必须显式授权；普通构建不联网、不执行准备脚本。
+- `const` 只能做纯同步求值；不要依赖时间、环境或文件。
+- 反射只列公开字段；私有字段不会出现在 `fieldNames()` 里。
+- C ABI 的 `Int` 是 64 位；按 C 的 `int` 声明会错位。
+- 异常不能跨 C 帧；在边界处转换成错误码或明确的致命故障。
+
+## 练习
+
+1. 给 `User` 加 `[jsonName("user-id")]`，观察编码键名和错误路径的变化。
+2. 写一个 `const fn` 计算固定长度的查找表，并用 `FrozenList` 暴露；尝试在 `const` 里调用 `print`，读一遍编译诊断。
+3. 用 `extern fn` 声明一个 libc 函数并在 `main` 里调用；再用 `lyra import-c` 为一个小头文件生成绑定，比较自动生成和手写声明的差异。
+
+下一章用 `examples/jsonlines` 把这些能力串起来：一个可发布的库、一个 CLI、配置、错误和离线构建。

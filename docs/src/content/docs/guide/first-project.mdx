@@ -1,0 +1,137 @@
+---
+title: 第一个项目
+description: 用 lyra new 建立项目，跑通 check、run 和 test。
+---
+
+这一章只做一件事：把工具链和项目结构跑通。完成后你应该能创建项目、修改源码、运行测试，并知道每个命令生成了什么。
+
+## 安装 SDK
+
+从 [GitHub Releases](https://github.com/isyuah/lyra/releases) 下载对应平台的 SDK。Windows 解压后直接使用 `bin/lyra.exe`，不需要安装 Clang、LLVM、VS Build Tools 或 Visual C++ Redistributable；Ubuntu 22.04 解压后把 `bin` 加入 `PATH` 即可。
+
+```bash
+# Linux x86-64
+tar -xzf lyra-0.1.0-alpha.1-ubuntu22.04-x86_64.tar.gz
+export PATH="$PWD/lyra-0.1.0-alpha.1-ubuntu22.04-x86_64/bin:$PATH"
+lyra --version
+```
+
+```powershell
+# Windows x64（普通 PowerShell 即可）
+Expand-Archive lyra-0.1.0-alpha.1-windows-x64.zip -DestinationPath .
+$lyra = Resolve-Path 'lyra-0.1.0-alpha.1-windows-x64/bin/lyra.exe'
+& $lyra --version
+```
+
+后文统一写 `lyra`；如果你没有把 SDK 的 `bin` 加入 `PATH`，换成实际的可执行文件路径即可。
+
+## 创建项目
+
+```bash
+lyra new hello
+```
+
+生成的目录结构如下：
+
+```text
+hello/
+├── lyra.json5
+├── src/
+│   └── main.ly
+└── tests/
+    └── answer.ly
+```
+
+`lyra.json5` 是包清单：
+
+```json
+{
+  "dependencies": {},
+  "kind": "app",
+  "name": "hello",
+  "version": "0.1.0"
+}
+```
+
+`kind` 为 `app` 时项目需要入口 `fn main`；库项目写 `kind: "lib"`，可以没有 `main`，供其他包导入。`dependencies` 记录依赖的包名、版本和来源，`lyra lock` 会把解析结果写入 `lyra.lock`。
+
+入口文件是 `src/main.ly`：
+
+```lyra
+pub fn answer(): Int { 42 }
+
+fn main(): Unit { print(answer()) }
+```
+
+```output
+42
+```
+
+一个目录是一个模块。`src/main.ly` 是包的根模块；`src/tools/math.ly` 会变成 `self.tools.math`。`pub` 决定声明是否跨模块可见。模块和包的完整规则在[模块、包与测试](/guide/modules-packages-testing/)一章展开。
+
+测试放在 `tests/` 下，每个 `.ly` 文件就是一个独立测试程序：
+
+```lyra no-check
+import self.{answer}
+
+fn main(): Unit {
+    #assert(answer() == 42, "expected 42")
+}
+```
+
+`import self.{answer}` 从当前包的公开 API 引入 `answer`；`#assert` 失败时会把调用位置和消息写进诊断。测试通过时，`lyra test` 会为每个文件打印一行 `ok`。
+
+## 三个命令
+
+```bash
+lyra check hello
+lyra run hello
+lyra test hello
+```
+
+```text
+ok hello/answer.ly
+42
+```
+
+`check` 只做类型检查和诊断，不生成原生产物；`run` 编译并运行；`test` 编译并运行 `tests/*.ly`。三个命令都接受 `--diagnostics=json`，诊断写到标准错误，成功时输出 `[]`。
+
+构建发布版本：
+
+```bash
+lyra build hello --release
+```
+
+产物默认在 `hello/build/release/app.exe`（Windows）或 `hello/build/release/app`（Linux）。部署时只需要分发这个可执行文件，不需要带 Lyra 或 SDK。Debug 构建默认开启 `-O0` 和源码级调试信息；`--release` 使用 `-O2`，需要符号时再加 `--debug-info`。
+
+## 依赖与离线构建
+
+如果项目有依赖，先解析并写锁文件：
+
+```bash
+lyra lock hello
+lyra test hello --locked --offline
+lyra run hello --release --locked --offline
+```
+
+`--locked` 要求现有 `lyra.lock` 与清单一致，不会悄悄改依赖；`--offline` 禁止访问网络，只使用已缓存的包。新项目没有依赖时，这两个选项也可以直接用于验证可离线构建。
+
+## 诊断与格式化
+
+把诊断接进编辑器或 CI 时，用 JSON 输出：
+
+```bash
+lyra check hello --diagnostics=json
+```
+
+诊断数组里的 `range.start/end` 是左闭右开的源码范围：`offset` 是从 0 开始的 UTF-8 字节偏移，`line/column` 从 1 开始，列按 Unicode 码点计。失败时进程以非零状态退出。
+
+`lyra fmt` 整理显式传入的 `.ly` 文件的缩进和行尾空白；`--check` 只检查不写入。它不会重排语句，也不会改动字面量或注释内容。
+
+## 练习
+
+1. 给 `answer()` 加一个参数，返回 `answer(base: Int): Int`，并同步修改测试。
+2. 运行 `lyra check hello --diagnostics=json`，故意删掉一个分号或改错类型，观察诊断里的 `code`、`range` 和 `message`。
+3. 用 `lyra build hello --release -o hello-app` 把产物输出到自定义路径，确认不依赖 `build/` 目录也能运行。
+
+下一章开始写真正的 Lyra 代码：绑定、基本类型、运算符和控制流。

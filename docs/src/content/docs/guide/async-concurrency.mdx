@@ -1,0 +1,240 @@
+---
+title: 异步与并发
+description: 冷 Task、执行域、任务组、Channel、select、阻塞池和取消。
+---
+
+Lyra 的并发模型有两个关键词：冷 Task 和执行域。调用 `async fn` 不会启动函数体，只返回一个冷 `Task<T>`；第一次 `await` 或 `spawn` 才启动。普通 `spawn` 在同一个串行执行域里排队，跨域并行要显式使用 `parallel` 或 `parallelFor`。
+
+这个模型把“创建任务”和“开始执行”分开，也让并发边界在源码里可见。
+
+## 冷 Task
+
+```lyra
+async fn twice(value: Int): Int {
+    print("started ${value}")
+    await sleepMs(0)
+    value * 2
+}
+
+async fn main(): Unit {
+    val cold = twice(21)
+    print("created")
+    print(await cold)
+    print(await cold)
+}
+```
+
+```output
+created
+started 21
+42
+42
+```
+
+`twice(21)` 只创建 Task，不打印 `started`。第一次 `await` 启动函数体，第二次 `await` 复用第一次的结果，不会重新执行。丢弃 `Task<T>` 会得到警告；如果确实不关心结果，用 `val _ = ...` 明确表示。
+
+`async { ... }` 和 `async (value) => { ... }` 可以直接创建异步块和异步 lambda：
+
+```lyra
+async fn main(): Unit {
+    val cold = async { 21 * 2 }
+    print("created")
+    print(await cold)
+
+    print("before blocking")
+    val result = await blocking {
+        gcCollect()
+        40 + 2
+    }
+    print(result)
+}
+```
+
+```output
+created
+42
+before blocking
+42
+```
+
+`blocking { ... }` 返回一个 Task，把同步工作交给有界线程池；`await` 等待它完成。文件读写、SQLite 调用这类同步 API 应该放进 `blocking`，不要直接占住当前执行域。
+
+## 执行域、任务组与并行
+
+- `spawn task` 在当前串行执行域启动任务，返回 `Task<T>`。同一域里的任务按调度顺序推进；一个任务 `await` 时，同域的其他任务可以继续。
+- `parallel { ... }` 在另一个执行域启动异步块，立即返回已启动的 Task。跨域共享普通可变对象时，复合更新要自己用锁或原子操作保护。
+- `taskGroup { ... }` 在当前域建立子组，等组内所有孩子收尾后再把块尾值交给外层。块里的 `return`、`?` 和 `throw` 只作用于任务体，不跨到外层。
+- `parallelFor(values, maxConcurrency)` 用有界 Worker 并行遍历列表；回调返回 `Task<Unit>`，适合把每项工作丢给异步函数。
+
+```lyra
+async fn work(name: String): Unit {
+    defer print("cleanup ${name}")
+    await sleepMs(0)
+    print("work ${name}")
+}
+
+async fn main(): Unit {
+    taskGroup {
+        spawn work("A");
+        spawn work("B");
+    }
+    print("done")
+}
+```
+
+```output
+work A
+cleanup A
+work B
+cleanup B
+done
+```
+
+`taskGroup` 会等 A、B 都收尾后才继续执行 `print("done")`。块体顶层的 `defer` 在孩子结束后执行；孩子的失败会留在组的作用域内，不会被静默丢弃。
+
+并行遍历用原子操作汇总结果，避免多个域同时改普通变量：
+
+```lyra
+import std.collections.{parallelFor}
+import std.sync.{AtomicInt}
+
+async fn work(value: Int, total: AtomicInt): Unit {
+    val _ = total.fetchAdd(value)
+}
+
+async fn main(): Unit {
+    val total = AtomicInt(0)
+    await parallelFor([1, 2, 3, 4]) { work(it, total) }
+    print(total.load())
+}
+```
+
+```output
+10
+```
+
+`parallelFor` 的并发上限取传入值与 `std.task.parallelism()` 的较小值；Worker 数由 `LYRA_PARALLEL_WORKERS` 配置，默认是 2。遍历期间不要经别名修改输入列表；需要更新数据时，把结果写到独立结构，遍历结束后再合并。
+
+## Channel 与 select
+
+`Channel<T>(capacity)` 创建有界通道。容量为 0 时是直接交接：发送方要等到接收方接手；正容量提供缓冲和背压。`send`、`receive` 返回冷 Task，需要 `await`。
+
+```lyra
+async fn produce(values: Channel<Int?>): Unit {
+    for value in [1, 2, 3] { await values.send(value) }
+    values.close()
+}
+
+async fn main(): Unit {
+    val values = Channel<Int?>(1)
+    val worker = parallel { await produce(values); }
+
+    var total = 0
+    for await value in values { total += value ?? 0 }
+    await worker
+    print(total)
+}
+```
+
+```output
+6
+```
+
+`for await value in values` 一直读到通道关闭；关闭后先读完缓冲再结束。退出循环不会自动关闭通道。`values.close()` 对已经关闭的通道是幂等的；向已关闭通道发送会抛 `ChannelClosed`。
+
+`select` 在多个等待操作里选择一个提交。多个分支同时就绪时按源码顺序；只执行被选中的分支，未选中的 Task 不会启动。
+
+```lyra
+async fn main(): Unit {
+    val values = Channel<Int?>(1)
+
+    print(await select {
+        values.receive() => "received",
+        sleepMs(0) => "timeout",
+    })
+
+    await values.send(7)
+    print(await select {
+        val item = values.receive() => match item { Some(value) => value ?? 0, None => -1 },
+        sleepMs(100) => -2,
+    })
+}
+```
+
+```output
+timeout
+7
+```
+
+第一次 `select` 时通道为空，接收分支未就绪，计时器分支提交，得到 `timeout`。发送 7 之后，接收分支就绪，拿到 `7`。`select` 分支里的绑定只在分支体内有效，不会逃逸到外面；每个分支只能是通道收发或计时器，不能放任意 Task。
+
+不用等待时，可以同步调用 `trySend` / `tryReceive`：
+
+- `trySend(value)` 返回 `ChannelSendResult.Sent`、`.Full` 或 `.Closed`。
+- `tryReceive()` 返回 `ChannelReceiveResult.Received(value)`、`.Empty` 或 `.Closed`。
+- 两个操作和异步收发使用同一个队列，可以直接交接。
+
+## 取消
+
+取消是协作式的，不是强停。运行时在 Lyra 循环回边和递归调用处自动检查取消；`Task.cancelled()` 可查询当前请求，`Task.checkCancellation()` 可显式添加检查点。取消会跳过普通 `catch`，但已登记的 `defer` 仍会执行。
+
+```lyra
+async fn slow(started: Channel<Int>): Unit {
+    defer print("cleanup")
+    await started.send(1)
+    await sleepMs(100)
+    print("finished")
+}
+
+async fn main(): Unit {
+    val started = Channel<Int>(0)
+    val job = spawn slow(started)
+    await started.receive()
+    job.cancel()
+
+    match awaitOutcome(job) {
+        Completed(_) => print("completed"),
+        Failed(problem) => print(problem.message),
+        Cancelled(cleanups) => print("cancelled ${cleanups.size}"),
+    }
+}
+```
+
+```output
+cleanup
+cancelled 0
+```
+
+`awaitOutcome` 把目标的成功、失败和取消分别表示为 `Completed`、`Failed`、`Cancelled`，不会把取消伪装成普通异常。`Cancelled(cleanups)` 里的列表是清理失败的快照；清理本身成功时为空。重复 `awaitOutcome` 仍然复用第一次的结果。
+
+取消一个还没启动的 Task，函数体不会执行，也不会有清理；取消一个正在运行的任务，会等它执行完已登记的同步清理后再结束。取消不会自动取消兄弟任务；需要整个组一起停时，用 `taskGroup` 的结构化边界或显式取消每个句柄。
+
+## 异步入口
+
+`async fn main(): Unit` 由运行时驱动。需要把业务错误报告给进程退出状态时，可以写：
+
+```lyra
+async fn main(): Result<Unit,String> {
+    await sleepMs(0)
+    Err("configuration is invalid")
+}
+```
+
+返回 `Err` 时，消息写到标准错误，进程以非零状态退出，不经过普通 `try/catch`。返回 `Ok({})` 或 `Unit` 表示成功。异步入口仍然会等待任务组和已启动的孩子完成清理。
+
+## 常见坑
+
+- 调用 `async fn` 不会执行函数体；忘记 `await` 或 `spawn` 会得到“丢弃 Task”的警告。
+- 重复 `await` 不会重新运行任务；它复用第一次的结果。
+- `spawn` 是同一串行域，不是并行。需要跨域并行时写 `parallel` 或 `parallelFor`。
+- 在异步代码里直接做同步文件或 SQLite 操作会占住执行域；放进 `blocking`。
+- `for await` 退出不会关闭通道；关闭责任在发送方或明确的所有者。
+- 取消不是强停；同步 C 调用不会被强行打断，必须让它安全收尾。
+
+## 练习
+
+1. 写一个生产者/消费者：生产者向容量为 1 的 `Channel<Int>` 发送 1 到 5，消费者用 `for await` 求和并打印。
+2. 用 `select` 实现“从通道收一条消息，最多等 50 毫秒”；超时时打印 `timeout`。
+3. 用 `parallelFor` 并行计算一组数字的平方和，用 `AtomicInt` 汇总；对比单线程 `fold` 的结果。
+
+下一章回到工程侧：目录模块、导入、可见性、workspace、锁文件和测试如何组织一个可发布项目。

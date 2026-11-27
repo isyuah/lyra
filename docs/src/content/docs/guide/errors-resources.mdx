@@ -1,0 +1,238 @@
+---
+title: 错误与资源
+description: Result、?、异常、defer 和取消如何分工。
+---
+
+Lyra 把“可预期的失败”和“程序约定被破坏”分成两条通道。`Result` 和 `Option` 是值，调用者用 `match`、`if let`、`?` 或组合方法处理；`Exception` 是异常路径，用 `try/catch` 捕获。`defer` 负责离开作用域时的同步清理，不依赖走的是哪条通道。
+
+## Result 与 Option 的组合
+
+`Result<T,E>` 和 `Option<T>` 的方法不需要导入。常用操作：
+
+| 操作 | `Option<T>` | `Result<T,E>` |
+|---|---|---|
+| 判断 | `isSome()` / `isNone()` | `isOk()` / `isErr()` |
+| 变换成功值 | `map { ... }` | `map { ... }` |
+| 串接 | `flatMap { ... }` 返回 `Option<U>` | `flatMap { ... }` 返回 `Result<U,E>` |
+| 恢复 | `orElse { ... }` | `orElse { error => ... }` |
+| 取默认值 | `value ?? fallback` | `unwrapOr(default)`、`unwrapOrElse { ... }` |
+| 显式互转 | `toResult { ... }` | `toOption()` |
+| 取值 | `unwrap()`、`expect(message)` | `unwrap()`、`expect(message)` |
+
+```lyra
+fn firstPositive(values: List<Int>): Int? {
+    for value in values {
+        if value > 0 { return Some(value) }
+    }
+    None
+}
+
+fn main(): Unit {
+    print(firstPositive([-1, 2, 3]).map { it * 10 } ?? 0)
+    print(firstPositive([-1]).orElse { Some(9) } ?? 0)
+    print(firstPositive([-1]).toResult { "missing" }.isErr())
+    print(Some(2).flatMap { Some(it + 1) } ?? 0)
+    print(Some(2).toResult { "missing" }.failureInfo() == None)
+}
+```
+
+```output
+20
+9
+true
+3
+true
+```
+
+`map` 保留一层包装，`flatMap` 直接采用回调返回的包装；回调只在对应分支运行一次。`unwrap()` / `expect()` 适合测试和内部不变量，失败会抛 `UnwrapError` 并照常执行 `defer`；可预期的业务失败不要靠 `unwrap`。
+
+## ? 传播
+
+`?` 在 `Result` 上提取 `Ok` 值，在 `Err` 时提前返回；在 `Option` 上提取 `Some` 值，在 `None` 时提前返回。它只退出最近的函数或 lambda。
+
+```lyra
+import std.text.{StringOps}
+
+fn parsePort(text: String): Result<Int,String> {
+    match text.parseInt() {
+        Ok(port) if port > 0 && port <= 65535 => Ok(port),
+        Ok(_) => Err("out of range"),
+        Err(_) => Err("not a number"),
+    }
+}
+
+fn requirePort(text: String): Result<Int,String> {
+    val port = parsePort(text)?
+    Ok(port + 1)
+}
+
+fn main(): Unit {
+    for input in ["8080", "70000", "abc"] {
+        print(match requirePort(input) {
+            Ok(port) => "ok ${port}",
+            Err(reason) => "bad: ${reason}",
+        })
+    }
+}
+```
+
+```output
+ok 8081
+bad: out of range
+bad: not a number
+```
+
+`?` 作用于 `Result` 时，错误类型可以原样传播；目标错误是共同 `Error` 时，具体错误会自动包装；两个具体错误类型之间只查一条可见的 `implicit` 转换。`?` 不会把 `None` 自动变成 `Err`，也不会在 `Option` 和 `Result` 之间隐式互转。
+
+## 共同 Error
+
+标准库提供共同的 `Error` 值：字符串或提供可见同步实例方法 `fn message(): String` 的类型可以提升为 `Error`。`Error` 保留 `message`、`original`、`cause` 和 `suppressed`，所以跨层传播后仍能检查原始具体错误。
+
+```lyra
+struct LookupFailed(val code: Int) {
+    fn message(): String { "lookup ${code}" }
+}
+struct ServiceFailure(val code: Int) {
+    fn message(): String { "service ${code}" }
+}
+implicit (failure: LookupFailed): ServiceFailure { ServiceFailure(failure.code) }
+
+fn query(fail: Bool): Result<Int, LookupFailed> {
+    if fail { Err(LookupFailed(7)) } else { Ok(12) }
+}
+
+fn convert(fail: Bool): Result<Int, ServiceFailure> {
+    Ok(query(fail)?)
+}
+
+fn main(): Unit {
+    print(match convert(false) { Ok(value) => value, Err(_) => 0 })
+    match convert(true).failureInfo() {
+        Some(error) => {
+            print(error.message)
+            print(error.original is ServiceFailure)
+        },
+        None => print("unexpected"),
+    }
+}
+```
+
+```output
+12
+service 7
+true
+```
+
+`failureInfo()` 在 `Err` 时返回共同 `Error`，在 `Ok` 时返回 `None`。`original` 保留转换前的具体载荷，可以安全地 `as?` 检查；`cause` 指向前因，`suppressed` 保存清理或附加失败。`withSuppressed(error)` 返回附加失败后的新值，读取 `suppressed` 得到列表快照。
+
+## 异常
+
+普通异常用 `throw Exception("reason")` 或自定义异常类型抛出，用 `try/catch` 捕获。自定义异常用 `exception Name` 声明：
+
+```lyra
+exception MissingEntry
+
+fn lookup(ok: Bool): Int {
+    if ok { 7 } else { throw MissingEntry("missing") }
+}
+
+fn main(): Unit {
+    try {
+        print(lookup(false))
+    } catch problem: MissingEntry {
+        print("caught ${problem.message}")
+    } catch problem: Exception {
+        print("other ${problem.message}")
+    }
+}
+```
+
+```output
+caught missing
+```
+
+- `catch problem: Type if condition { ... }` 先按类型匹配，再用绑定求条件；条件为假继续匹配后续分支。
+- 根类型 `Exception` 的捕获和 `catch { ... }` 必须放在最后。`catch { ... }` 捕获普通异常，但不会吞掉取消。
+- catch 中单独写 `throw` 会原样重抛当前异常，保留最初抛出的位置。
+- 未捕获的异常会输出原因、源码位置和异步调用链，并以非零状态退出。
+
+运行时整数溢出、除零和非法移位抛 `ArithmeticError`；列表、字符串和字节的下标越界抛 `BoundsError`。这些异常沿普通异常路径清理和捕获。段错误、进程被终止和运行时损坏不属于可恢复路径，不要用 `catch` 兜底。
+
+`throws` 可以写在函数返回类型后面，作为文档提示和 IDE 悬停信息；它不改变函数类型，也不强制调用者捕获。业务失败优先用 `Result`，异常留给“调用契约被破坏”或内部不变量失败。
+
+## defer
+
+`defer` 注册同步清理，在离开当前词法块时按注册的逆序各执行一次。正常完成、`return`、`?` 提前返回、异常展开和协作式取消都会执行。
+
+```lyra
+fn main(): Unit {
+    defer print("first")
+    defer print("second")
+    print("body")
+}
+```
+
+```output
+body
+second
+first
+```
+
+`defer` 里不能 `await`、`spawn` 或取消任务；清理必须是同步的。需要异步 flush、commit 或协议确认时，把这一步放进正常流程并显式 `await`。
+
+清理本身也可能失败。如果正在展开异常或取消，原异常/取消仍是主因，清理异常作为附加原因保存在 `suppressed`；如果块原本正常返回，清理异常会接管这次返回。无论哪种情况，后续清理仍会继续执行。
+
+## 资源与别名
+
+`File`、`Connection` 等外部资源是普通引用对象。GC 管理包装对象的内存，不替调用者决定何时关闭操作系统或数据库句柄。用 `defer`、`close` 或作用域 API 明确释放。
+
+```lyra
+import std.io.{File, IoError, LineReader}
+
+fn firstLine(path: String): Result<String?,IoError> {
+    val file = File.openRead(path)?
+    defer file.close()
+    val reader = LineReader.fromFile(file, maxBytes: 1024)?
+    reader.readLine()
+}
+```
+
+赋值和传参只复制引用。一次成功关闭对所有别名可见；后续读写得到可识别的已关闭错误，重复 `close()` 空闲时成功。如果仍有读写占用句柄，本次 `close()` 抛 `Busy` 并保持打开，等操作结束后可以重试。
+
+也可以使用作用域 API，让库在回调退出时关闭，包括返回 `Err` 或抛异常的路径：
+
+```lyra
+import std.io.{File, IoError}
+
+fn copyFile(source: String, destination: String): Result<Unit, IoError> {
+    File.withRead(source) { input =>
+        File.withWrite(destination) { output =>
+            while true {
+                match input.read()? {
+                    None => break,
+                    Some(chunk) => { output.write(chunk)?; },
+                }
+            }
+            output.flush()
+        }
+    }
+}
+```
+
+I/O 是同步的。异步服务里需要读文件或访问 SQLite 时，把整段同步工作放进 `await blocking { ... }`，不要把阻塞调用直接放在执行域里。
+
+## 常见坑
+
+- `?` 只退出最近的函数或 lambda；lambda 里的 `?` 不会跳过外层调用。
+- `unwrap` 会抛异常，不是“取出或默认”；业务失败用 `??`、`orElse` 或 `match`。
+- 宽泛的 `catch { ... }` 不捕获取消；不要用它代替任务清理。
+- `defer` 不能挂起；异步清理要显式写进正常流程。
+- 关闭文件不会复制或移动句柄；所有别名看到同一个关闭状态。
+
+## 练习
+
+1. 写 `parseConfig(text: String): Result<Config, String>`，把整数解析失败和缺失字段分别映射成可读错误，再用 `?` 组合两个解析步骤。
+2. 定义 `exception InvalidConfig`，在配置为空时抛出，并用 `catch problem: InvalidConfig` 捕获。
+3. 写一个函数，用 `defer` 按逆序打印三个清理步骤，并在中间用 `?` 提前返回，确认清理仍然执行。
+
+下一章进入异步与并发：冷 `Task`、执行域、任务组、Channel、`select`、阻塞池和取消。

@@ -4,6 +4,8 @@ Lyra 是一门使用 LLVM AOT 的编译型语言。编译器把通过静态检�
 
 **0.1 Alpha 的使用范围：** Windows x64 和 Linux x86-64 上的单机 CLI、可发布的源码库，以及使用 SQLite 的小型 HTTP/HTTPS 服务。语言和包格式仍处于开发期。
 
+教程源码在 [`docs/`](docs/)（Astro Starlight）；本地构建和内容约定见 [`docs/README.md`](docs/README.md)。
+
 ## 用预编译 SDK 新建项目
 
 从 [GitHub Releases](https://github.com/isyuah/lyra/releases) 下载对应平台的 SDK；发布页的 `SHA256SUMS` 可校验归档。

@@ -1,0 +1,33 @@
+---
+title: 教程总览
+description: 从安装 Lyra 到交付 JSONL CLI 和 HTTP/SQLite 服务的完整学习路径。
+---
+
+这套教程面向已经会至少一门主流语言、但还没写过 Lyra 的开发者。它不解释变量、循环和函数是什么，而是直接讲 Lyra 自己的模型：值类型和引用类型怎么分工，空值为什么必须显式处理，`Result` 与异常各自负责什么，冷 `Task` 和执行域如何改变并发写法，以及模块、包和宏如何支撑一个能发布的项目。
+
+## 学习路径
+
+教程分成四段，建议按顺序阅读。每章末尾有练习；代码块可以直接复制到本地项目运行。
+
+| 阶段 | 章节 | 你会做出什么 |
+|---|---|---|
+| 入门 | [Lyra 是什么](/guide/what-is-lyra/)、[第一个项目](/guide/first-project/) | 跑通项目创建、检查、运行和测试 |
+| 语言基础 | [表达式、值与控制流](/guide/values-and-control-flow/)、[数据建模](/guide/data-modeling/)、[函数、闭包与集合](/guide/functions-closures-collections/) | 用小段程序建立类型和逻辑 |
+| 语言能力 | [泛型、接口与转换](/guide/generics-interfaces/)、[错误与资源](/guide/errors-resources/)、[异步与并发](/guide/async-concurrency/) | 写出可复用接口、可靠的错误边界和并发任务 |
+| 工程与实战 | [模块、包与测试](/guide/modules-packages-testing/)、[元编程与外部边界](/guide/metaprogramming-ffi/)、[JSONL 统计 CLI](/guide/jsonlines-cli/)、[HTTP/SQLite 用户服务](/guide/http-sqlite-service/) | 组织可发布项目，并交付两个完整示例 |
+
+## 版本与事实来源
+
+当前文档对应 Lyra `0.1.0-alpha.1` 的仓库工作树。教程只把编译器已经实现、且仓库示例或测试能够验证的行为当作可写代码。语言设计仍在演进；遇到文档与编译器不一致时，以编译器输出和仓库测试为准。
+
+需要查具体语法或标准库 API 时，先看：
+
+- [仓库 README](https://github.com/isyuah/lyra/blob/main/README.md)：当前可运行的语法和命令总览。
+- [标准库索引](https://github.com/isyuah/lyra/blob/main/std/README.md)：各 `std` 包的入口和示例。
+- [示例项目](https://github.com/isyuah/lyra/tree/main/examples)：可以直接构建、运行的完整项目。
+
+## 约定
+
+- 终端命令用 `bash` 代码块；Windows PowerShell 的差异会单独说明。
+- Lyra 源码用 `lyra` 代码块；紧跟在后面的 `output` 块是程序的标准输出。
+- 标有“当前限制”的段落说明 0.1 Alpha 尚未覆盖的能力，不把它们当成已经可用。
