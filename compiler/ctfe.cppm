@@ -1,6 +1,5 @@
 module;
 #include <algorithm>
-#include <array>
 #include <bit>
 #include <cmath>
 #include <cstdio>
@@ -769,17 +768,17 @@ struct Evaluation {
     }
 
     EvalValue numericMember(const CheckedFunction& fn, Span site, Type type, Callee operation, const ConstScalar& input,
-                            std::span<const ConstScalar> args) const {
+                            const ConstScalar& first, const ConstScalar& second) const {
         if (type.kind == Type::Real) {
             auto value = real(type, std::get<double>(input));
             if (operation == Callee::IsFinite) return value.isFinite();
             if (operation == Callee::IsNaN) return value.isNaN();
             if (operation == Callee::IsInfinite) return value.isInfinity();
             if (operation == Callee::NumericAbs) return asDouble(llvm::abs(value), type);
-            auto other = real(type, std::get<double>(args[0]));
+            auto other = real(type, std::get<double>(first));
             if (operation == Callee::NumericMin) return asDouble(llvm::minimum(value, other), type);
             if (operation == Callee::NumericMax) return asDouble(llvm::maximum(value, other), type);
-            auto upper = real(type, std::get<double>(args[1]));
+            auto upper = real(type, std::get<double>(second));
             auto order = other.compare(upper);
             if (order == llvm::APFloat::cmpGreaterThan || order == llvm::APFloat::cmpUnordered)
                 error(sources, fn, site, "LYCT0003", "invalid clamp bounds");
@@ -792,10 +791,10 @@ struct Evaluation {
             return signedValue && value.isNegative() ? (-value).getZExtValue() : value.getZExtValue();
         }
         auto less = [&](const llvm::APInt& left, const llvm::APInt& right) { return signedValue ? left.slt(right) : left.ult(right); };
-        auto other = integer(type, args[0]);
+        auto other = integer(type, first);
         if (operation == Callee::NumericMin) return (less(value, other) ? value : other).getZExtValue();
         if (operation == Callee::NumericMax) return (less(value, other) ? other : value).getZExtValue();
-        auto upper = integer(type, args[1]);
+        auto upper = integer(type, second);
         if (less(upper, other)) error(sources, fn, site, "LYCT0003", "invalid clamp bounds");
         return (less(value, other) ? other : less(upper, value) ? upper : value).getZExtValue();
     }
@@ -1115,10 +1114,11 @@ struct Evaluation {
                     auto from = fn.expressions[*item.receiver].type;
                     if (info.callee == Callee::NumericAbs || info.callee == Callee::NumericMin || info.callee == Callee::NumericMax ||
                         info.callee == Callee::NumericClamp || info.callee == Callee::IsFinite || info.callee == Callee::IsNaN || info.callee == Callee::IsInfinite) {
-                        std::array<ConstScalar, 2> args;
-                        for (std::size_t index = 0; index < item.arguments.size(); ++index)
-                            args[info.argumentSlots[index]] = scalarValue(sub(item.arguments[index].value), fn, site);
-                        return numericMember(fn, item.name.span, from, info.callee, scalarValue(receiver, fn, site), args);
+                        auto first = item.arguments.empty() ? EvalValue{} : sub(item.arguments.front().value);
+                        auto second = item.arguments.size() < 2 ? EvalValue{} : sub(item.arguments.back().value);
+                        bool reversed = item.arguments.size() == 2 && info.argumentSlots.front() == 1;
+                        return numericMember(fn, item.name.span, from, info.callee, scalarValue(receiver, fn, site),
+                            scalarValue(reversed ? second : first, fn, site), scalarValue(reversed ? first : second, fn, site));
                     }
                     if (info.callee == Callee::SumPresent || info.callee == Callee::SumAbsent || info.callee == Callee::SumUnwrap ||
                         info.callee == Callee::CarryFailure) {
