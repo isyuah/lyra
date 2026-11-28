@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
     inputs:
       package_sdk:
-        description: 'Build downloadable SDK artifacts without publishing a release'
+        description: 'Build downloadable SDK and installer artifacts without publishing a release'
         type: boolean
         default: false
 
@@ -98,13 +98,34 @@ jobs:
         if: needs.prepare.outputs.tag != ''
         env:
           SDK_TAG: ${{ needs.prepare.outputs.tag }}
-        run: python tools/package_sdk.py build/windows-release --tag $env:SDK_TAG --output (Join-Path $env:RUNNER_TEMP 'lyra-dist')
+        run: |
+          $dist = Join-Path $env:RUNNER_TEMP 'lyra-dist'
+          python tools/package_sdk.py build/windows-release --tag $env:SDK_TAG --output $dist
+          Copy-Item install.ps1 (Join-Path $dist 'lyra-install.ps1')
+      - name: Test Windows install and upgrade
+        if: needs.prepare.outputs.tag != ''
+        env:
+          SDK_TAG: ${{ needs.prepare.outputs.tag }}
+        shell: pwsh
+        run: |
+          $dist = Join-Path $env:RUNNER_TEMP 'lyra-dist'
+          $archive = Get-ChildItem -LiteralPath $dist -Filter '*.zip' -File | Select-Object -First 1
+          $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $archive.FullName).Hash
+          $install = Join-Path $env:RUNNER_TEMP 'lyra-installer-smoke'
+          & ./install.ps1 -InstallDir $install -Tag $env:SDK_TAG -ArchivePath $archive.FullName -Sha256 $hash -NoPath
+          if ((& (Join-Path $install 'bin/lyra.exe') --version) -ne "lyra $($env:SDK_TAG.Substring(1))") { throw 'First SDK installation failed.' }
+          Set-Content -LiteralPath (Join-Path $install 'obsolete.txt') -Value 'old install marker'
+          & ./install.ps1 -InstallDir $install -Tag $env:SDK_TAG -ArchivePath $archive.FullName -Sha256 $hash -NoPath
+          if (Test-Path -LiteralPath (Join-Path $install 'obsolete.txt')) { throw 'SDK upgrade did not replace the previous installation.' }
+          $backup = Get-ChildItem -LiteralPath (Split-Path $install -Parent) -Directory -Filter '.lyra-backup-*' | Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName 'obsolete.txt') } | Select-Object -First 1
+          if (-not $backup) { throw 'The upgrade did not preserve unmanaged user files from the previous SDK directory.' }
+          if (-not (Select-String -LiteralPath (Join-Path $install 'share/lyra/std/httpClient/src/httpClient.ly') -Pattern '构造不带正文的冷 GET 请求')) { throw 'The installed standard library is missing the httpGet documentation.' }
       - name: Upload Windows SDK
         if: needs.prepare.outputs.tag != ''
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: sdk-windows-x64
-          path: ${{ runner.temp }}/lyra-dist/*.zip
+          path: ${{ runner.temp }}/lyra-dist/*
           if-no-files-found: error
           compression-level: 0
           retention-days: 7
@@ -136,11 +157,13 @@ jobs:
           ubuntu="lyra-$version-ubuntu22.04-x86_64.tar.gz"
           test -s "$windows"
           test -s "$ubuntu"
-          sha256sum "$windows" "$ubuntu" > SHA256SUMS
+          test -s lyra-install.ps1
+          test -s lyra-install.sh
+          sha256sum "$windows" "$ubuntu" lyra-install.ps1 lyra-install.sh > SHA256SUMS
           if [[ "$(gh api "repos/$GH_REPO/commits/refs/tags/$SDK_TAG" --jq '.sha')" != "$SDK_COMMIT" ]]; then
             echo 'The tag no longer points at the verified commit.' >&2
             exit 1
           fi
           flags=(--verify-tag --generate-notes --title "Lyra $version")
           if [[ "$version" == *-* ]]; then flags+=(--prerelease); fi
-          gh release create "$SDK_TAG" "$windows" "$ubuntu" SHA256SUMS "${flags[@]}"
+          gh release create "$SDK_TAG" "$windows" "$ubuntu" lyra-install.ps1 lyra-install.sh SHA256SUMS "${flags[@]}"

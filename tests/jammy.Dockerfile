@@ -43,9 +43,20 @@ RUN sh /verify.sh verify /apps
 FROM builder AS sdk-package
 COPY --from=verify /sdk-verified /sdk-verified
 COPY tools/package_sdk.py tools/
+COPY install.sh tools/install.sh
 ARG LYRA_RELEASE_TAG
 RUN test -n "$LYRA_RELEASE_TAG" \
-    && python3 tools/package_sdk.py build/release --tag "$LYRA_RELEASE_TAG" --output /out/dist
+    && python3 tools/package_sdk.py build/release --tag "$LYRA_RELEASE_TAG" --output /out/dist \
+    && archive="$(find /out/dist -maxdepth 1 -name '*.tar.gz' -print -quit)" \
+    && archive_hash="$(sha256sum "$archive" | cut -d ' ' -f 1)" \
+    && mkdir -p /tmp/lyra-installer-home \
+    && HOME=/tmp/lyra-installer-home sh tools/install.sh --install-dir /tmp/lyra-installer-probe --tag "$LYRA_RELEASE_TAG" --archive "$archive" --sha256 "$archive_hash" \
+    && touch /tmp/lyra-installer-probe/obsolete.txt \
+    && HOME=/tmp/lyra-installer-home sh tools/install.sh --install-dir /tmp/lyra-installer-probe --tag "$LYRA_RELEASE_TAG" --archive "$archive" --sha256 "$archive_hash" \
+    && test ! -e /tmp/lyra-installer-probe/obsolete.txt \
+    && test -n "$(find /tmp -maxdepth 2 -type f -path '/tmp/.lyra-backup-lyra-installer-probe-*/obsolete.txt' -print -quit)" \
+    && test "$(/tmp/lyra-installer-probe/bin/lyra --version)" = "lyra ${LYRA_RELEASE_TAG#v}" \
+    && cp tools/install.sh /out/dist/lyra-install.sh
 
 FROM scratch AS sdk-dist
 COPY --from=sdk-package /out/dist/ /

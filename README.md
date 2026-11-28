@@ -6,6 +6,37 @@ Lyra 是一门使用 LLVM AOT 的编译型语言。编译器把通过静态检�
 
 教程源码在 [`docs/`](docs/)（Astro Starlight）；本地构建和内容约定见 [`docs/README.md`](docs/README.md)。
 
+## 安装或更新 SDK
+
+Windows x64 和 Linux x86-64 都可以用安装脚本获取最新发布版。脚本先校验 `SHA256SUMS`，再校验 SDK 内部文件清单；升级前先暂存旧版本，安装失败时恢复。若旧目录含有用户文件或修改过的 SDK 文件，会保留旧目录备份。无需管理员权限。
+
+**Windows x64：** 在 PowerShell 中下载并运行：
+
+```powershell
+$installer = Join-Path $env:TEMP 'lyra-install.ps1'
+Invoke-WebRequest 'https://raw.githubusercontent.com/isyuah/lyra/main/install.ps1' -OutFile $installer
+& $installer
+```
+
+脚本会复用 `PATH` 中的已有 SDK；未检测到时安装到 `%LOCALAPPDATA%\Programs\Lyra` 并添加到当前用户的 `PATH`。已有 SDK 不在 `PATH` 时，传入它的目录，例如 `& $installer -InstallDir 'E:\Softw\lyra'`。更新前应关闭正在运行的 Lyra 语言服务和 CLI。
+
+**Ubuntu 22.04+ x86-64：** 在 Shell 中运行：
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/isyuah/lyra/main/install.sh | sh
+```
+
+脚本会复用 `PATH` 中能识别的 SDK；未检测到时安装到 `~/.local/opt/lyra`，并在 `~/.local/bin/lyra` 创建稳定入口。若 `~/.local/bin` 不在 `PATH`，脚本会打印需要添加的配置。要指定目录，先下载脚本再传 `--install-dir`：
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/isyuah/lyra/main/install.sh -o /tmp/lyra-install.sh
+sh /tmp/lyra-install.sh --install-dir "$HOME/.local/opt/lyra"
+```
+
+安装脚本需要 `curl`、`tar` 和 `sha256sum`。
+
+两端脚本也可通过 GitHub Actions 的 **package_sdk** 手动构建任务下载；Release 同时提供脚本和原始压缩包。需要离线安装时，可下载对应 SDK 归档并手动校验发布页中的 `SHA256SUMS`。
+
 ## 用预编译 SDK 新建项目
 
 从 [GitHub Releases](https://github.com/isyuah/lyra/releases) 下载对应平台的 SDK；发布页的 `SHA256SUMS` 可校验归档。
@@ -89,7 +120,7 @@ git tag -a v0.1.0-alpha.1 -m "Lyra 0.1.0-alpha.1"
 git push origin v0.1.0-alpha.1
 ```
 
-GitHub Actions 校验 tag 和该提交的 `VERSION` 一致，在 Windows x64 与 Ubuntu 22.04 x86-64 分别验收 Debug、Release 和可搬迁 SDK；两边都通过后才将 Windows ZIP、Ubuntu TAR.GZ 和 `SHA256SUMS` 发到同一 GitHub Release。带预发布后缀的版本标记为 Pre-release。分支和 PR 只跑验收；在 Actions 手动选择 `package_sdk` 可验证出包并下载临时制品，不会发布。
+GitHub Actions 校验 tag 和该提交的 `VERSION` 一致，在 Windows x64 与 Ubuntu 22.04 x86-64 分别验收 Debug、Release 和可搬迁 SDK，并测试两端的安装与覆盖升级；全部通过后才将安装脚本、Windows ZIP、Ubuntu TAR.GZ 和 `SHA256SUMS` 发到同一 GitHub Release。带预发布后缀的版本标记为 Pre-release。分支和 PR 只跑验收；在 Actions 手动选择 `package_sdk` 可验证出包并下载临时制品，不会发布。
 
 Windows CI 固定使用 Clang 23.1.6 构建 Lyra，避免依赖 Runner 自带的 Clang；SDK 内仍使用 LLVM 18.1.8。
 
